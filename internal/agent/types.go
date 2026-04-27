@@ -16,6 +16,7 @@ const (
 	AgentTypeClaudeCode  AgentType = "cc"       // Claude Code CLI
 	AgentTypeCodex       AgentType = "cod"      // Codex CLI (OpenAI)
 	AgentTypeGemini      AgentType = "gmi"      // Gemini CLI (Google)
+	AgentTypePi          AgentType = "pi"       // Pi coding agent
 	AgentTypeAntigravity AgentType = "agy"      // Antigravity CLI (Google) — successor to the Gemini CLI
 	AgentTypeGrok        AgentType = "grok"     // Grok Build CLI (xAI)
 	AgentTypeOllama      AgentType = "ollama"   // Local Ollama CLI
@@ -59,6 +60,8 @@ func (t AgentType) Canonical() AgentType {
 		return AgentTypeCodex
 	case "gmi", "gemini", "gemini-cli", "gemini_cli", "geminicli", "google", "google-ai", "google_ai", "google-gemini", "google_gemini", "googlegemini":
 		return AgentTypeGemini
+	case "pi", "pi-coding-agent", "pi_coding_agent", "picodingagent":
+		return AgentTypePi
 	case "agy", "antigravity", "antigravity-cli", "antigravity_cli", "antigravitycli", "google-antigravity":
 		return AgentTypeAntigravity
 	case "grok", "grok-build", "grok_build", "grokbuild", "xai-grok-build", "xai_grok_build", "xaigrokbuild":
@@ -91,6 +94,8 @@ func (t AgentType) DisplayName() string {
 		return "Codex CLI"
 	case AgentTypeGemini:
 		return "Gemini CLI"
+	case AgentTypePi:
+		return "Pi"
 	case AgentTypeAntigravity:
 		return "Antigravity CLI"
 	case AgentTypeGrok:
@@ -121,6 +126,8 @@ func (t AgentType) ProfileName() string {
 		return "Codex"
 	case AgentTypeGemini:
 		return "Gemini"
+	case AgentTypePi:
+		return "Pi"
 	case AgentTypeAntigravity:
 		return "Antigravity"
 	case AgentTypeGrok:
@@ -151,7 +158,7 @@ func (t AgentType) ProfileName() string {
 // IsValid returns true if this is a known agent type.
 func (t AgentType) IsValid() bool {
 	switch t.Canonical() {
-	case AgentTypeClaudeCode, AgentTypeCodex, AgentTypeGemini, AgentTypeAntigravity, AgentTypeGrok, AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeUser:
+	case AgentTypeClaudeCode, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeAntigravity, AgentTypeGrok, AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeUser:
 		return true
 	default:
 		return false

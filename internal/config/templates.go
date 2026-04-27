@@ -406,7 +406,11 @@ func DefaultAgentTemplates() AgentConfig {
 		// ship — it collides with Grok Build's `agent` binary on multi-CLI boxes.
 		// Override [agents].cursor to opt into different flags or a different
 		// binary name.
-		Cursor:   `cursor-agent --yolo{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		Cursor: `cursor-agent --yolo{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		// Pi launches the provider-backed Pi coding harness. SystemPromptFile is
+		// appended as a system prompt so persona prompts work in the same way as
+		// the other interactive agents.
+		Pi:       `pi{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .SystemPromptFile}} --append-system-prompt "$(cat {{shellQuote .SystemPromptFile}})"{{end}}`,
 		Windsurf: `windsurf{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
 		Aider:    `aider{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
 		// Opencode (oc): the upstream `opencode` binary takes `-m/--model

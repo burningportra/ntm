@@ -314,6 +314,46 @@ var (
 	agyHeaderPattern = regexp.MustCompile(`(?i)antigravity`)
 )
 
+// Pi (pi) patterns.
+var (
+	piRateLimitPatterns = []string{
+		"rate limit",
+		"too many requests",
+		"quota exceeded",
+		"usage limit",
+		"try again later",
+	}
+
+	piWorkingPatterns = []string{
+		"```",
+		"tool call",
+		"running ",
+		"reading ",
+		"writing ",
+		"editing ",
+		"searching ",
+		"thinking",
+	}
+
+	piIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),
+		regexp.MustCompile(`(?m)^>\s*$`),
+		regexp.MustCompile(`(?i)pi\s+-\s+ai\s+coding\s+assistant`),
+		regexp.MustCompile(`(?i)\bpi\b.*\b(coding\s+assistant|terminal\s+coding\s+harness)\b`),
+	}
+
+	piErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+		"permission denied",
+		"connection refused",
+		"timeout",
+	}
+
+	piHeaderPattern = regexp.MustCompile(`(?im)(^\s*pi\s+-\s+ai\s+coding\s+assistant\b|\bpi\b.*\b(coding\s+assistant|terminal\s+coding\s+harness)\b|\[pi(?:[-_][[:alnum:]-]+)?\])`)
+)
+
 // Cursor (cursor) patterns.
 var (
 	cursorRateLimitPatterns = []string{

@@ -46,6 +46,7 @@ const (
 	AgentGemini      = agent.AgentTypeGemini
 	AgentAntigravity = agent.AgentTypeAntigravity
 	AgentGrok        = agent.AgentTypeGrok
+	AgentPi          = agent.AgentTypePi
 	AgentCursor      = agent.AgentTypeCursor
 	AgentWindsurf    = agent.AgentTypeWindsurf
 	AgentAider       = agent.AgentTypeAider
@@ -478,6 +479,11 @@ func detectAgentFromCommand(command string) AgentType {
 	// Gemini CLI
 	if isAgent("gemini") {
 		return AgentGemini
+	}
+
+	// Pi coding agent
+	if isAgent("pi") || strings.Contains(cmd, "pi-coding-agent") {
+		return AgentPi
 	}
 
 	// Cursor

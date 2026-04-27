@@ -96,6 +96,10 @@ func (p *parserImpl) DetectAgentType(output string) AgentType {
 		return AgentTypeGemini
 	}
 
+	if piHeaderPattern.MatchString(output) {
+		return AgentTypePi
+	}
+
 	// New Agents: Cursor, Windsurf, Aider
 	if cursorHeaderPattern.MatchString(output) {
 		return AgentTypeCursor
@@ -124,6 +128,7 @@ func (p *parserImpl) detectByPatternFrequency(output string) AgentType {
 	scores[AgentTypeClaudeCode] = p.countMatches(output, ccWorkingPatterns)
 	scores[AgentTypeCodex] = p.countMatches(output, codWorkingPatterns)
 	scores[AgentTypeGemini] = p.countMatches(output, gmiWorkingPatterns)
+	scores[AgentTypePi] = p.countMatches(output, piWorkingPatterns)
 	scores[AgentTypeCursor] = p.countMatches(output, cursorWorkingPatterns)
 	scores[AgentTypeWindsurf] = p.countMatches(output, windsurfWorkingPatterns)
 	scores[AgentTypeAider] = p.countMatches(output, aiderWorkingPatterns)
@@ -135,6 +140,7 @@ func (p *parserImpl) detectByPatternFrequency(output string) AgentType {
 		AgentTypeClaudeCode,
 		AgentTypeCodex,
 		AgentTypeGemini,
+		AgentTypePi,
 		AgentTypeCursor,
 		AgentTypeWindsurf,
 		AgentTypeAider,
@@ -202,7 +208,7 @@ func (p *parserImpl) extractMetrics(output string, state *AgentState) {
 			state.IsContextLow = true
 		}
 
-	case AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeOllama:
+	case AgentTypePi, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeOllama:
 		// No specific metrics yet for these agents
 	}
 }
@@ -290,6 +296,8 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, codRateLimitPatterns)
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiRateLimitPatterns)
+	case AgentTypePi:
+		return matchAny(recentOutput, piRateLimitPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorRateLimitPatterns)
 	case AgentTypeWindsurf:
@@ -303,6 +311,7 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, ccRateLimitPatterns) ||
 			matchAny(recentOutput, codRateLimitPatterns) ||
 			matchAny(recentOutput, gmiRateLimitPatterns) ||
+			matchAny(recentOutput, piRateLimitPatterns) ||
 			matchAny(recentOutput, cursorRateLimitPatterns) ||
 			matchAny(recentOutput, windsurfRateLimitPatterns) ||
 			matchAny(recentOutput, aiderRateLimitPatterns) ||
@@ -323,6 +332,8 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, codWorkingPatterns)
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiWorkingPatterns)
+	case AgentTypePi:
+		return matchAny(recentOutput, piWorkingPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorWorkingPatterns)
 	case AgentTypeWindsurf:
@@ -336,6 +347,7 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, ccWorkingPatterns) ||
 			matchAny(recentOutput, codWorkingPatterns) ||
 			matchAny(recentOutput, gmiWorkingPatterns) ||
+			matchAny(recentOutput, piWorkingPatterns) ||
 			matchAny(recentOutput, cursorWorkingPatterns) ||
 			matchAny(recentOutput, windsurfWorkingPatterns) ||
 			matchAny(recentOutput, aiderWorkingPatterns) ||
@@ -389,6 +401,8 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		// Gemini (and its successor Antigravity) are trickier - check for prompt
 		// or lack of working indicators
 		return matchAnyRegex(lastLines, gmiIdlePatterns)
+	case AgentTypePi:
+		return matchAnyRegex(lastLines, piIdlePatterns)
 	case AgentTypeCursor:
 		return matchAnyRegex(lastLines, cursorIdlePatterns)
 	case AgentTypeWindsurf:
@@ -402,6 +416,7 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		return matchAnyRegex(lastLines, ccIdlePatterns) ||
 			matchAnyRegex(lastLines, codIdlePatterns) ||
 			matchAnyRegex(lastLines, gmiIdlePatterns) ||
+			matchAnyRegex(lastLines, piIdlePatterns) ||
 			matchAnyRegex(lastLines, cursorIdlePatterns) ||
 			matchAnyRegex(lastLines, windsurfIdlePatterns) ||
 			matchAnyRegex(lastLines, aiderIdlePatterns) ||
@@ -427,6 +442,8 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, codErrorPatterns)
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiErrorPatterns)
+	case AgentTypePi:
+		return matchAny(recentOutput, piErrorPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorErrorPatterns)
 	case AgentTypeWindsurf:
@@ -440,6 +457,7 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, ccErrorPatterns) ||
 			matchAny(recentOutput, codErrorPatterns) ||
 			matchAny(recentOutput, gmiErrorPatterns) ||
+			matchAny(recentOutput, piErrorPatterns) ||
 			matchAny(recentOutput, cursorErrorPatterns) ||
 			matchAny(recentOutput, windsurfErrorPatterns) ||
 			matchAny(recentOutput, aiderErrorPatterns) ||
@@ -459,6 +477,8 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		return collectMatches(recentOutput, codRateLimitPatterns)
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return collectMatches(recentOutput, gmiRateLimitPatterns)
+	case AgentTypePi:
+		return collectMatches(recentOutput, piRateLimitPatterns)
 	case AgentTypeCursor:
 		return collectMatches(recentOutput, cursorRateLimitPatterns)
 	case AgentTypeWindsurf:
@@ -472,6 +492,7 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		matches := collectMatches(recentOutput, ccRateLimitPatterns)
 		matches = append(matches, collectMatches(recentOutput, codRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, gmiRateLimitPatterns)...)
+		matches = append(matches, collectMatches(recentOutput, piRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, cursorRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, windsurfRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, aiderRateLimitPatterns)...)
@@ -492,6 +513,8 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 		return collectMatches(recentOutput, codWorkingPatterns)
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return collectMatches(recentOutput, gmiWorkingPatterns)
+	case AgentTypePi:
+		return collectMatches(recentOutput, piWorkingPatterns)
 	case AgentTypeCursor:
 		return collectMatches(recentOutput, cursorWorkingPatterns)
 	case AgentTypeWindsurf:
@@ -504,6 +527,7 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 		matches := collectMatches(recentOutput, ccWorkingPatterns)
 		matches = append(matches, collectMatches(recentOutput, codWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, gmiWorkingPatterns)...)
+		matches = append(matches, collectMatches(recentOutput, piWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, cursorWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, windsurfWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, aiderWorkingPatterns)...)

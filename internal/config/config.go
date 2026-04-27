@@ -837,6 +837,7 @@ type AgentConfig struct {
 	Claude       string            `toml:"claude"`
 	Codex        string            `toml:"codex"`
 	Gemini       string            `toml:"gemini"`
+	Pi           string            `toml:"pi"`
 	Antigravity  string            `toml:"antigravity"` // Antigravity (agy) launch command — successor to the Gemini CLI
 	Grok         string            `toml:"grok"`        // Official xAI Grok Build launch command
 	Ollama       string            `toml:"ollama"`
@@ -1858,11 +1859,13 @@ type ModelsConfig struct {
 	DefaultClaude string            `toml:"default_claude"` // Default model for Claude
 	DefaultCodex  string            `toml:"default_codex"`  // Default model for Codex
 	DefaultGemini string            `toml:"default_gemini"` // Default model for Gemini
+	DefaultPi     string            `toml:"default_pi"`     // Default model for Pi
 	DefaultGrok   string            `toml:"default_grok"`   // Optional Grok Build default; empty delegates to the CLI
 	DefaultOllama string            `toml:"default_ollama"` // Default model for Ollama
 	Claude        map[string]string `toml:"claude"`         // Claude model aliases
 	Codex         map[string]string `toml:"codex"`          // Codex model aliases
 	Gemini        map[string]string `toml:"gemini"`         // Gemini model aliases
+	Pi            map[string]string `toml:"pi"`             // Pi model aliases
 	Grok          map[string]string `toml:"grok"`           // Grok Build model aliases
 	Ollama        map[string]string `toml:"ollama"`         // Ollama model aliases
 	Cursor        map[string]string `toml:"cursor"`         // Cursor model aliases
@@ -1882,6 +1885,7 @@ func DefaultModels() ModelsConfig {
 		DefaultClaude: "claude-opus-4-8",
 		DefaultCodex:  DefaultCodexModel,
 		DefaultGemini: "gemini-3-pro-preview",
+		DefaultPi:     "",
 		DefaultGrok:   "",
 		DefaultOllama: "llama3",
 		Claude: map[string]string{
@@ -1904,6 +1908,12 @@ func DefaultModels() ModelsConfig {
 			"flash":  "gemini-3-flash",
 			"flash2": "gemini-2.0-flash",
 		},
+		Pi: map[string]string{
+			"opus":   "anthropic/claude-opus-4-6",
+			"sonnet": "anthropic/claude-sonnet-4-6",
+			"codex":  "openai/gpt-5.3-codex",
+			"gemini": "google/gemini-3-pro-preview",
+		},
 		Grok: map[string]string{},
 		Ollama: map[string]string{
 			"llama3": "llama3",
@@ -1919,6 +1929,8 @@ func canonicalModelLookupAgentType(agentType string) string {
 		return "codex"
 	case agent.AgentTypeGemini:
 		return "gemini"
+	case agent.AgentTypePi:
+		return "pi"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
 	case agent.AgentTypeGrok:
@@ -1961,6 +1973,8 @@ func (m *ModelsConfig) AliasesFor(agentType string) map[string]string {
 		return m.Codex
 	case "gemini":
 		return m.Gemini
+	case "pi":
+		return m.Pi
 	case "grok":
 		return m.Grok
 	case "ollama":
@@ -1995,6 +2009,8 @@ func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 			return m.DefaultCodex
 		case "gemini":
 			return m.DefaultGemini
+		case "pi":
+			return m.DefaultPi
 		case "grok":
 			return m.DefaultGrok
 		case "ollama":
@@ -3819,6 +3835,9 @@ func Print(cfg *Config, w io.Writer) error {
 	if cfg.Agents.Antigravity != "" {
 		fmt.Fprintf(w, "antigravity = %q\n", cfg.Agents.Antigravity)
 	}
+	if cfg.Agents.Pi != "" {
+		fmt.Fprintf(w, "pi = %q\n", cfg.Agents.Pi)
+	}
 	if cfg.Agents.Cursor != "" {
 		fmt.Fprintf(w, "cursor = %q\n", cfg.Agents.Cursor)
 	}
@@ -4163,6 +4182,9 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "default_claude = %q\n", cfg.Models.DefaultClaude)
 	fmt.Fprintf(w, "default_codex = %q\n", cfg.Models.DefaultCodex)
 	fmt.Fprintf(w, "default_gemini = %q\n", cfg.Models.DefaultGemini)
+	if cfg.Models.DefaultPi != "" {
+		fmt.Fprintf(w, "default_pi = %q\n", cfg.Models.DefaultPi)
+	}
 	fmt.Fprintf(w, "default_grok = %q  # Empty delegates model selection to Grok Build\n", cfg.Models.DefaultGrok)
 	fmt.Fprintln(w)
 
@@ -4199,6 +4221,15 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# Grok Build model aliases (e.g., --grok=1:MODEL_ID)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Grok) {
 		fullName := cfg.Models.Grok[alias]
+		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+	}
+	fmt.Fprintln(w)
+
+	// Write Pi model aliases
+	fmt.Fprintln(w, "[models.pi]")
+	fmt.Fprintln(w, "# Pi model aliases (e.g., --pi=1:sonnet)")
+	for _, alias := range sortedStringMapKeys(cfg.Models.Pi) {
+		fullName := cfg.Models.Pi[alias]
 		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
 	}
 	fmt.Fprintln(w)
@@ -4941,6 +4972,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Agents.Antigravity, nil
 		case "grok":
 			return cfg.Agents.Grok, nil
+		case "pi":
+			return cfg.Agents.Pi, nil
 		case "cursor":
 			return cfg.Agents.Cursor, nil
 		case "windsurf":
@@ -5183,6 +5216,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Models.DefaultGemini, nil
 		case "default_grok":
 			return cfg.Models.DefaultGrok, nil
+		case "default_pi":
+			return cfg.Models.DefaultPi, nil
 		case "claude":
 			return cfg.Models.Claude, nil
 		case "codex":
@@ -5191,6 +5226,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Models.Gemini, nil
 		case "grok":
 			return cfg.Models.Grok, nil
+		case "pi":
+			return cfg.Models.Pi, nil
 		}
 	case "alerts":
 		if len(parts) < 2 {
@@ -6077,6 +6114,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agents.claude", defaults.Agents.Claude, cfg.Agents.Claude)
 	addDiff("agents.codex", defaults.Agents.Codex, cfg.Agents.Codex)
 	addDiff("agents.gemini", defaults.Agents.Gemini, cfg.Agents.Gemini)
+	addDiff("agents.pi", defaults.Agents.Pi, cfg.Agents.Pi)
 	addDiff("agents.grok", defaults.Agents.Grok, cfg.Agents.Grok)
 	addDiff("agents.cursor", defaults.Agents.Cursor, cfg.Agents.Cursor)
 	addDiff("agents.windsurf", defaults.Agents.Windsurf, cfg.Agents.Windsurf)
@@ -6154,10 +6192,12 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("models.default_claude", defaults.Models.DefaultClaude, cfg.Models.DefaultClaude)
 	addDiff("models.default_codex", defaults.Models.DefaultCodex, cfg.Models.DefaultCodex)
 	addDiff("models.default_gemini", defaults.Models.DefaultGemini, cfg.Models.DefaultGemini)
+	addDiff("models.default_pi", defaults.Models.DefaultPi, cfg.Models.DefaultPi)
 	addDiff("models.default_grok", defaults.Models.DefaultGrok, cfg.Models.DefaultGrok)
 	addDiff("models.claude", defaults.Models.Claude, cfg.Models.Claude)
 	addDiff("models.codex", defaults.Models.Codex, cfg.Models.Codex)
 	addDiff("models.gemini", defaults.Models.Gemini, cfg.Models.Gemini)
+	addDiff("models.pi", defaults.Models.Pi, cfg.Models.Pi)
 	addDiff("models.grok", defaults.Models.Grok, cfg.Models.Grok)
 
 	// Alerts

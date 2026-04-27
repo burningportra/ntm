@@ -216,6 +216,7 @@ var agentTypeBudgetPct = map[string]float64{
 	"cod":      0.94, // Codex: 94% of limit
 	"gmi":      0.10, // Gemini: 10% of 1M (still 100K tokens, avoids excessive context)
 	"agy":      0.10, // Antigravity (Gemini successor): mirrors Gemini's budget
+	"pi":       0.90, // Pi: provider-backed coding harness, use a conservative cloud-agent budget
 	"cursor":   0.85, // Cursor
 	"windsurf": 0.85, // Windsurf
 	"aider":    0.85, // Aider
@@ -228,6 +229,7 @@ var agentTypeDefaultModels = map[string]string{
 	"cod":      "gpt-5-codex",
 	"gmi":      "gemini-2.0-flash",
 	"agy":      "gemini-3-pro-preview", // Antigravity pins Gemini 3 Pro
+	"pi":       "claude-opus-4",
 	"cursor":   "claude-3.5-sonnet",
 	"windsurf": "claude-3.5-sonnet",
 	"aider":    "claude-3.5-sonnet",

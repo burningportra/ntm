@@ -22,6 +22,7 @@ const (
 	AgentTypeClaude      AgentType = "claude"
 	AgentTypeCodex       AgentType = "codex"
 	AgentTypeGemini      AgentType = "gemini"
+	AgentTypePi          AgentType = "pi"
 	AgentTypeAntigravity AgentType = "antigravity"
 )
 
@@ -156,6 +157,26 @@ func (pm *ProfileMatcher) loadDefaults() {
 			PreferredFiles:  []string{"*.md", "docs/**", "README*", "*.txt"},
 			AvoidFiles:      []string{"*_test.go"},
 			PreferredLabels: []string{"docs", "research", "spike", "chore"},
+		},
+		Performance: Performance{
+			SuccessRate: 0.85,
+		},
+	}
+
+	pm.profiles[AgentTypePi] = &AgentProfile{
+		Type:          AgentTypePi,
+		Model:         "pi-default",
+		ContextBudget: models.GetTokenBudget("pi"),
+		Specializations: []Specialization{
+			SpecComplex,
+			SpecQuick,
+			SpecRefactorSmall,
+			SpecDebug,
+		},
+		Preferences: Preferences{
+			PreferredFiles:  []string{"internal/**/*.go", "cmd/**/*.go", "docs/**", "*.md"},
+			AvoidFiles:      []string{},
+			PreferredLabels: []string{"task", "bug", "feature", "chore", "P1", "P2"},
 		},
 		Performance: Performance{
 			SuccessRate: 0.85,
@@ -563,6 +584,8 @@ func NormalizeAgentType(t string) string {
 		return "gemini"
 	case agentpkg.AgentTypeAntigravity:
 		return "antigravity"
+	case agentpkg.AgentTypePi:
+		return "pi"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:
@@ -590,6 +613,8 @@ func ParseAgentType(s string) AgentType {
 		return AgentTypeGemini
 	case "antigravity":
 		return AgentTypeAntigravity
+	case "pi":
+		return AgentTypePi
 	default:
 		return AgentType(normalized)
 	}
