@@ -124,6 +124,13 @@ func defaultPatterns() []Pattern {
 		{Name: "gemini_prompt", RegexStr: `(?i)gemini\s*>?\s*$`, Agent: "gemini", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Gemini prompt"},
 		{Name: "gemini_triple_arrow", RegexStr: `>>>\s*$`, Agent: "gemini", State: StateWaiting, Category: CategoryIdle, Priority: 90, Description: "Gemini triple arrow prompt"},
 
+		// Pi patterns
+		{Name: "pi_prompt", RegexStr: `(?im)^\s*pi>\s*$`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Pi prompt"},
+		{Name: "pi_version", RegexStr: `(?im)^\s*pi\s+v[0-9]+(?:\.[0-9]+)*\b`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Pi version banner"},
+		{Name: "pi_path_status", RegexStr: `(?m)^\s*(?:/|~)[^\n]*\([^\)\n]+\)\s*$`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 98, Description: "Pi path/status line"},
+		{Name: "pi_model_status", RegexStr: `(?m)^\s*(?:[$↑][^\n]*(?:\(auto\)|\bCodex:|\bgpt-|\bclaude-|\bgemini-))`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 98, Description: "Pi model/status line"},
+		{Name: "pi_banner", RegexStr: `(?im)^\s*pi\s+-\s+ai\s+coding\s+assistant\b`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Pi coding assistant banner"},
+
 		// Antigravity (agy) first-run workspace-trust dialog: the pane is
 		// alive but permanently stalled on a menu waiting for a keystroke.
 		// Without these, health reported such panes as OK — the worst
@@ -443,7 +450,7 @@ func isGenericShellIdlePattern(name string) bool {
 
 func isKnownAgentPatternType(agentType string) bool {
 	switch normalizeAgentType(agentType) {
-	case "claude", "codex", "gemini", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "pi", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama":
 		return true
 	default:
 		return false

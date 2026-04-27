@@ -1975,6 +1975,8 @@ func isAgentIdlePrompt(output, agentType string) bool {
 	case "gemini", "gmi":
 		// Gemini shows ">" when idle
 		return strings.HasSuffix(lastLine, ">")
+	case "pi":
+		return strings.HasSuffix(lastLine, ">")
 	default:
 		// Generic check for common prompt patterns
 		return strings.HasSuffix(lastLine, ">") || strings.HasSuffix(lastLine, "$") || strings.HasSuffix(lastLine, "%")
@@ -2026,6 +2028,10 @@ func isAgentRunning(output, agentType string) bool {
 		// Gemini shows "gemini" in startup or prompt
 		return strings.Contains(outputLower, "gemini") ||
 			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
+	case "pi":
+		return strings.Contains(outputLower, "pi - ai coding assistant") ||
+			strings.Contains(outputLower, "pi coding agent") ||
+			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
 	case "cursor":
 		return strings.Contains(outputLower, "cursor") ||
 			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
@@ -2058,6 +2064,8 @@ func getAgentCommand(agentType string) string {
 		return "codex"
 	case "gemini":
 		return "gemini"
+	case "pi":
+		return "pi"
 	case "antigravity":
 		return "agy"
 	case "cursor":

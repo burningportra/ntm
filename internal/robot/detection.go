@@ -34,17 +34,19 @@ type AgentDetection struct {
 
 // processPatterns maps process/command names to agent types
 var processPatterns = map[string]string{
-	"claude":       "claude",
-	"claude-code":  "claude",
-	"codex":        "codex",
-	"codex-cli":    "codex",
-	"openai-codex": "codex",
-	"gemini":       "gemini",
-	"gemini-cli":   "gemini",
-	"cursor":       "cursor",
-	"windsurf":     "windsurf",
-	"aider":        "aider",
-	"aider-chat":   "aider",
+	"claude":          "claude",
+	"claude-code":     "claude",
+	"codex":           "codex",
+	"codex-cli":       "codex",
+	"openai-codex":    "codex",
+	"gemini":          "gemini",
+	"gemini-cli":      "gemini",
+	"pi":              "pi",
+	"pi-coding-agent": "pi",
+	"cursor":          "cursor",
+	"windsurf":        "windsurf",
+	"aider":           "aider",
+	"aider-chat":      "aider",
 	// `opencode` (https://opencode.ai) — note we deliberately do NOT add a
 	// bare `oc` pattern here because `processPatterns` uses substring match
 	// (`strings.Contains`), and `oc` collides with both the OpenShift CLI
@@ -82,6 +84,15 @@ var contentPatterns = []struct {
 		patterns: []*regexp.Regexp{
 			regexp.MustCompile(`(?i)gemini\s*(>|cli|$)`),
 			regexp.MustCompile(`(?i)google\s+ai`),
+		},
+	},
+	{
+		agentType: "pi",
+		patterns: []*regexp.Regexp{
+			regexp.MustCompile(`(?im)^\s*pi\s+-\s+ai\s+coding\s+assistant\b`),
+			regexp.MustCompile(`(?im)^\s*pi>\s*$`),
+			regexp.MustCompile(`(?i)\bpi\b.*\b(terminal\s+coding\s+harness|coding\s+agent)\b`),
+			regexp.MustCompile(`(?i)\[pi(?:[-_][[:alnum:]-]+)?\]`),
 		},
 	},
 	{
@@ -241,7 +252,7 @@ func detectFromContent(content string) AgentDetection {
 func DetectFromTitle(title string) AgentDetection {
 	title = strings.ToLower(title)
 
-	agents := []string{"claude", "codex", "gemini", "cursor", "windsurf", "aider", "ollama"}
+	agents := []string{"claude", "codex", "gemini", "pi", "cursor", "windsurf", "aider", "ollama"}
 	for _, agent := range agents {
 		if strings.Contains(title, agent) {
 			return AgentDetection{
@@ -268,6 +279,8 @@ func DetectFromNTMTitle(title string) AgentDetection {
 		return AgentDetection{Type: "codex", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "gmi"):
 		return AgentDetection{Type: "gemini", Confidence: 0.9, Method: MethodTitle}
+	case containsShortForm(lower, "pi"):
+		return AgentDetection{Type: "pi", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "grok"):
 		return AgentDetection{Type: "grok", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "cursor"):

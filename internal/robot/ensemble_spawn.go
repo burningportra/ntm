@@ -628,6 +628,8 @@ func normalizeEnsembleAgentType(value string) string {
 		return "cod"
 	case agent.AgentTypeGemini:
 		return "gmi"
+	case agent.AgentTypePi:
+		return "pi"
 	case agent.AgentTypeAntigravity:
 		return "agy"
 	case agent.AgentTypeCursor:

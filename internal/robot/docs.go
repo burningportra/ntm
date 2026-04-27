@@ -293,7 +293,7 @@ func getExamplesContent() *DocsContent {
 				Name:        "send_to_type",
 				Description: "Send prompt to specific agent type",
 				Command:     "ntm --robot-send=proj --msg='Review code' --type=claude",
-				Notes:       "Filters by agent type: claude, codex, gemini",
+				Notes:       "Filters by agent type: claude, codex, gemini, pi",
 			},
 			{
 				Name:        "send_to_panes",

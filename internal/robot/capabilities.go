@@ -696,7 +696,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-activity", Type: "string", Required: true, Description: "Session name"},
 				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated N, W.P, or %N pane selectors"},
-				{Name: "activity-type", Flag: "--activity-type", Type: "string", Required: false, Description: "Comma-separated agent types to filter: claude, codex, antigravity, grok, gemini"},
+				{Name: "activity-type", Flag: "--activity-type", Type: "string", Required: false, Description: "Comma-separated agent types to filter: claude, codex, antigravity, grok, gemini, pi"},
 			},
 			Examples: []string{
 				"ntm --robot-activity=myproject --activity-type=claude",
@@ -1202,6 +1202,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "spawn-cc", Flag: "--spawn-cc", Type: "int", Required: false, Description: "Number of Claude agents"},
 				{Name: "spawn-cod", Flag: "--spawn-cod", Type: "int", Required: false, Description: "Number of Codex agents"},
 				{Name: "spawn-gmi", Flag: "--spawn-gmi", Type: "int", Required: false, Description: "Number of Gemini agents (legacy)"},
+				{Name: "spawn-pi", Flag: "--spawn-pi", Type: "int", Required: false, Description: "Number of Pi agents"},
 				{Name: "spawn-agy", Flag: "--spawn-agy", Type: "int", Required: false, Description: "Number of Antigravity (agy) agents"},
 				{Name: "spawn-grok", Flag: "--spawn-grok", Type: "int", Required: false, Description: "Number of Grok Build agents (phase one: launch only; no wait or assignment)"},
 				{Name: "spawn-preset", Flag: "--spawn-preset", Type: "string", Required: false, Description: "Use recipe preset instead of counts"},
