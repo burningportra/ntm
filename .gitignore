@@ -129,6 +129,8 @@ storage.sqlite3-wal.corrupt-*
 # Ephemeral debug output files at repo root
 /*.txt
 /*.py
+# Pi local state (machine-local, never tracked)
+/.pi
 
 # Agent scratch/debug test files (machine-local, never tracked)
 **/zz_live_debug_test.go
