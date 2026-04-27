@@ -54,6 +54,7 @@ type AgentConfig struct {
 	Claude      int `json:"cc"`
 	Codex       int `json:"cod"`
 	Gemini      int `json:"gmi"`
+	Pi          int `json:"pi"`
 	Antigravity int `json:"agy,omitempty"`
 	Grok        int `json:"grok,omitempty"`
 	Cursor      int `json:"cursor"`
@@ -66,7 +67,7 @@ type AgentConfig struct {
 
 // Total returns the total number of agents.
 func (a AgentConfig) Total() int {
-	return a.Claude + a.Codex + a.Gemini + a.Antigravity + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Ollama + a.User
+	return a.Claude + a.Codex + a.Gemini + a.Pi + a.Antigravity + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Ollama + a.User
 }
 
 // ErrAutomatedRelaunchNotImplemented is the sentinel returned when a saved
@@ -145,6 +146,7 @@ type ConfigSnapshot struct {
 	ClaudeCmd      string `json:"claude_cmd,omitempty"`
 	CodexCmd       string `json:"codex_cmd,omitempty"`
 	GeminiCmd      string `json:"gemini_cmd,omitempty"`
+	PiCmd          string `json:"pi_cmd,omitempty"`
 	AntigravityCmd string `json:"antigravity_cmd,omitempty"`
 	CursorCmd      string `json:"cursor_cmd,omitempty"`
 	WindsurfCmd    string `json:"windsurf_cmd,omitempty"`
@@ -158,6 +160,7 @@ type AgentCommands struct {
 	Claude      string
 	Codex       string
 	Gemini      string
+	Pi          string
 	Antigravity string
 	Cursor      string
 	Windsurf    string

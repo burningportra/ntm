@@ -176,6 +176,8 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 		return cfg.Agents.Codex, nil, nil
 	case AgentTypeGemini:
 		return cfg.Agents.Gemini, nil, nil
+	case AgentTypePi:
+		return cfg.Agents.Pi, nil, nil
 	case AgentTypeAntigravity:
 		return cfg.Agents.Antigravity, nil, nil
 	case AgentTypeGrok:
@@ -345,6 +347,7 @@ func newAddCmd() *cobra.Command {
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypePi, &agentSpecs), "pi", "Pi agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model pinned to Gemini 3.1 Pro (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N or N:model[:effort])")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOllama, &agentSpecs), "ollama", "Ollama agents (N or N:model)")
@@ -597,7 +600,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 
 	// Add agents
 	flatAgents := opts.Agents.Flatten()
-	ccCount, codCount, gmiCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+	ccCount, codCount, gmiCount, piCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 	var rateLimitTracker *ratelimit.RateLimitTracker
 	openAICooldownWaited := false
 	ollamaHost := ""
@@ -678,6 +681,8 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			codCount++
 		case AgentTypeGemini:
 			gmiCount++
+		case AgentTypePi:
+			piCount++
 		case AgentTypeAntigravity:
 			agyCount++
 		case AgentTypeGrok:
@@ -1028,6 +1033,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			AddedClaude:         ccCount,
 			AddedCodex:          codCount,
 			AddedGemini:         gmiCount,
+			AddedPi:             piCount,
 			AddedAntigravity:    agyCount,
 			AddedGrok:           grokCount,
 			AddedOllama:         ollamaCount,

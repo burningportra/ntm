@@ -336,6 +336,8 @@ func canonicalSpawnAgentType(raw string) (AgentType, bool) {
 		return AgentTypeCodex, true
 	case agentpkg.AgentTypeGemini:
 		return AgentTypeGemini, true
+	case agentpkg.AgentTypePi:
+		return AgentTypePi, true
 	case agentpkg.AgentTypeAntigravity:
 		return AgentTypeAntigravity, true
 	case agentpkg.AgentTypeGrok:
@@ -360,6 +362,7 @@ func orderedSpawnAgentTypes() []AgentType {
 		AgentTypeClaude,
 		AgentTypeCodex,
 		AgentTypeGemini,
+		AgentTypePi,
 		AgentTypeAntigravity,
 		AgentTypeGrok,
 		AgentTypeCursor,
@@ -498,6 +501,7 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 	opts.CCCount = 0
 	opts.CodCount = 0
 	opts.GmiCount = 0
+	opts.PiCount = 0
 	opts.AgyCount = 0
 	opts.GrokCount = 0
 	opts.CursorCount = 0
@@ -514,6 +518,8 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 			opts.CodCount++
 		case AgentTypeGemini:
 			opts.GmiCount++
+		case AgentTypePi:
+			opts.PiCount++
 		case AgentTypeAntigravity:
 			opts.AgyCount++
 		case AgentTypeGrok:
@@ -545,6 +551,7 @@ func populateSpawnAgentsFromCounts(opts *SpawnOptions) {
 		{agentType: AgentTypeClaude, count: opts.CCCount},
 		{agentType: AgentTypeCodex, count: opts.CodCount},
 		{agentType: AgentTypeGemini, count: opts.GmiCount},
+		{agentType: AgentTypePi, count: opts.PiCount},
 		{agentType: AgentTypeAntigravity, count: opts.AgyCount},
 		{agentType: AgentTypeGrok, count: opts.GrokCount},
 		{agentType: AgentTypeCursor, count: opts.CursorCount},
@@ -642,7 +649,7 @@ func prependSpawnPaneEnv(command string, env map[string]string) string {
 func validateSpawnAgentTypes(agents []FlatAgent, pluginMap map[string]plugins.AgentPlugin) error {
 	for _, agent := range agents {
 		switch agent.Type {
-		case AgentTypeClaude, AgentTypeCodex, AgentTypeGemini, AgentTypeAntigravity, AgentTypeGrok,
+		case AgentTypeClaude, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeAntigravity, AgentTypeGrok,
 			AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode:
 			continue
 		default:
@@ -665,6 +672,8 @@ func spawnAgentCommandTemplate(agentType AgentType, pluginMap map[string]plugins
 		return cfg.Agents.Codex, nil, nil
 	case AgentTypeGemini:
 		return cfg.Agents.Gemini, nil, nil
+	case AgentTypePi:
+		return cfg.Agents.Pi, nil, nil
 	case AgentTypeAntigravity:
 		tmpl := cfg.Agents.Antigravity
 		if tmpl == "" {
@@ -928,7 +937,7 @@ func sortPanesForAssignment(panes []tmux.Pane) {
 }
 
 func legacySpawnTotalAgentCount(opts SpawnOptions) int {
-	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.GrokCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OllamaCount
+	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.AgyCount + opts.GrokCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OllamaCount
 }
 
 func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
@@ -936,6 +945,7 @@ func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
 		"NTM_AGENT_COUNT_CC":       fmt.Sprintf("%d", opts.CCCount),
 		"NTM_AGENT_COUNT_COD":      fmt.Sprintf("%d", opts.CodCount),
 		"NTM_AGENT_COUNT_GMI":      fmt.Sprintf("%d", opts.GmiCount),
+		"NTM_AGENT_COUNT_PI":       fmt.Sprintf("%d", opts.PiCount),
 		"NTM_AGENT_COUNT_AGY":      fmt.Sprintf("%d", opts.AgyCount),
 		"NTM_AGENT_COUNT_GROK":     fmt.Sprintf("%d", opts.GrokCount),
 		"NTM_AGENT_COUNT_CURSOR":   fmt.Sprintf("%d", opts.CursorCount),
@@ -955,6 +965,7 @@ func spawnSessionCreatedEventFields(opts SpawnOptions, dir string) map[string]st
 		"agent_cc":       fmt.Sprintf("%d", opts.CCCount),
 		"agent_cod":      fmt.Sprintf("%d", opts.CodCount),
 		"agent_gmi":      fmt.Sprintf("%d", opts.GmiCount),
+		"agent_pi":       fmt.Sprintf("%d", opts.PiCount),
 		"agent_agy":      fmt.Sprintf("%d", opts.AgyCount),
 		"agent_grok":     fmt.Sprintf("%d", opts.GrokCount),
 		"agent_cursor":   fmt.Sprintf("%d", opts.CursorCount),
@@ -1113,6 +1124,7 @@ type SpawnOptions struct {
 	CCCount            int
 	CodCount           int
 	GmiCount           int
+	PiCount            int
 	AgyCount           int
 	GrokCount          int
 	CursorCount        int
@@ -1811,6 +1823,7 @@ Examples:
 			ccCount := agentSpecs.ByType(AgentTypeClaude).TotalCount()
 			codCount := agentSpecs.ByType(AgentTypeCodex).TotalCount()
 			gmiCount := agentSpecs.ByType(AgentTypeGemini).TotalCount()
+			piCount := agentSpecs.ByType(AgentTypePi).TotalCount()
 
 			// Apply implicit project count defaults only when the user did not
 			// request a persona set/list. With --profile-set/--profiles the
@@ -1822,6 +1835,7 @@ Examples:
 				ccCount = agentSpecs.ByType(AgentTypeClaude).TotalCount()
 				codCount = agentSpecs.ByType(AgentTypeCodex).TotalCount()
 				gmiCount = agentSpecs.ByType(AgentTypeGemini).TotalCount()
+				piCount = agentSpecs.ByType(AgentTypePi).TotalCount()
 				if !IsJSONOutput() && len(agentSpecs) > 0 {
 					fmt.Printf("Using default configuration: %s\n", formatSpawnCountSummary(cfg.ProjectDefaults))
 				}
@@ -1906,6 +1920,7 @@ Examples:
 				CCCount:                 ccCount,
 				CodCount:                codCount,
 				GmiCount:                gmiCount,
+				PiCount:                 piCount,
 				UserPane:                !noUserPane,
 				AutoRestart:             autoRestart,
 				RecipeName:              recipeName,
@@ -1967,6 +1982,7 @@ Examples:
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypePi, &agentSpecs), "pi", "Pi agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model is pinned to Gemini 3.1 Pro (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().IntVar(&localCount, "local", 0, "Local agents via Ollama (alias: --ollama)")
@@ -2167,7 +2183,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 	if len(opts.Agents) == 0 {
 		totalAgents = legacySpawnTotalAgentCount(opts)
 		if totalAgents == 0 {
-			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --agy, --grok, --cursor, --windsurf, --aider, --ollama or plugin flags)"))
+			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --pi, --agy, --grok, --cursor, --windsurf, --aider, --ollama or plugin flags)"))
 		}
 	} else {
 		totalAgents = len(opts.Agents)
@@ -4412,6 +4428,8 @@ func agentTypeToProgram(agentType string) string {
 		return "codex-cli"
 	case "gmi":
 		return "gemini-cli"
+	case "pi":
+		return "pi"
 	case "cursor":
 		return "cursor"
 	case "windsurf":
@@ -4422,6 +4440,19 @@ func agentTypeToProgram(agentType string) string {
 		return "opencode"
 	default:
 		return agentType
+	}
+}
+
+// defaultRegistrationModel returns a non-empty model label for CLIs that can
+// launch with provider defaults. Agent Mail requires an underlying model string,
+// but passing a default through the launch template can change provider
+// selection, so keep this fallback scoped to registration metadata.
+func defaultRegistrationModel(agentType string) string {
+	switch agentType {
+	case "pi":
+		return "pi-default"
+	default:
+		return ""
 	}
 }
 

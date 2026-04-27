@@ -54,6 +54,7 @@ type SpawnOptions struct {
 	CCCount            int           // Claude agents
 	CodCount           int           // Codex agents
 	GmiCount           int           // Gemini agents
+	PiCount            int           // Pi agents
 	AgyCount           int           // Antigravity agents
 	GrokCount          int           // Grok Build agents
 	Preset             string        // Recipe/preset name
@@ -185,6 +186,7 @@ func validateSpawnRequest(opts SpawnOptions) (string, error) {
 		{flag: "--spawn-cc", value: opts.CCCount},
 		{flag: "--spawn-cod", value: opts.CodCount},
 		{flag: "--spawn-gmi", value: opts.GmiCount},
+		{flag: "--spawn-pi", value: opts.PiCount},
 		{flag: "--spawn-agy", value: opts.AgyCount},
 		{flag: "--spawn-grok", value: opts.GrokCount},
 	}
@@ -193,8 +195,8 @@ func validateSpawnRequest(opts SpawnOptions) (string, error) {
 			return "", fmt.Errorf("%s must be zero or greater, got %d", count.flag, count.value)
 		}
 	}
-	if opts.CCCount+opts.CodCount+opts.GmiCount+opts.AgyCount+opts.GrokCount <= 0 {
-		return "", errors.New("no agents specified (use cc, cod, gmi, agy, or grok counts)")
+	if opts.CCCount+opts.CodCount+opts.GmiCount+opts.PiCount+opts.AgyCount+opts.GrokCount <= 0 {
+		return "", errors.New("no agents specified (use cc, cod, gmi, pi, agy, or grok counts)")
 	}
 	if opts.GrokCount > 0 && opts.WaitReady {
 		return "", errGrokSpawnWaitUnavailable
@@ -466,7 +468,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	_ = audit.LogEvent(opts.Session, audit.EventTypeSpawn, audit.ActorSystem, "robot.spawn", map[string]interface{}{
 		"phase":           "start",
 		"session":         opts.Session,
-		"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.GrokCount,
+		"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.AgyCount + opts.GrokCount,
 		"preset":          opts.Preset,
 		"no_user_pane":    opts.NoUserPane,
 		"dry_run":         opts.DryRun,
@@ -484,7 +486,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		payload := map[string]interface{}{
 			"phase":           "finish",
 			"session":         opts.Session,
-			"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.GrokCount,
+			"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.AgyCount + opts.GrokCount,
 			"preset":          opts.Preset,
 			"no_user_pane":    opts.NoUserPane,
 			"dry_run":         opts.DryRun,
@@ -614,7 +616,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	// handoffCtx is available for use in work prompts below
 	_ = handoffCtx // silence unused warning when not in orchestrator mode
 
-	totalAgents := opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.GrokCount
+	totalAgents := opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.AgyCount + opts.GrokCount
 
 	// Calculate total panes needed
 	totalPanes := totalAgents
@@ -729,6 +731,17 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 				Name:  dryRunNameMap.AssignNew("grok", grokPane),
 				Type:  "grok",
 				Title: fmt.Sprintf("%s__grok_%d", opts.Session, i+1),
+			})
+			paneIdx++
+		}
+
+		for i := 0; i < opts.PiCount; i++ {
+			piPane := fmt.Sprintf("0.%d", paneIdx)
+			output.WouldCreate = append(output.WouldCreate, SpawnedAgent{
+				Pane:  piPane,
+				Name:  dryRunNameMap.AssignNew("pi", piPane),
+				Type:  "pi",
+				Title: fmt.Sprintf("%s__pi_%d", opts.Session, i+1),
 			})
 			paneIdx++
 		}
@@ -918,6 +931,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		{agentType: "gemini", count: opts.GmiCount},
 		{agentType: "antigravity", count: opts.AgyCount},
 		{agentType: "grok", count: opts.GrokCount},
+		{agentType: "pi", count: opts.PiCount},
 	} {
 		for i := 0; i < spec.count; i++ {
 			launchRequests = append(launchRequests, launchRequest{agentType: spec.agentType, number: i + 1})
@@ -1269,6 +1283,8 @@ func agentTypeShort(agentType string) string {
 		return "cod"
 	case tmux.AgentGemini:
 		return "gmi"
+	case tmux.AgentPi:
+		return "pi"
 	case tmux.AgentAntigravity:
 		return "agy"
 	case tmux.AgentGrok:
@@ -1294,6 +1310,7 @@ func getAgentCommands(cfg *config.Config) map[string]string {
 		"claude":      "claude",
 		"codex":       "codex",
 		"gemini":      "gemini",
+		"pi":          "pi",
 		"antigravity": "agy",
 		"grok":        "grok --always-approve",
 	}
@@ -1306,6 +1323,9 @@ func getAgentCommands(cfg *config.Config) map[string]string {
 	}
 	if cfg != nil && cfg.Agents.Gemini != "" {
 		defaults["gemini"] = cfg.Agents.Gemini
+	}
+	if cfg != nil && cfg.Agents.Pi != "" {
+		defaults["pi"] = cfg.Agents.Pi
 	}
 	if cfg != nil && cfg.Agents.Antigravity != "" {
 		defaults["antigravity"] = cfg.Agents.Antigravity

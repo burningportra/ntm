@@ -65,7 +65,7 @@ func PrintStunningHelp(w io.Writer) {
 			icon:  ic.Rocket,
 			color: t.Green,
 			commands: []commandHelp{
-				{"spawn", "sat", "<name> --cc=N --cod=N --agy=N", "Create session and launch agents"},
+				{"spawn", "sat", "<name> --cc=N --cod=N --gmi=N --pi=N", "Create session and launch agents"},
 				{"create", "cnt", "<name> [panes]", "Create empty session with N panes"},
 				{"quick", "qps", "<name> [--template=go]", "Quick project setup with git, vscode"},
 			},
@@ -75,7 +75,7 @@ func PrintStunningHelp(w io.Writer) {
 			icon:  ic.Robot,
 			color: t.Mauve,
 			commands: []commandHelp{
-				{"add", "ant", "<session> --cc=N --cod=N", "Add agents to existing session"},
+				{"add", "ant", "<session> --cc=N --cod=N --pi=N", "Add agents to existing session"},
 				{"send", "bp", "<session> <prompt> [--agents]", "Send prompt to agents"},
 				{"assign", "", "<session> --strategy=dependency", "Assign work to agents"},
 				{"interrupt", "int", "<session>", "Send Ctrl+C to all agents"},
@@ -90,7 +90,7 @@ func PrintStunningHelp(w io.Writer) {
 				{"list", "lnt", "", "List all tmux sessions"},
 				{"status", "snt", "<session>", "Show detailed session status"},
 				{"view", "vnt", "<session>", "Tile all panes and attach"},
-				{"zoom", "znt", "<session> <pane|cc|cod|agy|gmi>", "Zoom to specific pane"},
+				{"zoom", "znt", "<session> <pane|cc|cod|agy|gmi|pi>", "Zoom to specific pane"},
 				{"dashboard", "", "<session>", "Interactive session dashboard"},
 			},
 		},
@@ -236,7 +236,7 @@ func renderExamples(width int, t theme.Theme, ic icons.IconSet) string {
 		cmd  string
 		desc string
 	}{
-		{"ntm spawn myproject --cc=2 --cod=2", "Create session with 2 Claude + 2 Codex agents"},
+		{"ntm spawn myproject --cc=2 --cod=2 --pi=1", "Create session with Claude, Codex, and Pi agents"},
 		{"ntm send myproject \"fix the tests\"", "Send prompt to all agents"},
 		{"ntm palette myproject", "Open command palette (or press F6)"},
 		{"ntm view myproject", "Tile all panes and attach"},
@@ -345,7 +345,7 @@ func PrintMinimalHelp(w io.Writer) {
 
 	// Essential commands: spawn, send, status, kill, help
 	essentialCommands := []commandHelp{
-		{"spawn", "sat", "<name> --cc=N --cod=N --agy=N", "Create session and launch agents"},
+		{"spawn", "sat", "<name> --cc=N --cod=N --gmi=N --pi=N", "Create session and launch agents"},
 		{"send", "bp", "<session> <prompt> [--agents]", "Send prompt to agents"},
 		{"status", "snt", "<session>", "Show detailed session status"},
 		{"kill", "knt", "[-f] <session>", "Kill a session"},
@@ -389,8 +389,8 @@ func PrintMinimalHelp(w io.Writer) {
 		Foreground(t.Overlay).
 		Italic(true)
 
-	b.WriteString("    " + cmdStyle.Render("ntm spawn myproject --cc=2 --cod=2") + "\n")
-	b.WriteString("    " + descStyle.Render("→ Create session with 2 Claude + 2 Codex agents") + "\n\n")
+	b.WriteString("    " + cmdStyle.Render("ntm spawn myproject --cc=2 --cod=2 --pi=1") + "\n")
+	b.WriteString("    " + descStyle.Render("→ Create session with Claude, Codex, and Pi agents") + "\n\n")
 
 	// ═══════════════════════════════════════════════════════════════
 	// FOOTER

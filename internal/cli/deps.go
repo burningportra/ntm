@@ -163,6 +163,14 @@ func defaultDepChecks() []depCheck {
 			InstallHint: "npm install -g @google/gemini-cli",
 		},
 		{
+			Name:        "Pi",
+			Command:     "pi",
+			VersionArgs: []string{"--version"},
+			Required:    false,
+			Category:    "AI Agents",
+			InstallHint: "npm install -g @mariozechner/pi-coding-agent",
+		},
+		{
 			// Deliberately `cursor-agent`, not `cursor`: on Linux `cursor` is
 			// the GUI editor launcher (useless in a tmux pane) and is often
 			// absent entirely on headless hosts, so checking it would report

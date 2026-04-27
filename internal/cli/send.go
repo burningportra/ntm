@@ -507,6 +507,10 @@ func sendErrorIsNil(err error) bool {
 }
 
 func matchesLegacySendTypeFilter(pane tmux.Pane, targetCC, targetCod, targetGmi bool) bool {
+	return matchesLegacySendTypeFilterWithTargets(pane, targetCC, targetCod, targetGmi, false, false)
+}
+
+func matchesLegacySendTypeFilterWithTargets(pane tmux.Pane, targetCC, targetCod, targetGmi, targetPi, targetAgy bool) bool {
 	switch tmux.AgentType(pane.Type).Canonical() {
 	case tmux.AgentClaude:
 		return targetCC
@@ -514,6 +518,10 @@ func matchesLegacySendTypeFilter(pane tmux.Pane, targetCC, targetCod, targetGmi 
 		return targetCod
 	case tmux.AgentGemini:
 		return targetGmi
+	case tmux.AgentPi:
+		return targetPi
+	case tmux.AgentAntigravity:
+		return targetAgy
 	default:
 		return false
 	}
@@ -521,7 +529,7 @@ func matchesLegacySendTypeFilter(pane tmux.Pane, targetCC, targetCod, targetGmi 
 
 func isInterruptibleAgentPane(pane tmux.Pane) bool {
 	switch tmux.AgentType(pane.Type).Canonical() {
-	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentGrok, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
+	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentAntigravity, tmux.AgentGrok, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
 		return true
 	default:
 		return false
@@ -702,7 +710,8 @@ func newSendCmd() *cobra.Command {
 		  ntm send myproject --cc "review the changes"          # All Claude agents
 		  ntm send myproject --cc=opus "review the changes"     # Only Claude Opus agents
 		  ntm send myproject --tag=frontend "update ui"         # Agents with 'frontend' tag
-		  ntm send myproject --cod --gmi "run the tests"        # Codex and Gemini
+			  ntm send myproject --cod --gmi "run the tests"        # Codex and Gemini
+			  ntm send myproject --pi "run the tests"               # Pi agents
 		  ntm send myproject --all "git status"                 # All panes
 		  ntm send myproject --pane=2 "specific pane"           # Single-window pane index
 		  ntm send myproject --pane=1.0 "specific pane"         # Exact window.pane
@@ -920,6 +929,8 @@ func newSendCmd() *cobra.Command {
 	cmd.Flags().Lookup("cod").NoOptDefVal = "true"
 	cmd.Flags().Var(newSendTargetValue(AgentTypeGemini, &targets), "gmi", "send to Gemini agents (optional :variant filter)")
 	cmd.Flags().Lookup("gmi").NoOptDefVal = "true"
+	cmd.Flags().Var(newSendTargetValue(AgentTypePi, &targets), "pi", "send to Pi agents (optional :variant filter)")
+	cmd.Flags().Lookup("pi").NoOptDefVal = "true"
 	cmd.Flags().Var(newSendTargetValue(AgentTypeAntigravity, &targets), "agy", "send to Antigravity (agy) agents (optional :variant filter)")
 	cmd.Flags().Lookup("agy").NoOptDefVal = "true"
 	cmd.Flags().BoolVar(&targetAll, "all", false, "send to all agent panes, overriding type/tag filters (the user pane is excluded unless --include-user)")
@@ -1565,6 +1576,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	targetCC := targets.HasTargetsForType(AgentTypeClaude)
 	targetCod := targets.HasTargetsForType(AgentTypeCodex)
 	targetGmi := targets.HasTargetsForType(AgentTypeGemini)
+	targetPi := targets.HasTargetsForType(AgentTypePi)
 	targetAgy := targets.HasTargetsForType(AgentTypeAntigravity)
 
 	// Helper for JSON error output
@@ -1698,7 +1710,7 @@ func runSendInternal(opts SendOptions) (err error) {
 		"prompt_length":  len(prompt),
 		"prompt_source":  promptSource,
 		"template":       templateName,
-		"targets":        buildSendTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags),
+		"targets":        buildSendTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags),
 		"dry_run":        dryRun,
 		"randomize":      opts.Randomize,
 		"seed":           opts.Seed,
@@ -1789,13 +1801,15 @@ func runSendInternal(opts SendOptions) (err error) {
 		}
 
 		// Filter by agent type if specified (only when exactly one type is set)
-		if targetCC && !targetCod && !targetGmi && !targetAgy {
+		if targetCC && !targetCod && !targetGmi && !targetPi && !targetAgy {
 			routeOpts.AgentType = "claude"
-		} else if targetCod && !targetCC && !targetGmi && !targetAgy {
+		} else if targetCod && !targetCC && !targetGmi && !targetPi && !targetAgy {
 			routeOpts.AgentType = "codex"
-		} else if targetGmi && !targetCC && !targetCod && !targetAgy {
+		} else if targetGmi && !targetCC && !targetCod && !targetPi && !targetAgy {
 			routeOpts.AgentType = "gemini"
-		} else if targetAgy && !targetCC && !targetCod && !targetGmi {
+		} else if targetPi && !targetCC && !targetCod && !targetGmi && !targetAgy {
+			routeOpts.AgentType = "pi"
+		} else if targetAgy && !targetCC && !targetCod && !targetGmi && !targetPi {
 			routeOpts.AgentType = "antigravity"
 		}
 
@@ -1888,7 +1902,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	// Build target description for hook environment
-	targetDesc := buildSendTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags)
+	targetDesc := buildSendTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags)
 
 	// Build execution context for hooks
 	hookCtx := hooks.ExecutionContext{
@@ -1900,6 +1914,7 @@ func runSendInternal(opts SendOptions) (err error) {
 			"NTM_TARGET_CC":      boolToStr(targetCC),
 			"NTM_TARGET_COD":     boolToStr(targetCod),
 			"NTM_TARGET_GMI":     boolToStr(targetGmi),
+			"NTM_TARGET_PI":      boolToStr(targetPi),
 			"NTM_TARGET_AGY":     boolToStr(targetAgy),
 			"NTM_TARGET_ALL":     boolToStr(targetAll),
 			"NTM_PANE_INDEX":     fmt.Sprintf("%d", paneIndex),
@@ -1929,7 +1944,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	// Auto-checkpoint before broadcast sends
-	isBroadcast := !opts.PanesSpecified && paneSelector == "" && (targetAll || (!targetCC && !targetCod && !targetGmi && !targetAgy && len(tags) == 0))
+	isBroadcast := !opts.PanesSpecified && paneSelector == "" && (targetAll || (!targetCC && !targetCod && !targetGmi && !targetPi && !targetAgy && len(tags) == 0))
 	// Checkpoint capture emits human-facing advisory logs from lower layers, so
 	// keep it on the interactive path and preserve a clean machine-output channel.
 	if !dryRun && !jsonOutput && !silent && isBroadcast && cfg != nil && cfg.Checkpoints.Enabled && cfg.Checkpoints.BeforeBroadcast {
@@ -1969,7 +1984,7 @@ func runSendInternal(opts SendOptions) (err error) {
 
 	// Broad sends apply type/tag filters after deterministic topology ordering.
 	if selectedPanes == nil {
-		noFilter := !targetCC && !targetCod && !targetGmi && !targetAgy && !targetAll && len(tags) == 0
+		noFilter := !targetCC && !targetCod && !targetGmi && !targetPi && !targetAgy && !targetAll && len(tags) == 0
 		hasVariantFilter := len(targets) > 0
 
 		for i, p := range panes {
@@ -1996,7 +2011,7 @@ func runSendInternal(opts SendOptions) (err error) {
 				}
 
 				// Check type filters (only if specified)
-				hasTypeFilter := hasVariantFilter || targetCC || targetCod || targetGmi || targetAgy
+				hasTypeFilter := hasVariantFilter || targetCC || targetCod || targetGmi || targetPi || targetAgy
 
 				if hasTypeFilter {
 					if hasVariantFilter {
@@ -2004,7 +2019,7 @@ func runSendInternal(opts SendOptions) (err error) {
 							continue
 						}
 					} else {
-						match := matchesLegacySendTypeFilter(p, targetCC, targetCod, targetGmi)
+						match := matchesLegacySendTypeFilterWithTargets(p, targetCC, targetCod, targetGmi, targetPi, targetAgy)
 						if !match {
 							continue
 						}
@@ -3347,6 +3362,10 @@ func buildObservedTargetTypes(panes []tmux.Pane) string {
 }
 
 func buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
+	return buildTargetDescriptionWithPi(targetCC, targetCod, targetGmi, false, targetAgy, targetAll, skipFirst, paneIndex, tags)
+}
+
+func buildTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
 	if paneIndex >= 0 {
 		return fmt.Sprintf("pane:%d", paneIndex)
 	}
@@ -3363,6 +3382,9 @@ func buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll
 	}
 	if targetGmi {
 		targets = append(targets, "gmi")
+	}
+	if targetPi {
+		targets = append(targets, "pi")
 	}
 	if targetAgy {
 		targets = append(targets, "agy")
@@ -3381,13 +3403,17 @@ func buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll
 }
 
 func buildSendTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
+	return buildSendTargetDescriptionWithPi(targetCC, targetCod, targetGmi, false, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, paneSelectors, panesSpecified, tags)
+}
+
+func buildSendTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
 	if paneSelector != "" {
 		return "pane:" + paneSelector
 	}
 	if panesSpecified {
 		return "panes:" + strings.Join(paneSelectors, ",")
 	}
-	return buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst, paneIndex, tags)
+	return buildTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst, paneIndex, tags)
 }
 
 // getSessionWorkingDir returns the working directory for a resolved session,

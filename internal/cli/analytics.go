@@ -260,7 +260,7 @@ func updateAgentStats(breakdown map[string]AgentStats, agentType string, countDe
 
 func isAnalyticsAgentType(agentType string) bool {
 	switch agentType {
-	case "claude", "codex", "gemini", "grok", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "pi", "grok", "cursor", "windsurf", "aider", "oc", "ollama":
 		return true
 	default:
 		return false
@@ -299,7 +299,7 @@ func parseTargetTypes(targets string) []string {
 	}
 
 	if legacyAll && len(result) == 0 {
-		return []string{"claude", "codex", "gemini", "grok"}
+		return []string{"claude", "codex", "gemini", "pi", "grok"}
 	}
 	return result
 }
