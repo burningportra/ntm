@@ -845,6 +845,7 @@ func buildAgentCommands(state *session.SessionState) session.AgentCommands {
 		Codex:       render(cfg.Agents.Codex, "cod"),
 		Gemini:      render(cfg.Agents.Gemini, "gmi"),
 		Pi:          render(cfg.Agents.Pi, "pi"),
+		Kimi:        render(cfg.Agents.Kimi, "kimi"),
 		Antigravity: render(cfg.Agents.Antigravity, "agy"),
 		Cursor:      render(cfg.Agents.Cursor, "cursor"),
 		Windsurf:    render(cfg.Agents.Windsurf, "windsurf"),
@@ -907,6 +908,8 @@ func agentTemplateAndType(agentType string) (string, AgentType, bool) {
 		return cfg.Agents.Gemini, AgentTypeGemini, true
 	case tmux.AgentPi:
 		return cfg.Agents.Pi, AgentTypePi, true
+	case tmux.AgentKimi:
+		return cfg.Agents.Kimi, AgentTypeKimi, true
 	case tmux.AgentAntigravity:
 		return cfg.Agents.Antigravity, AgentTypeAntigravity, true
 	case tmux.AgentCursor:

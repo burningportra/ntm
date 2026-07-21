@@ -3768,6 +3768,8 @@ func detectAgentType(title string) string {
 		return "gemini"
 	case strings.Contains(titleLower, "pi-coding-agent"):
 		return "pi"
+	case strings.Contains(titleLower, "kimi"):
+		return "kimi"
 	case strings.Contains(titleLower, "antigravity"):
 		return "antigravity"
 	case strings.Contains(titleLower, "cursor"):
@@ -3794,6 +3796,8 @@ func detectAgentType(title string) string {
 		return "gemini"
 	case containsShortForm(titleLower, "pi"):
 		return "pi"
+	case containsShortForm(titleLower, "kimi"):
+		return "kimi"
 	case containsShortForm(titleLower, "agy"):
 		return "antigravity"
 	case containsShortForm(titleLower, "grok"):
@@ -3808,7 +3812,7 @@ func detectAgentType(title string) string {
 }
 
 // DetectAgentType detects the agent type from a pane title.
-// Returns one of: "claude", "codex", "gemini", "pi", "cursor", "windsurf",
+// Returns one of: "claude", "codex", "gemini", "pi", "kimi", "cursor", "windsurf",
 // "aider", "oc" (opencode), "ollama", or "unknown".
 func DetectAgentType(title string) string {
 	return detectAgentType(title)
@@ -3837,6 +3841,8 @@ func ResolveAgentType(t string) string {
 		return "gemini"
 	case agent.AgentTypePi:
 		return "pi"
+	case agent.AgentTypeKimi:
+		return "kimi"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
 	case agent.AgentTypeGrok:
@@ -6037,6 +6043,8 @@ func agentTypeString(t tmux.AgentType) string {
 		return "gemini"
 	case tmux.AgentPi:
 		return "pi"
+	case tmux.AgentKimi:
+		return "kimi"
 	case tmux.AgentAntigravity:
 		return "antigravity"
 	case tmux.AgentGrok:

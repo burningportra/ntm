@@ -174,7 +174,7 @@ Custom prompt files support template variables:
 		},
 	}
 
-	cmd.Flags().StringVar(&agentType, "agent-type", "cc", "Agent type: cc, cod, gmi, pi, agy, cursor, windsurf|ws, aider, oc, or ollama")
+	cmd.Flags().StringVar(&agentType, "agent-type", "cc", "Agent type: cc, cod, gmi, pi, kimi, agy, cursor, windsurf|ws, aider, oc, or ollama")
 	cmd.Flags().StringVar(&promptFile, "prompt", "", "Custom prompt file (supports template variables)")
 	cmd.Flags().BoolVar(&noPrompt, "no-prompt", false, "Skip sending initial prompt")
 	cmd.ValidArgsFunction = completeSessionArgs
@@ -264,6 +264,9 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 	case "pi":
 		agentTypeFull = "pi"
 		agentCmdTemplate = cfg.Agents.Pi
+	case "kimi":
+		agentTypeFull = "kimi"
+		agentCmdTemplate = cfg.Agents.Kimi
 	case "antigravity":
 		agentTypeFull = "antigravity"
 		agentCmdTemplate = cfg.Agents.Antigravity
@@ -399,7 +402,7 @@ func controllerAgentList(panes []tmux.Pane) ([]string, int) {
 	for _, p := range panes {
 		canonical := p.Type.Canonical()
 		switch canonical {
-		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
+		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
 			count++
 			list = append(list, fmt.Sprintf("- Pane %d: %s", p.Index, canonical))
 		}

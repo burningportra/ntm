@@ -2586,6 +2586,8 @@ func bulkAssignTMUXAgentType(agentType string) tmux.AgentType {
 		return tmux.AgentGemini
 	case "pi":
 		return tmux.AgentPi
+	case "kimi":
+		return tmux.AgentKimi
 	case "antigravity":
 		return tmux.AgentAntigravity
 	case "grok":

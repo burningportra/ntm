@@ -361,7 +361,7 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 
 	for _, pane := range panes {
 		switch normalizedType := normalizeAgentType(string(pane.Type)); normalizedType {
-		case "claude", "codex", "gemini", "pi", "grok", "cursor", "windsurf", "aider", "oc", "ollama", "user":
+		case "claude", "codex", "gemini", "pi", "kimi", "grok", "cursor", "windsurf", "aider", "oc", "ollama", "user":
 			counts[normalizedType]++
 		default:
 			counts["other"]++

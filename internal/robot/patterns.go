@@ -131,6 +131,11 @@ func defaultPatterns() []Pattern {
 		{Name: "pi_model_status", RegexStr: `(?m)^\s*(?:[$↑][^\n]*(?:\(auto\)|\bCodex:|\bgpt-|\bclaude-|\bgemini-))`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 98, Description: "Pi model/status line"},
 		{Name: "pi_banner", RegexStr: `(?im)^\s*pi\s+-\s+ai\s+coding\s+assistant\b`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Pi coding assistant banner"},
 
+		// Kimi patterns
+		{Name: "kimi_prompt", RegexStr: `(?im)^\s*kimi>\s*$`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Kimi prompt"},
+		{Name: "kimi_banner", RegexStr: `(?i)kimi\s+(code|cli)`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Kimi code/cli banner"},
+		{Name: "kimi_moonshot", RegexStr: `(?i)moonshot(\s+ai)?\b`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Moonshot AI banner"},
+
 		// Antigravity (agy) first-run workspace-trust dialog: the pane is
 		// alive but permanently stalled on a menu waiting for a keystroke.
 		// Without these, health reported such panes as OK — the worst
@@ -450,7 +455,7 @@ func isGenericShellIdlePattern(name string) bool {
 
 func isKnownAgentPatternType(agentType string) bool {
 	switch normalizeAgentType(agentType) {
-	case "claude", "codex", "gemini", "pi", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "pi", "kimi", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama":
 		return true
 	default:
 		return false

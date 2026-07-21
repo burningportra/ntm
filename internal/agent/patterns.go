@@ -354,6 +354,46 @@ var (
 	piHeaderPattern = regexp.MustCompile(`(?im)(^\s*pi\s+-\s+ai\s+coding\s+assistant\b|\bpi\b.*\b(coding\s+assistant|terminal\s+coding\s+harness)\b|\[pi(?:[-_][[:alnum:]-]+)?\])`)
 )
 
+// Kimi (kimi) patterns.
+var (
+	kimiRateLimitPatterns = []string{
+		"rate limit",
+		"too many requests",
+		"quota exceeded",
+		"usage limit",
+		"try again later",
+	}
+
+	kimiWorkingPatterns = []string{
+		"```",
+		"tool call",
+		"running ",
+		"reading ",
+		"writing ",
+		"editing ",
+		"searching ",
+		"thinking",
+	}
+
+	kimiIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`>\s*$`),
+		regexp.MustCompile(`(?m)^>\s*$`),
+		regexp.MustCompile(`(?m)^kimi>\s*$`),
+		regexp.MustCompile(`(?i)kimi\s+(code|cli)`),
+	}
+
+	kimiErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+		"permission denied",
+		"connection refused",
+		"timeout",
+	}
+
+	kimiHeaderPattern = regexp.MustCompile(`(?i)\b(kimi|moonshot)(\s+(code|cli|ai))?\b`)
+)
+
 // Cursor (cursor) patterns.
 var (
 	cursorRateLimitPatterns = []string{
@@ -892,6 +932,14 @@ func GetPatternSet(agentType AgentType) *PatternSet {
 			ErrorPatterns:     gmiErrorPatterns,
 			MemoryPattern:     gmiMemoryPattern,
 			HeaderPattern:     gmiHeaderPattern,
+		}
+	case AgentTypeKimi:
+		return &PatternSet{
+			RateLimitPatterns: kimiRateLimitPatterns,
+			WorkingPatterns:   kimiWorkingPatterns,
+			IdlePatterns:      kimiIdlePatterns,
+			ErrorPatterns:     kimiErrorPatterns,
+			HeaderPattern:     kimiHeaderPattern,
 		}
 	case AgentTypeCursor:
 		return &PatternSet{

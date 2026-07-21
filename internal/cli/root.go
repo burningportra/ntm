@@ -3546,6 +3546,7 @@ var (
 	robotSpawnCod        int    // number of Codex agents
 	robotSpawnGmi        int    // number of Gemini agents
 	robotSpawnPi         int    // number of Pi agents
+	robotSpawnKimi       int    // number of Kimi agents
 	robotSpawnAgy        int    // number of Antigravity agents
 	robotSpawnGrok       int    // number of Grok Build agents
 	robotSpawnPreset     string // recipe/preset name
@@ -3672,7 +3673,7 @@ var (
 
 	// Robot-activity flags for agent activity detection
 	robotActivity           string // session name for activity query
-	robotActivityType       string // filter by agent type (claude, codex, gemini, pi, antigravity, grok)
+	robotActivityType       string // filter by agent type (claude, codex, gemini, pi, kimi, antigravity, grok)
 	robotProductivity       string // session name for productivity evidence query
 	robotProductivityWindow string // observation window for productivity and convergence
 	robotConvergedStreak    int    // consecutive converged observations required by robot wait
@@ -3694,7 +3695,7 @@ var (
 	robotRoute          string // session name for route
 	robotRouteStrategy  string // routing strategy (least-loaded, first-available, round-robin, etc.)
 	robotRouteLastAgent string // pane ID of the previously routed agent (sticky/round-robin anchor)
-	robotRouteType      string // filter by agent type (claude, codex, gemini, pi)
+	robotRouteType      string // filter by agent type (claude, codex, gemini, pi, kimi)
 	robotRouteExclude   string // comma-separated pane indices to exclude
 
 	// Robot-sequence flags for durable per-pane prompt progress.
@@ -4175,6 +4176,7 @@ func init() {
 	rootCmd.Flags().IntVar(&robotSpawnCod, "spawn-cod", 0, "Codex CLI agents to spawn. Use with --robot-spawn. Example: --spawn-cod=1")
 	rootCmd.Flags().IntVar(&robotSpawnGmi, "spawn-gmi", 0, "Gemini CLI agents to spawn. Use with --robot-spawn. Example: --spawn-gmi=1")
 	rootCmd.Flags().IntVar(&robotSpawnPi, "spawn-pi", 0, "Pi agents to spawn. Use with --robot-spawn. Example: --spawn-pi=1")
+	rootCmd.Flags().IntVar(&robotSpawnKimi, "spawn-kimi", 0, "Kimi CLI agents to spawn. Use with --robot-spawn. Example: --spawn-kimi=1")
 	rootCmd.Flags().IntVar(&robotSpawnAgy, "spawn-agy", 0, "Antigravity CLI agents to spawn. Use with --robot-spawn. Example: --spawn-agy=1")
 	rootCmd.Flags().IntVar(&robotSpawnGrok, "spawn-grok", 0, "Grok Build agents to spawn. Use with --robot-spawn. Example: --spawn-grok=1")
 	rootCmd.Flags().StringVar(&robotSpawnPreset, "spawn-preset", "", "Use recipe preset instead of counts. See --robot-recipes. Example: --spawn-preset=standard")
@@ -4194,7 +4196,7 @@ func init() {
 
 	// Robot-controller-spawn flags for launching controller agent
 	rootCmd.Flags().StringVar(&robotControllerSpawn, "robot-controller-spawn", "", "Launch controller agent in session. Required: SESSION. Example: ntm --robot-controller-spawn=proj")
-	rootCmd.Flags().StringVar(&robotControllerAgentType, "controller-agent-type", "cc", "Agent type for controller: cc, cod, gmi, pi, agy, cursor, windsurf|ws, aider, or ollama. Use with --robot-controller-spawn")
+	rootCmd.Flags().StringVar(&robotControllerAgentType, "controller-agent-type", "cc", "Agent type for controller: cc, cod, gmi, pi, kimi, agy, cursor, windsurf|ws, aider, or ollama. Use with --robot-controller-spawn")
 	rootCmd.Flags().StringVar(&robotControllerPrompt, "controller-prompt", "", "Custom prompt file. Use with --robot-controller-spawn")
 	rootCmd.Flags().BoolVar(&robotControllerNoPrompt, "controller-no-prompt", false, "Skip initial prompt. Use with --robot-controller-spawn")
 
@@ -4324,7 +4326,7 @@ func init() {
 
 	// Robot-activity flags for agent activity detection
 	rootCmd.Flags().StringVar(&robotActivity, "robot-activity", "", "Get agent activity state (idle/busy/error). Required: SESSION. Example: ntm --robot-activity=myproject")
-	rootCmd.Flags().StringVar(&robotActivityType, "activity-type", "", "Filter by agent type: claude, codex, gemini, pi, antigravity, grok. Optional with --robot-activity. Example: --activity-type=grok")
+	rootCmd.Flags().StringVar(&robotActivityType, "activity-type", "", "Filter by agent type: claude, codex, gemini, pi, kimi, antigravity, grok. Optional with --robot-activity. Example: --activity-type=grok")
 	rootCmd.Flags().StringVar(&robotProductivity, "robot-productivity", "", "Get evidence-backed swarm productivity. Required: SESSION. Example: ntm --robot-productivity=myproject")
 	rootCmd.Flags().StringVar(&robotProductivityWindow, "productivity-window", "30m", "Observation window for --robot-productivity and --wait-until=converged. Example: --productivity-window=1h")
 	rootCmd.Flags().IntVar(&robotConvergedStreak, "converged-streak", 3, "Consecutive converged observations required by --wait-until=converged")
@@ -4539,7 +4541,7 @@ func init() {
 	rootCmd.Flags().IntVar(&cassLimit, "limit", 10, "Max results to return (default varies by command)")
 	rootCmd.Flags().IntVar(&robotOffset, "offset", 0, "Pagination offset (default 0)")
 	// Note: --since already defined at line 1631 for robotSince (used by --robot-snapshot)
-	rootCmd.Flags().StringVar(&cassAgent, "agent", "", "Filter by agent type: claude, codex, gemini, pi, antigravity, cursor, etc.")
+	rootCmd.Flags().StringVar(&cassAgent, "agent", "", "Filter by agent type: claude, codex, gemini, pi, kimi, antigravity, cursor, etc.")
 	rootCmd.Flags().StringVar(&cassWorkspace, "workspace", "", "Filter by workspace/project path")
 
 	// --category and --tag for JFP
@@ -5083,6 +5085,7 @@ func robotSpawnOptionsFromFlags(cmd *cobra.Command, readyTimeout time.Duration, 
 		CodCount:           robotSpawnCod,
 		GmiCount:           robotSpawnGmi,
 		PiCount:            robotSpawnPi,
+		KimiCount:          robotSpawnKimi,
 		AgyCount:           robotSpawnAgy,
 		GrokCount:          robotSpawnGrok,
 		Preset:             robotSpawnPreset,

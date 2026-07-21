@@ -11,10 +11,10 @@ import (
 func TestNewProfileMatcher(t *testing.T) {
 	pm := NewProfileMatcher()
 
-	// Should have all default profiles (claude, codex, gemini, antigravity, Pi)
+	// Should have all default profiles (claude, codex, gemini, antigravity, Pi, Kimi)
 	profiles := pm.AllProfiles()
-	if len(profiles) != 5 {
-		t.Errorf("expected 5 profiles, got %d", len(profiles))
+	if len(profiles) != 6 {
+		t.Errorf("expected 6 profiles, got %d", len(profiles))
 	}
 
 	// Check Claude profile
@@ -59,6 +59,16 @@ func TestNewProfileMatcher(t *testing.T) {
 	if pi.ContextBudget != expectedPi {
 		t.Errorf("Pi context budget should be %d, got %d", expectedPi, pi.ContextBudget)
 	}
+
+	// Check Kimi profile
+	kimi := pm.GetProfile(AgentTypeKimi)
+	if kimi == nil {
+		t.Fatal("Kimi profile should exist")
+	}
+	expectedKimi := models.GetTokenBudget("kimi")
+	if kimi.ContextBudget != expectedKimi {
+		t.Errorf("Kimi context budget should be %d, got %d", expectedKimi, kimi.ContextBudget)
+	}
 }
 
 func TestGetProfileByName(t *testing.T) {
@@ -78,6 +88,9 @@ func TestGetProfileByName(t *testing.T) {
 		{"gmi", AgentTypeGemini},
 		{"pi", AgentTypePi},
 		{"pi-coding-agent", AgentTypePi},
+		{"kimi", AgentTypeKimi},
+		{"kimi-k2", AgentTypeKimi},
+		{"moonshot", AgentTypeKimi},
 		{"CLAUDE", AgentTypeClaude}, // Case insensitive
 	}
 

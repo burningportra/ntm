@@ -1439,6 +1439,8 @@ func NormalizeAgentType(t string) string {
 		return "antigravity"
 	case agent.AgentTypePi:
 		return "pi"
+	case agent.AgentTypeKimi:
+		return "kimi"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
@@ -1458,7 +1460,7 @@ func NormalizeAgentType(t string) string {
 // Case-insensitive: "Claude", "CLAUDE", "claude" are all valid.
 func IsValidAgentType(t string) bool {
 	switch NormalizeAgentType(t) {
-	case "claude", "codex", "gemini", "antigravity", "pi", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "antigravity", "pi", "kimi", "cursor", "windsurf", "aider", "oc", "ollama":
 		return true
 	default:
 		return false

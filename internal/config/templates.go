@@ -411,6 +411,7 @@ func DefaultAgentTemplates() AgentConfig {
 		// appended as a system prompt so persona prompts work in the same way as
 		// the other interactive agents.
 		Pi:       `pi{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .SystemPromptFile}} --append-system-prompt "$(cat {{shellQuote .SystemPromptFile}})"{{end}}`,
+		Kimi:     `kimi{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .SystemPromptFile}} --append-system-prompt "$(cat {{shellQuote .SystemPromptFile}})"{{end}}`,
 		Windsurf: `windsurf{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
 		Aider:    `aider{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
 		// Opencode (oc): the upstream `opencode` binary takes `-m/--model

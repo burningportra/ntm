@@ -291,6 +291,8 @@ func ackPaneTMUXAgentType(pane tmux.Pane) tmux.AgentType {
 		return tmux.AgentGemini
 	case "pi":
 		return tmux.AgentPi
+	case "kimi":
+		return tmux.AgentKimi
 	case "antigravity":
 		return tmux.AgentAntigravity
 	case "cursor":

@@ -2032,6 +2032,10 @@ func isAgentRunning(output, agentType string) bool {
 		return strings.Contains(outputLower, "pi - ai coding assistant") ||
 			strings.Contains(outputLower, "pi coding agent") ||
 			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
+	case "kimi":
+		return strings.Contains(outputLower, "kimi") ||
+			strings.Contains(outputLower, "moonshot") ||
+			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
 	case "cursor":
 		return strings.Contains(outputLower, "cursor") ||
 			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
@@ -2066,6 +2070,8 @@ func getAgentCommand(agentType string) string {
 		return "gemini"
 	case "pi":
 		return "pi"
+	case "kimi":
+		return "kimi"
 	case "antigravity":
 		return "agy"
 	case "cursor":

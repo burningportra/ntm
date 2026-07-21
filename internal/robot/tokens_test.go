@@ -318,7 +318,7 @@ func TestParseAgentTypes_GrokAndLegacyAll(t *testing.T) {
 		{input: "grok", want: []string{"grok"}},
 		{input: "grok-build", want: []string{"grok"}},
 		{input: "xai_grok_build", want: []string{"grok"}},
-		{input: "all", want: []string{"claude", "codex", "gemini", "grok"}},
+		{input: "all", want: []string{"claude", "codex", "gemini", "pi", "kimi", "grok"}},
 	}
 
 	for _, tt := range tests {

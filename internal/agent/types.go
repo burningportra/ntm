@@ -17,6 +17,7 @@ const (
 	AgentTypeCodex       AgentType = "cod"      // Codex CLI (OpenAI)
 	AgentTypeGemini      AgentType = "gmi"      // Gemini CLI (Google)
 	AgentTypePi          AgentType = "pi"       // Pi coding agent
+	AgentTypeKimi        AgentType = "kimi"     // Kimi CLI (Moonshot AI)
 	AgentTypeAntigravity AgentType = "agy"      // Antigravity CLI (Google) — successor to the Gemini CLI
 	AgentTypeGrok        AgentType = "grok"     // Grok Build CLI (xAI)
 	AgentTypeOllama      AgentType = "ollama"   // Local Ollama CLI
@@ -62,11 +63,13 @@ func (t AgentType) Canonical() AgentType {
 		return AgentTypeGemini
 	case "pi", "pi-coding-agent", "pi_coding_agent", "picodingagent":
 		return AgentTypePi
+	case "kimi", "kimi-cli", "kimi_cli", "kimicli", "kimi-code", "kimi_code", "kimicode", "moonshot", "moonshot-ai", "moonshot_ai", "kimi-k2", "k2":
+		return AgentTypeKimi
 	case "agy", "antigravity", "antigravity-cli", "antigravity_cli", "antigravitycli", "google-antigravity":
 		return AgentTypeAntigravity
 	case "grok", "grok-build", "grok_build", "grokbuild", "xai-grok-build", "xai_grok_build", "xaigrokbuild":
 		return AgentTypeGrok
-	case "cursor":
+	case "cursor", "agent", "agt", "cursor-agent", "cursor_agent", "cursoragent":
 		return AgentTypeCursor
 	case "windsurf", "ws":
 		return AgentTypeWindsurf
@@ -96,6 +99,8 @@ func (t AgentType) DisplayName() string {
 		return "Gemini CLI"
 	case AgentTypePi:
 		return "Pi"
+	case AgentTypeKimi:
+		return "Kimi CLI"
 	case AgentTypeAntigravity:
 		return "Antigravity CLI"
 	case AgentTypeGrok:
@@ -103,7 +108,7 @@ func (t AgentType) DisplayName() string {
 	case AgentTypeOllama:
 		return "Ollama"
 	case AgentTypeCursor:
-		return "Cursor"
+		return "Cursor Agent"
 	case AgentTypeWindsurf:
 		return "Windsurf"
 	case AgentTypeAider:
@@ -128,6 +133,8 @@ func (t AgentType) ProfileName() string {
 		return "Gemini"
 	case AgentTypePi:
 		return "Pi"
+	case AgentTypeKimi:
+		return "Kimi"
 	case AgentTypeAntigravity:
 		return "Antigravity"
 	case AgentTypeGrok:
@@ -135,7 +142,7 @@ func (t AgentType) ProfileName() string {
 	case AgentTypeOllama:
 		return "Ollama"
 	case AgentTypeCursor:
-		return "Cursor"
+		return "Agent"
 	case AgentTypeWindsurf:
 		return "Windsurf"
 	case AgentTypeAider:
@@ -158,7 +165,7 @@ func (t AgentType) ProfileName() string {
 // IsValid returns true if this is a known agent type.
 func (t AgentType) IsValid() bool {
 	switch t.Canonical() {
-	case AgentTypeClaudeCode, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeAntigravity, AgentTypeGrok, AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeUser:
+	case AgentTypeClaudeCode, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeKimi, AgentTypeAntigravity, AgentTypeGrok, AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeUser:
 		return true
 	default:
 		return false

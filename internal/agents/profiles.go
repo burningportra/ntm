@@ -23,6 +23,7 @@ const (
 	AgentTypeCodex       AgentType = "codex"
 	AgentTypeGemini      AgentType = "gemini"
 	AgentTypePi          AgentType = "pi"
+	AgentTypeKimi        AgentType = "kimi"
 	AgentTypeAntigravity AgentType = "antigravity"
 )
 
@@ -167,6 +168,26 @@ func (pm *ProfileMatcher) loadDefaults() {
 		Type:          AgentTypePi,
 		Model:         "pi-default",
 		ContextBudget: models.GetTokenBudget("pi"),
+		Specializations: []Specialization{
+			SpecComplex,
+			SpecQuick,
+			SpecRefactorSmall,
+			SpecDebug,
+		},
+		Preferences: Preferences{
+			PreferredFiles:  []string{"internal/**/*.go", "cmd/**/*.go", "docs/**", "*.md"},
+			AvoidFiles:      []string{},
+			PreferredLabels: []string{"task", "bug", "feature", "chore", "P1", "P2"},
+		},
+		Performance: Performance{
+			SuccessRate: 0.85,
+		},
+	}
+
+	pm.profiles[AgentTypeKimi] = &AgentProfile{
+		Type:          AgentTypeKimi,
+		Model:         "kimi-k2",
+		ContextBudget: models.GetTokenBudget("kimi"),
 		Specializations: []Specialization{
 			SpecComplex,
 			SpecQuick,
@@ -573,6 +594,8 @@ func NormalizeAgentType(t string) string {
 		return "codex"
 	case "gemini-pro", "gemini-ultra", "gemini-3-pro-preview":
 		return "gemini"
+	case "kimi-k2", "k2", "moonshot":
+		return "kimi"
 	}
 
 	switch agentpkg.AgentType(normalized).Canonical() {
@@ -586,6 +609,8 @@ func NormalizeAgentType(t string) string {
 		return "antigravity"
 	case agentpkg.AgentTypePi:
 		return "pi"
+	case agentpkg.AgentTypeKimi:
+		return "kimi"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:
@@ -615,6 +640,8 @@ func ParseAgentType(s string) AgentType {
 		return AgentTypeAntigravity
 	case "pi":
 		return AgentTypePi
+	case "kimi":
+		return AgentTypeKimi
 	default:
 		return AgentType(normalized)
 	}

@@ -178,6 +178,8 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 		return cfg.Agents.Gemini, nil, nil
 	case AgentTypePi:
 		return cfg.Agents.Pi, nil, nil
+	case AgentTypeKimi:
+		return cfg.Agents.Kimi, nil, nil
 	case AgentTypeAntigravity:
 		return cfg.Agents.Antigravity, nil, nil
 	case AgentTypeGrok:
@@ -247,6 +249,7 @@ func newAddCmd() *cobra.Command {
 	  ntm add myproject --cc=2           # Add 2 Claude agents (default model)
 	  ntm add myproject --cc=1:opus      # Add 1 Claude Opus agent
 	  ntm add myproject --cod=1 --gmi=1  # Add 1 Codex, 1 Gemini
+	  ntm add myproject --agent=2        # Add 2 Cursor Agent CLI agents (alias: --cursor)
 
 		With --label, target a labeled session:
 	  ntm add myproject --label frontend --cc=1  # Add to myproject--frontend
@@ -348,10 +351,12 @@ func newAddCmd() *cobra.Command {
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypePi, &agentSpecs), "pi", "Pi agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeKimi, &agentSpecs), "kimi", "Kimi agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model pinned to Gemini 3.1 Pro (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N or N:model[:effort])")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOllama, &agentSpecs), "ollama", "Ollama agents (N or N:model)")
-	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "cursor", "Cursor agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "cursor", "Cursor Agent CLI agents (N or N:model); alias: --agent")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "agent", "Cursor Agent CLI agents (N or N:model); alias of --cursor")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeWindsurf, &agentSpecs), "windsurf", "Windsurf agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAider, &agentSpecs), "aider", "Aider agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOpencode, &agentSpecs), "oc", "Opencode agents (N or N:model)")
@@ -600,7 +605,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 
 	// Add agents
 	flatAgents := opts.Agents.Flatten()
-	ccCount, codCount, gmiCount, piCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+	ccCount, codCount, gmiCount, piCount, kimiCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 	var rateLimitTracker *ratelimit.RateLimitTracker
 	openAICooldownWaited := false
 	ollamaHost := ""
@@ -683,6 +688,8 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			gmiCount++
 		case AgentTypePi:
 			piCount++
+		case AgentTypeKimi:
+			kimiCount++
 		case AgentTypeAntigravity:
 			agyCount++
 		case AgentTypeGrok:
@@ -1034,6 +1041,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			AddedCodex:          codCount,
 			AddedGemini:         gmiCount,
 			AddedPi:             piCount,
+			AddedKimi:           kimiCount,
 			AddedAntigravity:    agyCount,
 			AddedGrok:           grokCount,
 			AddedOllama:         ollamaCount,

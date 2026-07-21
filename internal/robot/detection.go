@@ -43,7 +43,12 @@ var processPatterns = map[string]string{
 	"gemini-cli":      "gemini",
 	"pi":              "pi",
 	"pi-coding-agent": "pi",
+	"kimi":            "kimi",
+	"kimi-cli":        "kimi",
 	"cursor":          "cursor",
+	"agent":           "cursor",
+	"agt":             "cursor",
+	"cursor-agent":    "cursor",
 	"windsurf":        "windsurf",
 	"aider":           "aider",
 	"aider-chat":      "aider",
@@ -93,6 +98,14 @@ var contentPatterns = []struct {
 			regexp.MustCompile(`(?im)^\s*pi>\s*$`),
 			regexp.MustCompile(`(?i)\bpi\b.*\b(terminal\s+coding\s+harness|coding\s+agent)\b`),
 			regexp.MustCompile(`(?i)\[pi(?:[-_][[:alnum:]-]+)?\]`),
+		},
+	},
+	{
+		agentType: "kimi",
+		patterns: []*regexp.Regexp{
+			regexp.MustCompile(`(?im)^\s*kimi>\s*$`),
+			regexp.MustCompile(`(?i)kimi\s+(code|cli)`),
+			regexp.MustCompile(`(?i)moonshot(\s+ai)?`),
 		},
 	},
 	{
@@ -252,7 +265,7 @@ func detectFromContent(content string) AgentDetection {
 func DetectFromTitle(title string) AgentDetection {
 	title = strings.ToLower(title)
 
-	agents := []string{"claude", "codex", "gemini", "pi", "cursor", "windsurf", "aider", "ollama"}
+	agents := []string{"claude", "codex", "gemini", "pi", "kimi", "cursor", "windsurf", "aider", "ollama"}
 	for _, agent := range agents {
 		if strings.Contains(title, agent) {
 			return AgentDetection{
@@ -281,6 +294,8 @@ func DetectFromNTMTitle(title string) AgentDetection {
 		return AgentDetection{Type: "gemini", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "pi"):
 		return AgentDetection{Type: "pi", Confidence: 0.9, Method: MethodTitle}
+	case containsShortForm(lower, "kimi"):
+		return AgentDetection{Type: "kimi", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "grok"):
 		return AgentDetection{Type: "grok", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "cursor"):

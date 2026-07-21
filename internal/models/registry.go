@@ -64,6 +64,10 @@ var ContextLimits = map[string]int{
 	"gemini-3-pro-preview":  1000000,
 	"gemini-3-flash":        1000000,
 	"gemini-pro":            32000,
+
+	// Moonshot Kimi models
+	"kimi-k2":      256000,
+	"kimi-k2-0905": 256000,
 }
 
 // Aliases maps short names and common variants to canonical model names.
@@ -99,6 +103,9 @@ var Aliases = map[string]string{
 	"ultra":        "gemini-2.0-flash",
 	"gemini-flash": "gemini-2.0-flash",
 	"gemini-ultra": "gemini-2.0-flash",
+
+	// Kimi aliases
+	"kimi": "kimi-k2",
 }
 
 var (
@@ -217,6 +224,7 @@ var agentTypeBudgetPct = map[string]float64{
 	"gmi":      0.10, // Gemini: 10% of 1M (still 100K tokens, avoids excessive context)
 	"agy":      0.10, // Antigravity (Gemini successor): mirrors Gemini's budget
 	"pi":       0.90, // Pi: provider-backed coding harness, use a conservative cloud-agent budget
+	"kimi":     0.90, // Kimi: 90% of limit (cloud coding CLI, similar overhead to Claude)
 	"cursor":   0.85, // Cursor
 	"windsurf": 0.85, // Windsurf
 	"aider":    0.85, // Aider
@@ -230,6 +238,7 @@ var agentTypeDefaultModels = map[string]string{
 	"gmi":      "gemini-2.0-flash",
 	"agy":      "gemini-3-pro-preview", // Antigravity pins Gemini 3 Pro
 	"pi":       "claude-opus-4",
+	"kimi":     "kimi-k2",
 	"cursor":   "claude-3.5-sonnet",
 	"windsurf": "claude-3.5-sonnet",
 	"aider":    "claude-3.5-sonnet",

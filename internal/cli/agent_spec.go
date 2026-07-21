@@ -42,6 +42,7 @@ const (
 	AgentTypeCodex       AgentType = "cod"
 	AgentTypeGemini      AgentType = "gmi"
 	AgentTypePi          AgentType = "pi"
+	AgentTypeKimi        AgentType = "kimi"
 	AgentTypeAntigravity AgentType = "agy"
 	AgentTypeGrok        AgentType = "grok"
 	AgentTypeOllama      AgentType = "ollama"
@@ -308,6 +309,8 @@ func ValidateModelAlias(agentType AgentType, alias string) error {
 		aliases = cfg.Models.Gemini
 	case AgentTypePi:
 		aliases = cfg.Models.Pi
+	case AgentTypeKimi:
+		aliases = cfg.Models.Kimi
 	case AgentTypeGrok:
 		// Grok Build's available model IDs are account- and release-dependent.
 		// Known aliases still resolve through Models.Grok, but an exact model ID

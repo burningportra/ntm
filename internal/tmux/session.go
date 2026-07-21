@@ -47,6 +47,7 @@ const (
 	AgentAntigravity = agent.AgentTypeAntigravity
 	AgentGrok        = agent.AgentTypeGrok
 	AgentPi          = agent.AgentTypePi
+	AgentKimi        = agent.AgentTypeKimi
 	AgentCursor      = agent.AgentTypeCursor
 	AgentWindsurf    = agent.AgentTypeWindsurf
 	AgentAider       = agent.AgentTypeAider
@@ -484,6 +485,11 @@ func detectAgentFromCommand(command string) AgentType {
 	// Pi coding agent
 	if isAgent("pi") || strings.Contains(cmd, "pi-coding-agent") {
 		return AgentPi
+	}
+
+	// Kimi CLI (Moonshot AI)
+	if isAgent("kimi") || strings.Contains(cmd, "kimi-cli") || strings.Contains(cmd, "kimi-code") {
+		return AgentKimi
 	}
 
 	// Cursor

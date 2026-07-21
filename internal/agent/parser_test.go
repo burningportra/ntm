@@ -161,6 +161,27 @@ func TestParser_DetectAgentType_Aider(t *testing.T) {
 	}
 }
 
+func TestParser_DetectAgentType_Kimi(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	outputs := []string{
+		"Kimi Code CLI ready",
+		"kimi session started",
+		"Moonshot AI Kimi CLI",
+	}
+
+	for _, output := range outputs {
+		t.Run(output, func(t *testing.T) {
+			t.Parallel()
+			agentType := p.DetectAgentType(output)
+			if agentType != AgentTypeKimi {
+				t.Errorf("DetectAgentType(%q) = %v, want %v", output, agentType, AgentTypeKimi)
+			}
+		})
+	}
+}
+
 func TestParser_DetectAgentType_Ollama(t *testing.T) {
 	t.Parallel()
 	p := NewParser()
@@ -1318,6 +1339,14 @@ Error: quota exceeded. Please try again in 1 minute.`,
 			wantType:    AgentTypeAider,
 			wantWorking: true,
 			wantIdle:    false,
+			wantLimited: false,
+		},
+		{
+			name:        "kimi idle at prompt",
+			output:      "Kimi Code CLI\nDone.\nkimi> ",
+			wantType:    AgentTypeKimi,
+			wantWorking: false,
+			wantIdle:    true,
 			wantLimited: false,
 		},
 		{

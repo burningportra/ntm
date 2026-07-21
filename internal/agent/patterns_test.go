@@ -93,6 +93,18 @@ func TestMatchAny(t *testing.T) {
 			want:     true,
 		},
 		{
+			name:     "kimi rate limit",
+			text:     "quota exceeded, try again later",
+			patterns: kimiRateLimitPatterns,
+			want:     true,
+		},
+		{
+			name:     "kimi working",
+			text:     "editing internal/agent/types.go",
+			patterns: kimiWorkingPatterns,
+			want:     true,
+		},
+		{
 			name:     "cursor error",
 			text:     "error: connection lost",
 			patterns: cursorErrorPatterns,
@@ -108,6 +120,12 @@ func TestMatchAny(t *testing.T) {
 			name:     "aider error",
 			text:     "exception: file not found",
 			patterns: aiderErrorPatterns,
+			want:     true,
+		},
+		{
+			name:     "kimi error",
+			text:     "error: connection refused",
+			patterns: kimiErrorPatterns,
 			want:     true,
 		},
 	}
@@ -174,6 +192,12 @@ func TestMatchAnyRegex(t *testing.T) {
 			name:     "aider prompt",
 			text:     "aider> ",
 			patterns: aiderIdlePatterns,
+			want:     true,
+		},
+		{
+			name:     "kimi prompt",
+			text:     "kimi> ",
+			patterns: kimiIdlePatterns,
 			want:     true,
 		},
 	}
@@ -480,6 +504,24 @@ func TestHeaderPatterns(t *testing.T) {
 			pattern: aiderHeaderPattern,
 			want:    true,
 		},
+		{
+			name:    "kimi header",
+			text:    "Kimi Code CLI v1.0",
+			pattern: kimiHeaderPattern,
+			want:    true,
+		},
+		{
+			name:    "kimi moonshot",
+			text:    "Moonshot AI",
+			pattern: kimiHeaderPattern,
+			want:    true,
+		},
+		{
+			name:    "kimi cli",
+			text:    "kimi is ready",
+			pattern: kimiHeaderPattern,
+			want:    true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -516,6 +558,13 @@ func TestGetPatternSet(t *testing.T) {
 		},
 		{
 			agentType:         AgentTypeGemini,
+			hasRateLimitPats:  true,
+			hasWorkingPats:    true,
+			hasIdlePats:       true,
+			hasContextPattern: false,
+		},
+		{
+			agentType:         AgentTypeKimi,
 			hasRateLimitPats:  true,
 			hasWorkingPats:    true,
 			hasIdlePats:       true,
@@ -636,6 +685,7 @@ func TestAllPatternsCompile(t *testing.T) {
 		ccHeaderPattern,
 		codHeaderPattern,
 		gmiHeaderPattern,
+		kimiHeaderPattern,
 		cursorHeaderPattern,
 		windsurfHeaderPattern,
 		aiderHeaderPattern,
@@ -653,6 +703,7 @@ func TestAllPatternsCompile(t *testing.T) {
 		ccIdlePatterns,
 		codIdlePatterns,
 		gmiIdlePatterns,
+		kimiIdlePatterns,
 		cursorIdlePatterns,
 		windsurfIdlePatterns,
 		aiderIdlePatterns,

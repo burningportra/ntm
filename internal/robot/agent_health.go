@@ -508,6 +508,8 @@ func findPTState(ptStates map[string]*pt.AgentState, session, paneStr, agentType
 		agentPrefix = "gmi"
 	case agent.AgentTypePi:
 		agentPrefix = "pi"
+	case agent.AgentTypeKimi:
+		agentPrefix = "kimi"
 	case agent.AgentTypeAntigravity:
 		agentPrefix = "agy"
 	case agent.AgentTypeCursor:

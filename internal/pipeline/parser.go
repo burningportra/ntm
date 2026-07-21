@@ -549,7 +549,7 @@ func validateStep(step *Step, stepField string, stepIDs map[string]bool, result 
 			result.addWarning(ParseError{
 				Field:   stepField + ".agent",
 				Message: fmt.Sprintf("unknown agent type: %s", step.Agent),
-				Hint:    "Valid types: claude, codex, gemini, pi, cursor, windsurf, aider, ollama (and aliases)",
+				Hint:    "Valid types: claude, codex, gemini, pi, kimi, cursor, windsurf, aider, ollama (and aliases)",
 			})
 		}
 	}

@@ -338,6 +338,8 @@ func canonicalSpawnAgentType(raw string) (AgentType, bool) {
 		return AgentTypeGemini, true
 	case agentpkg.AgentTypePi:
 		return AgentTypePi, true
+	case agentpkg.AgentTypeKimi:
+		return AgentTypeKimi, true
 	case agentpkg.AgentTypeAntigravity:
 		return AgentTypeAntigravity, true
 	case agentpkg.AgentTypeGrok:
@@ -363,6 +365,7 @@ func orderedSpawnAgentTypes() []AgentType {
 		AgentTypeCodex,
 		AgentTypeGemini,
 		AgentTypePi,
+		AgentTypeKimi,
 		AgentTypeAntigravity,
 		AgentTypeGrok,
 		AgentTypeCursor,
@@ -502,6 +505,7 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 	opts.CodCount = 0
 	opts.GmiCount = 0
 	opts.PiCount = 0
+	opts.KimiCount = 0
 	opts.AgyCount = 0
 	opts.GrokCount = 0
 	opts.CursorCount = 0
@@ -520,6 +524,8 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 			opts.GmiCount++
 		case AgentTypePi:
 			opts.PiCount++
+		case AgentTypeKimi:
+			opts.KimiCount++
 		case AgentTypeAntigravity:
 			opts.AgyCount++
 		case AgentTypeGrok:
@@ -552,6 +558,7 @@ func populateSpawnAgentsFromCounts(opts *SpawnOptions) {
 		{agentType: AgentTypeCodex, count: opts.CodCount},
 		{agentType: AgentTypeGemini, count: opts.GmiCount},
 		{agentType: AgentTypePi, count: opts.PiCount},
+		{agentType: AgentTypeKimi, count: opts.KimiCount},
 		{agentType: AgentTypeAntigravity, count: opts.AgyCount},
 		{agentType: AgentTypeGrok, count: opts.GrokCount},
 		{agentType: AgentTypeCursor, count: opts.CursorCount},
@@ -649,7 +656,7 @@ func prependSpawnPaneEnv(command string, env map[string]string) string {
 func validateSpawnAgentTypes(agents []FlatAgent, pluginMap map[string]plugins.AgentPlugin) error {
 	for _, agent := range agents {
 		switch agent.Type {
-		case AgentTypeClaude, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeAntigravity, AgentTypeGrok,
+		case AgentTypeClaude, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeKimi, AgentTypeAntigravity, AgentTypeGrok,
 			AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode:
 			continue
 		default:
@@ -674,6 +681,8 @@ func spawnAgentCommandTemplate(agentType AgentType, pluginMap map[string]plugins
 		return cfg.Agents.Gemini, nil, nil
 	case AgentTypePi:
 		return cfg.Agents.Pi, nil, nil
+	case AgentTypeKimi:
+		return cfg.Agents.Kimi, nil, nil
 	case AgentTypeAntigravity:
 		tmpl := cfg.Agents.Antigravity
 		if tmpl == "" {
@@ -937,7 +946,7 @@ func sortPanesForAssignment(panes []tmux.Pane) {
 }
 
 func legacySpawnTotalAgentCount(opts SpawnOptions) int {
-	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.AgyCount + opts.GrokCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OllamaCount
+	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.AgyCount + opts.GrokCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OllamaCount
 }
 
 func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
@@ -946,6 +955,7 @@ func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
 		"NTM_AGENT_COUNT_COD":      fmt.Sprintf("%d", opts.CodCount),
 		"NTM_AGENT_COUNT_GMI":      fmt.Sprintf("%d", opts.GmiCount),
 		"NTM_AGENT_COUNT_PI":       fmt.Sprintf("%d", opts.PiCount),
+		"NTM_AGENT_COUNT_KIMI":     fmt.Sprintf("%d", opts.KimiCount),
 		"NTM_AGENT_COUNT_AGY":      fmt.Sprintf("%d", opts.AgyCount),
 		"NTM_AGENT_COUNT_GROK":     fmt.Sprintf("%d", opts.GrokCount),
 		"NTM_AGENT_COUNT_CURSOR":   fmt.Sprintf("%d", opts.CursorCount),
@@ -966,6 +976,7 @@ func spawnSessionCreatedEventFields(opts SpawnOptions, dir string) map[string]st
 		"agent_cod":      fmt.Sprintf("%d", opts.CodCount),
 		"agent_gmi":      fmt.Sprintf("%d", opts.GmiCount),
 		"agent_pi":       fmt.Sprintf("%d", opts.PiCount),
+		"agent_kimi":     fmt.Sprintf("%d", opts.KimiCount),
 		"agent_agy":      fmt.Sprintf("%d", opts.AgyCount),
 		"agent_grok":     fmt.Sprintf("%d", opts.GrokCount),
 		"agent_cursor":   fmt.Sprintf("%d", opts.CursorCount),
@@ -1125,6 +1136,7 @@ type SpawnOptions struct {
 	CodCount           int
 	GmiCount           int
 	PiCount            int
+	KimiCount          int
 	AgyCount           int
 	GrokCount          int
 	CursorCount        int
@@ -1678,9 +1690,10 @@ share the same project directory. Use ntm list --project myproject to see all.
 
 Examples:
   ntm spawn myproject --cc=2 --cod=2           # 2 Claude, 2 Codex + user pane
-  ntm spawn myproject --cc=3 --cod=3 --agy=1   # 3 Claude, 3 Codex, 1 Antigravity
-  ntm spawn myproject --cc=3 --cod=3 --gmi=1   # legacy: Gemini CLI instead of Antigravity
-  ntm spawn myproject --cc=4 --no-user         # 4 Claude, no user pane
+		  ntm spawn myproject --cc=3 --cod=3 --agy=1   # 3 Claude, 3 Codex, 1 Antigravity
+		  ntm spawn myproject --cc=3 --cod=3 --gmi=1   # legacy: Gemini CLI instead of Antigravity
+		  ntm spawn myproject --cc=2 --pi=1 --kimi=1   # 2 Claude, 1 Pi, 1 Kimi
+		  ntm spawn myproject --cc=4 --no-user         # 4 Claude, no user pane
   ntm spawn myproject -r full-stack            # Use full-stack recipe
   ntm spawn myproject -t red-green             # Use red-green workflow template
   ntm spawn myproject -t parallel-explore --cc=4  # Template with count override
@@ -1824,6 +1837,7 @@ Examples:
 			codCount := agentSpecs.ByType(AgentTypeCodex).TotalCount()
 			gmiCount := agentSpecs.ByType(AgentTypeGemini).TotalCount()
 			piCount := agentSpecs.ByType(AgentTypePi).TotalCount()
+			kimiCount := agentSpecs.ByType(AgentTypeKimi).TotalCount()
 
 			// Apply implicit project count defaults only when the user did not
 			// request a persona set/list. With --profile-set/--profiles the
@@ -1836,6 +1850,7 @@ Examples:
 				codCount = agentSpecs.ByType(AgentTypeCodex).TotalCount()
 				gmiCount = agentSpecs.ByType(AgentTypeGemini).TotalCount()
 				piCount = agentSpecs.ByType(AgentTypePi).TotalCount()
+				kimiCount = agentSpecs.ByType(AgentTypeKimi).TotalCount()
 				if !IsJSONOutput() && len(agentSpecs) > 0 {
 					fmt.Printf("Using default configuration: %s\n", formatSpawnCountSummary(cfg.ProjectDefaults))
 				}
@@ -1921,6 +1936,7 @@ Examples:
 				CodCount:                codCount,
 				GmiCount:                gmiCount,
 				PiCount:                 piCount,
+				KimiCount:               kimiCount,
 				UserPane:                !noUserPane,
 				AutoRestart:             autoRestart,
 				RecipeName:              recipeName,
@@ -1983,6 +1999,7 @@ Examples:
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypePi, &agentSpecs), "pi", "Pi agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeKimi, &agentSpecs), "kimi", "Kimi agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model is pinned to Gemini 3.1 Pro (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().IntVar(&localCount, "local", 0, "Local agents via Ollama (alias: --ollama)")
@@ -2183,7 +2200,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 	if len(opts.Agents) == 0 {
 		totalAgents = legacySpawnTotalAgentCount(opts)
 		if totalAgents == 0 {
-			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --pi, --agy, --grok, --cursor, --windsurf, --aider, --ollama or plugin flags)"))
+			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --pi, --kimi, --agy, --grok, --cursor, --windsurf, --aider, --ollama or plugin flags)"))
 		}
 	} else {
 		totalAgents = len(opts.Agents)
@@ -4430,6 +4447,8 @@ func agentTypeToProgram(agentType string) string {
 		return "gemini-cli"
 	case "pi":
 		return "pi"
+	case "kimi":
+		return "kimi"
 	case "cursor":
 		return "cursor"
 	case "windsurf":
@@ -4451,6 +4470,8 @@ func defaultRegistrationModel(agentType string) string {
 	switch agentType {
 	case "pi":
 		return "pi-default"
+	case "kimi":
+		return "kimi-default"
 	default:
 		return ""
 	}
