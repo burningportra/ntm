@@ -3024,3 +3024,87 @@ func TestSendLoopModeFlag(t *testing.T) {
 		t.Fatalf("--loop-mode default = %q, want false", flag.DefValue)
 	}
 }
+
+// TestBuildInterruptResponseSendsEscapeToMusePanes checks which byte each pane
+// receives from `ntm interrupt`. Muse Code stops a turn on Escape; Ctrl+C only
+// clears its draft while the turn keeps running, and on an idle composer it
+// arms quit, so a second interrupt exits Muse. Each pane runs a raw-mode reader
+// that records the first byte it gets.
+func TestBuildInterruptResponseSendsEscapeToMusePanes(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	dir := t.TempDir()
+	session := fmt.Sprintf("ntm-test-interrupt-muse-%d", time.Now().UnixNano())
+	reader := func(name string) string {
+		ready := filepath.Join(dir, name+".ready")
+		out := filepath.Join(dir, name+".out")
+		return fmt.Sprintf("stty raw -echo; touch '%s'; dd bs=1 count=1 2>/dev/null | od -An -tx1 > '%s'; sleep 30", ready, out)
+	}
+
+	musePane, err := tmux.DefaultClient.Run("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", session, "-x", "120", "-y", "40", "-c", dir, reader("muse"))
+	if err != nil {
+		t.Fatalf("new-session failed: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+	claudePane, err := tmux.DefaultClient.Run("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", session, "-c", dir, reader("cc"))
+	if err != nil {
+		t.Fatalf("split-window failed: %v", err)
+	}
+	musePane, claudePane = strings.TrimSpace(musePane), strings.TrimSpace(claudePane)
+	if err := tmux.SetPaneTitle(musePane, session+"__muse_1"); err != nil {
+		t.Fatalf("SetPaneTitle(muse) failed: %v", err)
+	}
+	if err := tmux.SetPaneTitle(claudePane, session+"__cc_2"); err != nil {
+		t.Fatalf("SetPaneTitle(cc) failed: %v", err)
+	}
+
+	waitForFile := func(path string) []byte {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if data, err := os.ReadFile(path); err == nil && (strings.HasSuffix(path, ".ready") || len(data) > 0) {
+				return data
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", path)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	waitForFile(filepath.Join(dir, "muse.ready"))
+	waitForFile(filepath.Join(dir, "cc.ready"))
+
+	resp, err := buildInterruptResponse(context.Background(), session, nil)
+	if err != nil {
+		t.Fatalf("buildInterruptResponse failed: %v", err)
+	}
+	if resp.Interrupted != 2 {
+		t.Fatalf("Interrupted = %d, want 2 (panes %v)", resp.Interrupted, resp.TargetedPanes)
+	}
+
+	if got := strings.TrimSpace(string(waitForFile(filepath.Join(dir, "muse.out")))); got != "1b" {
+		t.Errorf("muse pane received byte %q, want 1b (Escape)", got)
+	}
+	if got := strings.TrimSpace(string(waitForFile(filepath.Join(dir, "cc.out")))); got != "03" {
+		t.Errorf("claude pane received byte %q, want 03 (Ctrl+C)", got)
+	}
+}
+
+func TestInterruptKeyForPane(t *testing.T) {
+	tests := []struct {
+		paneType string
+		want     string
+	}{
+		{"muse", "Escape"},
+		{"muse-code", "Escape"},
+		{"cc", "C-c"},
+		{"cod", "C-c"},
+		{"kimi", "C-c"},
+		{"pi", "C-c"},
+	}
+	for _, tt := range tests {
+		if got := interruptKeyForPane(tmux.Pane{Type: tmux.AgentType(tt.paneType)}); got != tt.want {
+			t.Errorf("interruptKeyForPane(%q) = %q, want %q", tt.paneType, got, tt.want)
+		}
+	}
+}

@@ -2432,7 +2432,8 @@ func newInterruptCmd() *cobra.Command {
 		Use:   "interrupt <session>",
 		Short: "Send Ctrl+C to all agent panes",
 		Long: `Send an interrupt signal (Ctrl+C) to all agent panes in a session.
-User panes are not affected.
+Muse Code panes get Escape instead, because Ctrl+C in Muse only clears the
+draft and a second press quits it. User panes are not affected.
 
 Examples:
   ntm interrupt myproject
@@ -2484,7 +2485,7 @@ func runInterrupt(session string, tags []string) error {
 		return err
 	}
 
-	count := 0
+	ctrlC, escape := 0, 0
 	for _, p := range panes {
 		// Only interrupt agent panes
 		if isInterruptibleAgentPane(p) {
@@ -2495,15 +2496,39 @@ func runInterrupt(session string, tags []string) error {
 				}
 			}
 
-			if err := tmux.SendInterrupt(p.ID); err != nil {
+			key := interruptKeyForPane(p)
+			if err := tmux.SendKeyName(p.ID, key); err != nil {
 				return fmt.Errorf("interrupting pane %d: %w", p.Index, err)
 			}
-			count++
+			if key == museInterruptKey {
+				escape++
+			} else {
+				ctrlC++
+			}
 		}
 	}
 
-	fmt.Printf("Sent Ctrl+C to %d agent pane(s)\n", count)
+	if ctrlC > 0 || escape == 0 {
+		fmt.Printf("Sent Ctrl+C to %d agent pane(s)\n", ctrlC)
+	}
+	if escape > 0 {
+		fmt.Printf("Sent Escape to %d Muse pane(s)\n", escape)
+	}
 	return nil
+}
+
+// museInterruptKey stops a running Muse Code turn. Ctrl+C in Muse only clears
+// the composer draft while the turn keeps running, and on an idle composer it
+// arms quit, so a second Ctrl+C would exit Muse.
+const museInterruptKey = "Escape"
+
+// interruptKeyForPane returns the tmux key name that stops a pane's running
+// turn: Escape for Muse Code, Ctrl+C for every other agent.
+func interruptKeyForPane(pane tmux.Pane) string {
+	if tmux.AgentType(pane.Type).Canonical() == tmux.AgentMuse {
+		return museInterruptKey
+	}
+	return "C-c"
 }
 
 // buildInterruptResponse constructs the response for session interrupt.
@@ -2543,7 +2568,7 @@ func buildInterruptResponse(ctx context.Context, session string, tags []string) 
 			}
 
 			targetedPanes = append(targetedPanes, p.Index)
-			if err := tmux.SendInterrupt(p.ID); err != nil {
+			if err := tmux.SendKeyName(p.ID, interruptKeyForPane(p)); err != nil {
 				return nil, fmt.Errorf("interrupting pane %d: %w", p.Index, err)
 			}
 			interrupted++
