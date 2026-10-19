@@ -952,7 +952,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "interrupt",
 			Flag:        "--robot-interrupt",
 			Category:    "control",
-			Description: "Send Ctrl+C to stop agents, optionally send a new task.",
+			Description: "Send Ctrl+C (Escape to Muse Code panes) to stop agents, optionally send a new task.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-interrupt", Type: "string", Required: true, Description: "Session name"},
 				{Name: "msg", Flag: "--msg", Type: "string", Required: false, Description: "New task to send after Ctrl+C"},

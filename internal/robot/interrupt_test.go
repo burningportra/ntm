@@ -271,9 +271,9 @@ func TestObserveInterruptPollRefreshesActivityAndFailsClosed(t *testing.T) {
 }
 
 // TestClearRestoredMuseDrafts covers the follow-up message after an
-// interrupt: Ctrl+C or Esc cancels a Muse turn and puts the prompt back in the
-// composer, so interrupted Muse panes get a verified C-u before the follow-up
-// is typed, while other panes are left alone.
+// interrupt: Escape cancels a Muse turn and puts the prompt back in the
+// composer, so interrupted Muse panes get a verified clear before the
+// follow-up is typed, while other panes are left alone.
 func TestClearRestoredMuseDrafts(t *testing.T) {
 	panes := []tmux.Pane{
 		{ID: "%1", Index: 1, Type: tmux.AgentMuse},   // interrupted, clears
@@ -326,6 +326,122 @@ func TestClearRestoredMuseDrafts(t *testing.T) {
 	}
 	if !strings.Contains(failed[1].Reason, "tmux gone") {
 		t.Errorf("pane 5 reason = %q, want the tmux error", failed[1].Reason)
+	}
+}
+
+// TestInterruptKeyForAgentStopsMuseWithEscape: a Muse pane holding a draft or
+// queued input treats Ctrl+C as "clear the draft" or "submit the queued
+// input", so its turn keeps running; Escape is Muse's interrupt.
+func TestInterruptKeyForAgentStopsMuseWithEscape(t *testing.T) {
+	tests := []struct {
+		agentType tmux.AgentType
+		want      interruptKey
+	}{
+		{tmux.AgentMuse, interruptKey{tmuxKey: "Escape", label: "Escape"}},
+		{tmux.AgentType("muse-code"), interruptKey{tmuxKey: "Escape", label: "Escape"}},
+		{tmux.AgentClaude, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
+		{tmux.AgentCodex, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
+		{tmux.AgentUser, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
+		{tmux.AgentUnknown, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
+	}
+	for _, tt := range tests {
+		if got := interruptKeyForAgent(tt.agentType); got != tt.want {
+			t.Errorf("interruptKeyForAgent(%q) = %+v, want %+v", tt.agentType, got, tt.want)
+		}
+	}
+}
+
+// TestClearMuseDraftFallsBackToCtrlC: C-u kills only the cursor's line, so an
+// interrupted multi-line draft keeps its earlier lines. The clear then sends
+// one Ctrl+C, but only when the composer verifiably holds text, since Ctrl+C
+// on an empty Muse composer arms quit.
+func TestClearMuseDraftFallsBackToCtrlC(t *testing.T) {
+	type result struct {
+		cleared, verified bool
+		err               error
+	}
+	tests := []struct {
+		name       string
+		clears     []result // successive results of the verified C-u clear
+		ctrlCErr   error
+		want       result
+		wantErr    string
+		wantClears int
+		wantCtrlCs int
+	}{
+		{
+			name:       "single-line draft cleared by C-u",
+			clears:     []result{{cleared: true, verified: true}},
+			want:       result{cleared: true, verified: true},
+			wantClears: 1,
+		},
+		{
+			name:       "unverifiable clear does not risk Ctrl+C",
+			clears:     []result{{cleared: true, verified: false}},
+			want:       result{cleared: true, verified: false},
+			wantClears: 1,
+		},
+		{
+			name:       "C-u error stops before Ctrl+C",
+			clears:     []result{{err: errors.New("tmux gone")}},
+			wantErr:    "tmux gone",
+			wantClears: 1,
+		},
+		{
+			name:       "multi-line draft cleared by Ctrl+C",
+			clears:     []result{{cleared: false, verified: true}, {cleared: true, verified: true}},
+			want:       result{cleared: true, verified: true},
+			wantClears: 2,
+			wantCtrlCs: 1,
+		},
+		{
+			name:       "draft survives Ctrl+C",
+			clears:     []result{{cleared: false, verified: true}, {cleared: false, verified: true}},
+			want:       result{cleared: false, verified: true},
+			wantClears: 2,
+			wantCtrlCs: 1,
+		},
+		{
+			name:       "Ctrl+C send error",
+			clears:     []result{{cleared: false, verified: true}},
+			ctrlCErr:   errors.New("send-keys failed"),
+			wantErr:    "send-keys failed",
+			wantClears: 1,
+			wantCtrlCs: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clears, ctrlCs := 0, 0
+			clear := func(_ context.Context, target string, agentType tmux.AgentType) (bool, bool, error) {
+				if target != "%9" || agentType != tmux.AgentMuse {
+					t.Errorf("clear(%q, %q), want (%%9, muse)", target, agentType)
+				}
+				r := tt.clears[clears]
+				clears++
+				return r.cleared, r.verified, r.err
+			}
+			sendCtrlC := func(_ context.Context, target string) error {
+				if target != "%9" {
+					t.Errorf("sendCtrlC(%q), want %%9", target)
+				}
+				ctrlCs++
+				return tt.ctrlCErr
+			}
+
+			cleared, verified, err := clearMuseDraft(context.Background(), "%9", tmux.AgentMuse, clear, sendCtrlC)
+
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tt.wantErr)
+				}
+			} else if err != nil || cleared != tt.want.cleared || verified != tt.want.verified {
+				t.Fatalf("clearMuseDraft() = (%t, %t, %v), want (%t, %t, nil)", cleared, verified, err, tt.want.cleared, tt.want.verified)
+			}
+			if clears != tt.wantClears || ctrlCs != tt.wantCtrlCs {
+				t.Fatalf("C-u clears = %d, Ctrl+Cs = %d, want %d and %d", clears, ctrlCs, tt.wantClears, tt.wantCtrlCs)
+			}
+		})
 	}
 }
 

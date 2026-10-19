@@ -199,7 +199,7 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 
 	publishInterruptActuationRequest(trace, opts, targetKeys)
 
-	// Send Ctrl+C to all targets
+	// Send Ctrl+C (Escape to Muse Code panes) to all targets
 	for _, pane := range targetPanes {
 		paneKey := paneTargetKey(pane, multiWindow)
 		prevState := output.PreviousStates[paneKey]
@@ -211,11 +211,12 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 			continue
 		}
 
-		err := tmux.SendInterrupt(pane.ID)
+		key := interruptKeyForAgent(interruptPaneTMUXAgentType(pane))
+		err := tmux.DefaultClient.RunSilent("send-keys", "-t", pane.ID, key.tmuxKey)
 		if err != nil {
 			output.Failed = append(output.Failed, InterruptError{
 				Pane:   paneKey,
-				Reason: fmt.Sprintf("failed to send Ctrl+C: %v", err),
+				Reason: fmt.Sprintf("failed to send %s: %v", key.label, err),
 			})
 		} else {
 			output.Interrupted = append(output.Interrupted, paneKey)
@@ -335,7 +336,9 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 			messageTargets,
 			interrupted,
 			func(pane tmux.Pane) string { return paneTargetKey(pane, multiWindow) },
-			tmux.ClearComposerContext,
+			func(ctx context.Context, target string, agentType tmux.AgentType) (bool, bool, error) {
+				return clearMuseDraft(ctx, target, agentType, tmux.ClearComposerContext, sendCtrlCToPane)
+			},
 		)
 		output.Failed = append(output.Failed, clearFailures...)
 
@@ -584,14 +587,64 @@ func interruptPaneTMUXAgentType(pane tmux.Pane) tmux.AgentType {
 	return tmux.AgentType(interruptPaneAgentType(pane)).Canonical()
 }
 
+// interruptKey is the tmux key robot-interrupt sends to stop a pane's turn,
+// with the name its failure message uses.
+type interruptKey struct {
+	tmuxKey string
+	label   string
+}
+
+// interruptKeyForAgent returns the key that stops a running turn in a pane of
+// agentType. Muse Code stops a turn on Escape. Its Ctrl+C acts on the composer
+// first: with a draft there it only clears the draft, and with queued input it
+// submits that input as a steer, so in both cases the turn keeps running.
+// Escape stops the turn either way and leaves a draft in place. Verified
+// against muse 1.4.11 with the echo provider.
+func interruptKeyForAgent(agentType tmux.AgentType) interruptKey {
+	if agentType.Canonical() == tmux.AgentMuse {
+		return interruptKey{tmuxKey: "Escape", label: "Escape"}
+	}
+	return interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}
+}
+
+// sendCtrlCToPane sends one Ctrl+C to target.
+func sendCtrlCToPane(ctx context.Context, target string) error {
+	return tmux.DefaultClient.RunSilentContext(ctx, "send-keys", "-t", target, "C-c")
+}
+
+// clearMuseDraft clears an interrupted Muse pane's composer. It starts with
+// the verified C-u of clear, but C-u kills only the line the cursor is on, and
+// interrupted drafts are often several lines: a multi-line prompt comes back
+// whole, and queued input comes back on lines of its own. When the composer
+// verifiably still holds text, one Ctrl+C clears the whole draft (Muse offers
+// "press ↑ to restore" afterwards), and a second verified clear confirms it.
+// Ctrl+C is sent only when text is verified, because on an empty composer it
+// arms Muse's quit instead.
+func clearMuseDraft(
+	ctx context.Context,
+	target string,
+	agentType tmux.AgentType,
+	clear func(context.Context, string, tmux.AgentType) (cleared, verified bool, err error),
+	sendCtrlC func(context.Context, string) error,
+) (cleared, verified bool, err error) {
+	cleared, verified, err = clear(ctx, target, agentType)
+	if err != nil || !verified || cleared {
+		return cleared, verified, err
+	}
+	if err := sendCtrlC(ctx, target); err != nil {
+		return false, true, fmt.Errorf("send Ctrl+C to clear the rest of the draft: %w", err)
+	}
+	return clear(ctx, target, agentType)
+}
+
 // clearRestoredMuseDrafts clears the composer of every interrupted Muse Code
-// pane before the follow-up message is typed. Interrupting a Muse turn (Ctrl+C
-// or Esc) puts the interrupted prompt back in the composer as a draft, so the
-// follow-up would otherwise be appended to the old prompt. Muse's clear is a
-// lone C-u (Escape and a second Ctrl+C are not safe there), verified against
-// the "❯" composer line. A pane whose composer still holds text is reported
-// as failed and gets no follow-up. Other agents, and Muse panes that were
-// already idle and so were not interrupted, pass through untouched.
+// pane before the follow-up message is typed. Interrupting a Muse turn puts
+// the interrupted prompt, and any queued input, back in the composer as a
+// draft, so the follow-up would otherwise be appended to the old prompt. The
+// clear (clearMuseDraft in production) is verified against the "❯" composer
+// line. A pane whose composer still holds text is reported as failed and gets
+// no follow-up. Other agents, and Muse panes that were already idle and so
+// were not interrupted, pass through untouched.
 func clearRestoredMuseDrafts(
 	ctx context.Context,
 	targets []tmux.Pane,
@@ -617,7 +670,7 @@ func clearRestoredMuseDrafts(
 		case verified && !cleared:
 			failed = append(failed, InterruptError{
 				Pane:   key,
-				Reason: "Muse composer still holds the interrupted prompt after C-u; follow-up message not sent (inspect with --robot-tail)",
+				Reason: "Muse composer still holds the interrupted prompt after C-u and Ctrl+C; follow-up message not sent (inspect with --robot-tail)",
 			})
 		default:
 			kept = append(kept, pane)
