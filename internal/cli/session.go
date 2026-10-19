@@ -465,6 +465,9 @@ func runList(tags []string, project ...string) error {
 				if s.AgentCounts.Grok > 0 {
 					parts = append(parts, fmt.Sprintf("%d Grok", s.AgentCounts.Grok))
 				}
+				if s.AgentCounts.Muse > 0 {
+					parts = append(parts, fmt.Sprintf("%d Muse", s.AgentCounts.Muse))
+				}
 				if s.AgentCounts.Ollama > 0 {
 					parts = append(parts, fmt.Sprintf("%d OLL", s.AgentCounts.Ollama))
 				}
@@ -1075,6 +1078,7 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 	gmiCount := counts.Gemini
 	agyCount := counts.Antigravity
 	grokCount := counts.Grok
+	museCount := counts.Muse
 	ollamaCount := counts.Ollama
 	cursorCount := counts.Cursor
 	windsurfCount := counts.Windsurf
@@ -1375,6 +1379,10 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 		grokColorKey, grokIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentGrok}, t, ic)
 		fmt.Fprintf(w, "    %s%s Grok%s    %s%d instance(s)%s\n", color(grokColorKey), grokIcon, reset, text, grokCount, reset)
 	}
+	if museCount > 0 {
+		museColorKey, museIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentMuse}, t, ic)
+		fmt.Fprintf(w, "    %s%s Muse%s    %s%d instance(s)%s\n", color(museColorKey), museIcon, reset, text, museCount, reset)
+	}
 	if ollamaCount > 0 {
 		fmt.Fprintf(w, "    %s%s Ollama%s %s%d instance(s)%s\n", ollama, ic.Ollama, reset, text, ollamaCount, reset)
 	}
@@ -1399,7 +1407,7 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 		fmt.Fprintf(w, "    %s%s Other%s   %s%d pane(s)%s\n", color(otherColorKey), otherIcon, reset, text, otherCount, reset)
 	}
 
-	totalAgents := ccCount + codCount + gmiCount + agyCount + grokCount + ollamaCount + cursorCount + windsurfCount + aiderCount + otherCount
+	totalAgents := ccCount + codCount + gmiCount + agyCount + grokCount + museCount + ollamaCount + cursorCount + windsurfCount + aiderCount + otherCount
 	if totalAgents == 0 {
 		fmt.Fprintf(w, "    %sNo agents running%s\n", overlay, reset)
 	}
