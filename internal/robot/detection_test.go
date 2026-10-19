@@ -328,6 +328,14 @@ const (
 		"● Bash(muse --version)\n" +
 		"  ⎿  Muse Code 1.4.11 (1.4.11-R6667.1)\n\n" +
 		"✻ Cooked for 1m 12s · done 7:24 PM\n" + claudeTestChrome + claudeTestIdle
+
+	// Claude summarizing results on "·"-separated lines. Muse's status bar is
+	// "<model> · <cwd> · YOLO", so it is the muse- model name, not the "·"
+	// layout, that identifies it.
+	claudeTestDotSeparatedReplyScreen = "● Ran each package's tests:\n" +
+		"  robot · 412 passed · 0 failed\n" +
+		"  tmux · 96 passed · 0 failed\n\n" +
+		"✻ Cooked for 2m 3s · done 7:30 PM\n" + claudeTestChrome + claudeTestIdle
 )
 
 // TestDetectFromContent_ClaudeScreensNeverMuse is the other half of the
@@ -338,6 +346,7 @@ func TestDetectFromContent_ClaudeScreensNeverMuse(t *testing.T) {
 		"idle":          claudeTestIdleScreen,
 		"working":       claudeTestWorkingScreen,
 		"mentions muse": claudeTestMentionsMuseScreen,
+		"dot separated": claudeTestDotSeparatedReplyScreen,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if detection := detectFromContent(screen); detection.Type == "muse" {
