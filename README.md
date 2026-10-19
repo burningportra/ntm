@@ -65,7 +65,7 @@ NTM gives you a single local system for:
 NTM is a pure Go project, but the runtime experience is intentionally integration-heavy.
 
 - Required: `tmux`
-- Required for agent spawning: whichever CLIs you want to run, typically Claude Code, Codex, Gemini CLI, Antigravity CLI, Grok Build, Pi, and/or Kimi
+- Required for agent spawning: whichever CLIs you want to run, typically Claude Code, Codex, Gemini CLI, Antigravity CLI, Grok Build, Pi, Kimi, and/or Muse Code
 - Optional but powerful: `br`, `bv`, Agent Mail, `cass`, `dcg`, `pt`
 - Sanity check everything with `ntm deps -v`
 
@@ -85,7 +85,7 @@ ntm deps -v
 ntm quick api --template=go
 
 # Launch a mixed swarm
-ntm spawn api --cc=2 --cod=1 --gmi=1 --agy=1 --pi=1 --kimi=1
+ntm spawn api --cc=2 --cod=1 --gmi=1 --agy=1 --pi=1 --kimi=1 --muse=1
 
 # Open the live operator surfaces
 ntm dashboard api
@@ -115,7 +115,7 @@ can treat a swarm like a manageable unit instead of a pile of terminals.
 
 ```bash
 ntm quick payments --template=go
-ntm spawn payments --cc=3 --cod=2 --gmi=1 --agy=1 --pi=1 --kimi=1
+ntm spawn payments --cc=3 --cod=2 --gmi=1 --agy=1 --pi=1 --kimi=1 --muse=1
 ntm add payments --cc=1
 ntm list
 ntm status payments
@@ -156,6 +156,25 @@ automated prompt delivery/assignment, interrupt-with-message, restart, and
 restore-time process relaunch are not yet claimed. Those operations fail closed
 before pane mutation; interact with an authenticated Grok pane directly. Robot
 `--spawn-wait` and `--spawn-assign-work` also fail closed for Grok panes.
+
+#### Muse Code
+
+NTM runs Meta's Muse Code CLI (`muse`) as the `muse` agent type. Panes launch
+with `--yolo`, so Muse skips the workspace trust prompt and approvals. A bare
+spec uses `muse-wonder-1.0`; the aliases `wonder`, `wonder-full`, `spark`
+(`spark-1.3`) and `spark-1.2` pick other models, and `:effort` or `@effort` sets
+`--reasoning-effort`:
+
+```bash
+ntm spawn research --muse=2
+ntm spawn research --muse=1:wonder-full@xhigh
+ntm add research --muse=1:spark
+ntm send research --muse "run the tests"
+ntm --robot-spawn=research --spawn-muse=1
+```
+
+Override the launch command with `[agents] muse`, the default model with
+`[models] default_muse`, and the aliases under `[models.muse]`.
 
 Use labels when you want multiple coordinated swarms on the same project while
 keeping a shared project directory:
