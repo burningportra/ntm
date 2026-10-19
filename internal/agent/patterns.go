@@ -419,11 +419,16 @@ var (
 		"esc to interrupt",
 	}
 
-	// museIdlePatterns match the empty composer line ("❯" alone). A composer
-	// holding a draft is not idle, and submitted prompts echoed into the
-	// transcript ("❯ fix the bug") never match.
+	// museIdlePatterns match a composer waiting for input: a "❯" line that is
+	// empty or shows one of Muse's dim tips (MuseComposerTipPrefixes), with
+	// the composer rule directly below it. A composer holding a draft is not
+	// idle, and submitted prompts echoed into the transcript ("❯ fix the bug")
+	// never match because no rule follows them. Callers rule out
+	// MuseActivelyWorking first: the empty composer stays drawn below the live
+	// working line for the whole turn.
 	museIdlePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?m)^\s*❯[\s\x{00a0}]*$`),
+		regexp.MustCompile(`(?m)^[ \t\x{00a0}]*❯[ \t\x{00a0}]*\r?\n[ \t]*─`),
+		museComposerTipLinePattern(MuseComposerTipPrefixes),
 	}
 
 	museErrorPatterns = []string{
@@ -451,11 +456,61 @@ var (
 	museActiveWorkLineRe = regexp.MustCompile(`(?i)\([^()]*\besc\s+to\s+interrupt\s*\)`)
 )
 
+// MuseComposerTipPrefixes are the leading words of the feature tips Muse
+// draws in an empty composer. About seven seconds after a turn ends, an idle
+// Muse pane shows one tip ("❯ Type @ to search and insert workspace file
+// paths" in a live echo pane) and keeps it while the composer stays empty.
+// The list covers every tip text in the muse 1.4.11 binary's tip table. Only
+// leading words are matched so a tip cut short by a narrow pane still counts
+// as empty. Idle detection (museIdlePatterns) and the tmux composer-clear
+// check both read this list.
+var MuseComposerTipPrefixes = []string{
+	"Type @ to search and insert",
+	"Start a message with ! to run",
+	"Paste an image with Ctrl+V",
+	"Press Alt+V to dictate",
+	"Tab queues or steers",
+	"Press ? on an empty composer",
+	"Press Ctrl+O to expand",
+	"/side asks a quick question",
+	"/fork branches the conversation",
+	"/goal pins a session objective",
+	"/resume reopens a past session",
+	"Ask to 'use a workflow'",
+	"Say 'use a workflow'",
+	"Ask to monitor a running",
+	"/agent opens the subagent",
+	"/tasks shows workflows",
+	"/loop 10m <prompt>",
+	"Ctrl+B sends the selected task",
+	"/skills browses ready-made",
+	"/plugins marketplace installs",
+	"/effort adjusts reasoning",
+	"/usage shows this session",
+	"/export saves the conversation",
+}
+
+// museComposerTipLinePattern matches a Muse composer line that shows one of
+// the given tips, with the composer rule directly below it.
+func museComposerTipLinePattern(prefixes []string) *regexp.Regexp {
+	quoted := make([]string, len(prefixes))
+	for i, prefix := range prefixes {
+		quoted[i] = regexp.QuoteMeta(prefix)
+	}
+	return regexp.MustCompile(`(?m)^[ \t\x{00a0}]*❯[ \t\x{00a0}]+(?:` + strings.Join(quoted, "|") + `)[^\n]*\n[ \t]*─`)
+}
+
 // museLiveTailLines bounds the window MuseActivelyWorking scans. The working
 // line is the sixth line from the bottom (working line, blank, rule, composer,
 // rule, status bar); ten leaves room for a short multi-line draft without
 // reaching transcript history.
 const museLiveTailLines = 10
+
+// museIdleScanLines is the trailing window MuseIdlePromptShowing searches for
+// the idle composer (composer line, rule, status bar, with room to spare). It
+// matches the window the agent parser uses for Muse, so both report the same
+// idle verdict for a capture.
+const museIdleScanLines = 5
 
 // MuseActivelyWorking reports whether a Muse pane shows a live turn. Muse
 // replaces the working line with the reply when the turn ends, so a match in
@@ -464,6 +519,21 @@ const museLiveTailLines = 10
 func MuseActivelyWorking(output string) bool {
 	tail := util.GetLastNLines(stripANSICodes(output), museLiveTailLines)
 	return museActiveWorkLineRe.MatchString(tail)
+}
+
+// MuseIdlePromptShowing reports whether a Muse pane is waiting for input at
+// an empty composer: no live turn, and the bottom composer is empty or shows
+// one of Muse's dim tips. A composer holding a draft returns false, so a
+// pane is never offered new work on top of unsent text.
+// status.DetectIdleFromOutput (and through it the unified status detector's
+// dispatch confidence) calls this directly; the agent parser's detectIdle
+// applies the same museIdlePatterns over the same window.
+func MuseIdlePromptShowing(output string) bool {
+	if MuseActivelyWorking(output) {
+		return false
+	}
+	tail := util.GetLastNLines(stripANSICodes(output), museIdleScanLines)
+	return matchAnyRegex(tail, museIdlePatterns)
 }
 
 // IsMuseOutput reports whether output carries a Muse Code signature: the

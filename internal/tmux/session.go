@@ -2255,43 +2255,11 @@ func composerPlaceholderPrefixes(agentType AgentType) []string {
 	case AgentCodex:
 		return []string{"Ask Codex"}
 	case AgentMuse:
-		return museComposerTipPrefixes
+		// Muse's dim feature tips, shared with Muse idle detection.
+		return agent.MuseComposerTipPrefixes
 	default:
 		return nil
 	}
-}
-
-// museComposerTipPrefixes are the leading words of the feature tips Muse
-// draws in an empty composer. About seven seconds after a turn ends, an idle
-// Muse pane shows one tip ("❯ Type @ to search and insert workspace file
-// paths" in a live echo pane) and keeps it while the composer stays empty.
-// The list covers every tip text in the muse 1.4.11 binary's tip table. Only
-// leading words are matched so a tip cut short by a narrow pane still counts
-// as empty.
-var museComposerTipPrefixes = []string{
-	"Type @ to search and insert",
-	"Start a message with ! to run",
-	"Paste an image with Ctrl+V",
-	"Press Alt+V to dictate",
-	"Tab queues or steers",
-	"Press ? on an empty composer",
-	"Press Ctrl+O to expand",
-	"/side asks a quick question",
-	"/fork branches the conversation",
-	"/goal pins a session objective",
-	"/resume reopens a past session",
-	"Ask to 'use a workflow'",
-	"Say 'use a workflow'",
-	"Ask to monitor a running",
-	"/agent opens the subagent",
-	"/tasks shows workflows",
-	"/loop 10m <prompt>",
-	"Ctrl+B sends the selected task",
-	"/skills browses ready-made",
-	"/plugins marketplace installs",
-	"/effort adjusts reasoning",
-	"/usage shows this session",
-	"/export saves the conversation",
 }
 
 // composerLineEmpty reports whether the bottom-most marker line in the

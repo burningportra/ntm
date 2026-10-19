@@ -222,6 +222,17 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 		// already ruled out by ClaudeActivelyWorking above.
 	}
 
+	// Muse Code shares Claude's "❯" composer, keeps it drawn under the live
+	// working line, and fills an idle composer with dim feature tips about
+	// seven seconds after each turn, so no prompt-line pattern below can
+	// decide it. The shared recognizer is authoritative: idle means no live
+	// turn and an empty or tip-only composer. A draft is not idle, and the
+	// generic scan must not get a second look (a draft ending in ">" would
+	// match the generic prompt pattern).
+	if agentType == string(agent.AgentTypeMuse) {
+		return agent.MuseIdlePromptShowing(output)
+	}
+
 	// Strip ANSI first for cleaner processing
 	clean := StripANSI(output)
 

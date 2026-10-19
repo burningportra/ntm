@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 	"unicode"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 func TestMain(m *testing.M) {
@@ -3148,6 +3150,22 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 		found, empty := composerLineEmpty(screen(residue), "❯", prefixes)
 		if !found || empty {
 			t.Errorf("Muse composer residue %q: got (found=%v, empty=%v), want (true, false)", residue, found, empty)
+		}
+		if agent.MuseIdlePromptShowing(screen(residue)) {
+			t.Errorf("Muse composer residue %q: agent.MuseIdlePromptShowing = true, want false", residue)
+		}
+	}
+
+	// The composer clear check and Muse idle detection read one tip list, so
+	// a composer the clear check accepts as empty is also an idle prompt.
+	for _, prefix := range agent.MuseComposerTipPrefixes {
+		composer := "❯ " + prefix + " and the rest of the tip"
+		found, empty := composerLineEmpty(screen(composer), "❯", prefixes)
+		if !found || !empty {
+			t.Errorf("Muse tip %q: composerLineEmpty = (found=%v, empty=%v), want (true, true)", composer, found, empty)
+		}
+		if !agent.MuseIdlePromptShowing(screen(composer)) {
+			t.Errorf("Muse tip %q: agent.MuseIdlePromptShowing = false, want true", composer)
 		}
 	}
 }

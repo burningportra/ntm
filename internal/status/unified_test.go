@@ -1312,8 +1312,13 @@ func TestObservationConfidenceTrustsMuseComposer(t *testing.T) {
 		t.Errorf("heuristic-idle Muse confidence = %.2f, want below the dispatch threshold", got)
 	}
 	// A live turn is never idle evidence, even with the composer drawn.
-	if idlePromptShowing(museWorkingCapture, "muse") {
-		t.Errorf("idlePromptShowing(working Muse) = true")
+	if DetectIdleFromOutput(museWorkingCapture, "muse") {
+		t.Errorf("DetectIdleFromOutput(working Muse) = true")
+	}
+	// A draft reads as idle, but new work would be typed onto the unsent
+	// text, so it must not authorize dispatch.
+	if got := observationConfidence(AgentStatus{AgentType: "muse", State: StateIdle}, museDraftCapture); ObservationConfidenceIsActionable(got) {
+		t.Errorf("Muse draft confidence = %.2f, want below the dispatch threshold", got)
 	}
 }
 

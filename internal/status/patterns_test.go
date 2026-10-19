@@ -1,7 +1,11 @@
 package status
 
 import (
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 func TestStripANSI(t *testing.T) {
@@ -393,6 +397,113 @@ func TestDetectIdleFromOutput_MultipleLines(t *testing.T) {
 			result := DetectIdleFromOutput(tt.output, tt.agentType)
 			if result != tt.expected {
 				t.Errorf("DetectIdleFromOutput = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// A live capture from a muse 1.4.11 echo pane in a 160x45 tmux pane,
+// whitespace-trimmed the way tmux.Client returns captures (only the cwd is
+// shortened), taken ten seconds after the "hi" turn ended: the idle composer
+// shows a dim feature tip.
+var (
+	museLiveTipComposer = "❯ Type @ to search and insert workspace file paths"
+	museLiveVoiceBar    = "── Voice input (alt(option)+v to start) " + strings.Repeat("─", 120)
+	museLiveTipCapture  = "Muse Code 1.4.11\n\n" +
+		"  Skills: 276 loaded · 40 warnings · 76 details hidden (ctrl+o to expand)\n\n" +
+		"❯ hi\n\n" +
+		"◆ echo: hi\n\n" +
+		museLiveVoiceBar + "\n" +
+		museLiveTipComposer + "\n" +
+		strings.Repeat("─", 160) + "\n" +
+		"  echo · /private/tmp/claude-501/scratchpad/musews52 · YOLO"
+	museLiveTipWorkingCapture = strings.Replace(museLiveTipCapture,
+		museLiveVoiceBar, "◇ Thinking (2s · esc to interrupt)\n\n"+museLiveVoiceBar, 1)
+	museLiveDraftCapture = strings.Replace(museLiveTipCapture, museLiveTipComposer, "❯ draft not sent", 1)
+)
+
+// DetectIdleFromOutput feeds robot health, the robot idle check and the swarm
+// prompt injector. Before Muse had its own branch, an idle Muse pane read as
+// busy here as soon as its composer showed a tip, so those callers never saw
+// it idle.
+func TestDetectIdleFromOutput_Muse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"live capture with a tip in the composer", museLiveTipCapture, true},
+		{"empty composer", museIdleCapture, true},
+		{"working line above a tip composer", museLiveTipWorkingCapture, false},
+		{"working line above an empty composer", museWorkingCapture, false},
+		{"working line above a draft", museWorkingWithDraftCapture, false},
+		// Unsent text is not an idle prompt, even though the composer is
+		// drawn; a draft ending in ">" must not reach the generic scan either.
+		{"draft in the composer", museLiveDraftCapture, false},
+		{"multi-line draft", museDraftCapture, false},
+		{"draft ending in a chevron", strings.Replace(museLiveTipCapture, museLiveTipComposer, "❯ compare a>", 1), false},
+		{"trust prompt", museTrustPromptCapture, false},
+	}
+	for _, tt := range tests {
+		for _, agentType := range []string{"muse", "muse-code", "meta-muse"} {
+			t.Run(tt.name+"/"+agentType, func(t *testing.T) {
+				if got := DetectIdleFromOutput(tt.output, agentType); got != tt.want {
+					t.Errorf("DetectIdleFromOutput(%s) = %v, want %v", agentType, got, tt.want)
+				}
+			})
+		}
+	}
+}
+
+// TestMuseIdleAgreesWithUnifiedDetector pins the three Muse idle readers to
+// one rule: DetectIdleFromOutput (robot health, swarm injector), the unified
+// detector's state plus dispatch confidence, and the agent parser. A draft
+// leaves the pane idle in the unified state but never dispatchable.
+func TestMuseIdleAgreesWithUnifiedDetector(t *testing.T) {
+	t.Parallel()
+
+	d := NewDetector()
+	observedAt := time.Date(2026, 10, 19, 21, 0, 0, 0, time.UTC)
+	parser := agent.NewParser()
+
+	tests := []struct {
+		name      string
+		output    string
+		wantState AgentState
+		wantIdle  bool
+	}{
+		{"live tip", museLiveTipCapture, StateIdle, true},
+		{"captured tip", museIdleTipCapture, StateIdle, true},
+		{"empty composer", museIdleCapture, StateIdle, true},
+		{"live draft", museLiveDraftCapture, StateIdle, false},
+		{"multi-line draft", museDraftCapture, StateIdle, false},
+		{"working above a tip", museLiveTipWorkingCapture, StateWorking, false},
+		{"working above an empty composer", museWorkingCapture, StateWorking, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, activity := range []time.Time{observedAt, observedAt.Add(-time.Hour)} {
+				state, _ := d.determineStateAt(tt.output, "muse", activity, observedAt)
+				if state != tt.wantState {
+					t.Errorf("determineStateAt() = %v, want %v", state, tt.wantState)
+				}
+				confidence := observationConfidence(AgentStatus{AgentType: "muse", State: state}, tt.output)
+				dispatchable := state == StateIdle && ObservationConfidenceIsActionable(confidence)
+				if dispatchable != tt.wantIdle {
+					t.Errorf("unified dispatchable = %v (state %v, confidence %.2f), want %v", dispatchable, state, confidence, tt.wantIdle)
+				}
+			}
+			if got := DetectIdleFromOutput(tt.output, "muse"); got != tt.wantIdle {
+				t.Errorf("DetectIdleFromOutput() = %v, want %v", got, tt.wantIdle)
+			}
+			parsed, err := parser.ParseWithHint(tt.output, agent.AgentTypeMuse)
+			if err != nil {
+				t.Fatalf("ParseWithHint error: %v", err)
+			}
+			if parsed.IsIdle != tt.wantIdle {
+				t.Errorf("parser IsIdle = %v, want %v", parsed.IsIdle, tt.wantIdle)
 			}
 		})
 	}

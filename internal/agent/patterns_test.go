@@ -236,6 +236,36 @@ func TestMatchAnyRegex(t *testing.T) {
 			patterns: museIdlePatterns,
 			want:     false,
 		},
+		{
+			name:     "muse composer showing a tip",
+			text:     "── Voice input (alt(option)+v to start) ──\n❯ Type @ to search and insert workspace file paths\n──────\n  echo · /repo · YOLO",
+			patterns: museIdlePatterns,
+			want:     true,
+		},
+		{
+			name:     "muse composer showing a tip cut short",
+			text:     "── Voice input (alt(option)+v to start) ──\n❯ Press ? on an empty composer to see keyb…\n──────",
+			patterns: museIdlePatterns,
+			want:     true,
+		},
+		{
+			name:     "muse draft that starts like a tip",
+			text:     "── Voice input (alt(option)+v to start) ──\n❯ Type a summary of the bug\n──────",
+			patterns: museIdlePatterns,
+			want:     false,
+		},
+		{
+			name:     "muse multi-line draft with an empty first line",
+			text:     "── Voice input (alt(option)+v to start) ──\n❯\n  second line\n──────",
+			patterns: museIdlePatterns,
+			want:     false,
+		},
+		{
+			name:     "muse tip text echoed as a submitted prompt",
+			text:     "❯ Type @ to search and insert workspace file paths\n\n◆ echo: Type @ to search",
+			patterns: museIdlePatterns,
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {

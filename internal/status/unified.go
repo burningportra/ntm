@@ -267,8 +267,11 @@ const museComposerScanLines = 12
 // out agent.MuseActivelyWorking first. The composer counts whether it is
 // empty, shows one of Muse's dim feature tips ("❯ Type @ to search and
 // insert workspace file paths", drawn about seven seconds after a turn
-// ends), or holds a draft; in each case Muse is waiting for input.
-// Submitted prompts also start with "❯" in the transcript, so only the
+// ends), or holds a draft; in each case Muse is waiting for input, so the
+// pane's state is idle. Only an empty or tip-only composer is an idle
+// prompt (agent.MuseIdlePromptShowing, via DetectIdleFromOutput), so
+// observationConfidence keeps a pane holding a draft from being dispatched
+// to. Submitted prompts also start with "❯" in the transcript, so only the
 // bottom-most such line is the composer, and it must have a rule below it.
 func museComposerShowing(output string) bool {
 	lines := strings.Split(StripANSI(output), "\n")
@@ -284,17 +287,6 @@ func museComposerShowing(output string) bool {
 		}
 	}
 	return false
-}
-
-// idlePromptShowing reports whether output shows the agent's own idle prompt,
-// as opposed to only passing the fallback idle heuristics. Muse is decided
-// here because DetectIdleFromOutput's prompt-line scan has no Muse pattern
-// and its composer shows feature tips that no prompt pattern could list.
-func idlePromptShowing(output, agentType string) bool {
-	if agent.AgentType(agentType).Canonical() == agent.AgentTypeMuse {
-		return !agent.MuseActivelyWorking(output) && museComposerShowing(output)
-	}
-	return DetectIdleFromOutput(output, agentType)
 }
 
 // looksLikeIdle applies heuristics to detect likely idle state when
@@ -895,10 +887,12 @@ func observationConfidence(status AgentStatus, output string) float64 {
 	if status.State == StateUnknown {
 		return 0.25
 	}
-	if status.State == StateIdle && !idlePromptShowing(output, status.AgentType) {
+	if status.State == StateIdle && !DetectIdleFromOutput(output, status.AgentType) {
 		// The detector's fallback idle heuristics intentionally improve display
 		// quality for quiet panes, but a short line or a generic "done" marker is
-		// not strong enough evidence to authorize dispatching more work.
+		// not strong enough evidence to authorize dispatching more work. A
+		// Muse composer holding a draft lands here too: the pane is idle, but
+		// new work would be typed onto the unsent text.
 		return 0.5
 	}
 	return 0.95

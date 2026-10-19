@@ -208,6 +208,35 @@ const (
 		"  muse-wonder-1.0 · /path/to/repo · YOLO"
 )
 
+// Live captures from a muse 1.4.11 echo pane (`muse --provider echo --yolo`)
+// in a 160x45 tmux 3.7b pane, whitespace-trimmed the way tmux.Client returns
+// captures; only the status-bar cwd is shortened. museLiveTipScreen was taken
+// ten seconds after the "hi" turn ended, when Muse had drawn a dim feature
+// tip into the empty composer.
+var (
+	museLiveVoiceBar  = "── Voice input (alt(option)+v to start) " + strings.Repeat("─", 120)
+	museLiveRule      = strings.Repeat("─", 160)
+	museLiveStatusBar = "  echo · /private/tmp/claude-501/scratchpad/musews52 · YOLO"
+
+	museLiveTipScreen = "Muse Code 1.4.11\n\n" +
+		"  Skills: 276 loaded · 40 warnings · 76 details hidden (ctrl+o to expand)\n\n" +
+		"❯ hi\n\n" +
+		"◆ echo: hi\n\n" +
+		museLiveVoiceBar + "\n" +
+		"❯ Type @ to search and insert workspace file paths\n" +
+		museLiveRule + "\n" +
+		museLiveStatusBar
+
+	// The same screen while a turn runs: the live working line sits above
+	// the composer, which still shows the tip.
+	museLiveTipWorkingScreen = strings.Replace(museLiveTipScreen,
+		museLiveVoiceBar, "◇ Thinking (2s · esc to interrupt)\n\n"+museLiveVoiceBar, 1)
+
+	// Text typed into the idle composer and not sent (captured live).
+	museLiveDraftScreen = strings.Replace(museLiveTipScreen,
+		"❯ Type @ to search and insert workspace file paths", "❯ draft not sent", 1)
+)
+
 // museScreenInDir rewrites a capture's status-bar cwd. A cwd containing
 // "claude" matches ccHeaderPattern, which is what makes detection order matter.
 func museScreenInDir(screen, dir string) string {
@@ -286,6 +315,11 @@ func TestParser_Parse_MuseStates(t *testing.T) {
 		// The empty composer is still drawn below the live working line.
 		{name: "working above empty composer", output: museWorkingScreen, wantWorking: true},
 		{name: "finished turn", output: museFinishedScreen, wantIdle: true},
+		// About seven seconds after a turn the idle composer shows a dim tip.
+		{name: "idle composer showing a tip", output: museLiveTipScreen, wantIdle: true},
+		{name: "working above a tip composer", output: museLiveTipWorkingScreen, wantWorking: true},
+		// Unsent text in the composer is not an idle prompt.
+		{name: "draft in the composer", output: museLiveDraftScreen},
 	}
 
 	for _, tt := range tests {
@@ -307,6 +341,11 @@ func TestParser_Parse_MuseStates(t *testing.T) {
 				}
 				if state.IsRateLimited || state.IsInError {
 					t.Errorf("hint %q: IsRateLimited = %v, IsInError = %v, want both false", hint, state.IsRateLimited, state.IsInError)
+				}
+				// status.DetectIdleFromOutput and the unified detector decide
+				// Muse idleness with MuseIdlePromptShowing; the parser must agree.
+				if shared := MuseIdlePromptShowing(tt.output); state.IsIdle != shared {
+					t.Errorf("hint %q: IsIdle = %v but MuseIdlePromptShowing = %v", hint, state.IsIdle, shared)
 				}
 			}
 		})
@@ -345,6 +384,73 @@ func TestMuseActivelyWorking(t *testing.T) {
 				t.Errorf("MuseActivelyWorking() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMuseIdlePromptShowing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "live capture with a tip in the composer", output: museLiveTipScreen, want: true},
+		{name: "empty composer", output: museIdleScreen, want: true},
+		{name: "finished turn", output: museFinishedScreen, want: true},
+		{
+			// The composer line exactly as `capture-pane -e` returned it live.
+			name:   "ansi colored tip",
+			output: "\x1b[0m\x1b[38;2;90;160;255m❯ \x1b[38;2;103;108;116mType @ to search and insert workspace file paths\x1b[39m\n\x1b[2m\x1b[38;2;103;108;116m" + museLiveRule + "\n" + museLiveStatusBar,
+			want:   true,
+		},
+		{name: "working line above a tip composer", output: museLiveTipWorkingScreen},
+		{name: "working line above an empty composer", output: museWorkingScreen},
+		{name: "draft in the composer", output: museLiveDraftScreen},
+		{
+			name:   "working line above a draft",
+			output: "◇ Thinking (4s · esc to interrupt)\n\n" + museLiveVoiceBar + "\n❯ follow up\n" + museLiveRule + "\n" + museLiveStatusBar,
+		},
+		{
+			name:   "composer scrolled out of the window",
+			output: "❯\n" + museLiveRule + "\n" + strings.Repeat("◆ output line\n", museIdleScanLines),
+		},
+		{name: "trust prompt", output: "Do you trust this workspace?\n⟩ 1  Trust and continue\n  2  Quit"},
+		{name: "empty output", output: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := MuseIdlePromptShowing(tt.output); got != tt.want {
+				t.Errorf("MuseIdlePromptShowing() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMuseIdlePromptShowing_EveryTip draws each tip from the muse 1.4.11 tip
+// table into the live screen's composer, whole and cut short. Several tips
+// hold regexp metacharacters ("?", "+", "<", "'"), so this also proves the
+// list is quoted into museIdlePatterns correctly.
+func TestMuseIdlePromptShowing_EveryTip(t *testing.T) {
+	t.Parallel()
+
+	const liveTip = "❯ Type @ to search and insert workspace file paths"
+	if len(MuseComposerTipPrefixes) != 23 {
+		t.Fatalf("MuseComposerTipPrefixes has %d tips, want the 23 in muse 1.4.11", len(MuseComposerTipPrefixes))
+	}
+	for _, prefix := range MuseComposerTipPrefixes {
+		for _, composer := range []string{"❯ " + prefix + " and the rest of the tip", "❯ " + prefix + "…"} {
+			screen := strings.Replace(museLiveTipScreen, liveTip, composer, 1)
+			if !MuseIdlePromptShowing(screen) {
+				t.Errorf("composer %q: MuseIdlePromptShowing = false, want true", composer)
+			}
+			working := strings.Replace(museLiveTipWorkingScreen, liveTip, composer, 1)
+			if MuseIdlePromptShowing(working) {
+				t.Errorf("composer %q under a working line: MuseIdlePromptShowing = true, want false", composer)
+			}
+		}
 	}
 }
 
