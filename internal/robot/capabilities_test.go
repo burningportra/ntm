@@ -307,6 +307,28 @@ func TestSpawnCapabilitiesAdvertiseMuse(t *testing.T) {
 	t.Fatal("spawn capabilities omit --spawn-muse")
 }
 
+// TestSendCapabilitiesTypeFilterListsEveryAgentType keeps the --robot-send
+// --type description in step with the agent types the filter accepts.
+func TestSendCapabilitiesTypeFilterListsEveryAgentType(t *testing.T) {
+	output, err := GetCapabilitiesWithOptions(CapabilitiesOptions{Command: "send"})
+	if err != nil || !output.Success || len(output.Commands) != 1 {
+		t.Fatalf("send capabilities output=%+v err=%v", output, err)
+	}
+	const prefix = "Filter by agent type: "
+	for _, parameter := range output.Commands[0].Parameters {
+		if parameter.Flag != "--type" {
+			continue
+		}
+		if !strings.HasPrefix(parameter.Description, prefix) {
+			t.Fatalf("send --type description = %q, want it to start with %q", parameter.Description, prefix)
+		}
+		list := strings.TrimPrefix(parameter.Description, prefix)
+		assertTypeFilterNamesEveryAgentType(t, "--robot-send --type", strings.Split(list, ", "))
+		return
+	}
+	t.Fatal("send capabilities omit --type")
+}
+
 func TestActivityCapabilitiesAdvertiseGrok(t *testing.T) {
 	output, err := GetCapabilitiesWithOptions(CapabilitiesOptions{Command: "activity"})
 	if err != nil || !output.Success || len(output.Commands) != 1 {

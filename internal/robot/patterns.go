@@ -5,7 +5,10 @@ package robot
 import (
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 // AgentState represents the detected state of an agent.
@@ -142,7 +145,7 @@ func defaultPatterns() []Pattern {
 		// so only counts in the live tail, where Muse replaces the working line
 		// with the reply once the turn ends.
 		{Name: "muse_banner", RegexStr: `(?m)^\s*Muse Code \d+\.\d+`, Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Muse Code version banner"},
-		{Name: "muse_composer", RegexStr: `(?m)^\s*❯[\s\x{00a0}]*$`, Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Muse Code empty composer"},
+		{Name: "muse_composer", RegexStr: museComposerRegex(), Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Muse Code empty composer, or one showing a dim tip"},
 		{Name: "muse_working", RegexStr: `(?i)\([^()]*\besc\s+to\s+interrupt\s*\)`, Agent: "muse", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "Muse Code live working line (e.g. ◇ Thinking (3s · esc to interrupt))"},
 		// Muse asks "Do you trust this workspace?" before its first turn in an
 		// untrusted directory unless launched with --yolo or --trust-workspace;
@@ -220,6 +223,20 @@ func defaultPatterns() []Pattern {
 		{Name: "checkmark", RegexStr: `[✓✔]\s*$`, Agent: "*", State: StateWaiting, Category: CategoryCompletion, Priority: 65, Description: "Checkmark symbol"},
 		{Name: "summary_header", RegexStr: `(?i)^(?:summary|changes\s+made):`, Agent: "*", State: StateWaiting, Category: CategoryCompletion, Priority: 55, Description: "Summary header"},
 	}
+}
+
+// museComposerRegex matches Muse's composer waiting for input: a "❯" line
+// that is empty, or shows one of the dim tips Muse draws into the empty
+// composer about seven seconds after a turn (agent.MuseComposerTipPrefixes).
+// Only a tip's leading words are matched, so a tip cut short by a narrow pane
+// still counts. A composer holding a draft, and a submitted prompt echoed into
+// the transcript ("❯ fix the bug"), do not match.
+func museComposerRegex() string {
+	tips := make([]string, len(agent.MuseComposerTipPrefixes))
+	for i, tip := range agent.MuseComposerTipPrefixes {
+		tips[i] = regexp.QuoteMeta(tip)
+	}
+	return `(?m)^\s*❯(?:[ \t\x{00a0}]+(?:` + strings.Join(tips, "|") + `)[^\n]*)?[\s\x{00a0}]*$`
 }
 
 // Compile compiles all regex patterns in the library.

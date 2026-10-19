@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
@@ -1078,7 +1079,7 @@ func TestPrintHelp_UsesCurrentSharedModifierDescriptions(t *testing.T) {
 
 	for _, want := range []string{
 		"--since=VALUE   Time filter for commands that support it (history, diff, and summary accept duration or RFC3339; snapshot requires RFC3339; mail-check uses YYYY-MM-DD)",
-		"--type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, gemini, cursor, windsurf, aider)",
+		"--type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, gemini, pi, kimi, muse, cursor, windsurf, aider, opencode, ollama)",
 		"--timeout=VALUE Shared timeout for wait/ack/interrupt and spawn --spawn-wait",
 		"--strategy=NAME Strategy override for assign, route, and spawn --spawn-assign-work",
 		"--msg=TEXT      Shared message payload for send, ack echo detection, and interrupt retasks",
@@ -1089,6 +1090,55 @@ func TestPrintHelp_UsesCurrentSharedModifierDescriptions(t *testing.T) {
 	}
 	if strings.Contains(output, "--switch-account-pane") {
 		t.Fatalf("help output still references deprecated switch-account pane flag:\n%s", output)
+	}
+}
+
+// TestPrintHelp_TypeFilterListsEveryAgentType keeps the --type help line in
+// step with the agent types the filter accepts.
+func TestPrintHelp_TypeFilterListsEveryAgentType(t *testing.T) {
+	const prefix = "--type=TYPE     Agent type filter for commands that support it ("
+	for _, line := range strings.Split(RenderHelp(), "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		list := strings.TrimSuffix(strings.TrimPrefix(line, prefix), ")")
+		assertTypeFilterNamesEveryAgentType(t, "--robot-help --type", strings.Split(list, ", "))
+		return
+	}
+	t.Fatalf("help output has no %q line", prefix)
+}
+
+// assertTypeFilterNamesEveryAgentType checks a --type filter's documented
+// values: each entry ("muse", or aliases joined by "|" as in "claude|cc")
+// must resolve to one agent type, and every agent type ntm can target must
+// be listed.
+func assertTypeFilterNamesEveryAgentType(t *testing.T, source string, entries []string) {
+	t.Helper()
+	listed := make(map[agent.AgentType]bool)
+	for _, entry := range entries {
+		var canonical agent.AgentType
+		for _, alias := range strings.Split(entry, "|") {
+			got := agent.AgentType(alias).Canonical()
+			if !got.IsValid() || got == agent.AgentTypeUser {
+				t.Errorf("%s lists %q, which is not an agent type", source, alias)
+				continue
+			}
+			if canonical != "" && got != canonical {
+				t.Errorf("%s entry %q mixes agent types %q and %q", source, entry, canonical, got)
+			}
+			canonical = got
+		}
+		listed[canonical] = true
+	}
+	for _, want := range []agent.AgentType{
+		agent.AgentTypeClaudeCode, agent.AgentTypeCodex, agent.AgentTypeAntigravity, agent.AgentTypeGrok,
+		agent.AgentTypeGemini, agent.AgentTypePi, agent.AgentTypeKimi, agent.AgentTypeMuse,
+		agent.AgentTypeCursor, agent.AgentTypeWindsurf, agent.AgentTypeAider, agent.AgentTypeOpencode,
+		agent.AgentTypeOllama,
+	} {
+		if !listed[want] {
+			t.Errorf("%s omits agent type %q (%s)", source, want, want.DisplayName())
+		}
 	}
 }
 

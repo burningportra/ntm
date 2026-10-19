@@ -3,6 +3,8 @@ package robot
 import (
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 func TestNewPatternLibrary(t *testing.T) {
@@ -1145,6 +1147,8 @@ func TestMusePatterns_ClassifierStates(t *testing.T) {
 		{name: "idle", screen: museTestIdleScreen, want: StateWaiting},
 		{name: "working", screen: museTestWorkingScreen, want: StateThinking},
 		{name: "trust prompt", screen: museTestTrustPromptScreen, want: StateError},
+		{name: "idle composer showing a tip, banner scrolled away", screen: museTestTipScreen, want: StateWaiting},
+		{name: "working above a tip composer", screen: museTestTipWorkingScreen, want: StateThinking},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sc := NewStateClassifier("%1", &ClassifierConfig{AgentType: "muse", HysteresisDuration: 0})
@@ -1159,6 +1163,51 @@ func TestMusePatterns_ClassifierStates(t *testing.T) {
 				t.Fatalf("State = %q, want %q (patterns %v)", activity.State, tc.want, activity.DetectedPatterns)
 			}
 		})
+	}
+}
+
+// TestMusePatterns_TipComposerIsIdle covers a Muse pane deep in a session:
+// the banner has scrolled away, so the composer is the only idle signal, and
+// about seven seconds after a turn Muse draws a dim tip into it. Every tip in
+// agent.MuseComposerTipPrefixes, whole or cut short, must read as idle; a
+// draft must not, and a live working line must still win.
+func TestMusePatterns_TipComposerIsIdle(t *testing.T) {
+	lib := NewPatternLibrary()
+	const liveTip = "❯ Type @ to search and insert workspace file paths"
+
+	hasComposerMatch := func(screen string) bool {
+		for _, m := range lib.MatchByCategory(screen, "muse", CategoryIdle) {
+			if m.Pattern == "muse_composer" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasComposerMatch(museTestTipScreen) {
+		t.Fatal("live tip screen: muse_composer did not match the tipped composer")
+	}
+	if len(agent.MuseComposerTipPrefixes) == 0 {
+		t.Fatal("agent.MuseComposerTipPrefixes is empty")
+	}
+	for _, prefix := range agent.MuseComposerTipPrefixes {
+		for _, composer := range []string{"❯ " + prefix + " and the rest of the tip", "❯ " + prefix + "…"} {
+			screen := strings.Replace(museTestTipScreen, liveTip, composer, 1)
+			if !hasComposerMatch(screen) {
+				t.Errorf("composer %q: muse_composer did not match", composer)
+			}
+			working := strings.Replace(museTestTipWorkingScreen, liveTip, composer, 1)
+			if got := lib.MatchFirst(working, "muse"); got == nil || got.Pattern != "muse_working" {
+				t.Errorf("composer %q under a working line: MatchFirst = %+v, want muse_working", composer, got)
+			}
+		}
+	}
+
+	if hasComposerMatch(museTestTipDraftScreen) {
+		t.Error("draft screen: muse_composer matched a composer holding unsent text")
+	}
+	if lib.HasIdlePrompt(museTestTipDraftScreen, "muse") {
+		t.Error("draft screen with the banner scrolled away has an idle pattern match")
 	}
 }
 
@@ -1183,3 +1232,37 @@ const museTestTrustPromptScreen = "  Muse Code 1.4.11\n\n" +
 	"  /private/tmp/claude-501/claude-port\n\n" +
 	"  1  Trust and continue\n" +
 	"  2  Quit\n"
+
+const (
+	// museTestTipScreen is the bottom of a capture from a muse 1.4.11 echo
+	// pane (`muse --provider echo --yolo`, 160x45 tmux pane, prompts and
+	// rules shortened) eleven seconds after its sixteenth turn: the banner
+	// has scrolled out of the pane and the idle composer shows a dim tip.
+	museTestTipScreen = "◆ echo: line 15 of a longer prompt\n\n" +
+		"❯ line 16 of a longer prompt\n\n" +
+		"◆ echo: line 16 of a longer prompt\n\n" +
+		museTestVoiceBar + "\n" +
+		"❯ Type @ to search and insert workspace file paths\n" +
+		museTestRule + "\n" +
+		"  echo · /private/tmp/claude-501/claude-port · YOLO"
+
+	// museTestTipWorkingScreen is the same screen with a live working line
+	// above the tipped composer.
+	museTestTipWorkingScreen = "◆ echo: line 15 of a longer prompt\n\n" +
+		"❯ line 16 of a longer prompt\n\n" +
+		"◇ Thinking (2s · esc to interrupt)\n\n" +
+		museTestVoiceBar + "\n" +
+		"❯ Type @ to search and insert workspace file paths\n" +
+		museTestRule + "\n" +
+		"  echo · /private/tmp/claude-501/claude-port · YOLO"
+
+	// museTestTipDraftScreen is the same screen with unsent text in the
+	// composer instead of the tip.
+	museTestTipDraftScreen = "◆ echo: line 15 of a longer prompt\n\n" +
+		"❯ line 16 of a longer prompt\n\n" +
+		"◆ echo: line 16 of a longer prompt\n\n" +
+		museTestVoiceBar + "\n" +
+		"❯ draft not sent\n" +
+		museTestRule + "\n" +
+		"  echo · /private/tmp/claude-501/claude-port · YOLO"
+)

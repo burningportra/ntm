@@ -2022,7 +2022,7 @@ Common Modifiers:
 --robot-limit=N  Explicit pagination alias for robot list outputs
 --robot-offset=N Explicit pagination alias for robot list outputs
 --since=VALUE   Time filter for commands that support it (history, diff, and summary accept duration or RFC3339; snapshot requires RFC3339; mail-check uses YYYY-MM-DD)
---type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, gemini, cursor, windsurf, aider)
+--type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, gemini, pi, kimi, muse, cursor, windsurf, aider, opencode, ollama)
 --timeout=VALUE Shared timeout for wait/ack/interrupt and spawn --spawn-wait
 --poll=VALUE    Shared polling interval for wait/ack/send --track
 --strategy=NAME Strategy override for assign, route, and spawn --spawn-assign-work

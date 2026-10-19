@@ -913,7 +913,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "msg", Flag: "--msg", Type: "string", Required: true, Description: "Message content to send (or use --msg-file)"},
 				{Name: "msg-file", Flag: "--msg-file", Type: "string", Required: false, Description: "Read message content from file"},
 				{Name: "enter", Flag: "--enter", Type: "bool", Required: false, Description: "Send Enter after paste (default true). Alias: --submit"},
-				{Name: "type", Flag: "--type", Type: "string", Required: false, Description: "Filter by agent type: claude|cc, codex|cod, gemini|gmi, cursor, windsurf, aider"},
+				{Name: "type", Flag: "--type", Type: "string", Required: false, Description: "Filter by agent type: claude|cc, codex|cod, antigravity|agy, grok, gemini|gmi, pi, kimi, muse, cursor, windsurf, aider, opencode|oc, ollama"},
 				{Name: "all", Flag: "--all", Type: "bool", Required: false, Description: "Include user pane (default: agents only)"},
 				{Name: "pane", Flag: "--pane", Type: "string", Required: false, Description: "Resolve exactly one N, W.P, or %N pane selector (mutually exclusive with --panes)"},
 				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Filter to a set of N, W.P, or %N pane selectors"},
@@ -997,7 +997,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "dry-run", Flag: "--dry-run", Type: "bool", Required: false, Description: "Preview restart targets without executing"},
 				{Name: "restart-bead", Flag: "--restart-bead", Type: "string", Required: false, Description: "Bead id to assign after the restart and use for the synthesized prompt"},
 				{Name: "restart-prompt", Flag: "--restart-prompt", Type: "string", Required: false, Description: "Explicit prompt to send after restart; overrides the bead template"},
-				{Name: "restart-model", Flag: "--restart-model", Type: "string", Required: false, Description: "Relaunch with a model override using the spawn variant grammar (model or model@effort); claude/codex/gemini panes only, validated before any respawn"},
+				{Name: "restart-model", Flag: "--restart-model", Type: "string", Required: false, Description: "Relaunch with a model override using the spawn variant grammar (model or model@effort); claude/codex/gemini/muse panes only, validated before any respawn"},
 				{Name: "restart-agent-args", Flag: "--restart-agent-args", Type: "string", Required: false, Description: "Raw arguments appended to the relaunch command after configured args (last-flag-wins)"},
 			},
 			Examples: []string{

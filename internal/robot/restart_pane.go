@@ -193,8 +193,8 @@ func parseRestartLaunchOverride(model, args string) (restartLaunchOverride, erro
 // restartOverrideAppendFlags composes the per-agent-type flags that carry a
 // model/effort override when the configured relaunch command does not render
 // them itself. Appending after the configured args relies on last-flag-wins
-// parsing, which claude, codex, and gemini all honor. Agent types without a
-// known model flag reject the override loudly instead of dropping it.
+// parsing, which claude, codex, gemini, and muse all honor. Agent types without
+// a known model flag reject the override loudly instead of dropping it.
 func restartOverrideAppendFlags(resolvedType string, override restartLaunchOverride, needModel, needEffort bool) (string, error) {
 	var flags strings.Builder
 	switch resolvedType {
@@ -219,9 +219,17 @@ func restartOverrideAppendFlags(resolvedType string, override restartLaunchOverr
 		if needModel && override.Model != "" {
 			flags.WriteString(" --model " + tmux.ShellQuote(override.Model))
 		}
+	case "muse":
+		// The same flags the Muse launch template renders.
+		if needModel && override.Model != "" {
+			flags.WriteString(" --model " + tmux.ShellQuote(override.Model))
+		}
+		if needEffort && override.Effort != "" {
+			flags.WriteString(" --reasoning-effort " + tmux.ShellQuote(override.Effort))
+		}
 	default:
 		if override.Model != "" || override.Effort != "" {
-			return "", fmt.Errorf("agent type %q does not support a restart model override; supported: claude, codex, gemini", resolvedType)
+			return "", fmt.Errorf("agent type %q does not support a restart model override; supported: claude, codex, gemini, muse", resolvedType)
 		}
 	}
 	return flags.String(), nil
@@ -393,7 +401,7 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 				return output, nil
 			}
 			if _, err := restartOverrideAppendFlags(resolvedType, launchOverride, true, true); err != nil {
-				output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Use --restart-model only with claude, codex, or gemini panes")
+				output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Use --restart-model only with claude, codex, gemini, or muse panes")
 				return output, nil
 			}
 		}

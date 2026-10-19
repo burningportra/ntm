@@ -1685,10 +1685,31 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 		agentType string
 		codexCmd  string
 		claudeCmd string
+		museCmd   string
 		override  restartLaunchOverride
 		want      []string // substrings expected in the composed command
 		wantErr   string
 	}{
+		{
+			name:      "muse legacy config appends --model/--reasoning-effort",
+			agentType: "muse",
+			museCmd:   "muse --provider echo --yolo",
+			override:  restartLaunchOverride{Model: "muse-wonder-full-1.0", Effort: "max"},
+			want:      []string{"muse --provider echo --yolo --model 'muse-wonder-full-1.0' --reasoning-effort 'max'"},
+		},
+		{
+			name:      "muse legacy config appends a model-only override",
+			agentType: "muse",
+			museCmd:   "muse --provider echo --yolo",
+			override:  restartLaunchOverride{Model: "muse-wonder-full-1.0"},
+			want:      []string{"muse --provider echo --yolo --model 'muse-wonder-full-1.0'"},
+		},
+		{
+			name:      "muse default template renders the override itself",
+			agentType: "muse",
+			override:  restartLaunchOverride{Model: "muse-wonder-full-1.0", Effort: "max"},
+			want:      []string{"muse --yolo --model 'muse-wonder-full-1.0' --reasoning-effort 'max'"},
+		},
 		{
 			name:      "legacy codex config gets appended last-flag-wins override",
 			agentType: "codex",
@@ -1736,6 +1757,7 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 			cfg := &config.Config{}
 			cfg.Agents.Codex = tc.codexCmd
 			cfg.Agents.Claude = tc.claudeCmd
+			cfg.Agents.Muse = tc.museCmd
 			got, err := restartAgentLaunchCommandWithOverride(cfg, tc.agentType, "", tc.override)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -1750,6 +1772,11 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 				if !strings.Contains(got, want) {
 					t.Errorf("command %q missing %q", got, want)
 				}
+			}
+			// A template that renders the model itself must not get a second
+			// --model appended.
+			if tc.agentType == "muse" && strings.Count(got, "--model") != 1 {
+				t.Errorf("command %q carries %d --model flags, want 1", got, strings.Count(got, "--model"))
 			}
 			// last-flag-wins: the override model must come after the configured one.
 			if tc.override.Model != "" && strings.Contains(got, "-m gpt-5.6-sol") {

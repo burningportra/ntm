@@ -1701,6 +1701,7 @@ Shell Integration:
 				Verbose:       resolveRobotSmartRestartVerbose(cmd),
 				HardKill:      robotSmartRestartHardKill,
 				HardKillOnly:  robotSmartRestartHardKillOnly,
+				Config:        cfg,
 			}
 			if err := robot.PrintSmartRestart(cmd.Context(), opts); err != nil {
 				recordRobotProcessExit(err)
