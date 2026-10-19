@@ -349,6 +349,7 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 		"codex":    0,
 		"gemini":   0,
 		"pi":       0,
+		"muse":     0,
 		"grok":     0,
 		"cursor":   0,
 		"windsurf": 0,
@@ -361,7 +362,7 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 
 	for _, pane := range panes {
 		switch normalizedType := normalizeAgentType(string(pane.Type)); normalizedType {
-		case "claude", "codex", "gemini", "pi", "kimi", "grok", "cursor", "windsurf", "aider", "oc", "ollama", "user":
+		case "claude", "codex", "gemini", "pi", "kimi", "muse", "grok", "cursor", "windsurf", "aider", "oc", "ollama", "user":
 			counts[normalizedType]++
 		default:
 			counts["other"]++
@@ -369,10 +370,11 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 	}
 
 	return fmt.Sprintf(
-		"Claude=%d Codex=%d Gemini=%d Grok=%d Cursor=%d Windsurf=%d Aider=%d Opencode=%d Ollama=%d User=%d Other=%d",
+		"Claude=%d Codex=%d Gemini=%d Muse=%d Grok=%d Cursor=%d Windsurf=%d Aider=%d Opencode=%d Ollama=%d User=%d Other=%d",
 		counts["claude"],
 		counts["codex"],
 		counts["gemini"],
+		counts["muse"],
 		counts["grok"],
 		counts["cursor"],
 		counts["windsurf"],

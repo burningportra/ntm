@@ -849,6 +849,8 @@ func TestAgentBadge(t *testing.T) {
 		{"gemini", "gemini", "Gemini"},
 		{"gmi", "gmi", "Gemini"},
 		{"gemini alias", "google-gemini", "Gemini"},
+		{"muse", "muse", "Muse"},
+		{"muse alias", "muse-code", "Muse"},
 		{"cursor", "cursor", "Cursor"},
 		{"windsurf", "windsurf", "Windsurf"},
 		{"aider", "aider", "Aider"},
@@ -898,6 +900,8 @@ func TestOutputAgentBadgeColor(t *testing.T) {
 		{"claude", "claude", string(current.Claude)},
 		{"codex alias", "openai-codex", string(current.Codex)},
 		{"gemini alias", "google-gemini", string(current.Gemini)},
+		{"muse", "muse", string(current.Sky)},
+		{"muse alias", "muse-code", string(current.Sky)},
 		{"cursor", "cursor", string(current.Cursor)},
 		{"windsurf alias", "ws", string(current.Windsurf)},
 		{"aider", "aider", string(current.Aider)},
@@ -920,6 +924,34 @@ func TestOutputAgentBadgeColor(t *testing.T) {
 				t.Fatalf("outputAgentBadgeColor(%q) = %q, want %q", tc.agentType, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestAgentCountsResponseAlwaysEmitsMuse(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		counts AgentCountsResponse
+		want   string
+	}{
+		{AgentCountsResponse{}, `"muse":0`},
+		{AgentCountsResponse{Muse: 2, Total: 2}, `"muse":2`},
+	} {
+		data, err := json.Marshal(tc.counts)
+		if err != nil {
+			t.Fatalf("json.Marshal(%+v): %v", tc.counts, err)
+		}
+		if !strings.Contains(string(data), tc.want) {
+			t.Fatalf("json.Marshal(%+v) = %s, want it to contain %s", tc.counts, data, tc.want)
+		}
+	}
+
+	data, err := json.Marshal(AddResponse{AddedMuse: 1})
+	if err != nil {
+		t.Fatalf("json.Marshal(AddResponse): %v", err)
+	}
+	if !strings.Contains(string(data), `"added_muse":1`) {
+		t.Fatalf("AddResponse JSON = %s, want added_muse:1", data)
 	}
 }
 

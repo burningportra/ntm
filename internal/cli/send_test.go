@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -2144,6 +2145,202 @@ func TestBuildTargetDescription(t *testing.T) {
 			got := buildTargetDescription(tt.cc, tt.cod, tt.gmi, tt.agy, tt.all, tt.skipFirst, tt.paneIdx, nil)
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildSendTargetDescriptionMuse(t *testing.T) {
+	tests := []struct {
+		name              string
+		cc, oc, muse, all bool
+		paneSelector      string
+		want              string
+	}{
+		{name: "muse only", muse: true, want: "muse"},
+		{name: "cc and muse", cc: true, muse: true, want: "cc,muse"},
+		{name: "oc and muse", oc: true, muse: true, want: "oc,muse"},
+		{name: "all overrides muse", muse: true, all: true, want: "all"},
+		{name: "pane selector overrides muse", muse: true, paneSelector: "1.2", want: "pane:1.2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildSendTargetDescriptionWithPiAndKimi(tt.cc, false, false, false, false, false, tt.oc, tt.muse, tt.all, false, -1, tt.paneSelector, nil, false, nil)
+			if got != tt.want {
+				t.Errorf("buildSendTargetDescriptionWithPiAndKimi() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSendRouteAgentType(t *testing.T) {
+	tests := []struct {
+		name                        string
+		cc, cod, pi, kimi, oc, muse bool
+		want                        string
+	}{
+		{name: "muse only routes to muse", muse: true, want: "muse"},
+		{name: "cc only routes to claude", cc: true, want: "claude"},
+		{name: "kimi only routes to kimi", kimi: true, want: "kimi"},
+		{name: "oc only routes to opencode", oc: true, want: "opencode"},
+		{name: "cc and muse leaves routing unfiltered", cc: true, muse: true, want: ""},
+		{name: "oc and muse leaves routing unfiltered", oc: true, muse: true, want: ""},
+		{name: "pi and muse leaves routing unfiltered", pi: true, muse: true, want: ""},
+		{name: "no type flags leaves routing unfiltered", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sendRouteAgentType(tt.cc, tt.cod, false, tt.pi, tt.kimi, false, tt.oc, tt.muse)
+			if got != tt.want {
+				t.Errorf("sendRouteAgentType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesLegacySendTypeFilterMuse(t *testing.T) {
+	musePane := tmux.Pane{Type: tmux.AgentMuse}
+	museAliasPane := tmux.Pane{Type: tmux.AgentType("muse-code")}
+	claudePane := tmux.Pane{Type: tmux.AgentClaude}
+
+	if !matchesLegacySendTypeFilterWithOc(musePane, false, false, false, false, false, false, false, true) {
+		t.Error("muse pane should match when targetMuse is set")
+	}
+	if !matchesLegacySendTypeFilterWithOc(museAliasPane, false, false, false, false, false, false, false, true) {
+		t.Error("muse-code alias pane should match when targetMuse is set")
+	}
+	if matchesLegacySendTypeFilterWithOc(musePane, true, true, true, true, true, true, true, false) {
+		t.Error("muse pane must not match when only non-muse targets are set")
+	}
+	if matchesLegacySendTypeFilterWithOc(claudePane, false, false, false, false, false, false, false, true) {
+		t.Error("claude pane must not match a muse-only filter")
+	}
+	if matchesLegacySendTypeFilterWithPiAndKimi(musePane, true, true, true, true, true, true) {
+		t.Error("legacy pi/kimi filter must not select muse panes")
+	}
+}
+
+func TestSendMuseFlagSelectsMuseTargets(t *testing.T) {
+	cmd := newSendCmd()
+	if err := cmd.ParseFlags([]string{"--muse", "hello muse"}); err != nil {
+		t.Fatalf("ParseFlags(--muse) failed: %v", err)
+	}
+	if got := cmd.Flags().Args(); len(got) != 1 || got[0] != "hello muse" {
+		t.Fatalf("--muse consumed the prompt: remaining args = %v", got)
+	}
+	if got := cmd.Flags().Lookup("muse").Value.String(); got != "muse" {
+		t.Fatalf("--muse target value = %q, want %q", got, "muse")
+	}
+
+	variantCmd := newSendCmd()
+	if err := variantCmd.ParseFlags([]string{"--cc", "--muse=spark", "both"}); err != nil {
+		t.Fatalf("ParseFlags(--cc --muse=spark) failed: %v", err)
+	}
+	if got := variantCmd.Flags().Lookup("muse").Value.String(); got != "cc,muse:spark" {
+		t.Fatalf("--cc --muse=spark target value = %q, want %q", got, "cc,muse:spark")
+	}
+}
+
+// TestSendMuseTargetsOnlyMusePanes drives the real broad-send pane filter
+// against a tmux session holding claude, opencode and muse panes.
+func TestSendMuseTargetsOnlyMusePanes(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	tmpDir := t.TempDir()
+	oldCfg := cfg
+	oldJSONOutput := jsonOutput
+	defer func() {
+		cfg = oldCfg
+		jsonOutput = oldJSONOutput
+	}()
+	cfg = newTmuxIntegrationTestConfig(tmpDir)
+	cfg.Checkpoints.Enabled = false
+	jsonOutput = true
+
+	sessionName := fmt.Sprintf("ntm-test-send-muse-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(sessionName, tmpDir); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	defer func() { _ = tmux.KillSession(sessionName) }()
+
+	addPane := func(title string) string {
+		t.Helper()
+		paneID, err := tmux.DefaultClient.Run("split-window", "-d", "-t", sessionName, "-c", tmpDir, "-P", "-F", "#{pane_id}", "cat")
+		if err != nil {
+			t.Fatalf("split-window for %s: %v", title, err)
+		}
+		paneID = strings.TrimSpace(paneID)
+		if err := tmux.SetPaneTitle(paneID, sessionName+title); err != nil {
+			t.Fatalf("setting pane title %s: %v", title, err)
+		}
+		return paneID
+	}
+	ccPane := addPane("__cc_1")
+	ocPane := addPane("__oc_1")
+	musePane := addPane("__muse_1")
+
+	dryRunPaneIDs := func(targets SendTargets) []string {
+		t.Helper()
+		oldStdout := os.Stdout
+		r, w, pipeErr := os.Pipe()
+		if pipeErr != nil {
+			t.Fatalf("creating stdout pipe: %v", pipeErr)
+		}
+		os.Stdout = w
+		defer func() {
+			os.Stdout = oldStdout
+			_ = r.Close()
+		}()
+
+		sendErr := runSendWithTargets(SendOptions{
+			Session:      sessionName,
+			Prompt:       "muse targeting dry run",
+			PromptSource: "args",
+			Targets:      targets,
+			DryRun:       true,
+			NoHooks:      true,
+		})
+		_ = w.Close()
+		os.Stdout = oldStdout
+		output, readErr := io.ReadAll(r)
+		if readErr != nil {
+			t.Fatalf("reading dry-run output: %v", readErr)
+		}
+		if sendErr != nil {
+			t.Fatalf("dry run %v failed: %v (stdout=%q)", targets, sendErr, strings.TrimSpace(string(output)))
+		}
+		var result SendDryRunResult
+		if err := json.Unmarshal(output, &result); err != nil {
+			t.Fatalf("parsing dry-run JSON: %v (stdout=%q)", err, strings.TrimSpace(string(output)))
+		}
+		ids := make([]string, 0, len(result.WouldSend))
+		for _, entry := range result.WouldSend {
+			ids = append(ids, entry.PaneID)
+		}
+		sort.Strings(ids)
+		return ids
+	}
+	sorted := func(ids ...string) []string {
+		sort.Strings(ids)
+		return ids
+	}
+
+	tests := []struct {
+		name    string
+		targets SendTargets
+		want    []string
+	}{
+		{"muse alone", SendTargets{{Type: AgentTypeMuse}}, sorted(musePane)},
+		{"cc and muse", SendTargets{{Type: AgentTypeClaude}, {Type: AgentTypeMuse}}, sorted(ccPane, musePane)},
+		{"cc alone skips muse", SendTargets{{Type: AgentTypeClaude}}, sorted(ccPane)},
+		{"oc alone skips muse", SendTargets{{Type: AgentTypeOpencode}}, sorted(ocPane)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dryRunPaneIDs(tt.targets); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("dry run %v selected %v, want %v", tt.targets, got, tt.want)
 			}
 		})
 	}

@@ -320,6 +320,8 @@ func detectAgentTypeFromPane(pane tmux.Pane) string {
 		return "pi"
 	case tmux.AgentKimi:
 		return "kimi"
+	case tmux.AgentMuse:
+		return "muse"
 	case tmux.AgentAntigravity:
 		return "antigravity"
 	case tmux.AgentGrok:
@@ -615,6 +617,8 @@ func activityAgentTypeColor(agentType string, t theme.Theme) lipgloss.Color {
 		return t.Mauve
 	case agent.AgentTypeKimi:
 		return t.Sapphire
+	case agent.AgentTypeMuse:
+		return t.Sky
 	case agent.AgentTypeAntigravity:
 		return t.Lavender
 	case agent.AgentTypeGrok:

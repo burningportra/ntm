@@ -515,6 +515,10 @@ func matchesLegacySendTypeFilterWithTargets(pane tmux.Pane, targetCC, targetCod,
 }
 
 func matchesLegacySendTypeFilterWithPiAndKimi(pane tmux.Pane, targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy bool) bool {
+	return matchesLegacySendTypeFilterWithOc(pane, targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, false, false)
+}
+
+func matchesLegacySendTypeFilterWithOc(pane tmux.Pane, targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse bool) bool {
 	switch tmux.AgentType(pane.Type).Canonical() {
 	case tmux.AgentClaude:
 		return targetCC
@@ -528,6 +532,10 @@ func matchesLegacySendTypeFilterWithPiAndKimi(pane tmux.Pane, targetCC, targetCo
 		return targetKimi
 	case tmux.AgentAntigravity:
 		return targetAgy
+	case tmux.AgentOpencode:
+		return targetOc
+	case tmux.AgentMuse:
+		return targetMuse
 	default:
 		return false
 	}
@@ -535,7 +543,7 @@ func matchesLegacySendTypeFilterWithPiAndKimi(pane tmux.Pane, targetCC, targetCo
 
 func isInterruptibleAgentPane(pane tmux.Pane) bool {
 	switch tmux.AgentType(pane.Type).Canonical() {
-	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentAntigravity, tmux.AgentGrok, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
+	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentMuse, tmux.AgentAntigravity, tmux.AgentGrok, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
 		return true
 	default:
 		return false
@@ -718,6 +726,7 @@ func newSendCmd() *cobra.Command {
 		  ntm send myproject --tag=frontend "update ui"         # Agents with 'frontend' tag
 			  ntm send myproject --cod --gmi "run the tests"        # Codex and Gemini
 			  ntm send myproject --pi --kimi "run the tests"         # Pi and Kimi agents
+		  ntm send myproject --muse "run the tests"             # Muse Code agents
 		  ntm send myproject --all "git status"                 # All panes
 		  ntm send myproject --pane=2 "specific pane"           # Single-window pane index
 		  ntm send myproject --pane=1.0 "specific pane"         # Exact window.pane
@@ -939,8 +948,12 @@ func newSendCmd() *cobra.Command {
 	cmd.Flags().Lookup("pi").NoOptDefVal = "true"
 	cmd.Flags().Var(newSendTargetValue(AgentTypeKimi, &targets), "kimi", "send to Kimi agents (optional :variant filter)")
 	cmd.Flags().Lookup("kimi").NoOptDefVal = "true"
+	cmd.Flags().Var(newSendTargetValue(AgentTypeMuse, &targets), "muse", "send to Muse Code agents (optional :variant filter)")
+	cmd.Flags().Lookup("muse").NoOptDefVal = "true"
 	cmd.Flags().Var(newSendTargetValue(AgentTypeAntigravity, &targets), "agy", "send to Antigravity (agy) agents (optional :variant filter)")
 	cmd.Flags().Lookup("agy").NoOptDefVal = "true"
+	cmd.Flags().Var(newSendTargetValue(AgentTypeOpencode, &targets), "oc", "send to Opencode (oc) agents (optional :variant filter)")
+	cmd.Flags().Lookup("oc").NoOptDefVal = "true"
 	cmd.Flags().BoolVar(&targetAll, "all", false, "send to all agent panes, overriding type/tag filters (the user pane is excluded unless --include-user)")
 	cmd.Flags().BoolVar(&includeUser, "include-user", false, "opt the user/control pane into a --all broadcast (deliberate shell input only)")
 	cmd.Flags().BoolVar(&clearInput, "clear-input", false, "clear residual composer text (per-agent Escape ritual + C-u, verified) before typing each prompt; recommended after interrupts on codex panes")
@@ -1587,6 +1600,8 @@ func runSendInternal(opts SendOptions) (err error) {
 	targetPi := targets.HasTargetsForType(AgentTypePi)
 	targetKimi := targets.HasTargetsForType(AgentTypeKimi)
 	targetAgy := targets.HasTargetsForType(AgentTypeAntigravity)
+	targetOc := targets.HasTargetsForType(AgentTypeOpencode)
+	targetMuse := targets.HasTargetsForType(AgentTypeMuse)
 
 	// Helper for JSON error output
 	var (
@@ -1719,7 +1734,7 @@ func runSendInternal(opts SendOptions) (err error) {
 		"prompt_length":  len(prompt),
 		"prompt_source":  promptSource,
 		"template":       templateName,
-		"targets":        buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags),
+		"targets":        buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags),
 		"dry_run":        dryRun,
 		"randomize":      opts.Randomize,
 		"seed":           opts.Seed,
@@ -1810,19 +1825,7 @@ func runSendInternal(opts SendOptions) (err error) {
 		}
 
 		// Filter by agent type if specified (only when exactly one type is set)
-		if targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy {
-			routeOpts.AgentType = "claude"
-		} else if targetCod && !targetCC && !targetGmi && !targetPi && !targetKimi && !targetAgy {
-			routeOpts.AgentType = "codex"
-		} else if targetGmi && !targetCC && !targetCod && !targetPi && !targetKimi && !targetAgy {
-			routeOpts.AgentType = "gemini"
-		} else if targetPi && !targetCC && !targetCod && !targetGmi && !targetKimi && !targetAgy {
-			routeOpts.AgentType = "pi"
-		} else if targetKimi && !targetCC && !targetCod && !targetGmi && !targetPi && !targetAgy {
-			routeOpts.AgentType = "kimi"
-		} else if targetAgy && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi {
-			routeOpts.AgentType = "antigravity"
-		}
+		routeOpts.AgentType = sendRouteAgentType(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse)
 
 		recommendation, err := robot.GetRouteRecommendation(routeOpts)
 		if err != nil {
@@ -1913,7 +1916,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	// Build target description for hook environment
-	targetDesc := buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags)
+	targetDesc := buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse, targetAll, skipFirst, paneIndex, paneSelector, opts.PaneSelectors, opts.PanesSpecified, tags)
 
 	// Build execution context for hooks
 	hookCtx := hooks.ExecutionContext{
@@ -1927,6 +1930,7 @@ func runSendInternal(opts SendOptions) (err error) {
 			"NTM_TARGET_GMI":     boolToStr(targetGmi),
 			"NTM_TARGET_PI":      boolToStr(targetPi),
 			"NTM_TARGET_KIMI":    boolToStr(targetKimi),
+			"NTM_TARGET_MUSE":    boolToStr(targetMuse),
 			"NTM_TARGET_AGY":     boolToStr(targetAgy),
 			"NTM_TARGET_ALL":     boolToStr(targetAll),
 			"NTM_PANE_INDEX":     fmt.Sprintf("%d", paneIndex),
@@ -1956,7 +1960,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	// Auto-checkpoint before broadcast sends
-	isBroadcast := !opts.PanesSpecified && paneSelector == "" && (targetAll || (!targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && len(tags) == 0))
+	isBroadcast := !opts.PanesSpecified && paneSelector == "" && (targetAll || (!targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse && len(tags) == 0))
 	// Checkpoint capture emits human-facing advisory logs from lower layers, so
 	// keep it on the interactive path and preserve a clean machine-output channel.
 	if !dryRun && !jsonOutput && !silent && isBroadcast && cfg != nil && cfg.Checkpoints.Enabled && cfg.Checkpoints.BeforeBroadcast {
@@ -1996,7 +2000,7 @@ func runSendInternal(opts SendOptions) (err error) {
 
 	// Broad sends apply type/tag filters after deterministic topology ordering.
 	if selectedPanes == nil {
-		noFilter := !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetAll && len(tags) == 0
+		noFilter := !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse && !targetAll && len(tags) == 0
 		hasVariantFilter := len(targets) > 0
 
 		for i, p := range panes {
@@ -2023,7 +2027,7 @@ func runSendInternal(opts SendOptions) (err error) {
 				}
 
 				// Check type filters (only if specified)
-				hasTypeFilter := hasVariantFilter || targetCC || targetCod || targetGmi || targetPi || targetKimi || targetAgy
+				hasTypeFilter := hasVariantFilter || targetCC || targetCod || targetGmi || targetPi || targetKimi || targetAgy || targetOc || targetMuse
 
 				if hasTypeFilter {
 					if hasVariantFilter {
@@ -2031,7 +2035,7 @@ func runSendInternal(opts SendOptions) (err error) {
 							continue
 						}
 					} else {
-						match := matchesLegacySendTypeFilterWithPiAndKimi(p, targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy)
+						match := matchesLegacySendTypeFilterWithOc(p, targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse)
 						if !match {
 							continue
 						}
@@ -3373,15 +3377,39 @@ func buildObservedTargetTypes(panes []tmux.Pane) string {
 	return strings.Join(targets, ",")
 }
 
+// sendRouteAgentType returns the robot routing filter for --smart sends. It
+// names an agent type only when exactly one type flag is set; mixed or absent
+// type flags leave routing unfiltered.
+func sendRouteAgentType(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse bool) string {
+	if targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
+		return "claude"
+	} else if targetCod && !targetCC && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
+		return "codex"
+	} else if targetGmi && !targetCC && !targetCod && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
+		return "gemini"
+	} else if targetPi && !targetCC && !targetCod && !targetGmi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
+		return "pi"
+	} else if targetKimi && !targetCC && !targetCod && !targetGmi && !targetPi && !targetAgy && !targetOc && !targetMuse {
+		return "kimi"
+	} else if targetAgy && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetOc && !targetMuse {
+		return "antigravity"
+	} else if targetOc && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetMuse {
+		return "opencode"
+	} else if targetMuse && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc {
+		return "muse"
+	}
+	return ""
+}
+
 func buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
 	return buildTargetDescriptionWithPi(targetCC, targetCod, targetGmi, false, targetAgy, targetAll, skipFirst, paneIndex, tags)
 }
 
 func buildTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
-	return buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, false, targetAgy, targetAll, skipFirst, paneIndex, tags)
+	return buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, false, targetAgy, false, false, targetAll, skipFirst, paneIndex, tags)
 }
 
-func buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
+func buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse, targetAll, skipFirst bool, paneIndex int, tags []string) string {
 	if paneIndex >= 0 {
 		return fmt.Sprintf("pane:%d", paneIndex)
 	}
@@ -3408,6 +3436,12 @@ func buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetP
 	if targetAgy {
 		targets = append(targets, "agy")
 	}
+	if targetOc {
+		targets = append(targets, "oc")
+	}
+	if targetMuse {
+		targets = append(targets, "muse")
+	}
 	if len(tags) > 0 {
 		targets = append(targets, fmt.Sprintf("tags:[%s]", strings.Join(tags, ",")))
 	}
@@ -3426,17 +3460,17 @@ func buildSendTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targe
 }
 
 func buildSendTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
-	return buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, false, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, paneSelectors, panesSpecified, tags)
+	return buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, false, targetAgy, false, false, targetAll, skipFirst, paneIndex, paneSelector, paneSelectors, panesSpecified, tags)
 }
 
-func buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
+func buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
 	if paneSelector != "" {
 		return "pane:" + paneSelector
 	}
 	if panesSpecified {
 		return "panes:" + strings.Join(paneSelectors, ",")
 	}
-	return buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetAll, skipFirst, paneIndex, tags)
+	return buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse, targetAll, skipFirst, paneIndex, tags)
 }
 
 // getSessionWorkingDir returns the working directory for a resolved session,

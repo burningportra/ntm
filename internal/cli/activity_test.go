@@ -243,6 +243,8 @@ func TestActivityAgentTypeColor(t *testing.T) {
 		{"codex alias", "openai-codex", string(current.Codex)},
 		{"gemini alias", "google-gemini", string(current.Gemini)},
 		{"grok alias", "xai-grok-build", string(current.Pink)},
+		{"muse", "muse", string(current.Sky)},
+		{"muse alias", "muse-code", string(current.Sky)},
 		{"cursor", "cursor", string(current.Cursor)},
 		{"windsurf alias", "ws", string(current.Windsurf)},
 		{"aider", "aider", string(current.Aider)},

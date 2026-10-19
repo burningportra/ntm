@@ -100,10 +100,12 @@ func TestParseTargetTypes(t *testing.T) {
 		{"gmi", []string{"gemini"}},
 		{"pi", []string{"pi"}},
 		{"kimi", []string{"kimi"}},
+		{"muse", []string{"muse"}},
 		{"xai_grok_build", []string{"grok"}},
 		{"cc,cod", []string{"claude", "codex"}},
-		{"all", []string{"claude", "codex", "gemini", "pi", "kimi", "grok"}},
-		{"agents", []string{"claude", "codex", "gemini", "pi", "kimi", "grok"}},
+		{"cc,muse", []string{"claude", "muse"}},
+		{"all", []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "grok"}},
+		{"agents", []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "grok"}},
 		{"", []string{}},
 	}
 
