@@ -50,6 +50,11 @@ func TestAgentConfig_Total(t *testing.T) {
 			want:   3,
 		},
 		{
+			name:   "muse only",
+			config: AgentConfig{Muse: 2},
+			want:   2,
+		},
+		{
 			name:   "all types",
 			config: AgentConfig{Claude: 2, Codex: 1, Gemini: 1, Grok: 2, User: 1},
 			want:   7,
@@ -688,6 +693,7 @@ func TestGetAgentCommand(t *testing.T) {
 		Claude:   "claude --flag",
 		Codex:    "codex-cli run",
 		Gemini:   "gemini start",
+		Muse:     "muse --yolo",
 		Cursor:   "cursor agent",
 		Windsurf: "windsurf start",
 		Aider:    "aider --watch",
@@ -708,6 +714,8 @@ func TestGetAgentCommand(t *testing.T) {
 		{"gmi", "gemini start"},
 		{"gemini", "gemini start"},
 		{"google-gemini", "gemini start"},
+		{"muse", "muse --yolo"},
+		{"muse-code", "muse --yolo"},
 		{"cursor", "cursor agent"},
 		{"windsurf", "windsurf start"},
 		{"ws", "windsurf start"},
@@ -908,6 +916,22 @@ func TestCountAgents(t *testing.T) {
 		}
 		if cfg.Total() != 4 {
 			t.Errorf("Total() = %d, want 4", cfg.Total())
+		}
+	})
+
+	t.Run("muse panes", func(t *testing.T) {
+		t.Parallel()
+		panes := []tmux.Pane{
+			{Type: tmux.AgentMuse},
+			{Type: tmux.AgentMuse},
+			{Type: tmux.AgentClaude},
+		}
+		cfg := countAgents(panes)
+		if cfg.Muse != 2 || cfg.Claude != 1 || cfg.Kimi != 0 {
+			t.Errorf("counts = %+v, want Muse=2 Claude=1", cfg)
+		}
+		if cfg.Total() != 3 {
+			t.Errorf("Total() = %d, want 3", cfg.Total())
 		}
 	})
 

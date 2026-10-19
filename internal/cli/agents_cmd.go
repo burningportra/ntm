@@ -75,8 +75,8 @@ func newAgentsShowCmd() *cobra.Command {
 		Short:   "Show details of a specific agent profile",
 		Long: `Show detailed information about a specific agent profile.
 
-Agent types: claude, codex, gemini, pi, kimi, antigravity
-Aliases are supported (cc for claude, cod for codex, gmi for gemini, agy for antigravity).
+Agent types: claude, codex, gemini, pi, kimi, muse, antigravity
+Aliases are supported (cc for claude, cod for codex, gmi for gemini, agy for antigravity, muse-code for muse).
 
 Examples:
   ntm agents show claude
@@ -84,7 +84,8 @@ Examples:
   ntm agents profile codex
   ntm agents show gemini --json
   ntm agents show pi
-  ntm agents show kimi`,
+  ntm agents show kimi
+  ntm agents show muse`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runAgentsShow(args[0])

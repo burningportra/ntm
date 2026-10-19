@@ -193,6 +193,8 @@ func countAgents(panes []tmux.Pane) AgentConfig {
 			config.Pi++
 		case tmux.AgentKimi:
 			config.Kimi++
+		case tmux.AgentMuse:
+			config.Muse++
 		case tmux.AgentAntigravity:
 			config.Antigravity++
 		case tmux.AgentGrok:

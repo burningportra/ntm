@@ -107,6 +107,40 @@ func TestApplyModelCommands_HonorsCapturedModel(t *testing.T) {
 	}
 }
 
+// TestSessionRelaunchCommandsMuse checks both restore launch paths for a saved
+// Muse pane: the type-default command and the captured-model command.
+func TestSessionRelaunchCommandsMuse(t *testing.T) {
+	prevCfg := cfg
+	cfg = config.Default()
+	t.Cleanup(func() { cfg = prevCfg })
+
+	state := &session.SessionState{
+		Name:    "demo",
+		WorkDir: "/data/projects/demo",
+		Panes: []session.PaneState{
+			{Index: 1, AgentType: "muse", Model: "spark"},
+			{Index: 2, AgentType: "muse-code"},
+		},
+	}
+
+	if got := buildAgentCommands(state).Muse; got != "muse --yolo" {
+		t.Fatalf("buildAgentCommands().Muse = %q, want %q", got, "muse --yolo")
+	}
+
+	tmpl, cliType, ok := agentTemplateAndType("muse-code")
+	if !ok || cliType != AgentTypeMuse || tmpl != cfg.Agents.Muse {
+		t.Fatalf("agentTemplateAndType(muse-code) = %q, %q, %v; want the muse template", tmpl, cliType, ok)
+	}
+
+	applyModelCommands(state)
+	if want := "muse --yolo --model 'muse-spark-1.3'"; state.Panes[0].Command != want {
+		t.Fatalf("model pane Command = %q, want %q", state.Panes[0].Command, want)
+	}
+	if state.Panes[1].Command != "" {
+		t.Fatalf("no-model muse pane Command = %q, want empty (type-default fallback)", state.Panes[1].Command)
+	}
+}
+
 // TestApplyModelCommands_NilConfigSafe verifies the helper is a no-op (no panic)
 // when no config is loaded, leaving Command empty so launch falls back cleanly.
 func TestApplyModelCommands_NilConfigSafe(t *testing.T) {

@@ -1720,6 +1720,110 @@ func TestNormalizeSpawnOptions_ExpandsLegacyCountsIncludingOllama(t *testing.T) 
 	}
 }
 
+// spawnMusePlan parses a --muse flag value through the real spawn command and
+// returns the pane titles and rendered launch commands the launch loop would
+// produce for it, without creating a tmux session.
+func spawnMusePlan(t *testing.T, session, flagValue string) (SpawnOptions, []string, []string) {
+	t.Helper()
+
+	flag := newSpawnCmd().Flags().Lookup("muse")
+	if flag == nil {
+		t.Fatal("ntm spawn has no --muse flag")
+	}
+	value, ok := flag.Value.(*agentSpecsValue)
+	if !ok || value.agentType != AgentTypeMuse {
+		t.Fatalf("--muse flag value = %#v, want an agent spec value for %q", flag.Value, AgentTypeMuse)
+	}
+	if err := flag.Value.Set(flagValue); err != nil {
+		t.Fatalf("--muse=%s: %v", flagValue, err)
+	}
+
+	opts := SpawnOptions{Session: session, Agents: value.specs.Flatten()}
+	normalizeSpawnOptions(&opts)
+	if err := validateSpawnAgentTypes(opts.Agents, nil); err != nil {
+		t.Fatalf("validateSpawnAgentTypes() error = %v", err)
+	}
+
+	var titles, commands []string
+	for _, agent := range opts.Agents {
+		titles = append(titles, tmux.FormatPaneName(session, string(agent.Type), agent.Index, tmux.FormatPaneVariant(agent.Model, agent.ReasoningEffort)))
+		tmpl, env, err := spawnAgentCommandTemplate(agent.Type, nil, "")
+		if err != nil || len(env) != 0 {
+			t.Fatalf("spawnAgentCommandTemplate(%q) = env %v, err %v", agent.Type, env, err)
+		}
+		command, err := config.GenerateAgentCommand(tmpl, config.AgentTemplateVars{
+			Model:           resolveAgentModel(agent.Type, agent.Model, nil),
+			ModelAlias:      agent.Model,
+			ModelRequested:  agent.Model != "",
+			SessionName:     session,
+			PaneIndex:       agent.Index,
+			AgentType:       string(agent.Type),
+			ReasoningEffort: agent.ReasoningEffort,
+		})
+		if err != nil {
+			t.Fatalf("GenerateAgentCommand(%q) error = %v", agent.Type, err)
+		}
+		commands = append(commands, command)
+	}
+	return opts, titles, commands
+}
+
+func TestSpawnPlanMuse(t *testing.T) {
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+	cfg = config.Default()
+
+	t.Run("default model", func(t *testing.T) {
+		opts, titles, commands := spawnMusePlan(t, "proj", "2")
+
+		if opts.MuseCount != 2 || legacySpawnTotalAgentCount(opts) != 2 {
+			t.Fatalf("MuseCount = %d, total = %d, want 2 and 2", opts.MuseCount, legacySpawnTotalAgentCount(opts))
+		}
+		wantTitles := []string{"proj__muse_1", "proj__muse_2"}
+		if strings.Join(titles, ",") != strings.Join(wantTitles, ",") {
+			t.Fatalf("titles = %v, want %v", titles, wantTitles)
+		}
+		for i, command := range commands {
+			if command != "muse --yolo --model 'muse-wonder-1.0'" {
+				t.Fatalf("command[%d] = %q, want the muse-wonder-1.0 launch", i, command)
+			}
+		}
+		if got := spawnHookCountEnv(2, opts)["NTM_AGENT_COUNT_MUSE"]; got != "2" {
+			t.Fatalf("NTM_AGENT_COUNT_MUSE = %q, want 2", got)
+		}
+		if got := spawnSessionCreatedEventFields(opts, "/tmp/proj")["agent_muse"]; got != "2" {
+			t.Fatalf("agent_muse event field = %q, want 2", got)
+		}
+	})
+
+	t.Run("model alias and effort", func(t *testing.T) {
+		_, titles, commands := spawnMusePlan(t, "proj", "1:spark:xhigh")
+
+		if len(titles) != 1 || titles[0] != "proj__muse_1_spark@xhigh" {
+			t.Fatalf("titles = %v, want [proj__muse_1_spark@xhigh]", titles)
+		}
+		if want := "muse --yolo --model 'muse-spark-1.3' --reasoning-effort 'xhigh'"; commands[0] != want {
+			t.Fatalf("command = %q, want %q", commands[0], want)
+		}
+	})
+
+	t.Run("legacy count expands to muse panes", func(t *testing.T) {
+		opts := SpawnOptions{MuseCount: 2}
+		normalizeSpawnOptions(&opts)
+		if len(opts.Agents) != 2 || opts.Agents[0].Type != AgentTypeMuse || opts.Agents[1].Index != 2 || opts.MuseCount != 2 {
+			t.Fatalf("normalizeSpawnOptions(MuseCount=2) = %+v (MuseCount %d), want muse_1 and muse_2", opts.Agents, opts.MuseCount)
+		}
+	})
+
+	t.Run("canonical aliases", func(t *testing.T) {
+		for _, raw := range []string{"muse", "muse-code", " MUSE_CODE "} {
+			if got, ok := canonicalSpawnAgentType(raw); !ok || got != AgentTypeMuse {
+				t.Fatalf("canonicalSpawnAgentType(%q) = %q, %v; want muse", raw, got, ok)
+			}
+		}
+	})
+}
+
 func TestNormalizeSpawnOptions_RecomputesModernCountsFromAgents(t *testing.T) {
 
 	opts := SpawnOptions{

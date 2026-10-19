@@ -518,6 +518,8 @@ func agentTypeToString(t tmux.AgentType) string {
 		return "pi"
 	case tmux.AgentKimi:
 		return "kimi"
+	case tmux.AgentMuse:
+		return "muse"
 	case tmux.AgentGrok:
 		return "grok"
 	case tmux.AgentCursor:
@@ -559,6 +561,8 @@ func incrementAgentCounts(counts *output.AgentCountsResponse, t tmux.AgentType) 
 		counts.Pi++
 	case tmux.AgentKimi:
 		counts.Kimi++
+	case tmux.AgentMuse:
+		counts.Muse++
 	case tmux.AgentAntigravity:
 		counts.Antigravity++
 	case tmux.AgentGrok:

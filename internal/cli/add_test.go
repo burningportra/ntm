@@ -172,6 +172,45 @@ func TestResolveAddAgentCommandTemplate_Ollama(t *testing.T) {
 	}
 }
 
+func TestAddMuseFlagUsesMuseTemplate(t *testing.T) {
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+	cfg = config.Default()
+
+	flag := newAddCmd().Flags().Lookup("muse")
+	if flag == nil {
+		t.Fatal("expected add command to register --muse")
+	}
+	value, ok := flag.Value.(*agentSpecsValue)
+	if !ok || value.agentType != AgentTypeMuse {
+		t.Fatalf("--muse flag value = %#v, want an agent spec value for muse", flag.Value)
+	}
+	if err := flag.Value.Set("1:spark"); err != nil {
+		t.Fatalf("--muse=1:spark: %v", err)
+	}
+	agents := value.specs.Flatten()
+	if len(agents) != 1 || agents[0].Type != AgentTypeMuse || agents[0].Model != "spark" {
+		t.Fatalf("--muse=1:spark flattened to %+v, want one muse agent on spark", agents)
+	}
+
+	tmpl, env, err := resolveAddAgentCommandTemplate(AgentTypeMuse, nil, "")
+	if err != nil || len(env) != 0 || tmpl != cfg.Agents.Muse {
+		t.Fatalf("resolveAddAgentCommandTemplate(muse) = %q, %v, %v; want cfg.Agents.Muse", tmpl, env, err)
+	}
+	command, err := config.GenerateAgentCommand(tmpl, config.AgentTemplateVars{
+		Model:          ResolveModel(AgentTypeMuse, agents[0].Model),
+		ModelAlias:     agents[0].Model,
+		ModelRequested: true,
+		AgentType:      string(AgentTypeMuse),
+	})
+	if err != nil {
+		t.Fatalf("GenerateAgentCommand(muse) error = %v", err)
+	}
+	if want := "muse --yolo --model 'muse-spark-1.3'"; command != want {
+		t.Fatalf("muse add command = %q, want %q", command, want)
+	}
+}
+
 func TestNewAddCmd_RegistersOllamaFlag(t *testing.T) {
 
 	cmd := newAddCmd()

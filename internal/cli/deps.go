@@ -179,6 +179,14 @@ func defaultDepChecks() []depCheck {
 			InstallHint: "curl -LsSf https://code.kimi.com/install.sh | bash",
 		},
 		{
+			Name:        "Muse Code",
+			Command:     "muse",
+			VersionArgs: []string{"--version"},
+			Required:    false,
+			Category:    "AI Agents",
+			InstallHint: "curl -fsSL https://dev.meta.ai/install.sh | bash",
+		},
+		{
 			// Deliberately `cursor-agent`, not `cursor`: on Linux `cursor` is
 			// the GUI editor launcher (useless in a tmux pane) and is often
 			// absent entirely on headless hosts, so checking it would report

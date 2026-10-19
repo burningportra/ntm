@@ -571,6 +571,8 @@ func getAgentCommand(agentType string, cmds AgentCommands) string {
 		return cmds.Pi
 	case tmux.AgentKimi:
 		return cmds.Kimi
+	case tmux.AgentMuse:
+		return cmds.Muse
 	case tmux.AgentAntigravity:
 		return cmds.Antigravity
 	case tmux.AgentGrok:

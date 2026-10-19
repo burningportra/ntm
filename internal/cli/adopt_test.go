@@ -1,11 +1,15 @@
 package cli
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 func TestParsePaneList(t *testing.T) {
@@ -98,6 +102,96 @@ func TestAdoptedAgentCountsCanonicalGrokProjection(t *testing.T) {
 	}
 }
 
+func TestAdoptedAgentCountsMuse(t *testing.T) {
+	counts := AdoptedAgentCounts{}
+	for _, raw := range []string{"muse", "muse-code", " MUSE_CODE "} {
+		counts.increment(agentpkg.AgentType(raw))
+	}
+
+	if counts.Muse != 3 || counts.Kimi != 0 || counts.CC != 0 {
+		t.Fatalf("counts = %+v, want only Muse=3", counts)
+	}
+	if got := counts.countFor(agentpkg.AgentTypeMuse); got != 3 {
+		t.Fatalf("countFor(muse) = %d, want 3", got)
+	}
+	if got := counts.Total(); got != 3 {
+		t.Fatalf("Total() = %d, want 3", got)
+	}
+	if got, want := counts.Summary(), "muse:3"; got != want {
+		t.Fatalf("Summary() = %q, want %q", got, want)
+	}
+	encoded, err := json.Marshal(counts)
+	if err != nil {
+		t.Fatalf("json.Marshal(counts) error = %v", err)
+	}
+	if !strings.Contains(string(encoded), `"muse":3`) {
+		t.Fatalf("counts JSON = %s, want a muse count", encoded)
+	}
+}
+
+// TestAdoptMuseFlagRecordsMusePane drives `ntm adopt <session> --muse=<pane>
+// --dry-run` against a real tmux session and checks the JSON result records
+// that pane as a Muse agent. Dry run keeps it from renaming panes or
+// registering Agent Mail identities.
+func TestAdoptMuseFlagRecordsMusePane(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	oldJSON := jsonOutput
+	t.Cleanup(func() { jsonOutput = oldJSON })
+	jsonOutput = true
+
+	dir := t.TempDir()
+	session := fmt.Sprintf("ntm-test-adopt-muse-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(session, dir); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+	for i := 0; i < 3; i++ {
+		if _, err := tmux.DefaultClient.Run("split-window", "-d", "-t", session, "-c", dir); err != nil {
+			t.Fatalf("split-window %d failed: %v", i, err)
+		}
+		if _, err := tmux.DefaultClient.Run("select-layout", "-t", session, "tiled"); err != nil {
+			t.Fatalf("select-layout failed: %v", err)
+		}
+	}
+
+	panes, err := tmux.GetPanes(session)
+	if err != nil || len(panes) != 4 {
+		t.Fatalf("GetPanes() = %d panes, err %v; want 4", len(panes), err)
+	}
+	target := panes[0]
+	for _, p := range panes {
+		if p.Index > target.Index {
+			target = p
+		}
+	}
+
+	cmd := newAdoptCmd()
+	cmd.SetArgs([]string{session, fmt.Sprintf("--muse=%d", target.Index), "--dry-run"})
+	out, err := captureStdout(t, cmd.Execute)
+	if err != nil {
+		t.Fatalf("adopt --muse=%d failed: %v\n%s", target.Index, err, out)
+	}
+
+	var result AdoptResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("adopt output is not JSON: %v\n%s", err, out)
+	}
+	if !result.Success || !result.DryRun || result.TotalPanes != 4 {
+		t.Fatalf("result = %+v, want a successful dry run over 4 panes", result)
+	}
+	if result.Agents.Muse != 1 || result.Agents.Total() != 1 {
+		t.Fatalf("agents = %+v, want exactly one muse pane", result.Agents)
+	}
+	if len(result.AdoptedPanes) != 1 {
+		t.Fatalf("adopted panes = %+v, want one", result.AdoptedPanes)
+	}
+	got := result.AdoptedPanes[0]
+	if got.PaneID != target.ID || got.AgentType != "muse" || got.NewTitle != session+"__muse_1" || got.NTMIndex != 1 {
+		t.Fatalf("adopted pane = %+v, want pane %s as %s__muse_1", got, target.ID, session)
+	}
+}
+
 func TestAdoptedAgentMailRegistrations(t *testing.T) {
 	adopted := []AdoptedPaneInfo{
 		{PaneID: "%10", PaneIndex: 1, AgentType: "cc", OldTitle: "external-claude", NewTitle: "demo__cc_1"},
@@ -187,7 +281,7 @@ func TestValidateAdoptAssignments(t *testing.T) {
 		{
 			name:        "no panes",
 			assignments: map[agentpkg.AgentType][]paneSpec{},
-			wantErr:     "use one or more of --cc, --cod, --gmi, --pi, --kimi, --agy, --grok, --cursor, --windsurf, --aider, --oc, --ollama, or --user",
+			wantErr:     "use one or more of --cc, --cod, --gmi, --pi, --kimi, --muse, --agy, --grok, --cursor, --windsurf, --aider, --oc, --ollama, or --user",
 		},
 	}
 
@@ -219,6 +313,9 @@ func TestNewAdoptCmdSupportsAllAgentFlags(t *testing.T) {
 	}
 	if flag := cmd.Flags().Lookup("grok"); flag == nil || !strings.Contains(flag.Usage, "Grok Build") {
 		t.Fatalf("expected --grok flag with Grok Build help, got %+v", flag)
+	}
+	if flag := cmd.Flags().Lookup("muse"); flag == nil || !strings.Contains(flag.Usage, "Muse Code") {
+		t.Fatalf("expected --muse flag with Muse Code help, got %+v", flag)
 	}
 }
 

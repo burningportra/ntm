@@ -180,6 +180,8 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 		return cfg.Agents.Pi, nil, nil
 	case AgentTypeKimi:
 		return cfg.Agents.Kimi, nil, nil
+	case AgentTypeMuse:
+		return cfg.Agents.Muse, nil, nil
 	case AgentTypeAntigravity:
 		return cfg.Agents.Antigravity, nil, nil
 	case AgentTypeGrok:
@@ -250,6 +252,7 @@ func newAddCmd() *cobra.Command {
 	  ntm add myproject --cc=1:opus      # Add 1 Claude Opus agent
 	  ntm add myproject --cod=1 --gmi=1  # Add 1 Codex, 1 Gemini
 	  ntm add myproject --agent=2        # Add 2 Cursor Agent CLI agents (alias: --cursor)
+	  ntm add myproject --muse=1:spark   # Add 1 Muse Code agent on muse-spark-1.3
 
 		With --label, target a labeled session:
 	  ntm add myproject --label frontend --cc=1  # Add to myproject--frontend
@@ -352,6 +355,7 @@ func newAddCmd() *cobra.Command {
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypePi, &agentSpecs), "pi", "Pi agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeKimi, &agentSpecs), "kimi", "Kimi agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeMuse, &agentSpecs), "muse", "Muse Code agents (N or N:model[:effort])")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model pinned to Gemini 3.1 Pro (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N or N:model[:effort])")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOllama, &agentSpecs), "ollama", "Ollama agents (N or N:model)")
@@ -605,7 +609,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 
 	// Add agents
 	flatAgents := opts.Agents.Flatten()
-	ccCount, codCount, gmiCount, piCount, kimiCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+	ccCount, codCount, gmiCount, piCount, kimiCount, museCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 	var rateLimitTracker *ratelimit.RateLimitTracker
 	openAICooldownWaited := false
 	ollamaHost := ""
@@ -690,6 +694,8 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			piCount++
 		case AgentTypeKimi:
 			kimiCount++
+		case AgentTypeMuse:
+			museCount++
 		case AgentTypeAntigravity:
 			agyCount++
 		case AgentTypeGrok:
@@ -1042,6 +1048,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			AddedGemini:         gmiCount,
 			AddedPi:             piCount,
 			AddedKimi:           kimiCount,
+			AddedMuse:           museCount,
 			AddedAntigravity:    agyCount,
 			AddedGrok:           grokCount,
 			AddedOllama:         ollamaCount,
