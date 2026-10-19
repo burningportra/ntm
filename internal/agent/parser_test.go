@@ -454,6 +454,67 @@ func TestMuseIdlePromptShowing_EveryTip(t *testing.T) {
 	}
 }
 
+// museNarrowTipScreen is a live capture from a muse 1.4.11 echo pane in a
+// 26-column tmux 3.7b pane, trimmed the way tmux.Client returns captures,
+// fifteen seconds after a turn. Muse word-wraps the tip and draws only its
+// first line, so the composer shows "Type @ to search and" without the rest
+// of the "Type @ to search and insert" prefix (and without an ellipsis).
+const museNarrowTipScreen = "Muse Code 1.4.11\n\n" +
+	"  Skills: 276 loaded · 40\n" +
+	"  warnings · 76 details\n" +
+	"  hidden (ctrl+o to\n" +
+	"  expand)\n\n" +
+	"❯ hello tiny pane with a\n" +
+	"  long prompt\n\n" +
+	"◆ echo: hello tiny pane\n" +
+	"  with a long prompt\n\n" +
+	"── Voice input (alt(opti…\n" +
+	"❯ Type @ to search and\n" +
+	"──────────────────────────\n" +
+	"  echo · …/ws · YOLO"
+
+// TestMuseIdlePromptShowing_NarrowPaneTip covers tips cut short by a narrow
+// pane: every cut after a tip's second word is still an empty composer, for
+// the idle recognizer and the parser alike, while a single word or a draft
+// that only starts like a tip is not.
+func TestMuseIdlePromptShowing_NarrowPaneTip(t *testing.T) {
+	t.Parallel()
+
+	if !MuseIdlePromptShowing(museNarrowTipScreen) {
+		t.Error("26-column tip screen: MuseIdlePromptShowing = false, want true")
+	}
+	state, err := NewParser().ParseWithHint(museNarrowTipScreen, AgentTypeMuse)
+	if err != nil {
+		t.Fatalf("ParseWithHint: %v", err)
+	}
+	if !state.IsIdle || state.IsWorking {
+		t.Errorf("26-column tip screen: IsIdle=%v IsWorking=%v, want idle", state.IsIdle, state.IsWorking)
+	}
+
+	const narrowTip = "❯ Type @ to search and"
+	for _, prefix := range MuseComposerTipPrefixes {
+		words := strings.Fields(prefix)
+		for n := 2; n <= len(words); n++ {
+			composer := "❯ " + strings.Join(words[:n], " ")
+			if !IsMuseComposerTip(strings.TrimPrefix(composer, "❯ ")) {
+				t.Errorf("IsMuseComposerTip(%q) = false, want true", composer)
+			}
+			if !MuseIdlePromptShowing(strings.Replace(museNarrowTipScreen, narrowTip, composer, 1)) {
+				t.Errorf("composer %q: MuseIdlePromptShowing = false, want true", composer)
+			}
+		}
+	}
+
+	for _, draft := range []string{"❯ Type", "❯ /fork", "❯ Type @ me when done", "❯ Ask to merge the branch", "❯ Start a new branch"} {
+		if IsMuseComposerTip(strings.TrimPrefix(draft, "❯ ")) {
+			t.Errorf("IsMuseComposerTip(%q) = true, want false", draft)
+		}
+		if MuseIdlePromptShowing(strings.Replace(museNarrowTipScreen, narrowTip, draft, 1)) {
+			t.Errorf("draft %q: MuseIdlePromptShowing = true, want false", draft)
+		}
+	}
+}
+
 func TestParser_DetectAgentType_Ollama(t *testing.T) {
 	t.Parallel()
 	p := NewParser()

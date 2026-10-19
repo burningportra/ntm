@@ -2245,28 +2245,35 @@ func composerMarkerForAgent(agentType AgentType) string {
 	}
 }
 
-// composerPlaceholderPrefixes lists per-agent hint text the TUI renders in
-// an EMPTY composer (dim, but indistinguishable from real text in a plain
-// capture). Text matching a prefix counts as empty.
-func composerPlaceholderPrefixes(agentType AgentType) []string {
+// composerPlaceholder returns a matcher for the hint text an agent's TUI
+// renders in an EMPTY composer (dim, but indistinguishable from real text in
+// a plain capture), or nil when the TUI shows none. Text it accepts counts as
+// empty.
+func composerPlaceholder(agentType AgentType) func(text string) bool {
 	switch agentType.Canonical() {
 	case AgentClaude:
-		return []string{`Try "`}
+		return placeholderPrefix(`Try "`)
 	case AgentCodex:
-		return []string{"Ask Codex"}
+		return placeholderPrefix("Ask Codex")
 	case AgentMuse:
-		// Muse's dim feature tips, shared with Muse idle detection.
-		return agent.MuseComposerTipPrefixes
+		// Muse's dim feature tips, whole or cut short by a narrow pane,
+		// read by the same matcher as Muse idle detection.
+		return agent.IsMuseComposerTip
 	default:
 		return nil
 	}
 }
 
+// placeholderPrefix matches composer text that starts with prefix.
+func placeholderPrefix(prefix string) func(string) bool {
+	return func(text string) bool { return strings.HasPrefix(text, prefix) }
+}
+
 // composerLineEmpty reports whether the bottom-most marker line in the
 // capture carries no composer text. found=false means no marker line was
 // visible at all (verification impossible). Hint text the TUI renders in an
-// empty composer counts as empty.
-func composerLineEmpty(capture, marker string, placeholderPrefixes []string) (found, empty bool) {
+// empty composer (isPlaceholder, which may be nil) counts as empty.
+func composerLineEmpty(capture, marker string, isPlaceholder func(string) bool) (found, empty bool) {
 	lines := strings.Split(capture, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		idx := strings.Index(lines[i], marker)
@@ -2274,13 +2281,8 @@ func composerLineEmpty(capture, marker string, placeholderPrefixes []string) (fo
 			continue
 		}
 		text := strings.TrimSpace(lines[i][idx+len(marker):])
-		if text == "" {
+		if text == "" || (isPlaceholder != nil && isPlaceholder(text)) {
 			return true, true
-		}
-		for _, prefix := range placeholderPrefixes {
-			if strings.HasPrefix(text, prefix) {
-				return true, true
-			}
 		}
 		return true, false
 	}
@@ -2314,7 +2316,7 @@ func (c *Client) ClearComposerContext(ctx context.Context, target string, agentT
 	if err != nil {
 		return false, false, fmt.Errorf("capture pane for composer clear verification: %w", err)
 	}
-	found, empty := composerLineEmpty(capture, marker, composerPlaceholderPrefixes(agentType))
+	found, empty := composerLineEmpty(capture, marker, composerPlaceholder(agentType))
 	if !found {
 		return true, false, nil
 	}

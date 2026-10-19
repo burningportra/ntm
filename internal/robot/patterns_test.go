@@ -1209,6 +1209,32 @@ func TestMusePatterns_TipComposerIsIdle(t *testing.T) {
 	if lib.HasIdlePrompt(museTestTipDraftScreen, "muse") {
 		t.Error("draft screen with the banner scrolled away has an idle pattern match")
 	}
+
+	// A pane narrower than the tip shows only its first wrapped line, with
+	// no ellipsis (muse 1.4.11: "❯ Type @ to search and" at 26 columns,
+	// "❯ Type @" at 12). Each such cut is still the empty composer.
+	for _, composer := range []string{"❯ Type @ to search and", "❯ Type @", "❯ /goal pins a"} {
+		screen := strings.Replace(museTestTipScreen, liveTip, composer, 1)
+		if !hasComposerMatch(screen) {
+			t.Errorf("narrow-pane composer %q: muse_composer did not match", composer)
+		}
+		sc := NewStateClassifier("%1", &ClassifierConfig{AgentType: "muse", HysteresisDuration: 0})
+		if _, err := sc.ClassifyWithOutput(screen); err != nil {
+			t.Fatalf("baseline: %v", err)
+		}
+		activity, err := sc.ClassifyWithOutput(screen)
+		if err != nil {
+			t.Fatalf("ClassifyWithOutput: %v", err)
+		}
+		if activity.State != StateWaiting {
+			t.Errorf("narrow-pane composer %q: State = %q, want %q (patterns %v)", composer, activity.State, StateWaiting, activity.DetectedPatterns)
+		}
+	}
+	for _, draft := range []string{"❯ Type", "❯ Type @ me when done"} {
+		if hasComposerMatch(strings.Replace(museTestTipScreen, liveTip, draft, 1)) {
+			t.Errorf("draft %q: muse_composer matched", draft)
+		}
+	}
 }
 
 func TestMusePatterns_DoNotLeakToClaude(t *testing.T) {

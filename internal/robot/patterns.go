@@ -5,7 +5,6 @@ package robot
 import (
 	"regexp"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
@@ -227,16 +226,12 @@ func defaultPatterns() []Pattern {
 
 // museComposerRegex matches Muse's composer waiting for input: a "❯" line
 // that is empty, or shows one of the dim tips Muse draws into the empty
-// composer about seven seconds after a turn (agent.MuseComposerTipPrefixes).
-// Only a tip's leading words are matched, so a tip cut short by a narrow pane
-// still counts. A composer holding a draft, and a submitted prompt echoed into
-// the transcript ("❯ fix the bug"), do not match.
+// composer about seven seconds after a turn, whole or cut short by a narrow
+// pane (agent.MuseComposerTipPattern). A composer holding a draft, and a
+// submitted prompt echoed into the transcript ("❯ fix the bug"), do not
+// match.
 func museComposerRegex() string {
-	tips := make([]string, len(agent.MuseComposerTipPrefixes))
-	for i, tip := range agent.MuseComposerTipPrefixes {
-		tips[i] = regexp.QuoteMeta(tip)
-	}
-	return `(?m)^\s*❯(?:[ \t\x{00a0}]+(?:` + strings.Join(tips, "|") + `)[^\n]*)?[\s\x{00a0}]*$`
+	return `(?m)^\s*❯(?:[ \t\x{00a0}]+` + agent.MuseComposerTipPattern() + `)?[\s\x{00a0}]*$`
 }
 
 // Compile compiles all regex patterns in the library.

@@ -428,8 +428,13 @@ var (
 	// working line for the whole turn.
 	museIdlePatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?m)^[ \t\x{00a0}]*❯[ \t\x{00a0}]*\r?\n[ \t]*─`),
-		museComposerTipLinePattern(MuseComposerTipPrefixes),
+		regexp.MustCompile(`(?m)^[ \t\x{00a0}]*❯[ \t\x{00a0}]+` + MuseComposerTipPattern() + `\n[ \t]*─`),
 	}
+
+	// museComposerTipTextRe matches the whole text of a composer line, after
+	// the "❯" marker and with surrounding blanks trimmed, that is one of
+	// Muse's dim tips.
+	museComposerTipTextRe = regexp.MustCompile(`^` + MuseComposerTipPattern() + `$`)
 
 	museErrorPatterns = []string{
 		"error:",
@@ -460,10 +465,10 @@ var (
 // draws in an empty composer. About seven seconds after a turn ends, an idle
 // Muse pane shows one tip ("❯ Type @ to search and insert workspace file
 // paths" in a live echo pane) and keeps it while the composer stays empty.
-// The list covers every tip text in the muse 1.4.11 binary's tip table. Only
-// leading words are matched so a tip cut short by a narrow pane still counts
-// as empty. Idle detection (museIdlePatterns) and the tmux composer-clear
-// check both read this list.
+// The list covers every tip text in the muse 1.4.11 binary's tip table.
+// MuseComposerTipPattern turns it into the matcher that idle detection
+// (museIdlePatterns), the robot pattern library and the tmux composer-clear
+// check all use.
 var MuseComposerTipPrefixes = []string{
 	"Type @ to search and insert",
 	"Start a message with ! to run",
@@ -490,14 +495,45 @@ var MuseComposerTipPrefixes = []string{
 	"/export saves the conversation",
 }
 
-// museComposerTipLinePattern matches a Muse composer line that shows one of
-// the given tips, with the composer rule directly below it.
-func museComposerTipLinePattern(prefixes []string) *regexp.Regexp {
-	quoted := make([]string, len(prefixes))
-	for i, prefix := range prefixes {
-		quoted[i] = regexp.QuoteMeta(prefix)
+// museTipMinWords is the fewest leading words of a tip that still read as the
+// tip when a narrow pane cuts it short. A single word is not enough: a draft
+// such as "Type" or "/fork" would read as an empty composer.
+const museTipMinWords = 2
+
+// MuseComposerTipPattern returns an unanchored regular expression for the
+// text of a Muse composer line showing one of MuseComposerTipPrefixes, from
+// the first character after the blanks that follow "❯" to the end of the
+// line. Muse word-wraps a tip too long for the pane and draws only its first
+// line, with no ellipsis, so a narrow pane shows fewer words than the prefix
+// (measured on muse 1.4.11: "❯ Type @ to search and" at 26 to 30 columns,
+// "❯ Type @" at 12). A line matches when it holds a whole prefix followed by
+// anything, or at least the prefix's first museTipMinWords words followed only
+// by blanks or "…".
+func MuseComposerTipPattern() string {
+	alternatives := make([]string, 0, 2*len(MuseComposerTipPrefixes))
+	for _, prefix := range MuseComposerTipPrefixes {
+		alternatives = append(alternatives, regexp.QuoteMeta(prefix)+`[^\n]*`)
+		words := strings.Fields(prefix)
+		if len(words) < museTipMinWords {
+			continue
+		}
+		// Each later word is optional only if every word before it is shown:
+		// "a(?: b(?: c)?)?".
+		rest := ""
+		for i := len(words) - 1; i >= museTipMinWords; i-- {
+			rest = `(?: ` + regexp.QuoteMeta(words[i]) + rest + `)?`
+		}
+		lead := regexp.QuoteMeta(strings.Join(words[:museTipMinWords], " "))
+		alternatives = append(alternatives, lead+rest+`[ \t\x{00a0}…]*`)
 	}
-	return regexp.MustCompile(`(?m)^[ \t\x{00a0}]*❯[ \t\x{00a0}]+(?:` + strings.Join(quoted, "|") + `)[^\n]*\n[ \t]*─`)
+	return `(?:` + strings.Join(alternatives, "|") + `)`
+}
+
+// IsMuseComposerTip reports whether text, the content of a Muse composer line
+// after the "❯" marker with surrounding blanks trimmed, is one of Muse's dim
+// tips, whole or cut short by a narrow pane. Such a composer is empty.
+func IsMuseComposerTip(text string) bool {
+	return museComposerTipTextRe.MatchString(text)
 }
 
 // museLiveTailLines bounds the window MuseActivelyWorking scans. The working

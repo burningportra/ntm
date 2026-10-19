@@ -3093,16 +3093,16 @@ func TestComposerLineEmpty_BottomMostMarkerOnly(t *testing.T) {
 // verified clear on an idle pane would false-fail.
 func TestComposerLineEmpty_PlaceholderCountsAsEmpty(t *testing.T) {
 	capture := "chat\n❯ Try \"refactor <filepath>\"\n────\n"
-	found, empty := composerLineEmpty(capture, "❯", composerPlaceholderPrefixes(AgentClaude))
+	found, empty := composerLineEmpty(capture, "❯", composerPlaceholder(AgentClaude))
 	if !found || !empty {
 		t.Fatalf("claude placeholder: got (found=%v, empty=%v), want (true, true)", found, empty)
 	}
-	found, empty = composerLineEmpty("› Ask Codex to do anything\n", "›", composerPlaceholderPrefixes(AgentCodex))
+	found, empty = composerLineEmpty("› Ask Codex to do anything\n", "›", composerPlaceholder(AgentCodex))
 	if !found || !empty {
 		t.Fatalf("codex placeholder: got (found=%v, empty=%v), want (true, true)", found, empty)
 	}
 	// Real residue must still read as non-empty.
-	found, empty = composerLineEmpty("❯ Try harder next time, agent\n", "❯", composerPlaceholderPrefixes(AgentClaude))
+	found, empty = composerLineEmpty("❯ Try harder next time, agent\n", "❯", composerPlaceholder(AgentClaude))
 	if !found {
 		t.Fatalf("residue: marker not found")
 	}
@@ -3125,15 +3125,18 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 			"──────────────────────────────────────────────────\n" +
 			"  echo · /private/tmp/claude-501/musews · YOLO"
 	}
-	prefixes := composerPlaceholderPrefixes(AgentType("muse-code"))
+	prefixes := composerPlaceholder(AgentType("muse-code"))
 
 	for _, tip := range []string{
 		"❯ Type @ to search and insert workspace file paths",
 		"❯ Start a message with ! to run a shell command yourself",
 		"❯ Tab queues or steers while a run is active",
 		"❯ /loop 10m <prompt> schedules a recurring prompt",
-		// A narrow pane cuts the tip short.
 		"❯ Press ? on an empty composer to see keyb…",
+		// A pane narrower than the tip shows only its first wrapped line
+		// (measured on muse 1.4.11 at 26 and 12 columns).
+		"❯ Type @ to search and",
+		"❯ Type @",
 		"❯",
 	} {
 		found, empty := composerLineEmpty(screen(tip), "❯", prefixes)
@@ -3146,6 +3149,8 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 		"❯ draft text here",
 		"❯ Type a summary of the bug",
 		"❯ /fork",
+		"❯ Type",
+		"❯ Type @ me when done",
 	} {
 		found, empty := composerLineEmpty(screen(residue), "❯", prefixes)
 		if !found || empty {
@@ -3156,16 +3161,23 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 		}
 	}
 
-	// The composer clear check and Muse idle detection read one tip list, so
-	// a composer the clear check accepts as empty is also an idle prompt.
+	// The composer clear check and Muse idle detection read one tip matcher,
+	// so a composer the clear check accepts as empty is also an idle prompt,
+	// including every cut a narrow pane can make after the tip's second word.
 	for _, prefix := range agent.MuseComposerTipPrefixes {
-		composer := "❯ " + prefix + " and the rest of the tip"
-		found, empty := composerLineEmpty(screen(composer), "❯", prefixes)
-		if !found || !empty {
-			t.Errorf("Muse tip %q: composerLineEmpty = (found=%v, empty=%v), want (true, true)", composer, found, empty)
+		composers := []string{"❯ " + prefix + " and the rest of the tip"}
+		words := strings.Fields(prefix)
+		for n := 2; n < len(words); n++ {
+			composers = append(composers, "❯ "+strings.Join(words[:n], " "))
 		}
-		if !agent.MuseIdlePromptShowing(screen(composer)) {
-			t.Errorf("Muse tip %q: agent.MuseIdlePromptShowing = false, want true", composer)
+		for _, composer := range composers {
+			found, empty := composerLineEmpty(screen(composer), "❯", prefixes)
+			if !found || !empty {
+				t.Errorf("Muse tip %q: composerLineEmpty = (found=%v, empty=%v), want (true, true)", composer, found, empty)
+			}
+			if !agent.MuseIdlePromptShowing(screen(composer)) {
+				t.Errorf("Muse tip %q: agent.MuseIdlePromptShowing = false, want true", composer)
+			}
 		}
 	}
 }
