@@ -48,6 +48,7 @@ const (
 	AgentGrok        = agent.AgentTypeGrok
 	AgentPi          = agent.AgentTypePi
 	AgentKimi        = agent.AgentTypeKimi
+	AgentMuse        = agent.AgentTypeMuse
 	AgentCursor      = agent.AgentTypeCursor
 	AgentWindsurf    = agent.AgentTypeWindsurf
 	AgentAider       = agent.AgentTypeAider
@@ -458,6 +459,13 @@ func detectAgentFromCommand(command string) AgentType {
 		return AgentGrok
 	}
 
+	// Muse Code gets the same executable-only rule: "muse" is part of words
+	// like amuse and museum. It is checked before the substring rules below so
+	// a launcher path such as /tmp/claude-501/bin/muse is not taken for Claude.
+	if isMuseExecutable(cmd) {
+		return AgentMuse
+	}
+
 	// Helper to check if a command matches an agent
 	isAgent := func(name string) bool {
 		return cmd == name ||
@@ -521,16 +529,30 @@ func detectAgentFromCommand(command string) AgentType {
 // arbitrary arguments as executables creates false positives for a generic name
 // such as "grok".
 func commandExecutableIs(command, executable string) bool {
+	return strings.EqualFold(commandExecutableBase(command), executable)
+}
+
+// commandExecutableBase returns the basename of command's first token, without
+// quotes or a ".exe" suffix, or "" for an empty command.
+func commandExecutableBase(command string) string {
 	fields := strings.Fields(strings.TrimSpace(command))
 	if len(fields) == 0 {
-		return false
+		return ""
 	}
 	first := strings.Trim(fields[0], "'\"")
 	if i := strings.LastIndexAny(first, "/\\"); i >= 0 {
 		first = first[i+1:]
 	}
-	first = strings.TrimSuffix(first, ".exe")
-	return strings.EqualFold(first, executable)
+	return strings.TrimSuffix(first, ".exe")
+}
+
+// isMuseExecutable reports whether command runs Muse Code. The `muse` launcher
+// is a shell script that execs a versioned binary such as
+// muse-bin-1.4.11-R6667.1, which tmux truncates to muse-bin-1.4.11 in
+// pane_current_command, so both basenames count.
+func isMuseExecutable(command string) bool {
+	base := strings.ToLower(commandExecutableBase(command))
+	return base == "muse" || base == "muse-bin" || strings.HasPrefix(base, "muse-bin-")
 }
 
 func detectAgentFromArgv(argv []string) AgentType {
@@ -538,17 +560,21 @@ func detectAgentFromArgv(argv []string) AgentType {
 		return AgentUser
 	}
 
-	// Grok Build must be the process executable, never a coincidental argument.
+	// Grok Build and Muse Code must be the process executable, never a
+	// coincidental argument.
 	if commandExecutableIs(argv[0], "grok") {
 		return AgentGrok
 	}
+	if isMuseExecutable(argv[0]) {
+		return AgentMuse
+	}
 
 	joined := strings.Join(argv, " ")
-	if t := detectAgentFromCommand(joined); t != AgentUser && t != AgentGrok {
+	if t := detectAgentFromCommand(joined); t != AgentUser && t != AgentGrok && t != AgentMuse {
 		return t
 	}
 	for _, arg := range argv {
-		if t := detectAgentFromCommand(arg); t != AgentUser && t != AgentGrok {
+		if t := detectAgentFromCommand(arg); t != AgentUser && t != AgentGrok && t != AgentMuse {
 			return t
 		}
 	}
@@ -2143,6 +2169,10 @@ func ComposerClearKeys(agentType AgentType) []string {
 		return []string{"Escape", "Escape", "Escape", "C-u"}
 	case AgentClaude:
 		return []string{"Escape", "C-u"}
+	case AgentMuse:
+		// Escape and C-c both interrupt a running Muse turn, so only the
+		// line-kill is safe.
+		return []string{"C-u"}
 	default:
 		return []string{"C-u"}
 	}
@@ -2154,7 +2184,7 @@ func composerMarkerForAgent(agentType AgentType) string {
 	switch agentType.Canonical() {
 	case AgentCodex:
 		return "›"
-	case AgentClaude:
+	case AgentClaude, AgentMuse:
 		return "❯"
 	default:
 		return ""

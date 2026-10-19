@@ -1817,6 +1817,23 @@ func TestDetectAgentFromCommandEdgeCases(t *testing.T) {
 		{"grok exporter", "grok-exporter", AgentUser},
 		{"grok search argument", "rg grok", AgentUser},
 
+		// Muse Code: the `muse` launcher execs a versioned binary, which tmux
+		// reports truncated (muse-bin-1.4.11). Words containing "muse" are
+		// unrelated programs.
+		{"muse bare", "muse", AgentMuse},
+		{"muse with args", "/usr/local/bin/muse --yolo", AgentMuse},
+		{"muse tmux current command", "muse-bin-1.4.11", AgentMuse},
+		{"muse versioned binary path", "/Users/x/.local/bin/muse-bin-1.4.11-R6667.1", AgentMuse},
+		{"muse binary with args", "/Users/x/.local/bin/muse-bin-1.4.11-R6667.1 --provider echo --yolo", AgentMuse},
+		{"muse under claude dir", "/tmp/claude-501/bin/muse --yolo", AgentMuse},
+		{"MUSE uppercase", "MUSE", AgentMuse},
+		{"amuse", "amuse", AgentUser},
+		{"museum", "museum", AgentUser},
+		{"musescore", "musescore", AgentUser},
+		{"musescore path", "/Applications/MuseScore 4.app/Contents/MacOS/mscore", AgentUser},
+		{"muse search argument", "rg muse", AgentUser},
+		{"muse-binary lookalike", "muse-binary-viewer", AgentUser},
+
 		// Cursor
 		{"cursor bare", "cursor", AgentCursor},
 		{"cursor with args", "cursor .", AgentCursor},
@@ -1866,6 +1883,27 @@ func TestDetectAgentFromArgvRequiresGrokExecutable(t *testing.T) {
 	for _, argv := range negative {
 		if got := detectAgentFromArgv(argv); got == AgentGrok {
 			t.Errorf("detectAgentFromArgv(%q) falsely detected Grok", argv)
+		}
+	}
+}
+
+func TestDetectAgentFromArgvRequiresMuseExecutable(t *testing.T) {
+	t.Parallel()
+
+	positive := [][]string{
+		{"/Users/x/.local/bin/muse-bin-1.4.11-R6667.1", "--provider", "echo", "--yolo"},
+		{"muse", "--yolo", "--model", "muse-spark-1.3"},
+	}
+	for _, argv := range positive {
+		if got := detectAgentFromArgv(argv); got != AgentMuse {
+			t.Errorf("detectAgentFromArgv(%q) = %q, want %q", argv, got, AgentMuse)
+		}
+	}
+	// A bare "muse" argument is not evidence the process is Muse.
+	negative := [][]string{{"rg", "muse"}, {"python3", "tool.py", "muse"}, {"bash", "-lc", "echo muse"}, {"amuse"}, {"musescore", "score.mscz"}}
+	for _, argv := range negative {
+		if got := detectAgentFromArgv(argv); got == AgentMuse {
+			t.Errorf("detectAgentFromArgv(%q) falsely detected Muse", argv)
 		}
 	}
 }
@@ -2812,6 +2850,9 @@ func TestComposerClearKeys_PerAgentSequences(t *testing.T) {
 	}{
 		{AgentCodex, []string{"Escape", "Escape", "Escape", "C-u"}},
 		{AgentClaude, []string{"Escape", "C-u"}},
+		// Escape and C-c interrupt a running Muse turn.
+		{AgentMuse, []string{"C-u"}},
+		{AgentType("muse-code"), []string{"C-u"}},
 		{AgentGemini, []string{"C-u"}},
 		{AgentUser, []string{"C-u"}},
 	}
@@ -2824,6 +2865,27 @@ func TestComposerClearKeys_PerAgentSequences(t *testing.T) {
 			if got[i] != tc.want[i] {
 				t.Fatalf("ComposerClearKeys(%s)[%d] = %q, want %q", tc.agent, i, got[i], tc.want[i])
 			}
+		}
+	}
+}
+
+func TestComposerMarkerForAgent(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		agent AgentType
+		want  string
+	}{
+		{AgentCodex, "›"},
+		{AgentClaude, "❯"},
+		{AgentMuse, "❯"},
+		{AgentType(" Muse-Code "), "❯"},
+		{AgentGemini, ""},
+		{AgentUser, ""},
+	}
+	for _, tc := range cases {
+		if got := composerMarkerForAgent(tc.agent); got != tc.want {
+			t.Errorf("composerMarkerForAgent(%q) = %q, want %q", tc.agent, got, tc.want)
 		}
 	}
 }
@@ -2841,6 +2903,8 @@ func TestComposerLineEmpty_BottomMostMarkerOnly(t *testing.T) {
 		{"history echo above live empty composer", "› old submitted msg\nworking...\n› \n", "›", true, true},
 		{"no marker visible", "plain shell output\n$ \n", "›", false, false},
 		{"claude leftover", "chat\n❯ residue\n", "❯", true, false},
+		{"muse empty composer below echoed prompt", "❯ hello there\n\n◆ echo: hello there\n\n── Voice input (alt(option)+v to start) ──\n❯\n──────\n  muse-wonder-1.0 · /repo · YOLO", "❯", true, true},
+		{"muse leftover draft", "◆ echo: hi\n── Voice input (alt(option)+v to start) ──\n❯ draft text here\n──────\n  muse-wonder-1.0 · /repo · YOLO", "❯", true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

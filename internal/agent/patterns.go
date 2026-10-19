@@ -394,6 +394,84 @@ var (
 	kimiHeaderPattern = regexp.MustCompile(`(?i)\b(kimi|moonshot)(\s+(code|cli|ai))?\b`)
 )
 
+// Muse Code (muse) patterns, measured against muse 1.4.11 in tmux.
+//
+// Muse draws the same "❯" composer glyph as Claude Code and keeps it on screen
+// while a turn runs, with the live "◇ Thinking (1s · esc to interrupt)" line
+// just above the composer rule. So the empty composer only means idle once
+// MuseActivelyWorking has ruled out a live turn, and DetectAgentType checks the
+// Muse signatures before Claude's: a Muse status bar whose cwd contains
+// "claude" would otherwise match ccHeaderPattern.
+var (
+	museRateLimitPatterns = []string{
+		"rate limit",
+		"too many requests",
+		"quota exceeded",
+		"usage limit",
+		"try again later",
+	}
+
+	// museWorkingPatterns are the in-flight markers of a Muse turn. Both are
+	// shared with Claude Code, so they say nothing about which agent is running
+	// and are left out of detectByPatternFrequency.
+	museWorkingPatterns = []string{
+		"thinking (",
+		"esc to interrupt",
+	}
+
+	// museIdlePatterns match the empty composer line ("❯" alone). A composer
+	// holding a draft is not idle, and submitted prompts echoed into the
+	// transcript ("❯ fix the bug") never match.
+	museIdlePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^\s*❯[\s\x{00a0}]*$`),
+	}
+
+	museErrorPatterns = []string{
+		"error:",
+		"failed:",
+		"exception:",
+		"permission denied",
+		"connection refused",
+		"timeout",
+	}
+
+	// museHeaderPattern matches the "Muse Code 1.4.11" banner at the top of a
+	// Muse session.
+	museHeaderPattern = regexp.MustCompile(`(?m)^\s*Muse Code \d+\.\d+`)
+
+	// museStatusBarPattern matches the bottom status bar
+	// ("muse-wonder-1.0 · /repo · YOLO" or "muse-wonder-full-1.0 · max · /repo
+	// · YOLO"), which stays on screen after the banner scrolls into history.
+	museStatusBarPattern = regexp.MustCompile(`(?m)^\s*muse-[a-z0-9.-]+ · \S`)
+
+	// museActiveWorkLineRe matches the parenthetical on Muse's live working
+	// line ("(1s · esc to interrupt)", "(1m 5s · esc to interrupt)"). It is
+	// glyph- and verb-agnostic because the spinner glyph cycles ◇/◈/◆ and a
+	// missed working line would make a busy pane look idle.
+	museActiveWorkLineRe = regexp.MustCompile(`(?i)\([^()]*\besc\s+to\s+interrupt\s*\)`)
+)
+
+// museLiveTailLines bounds the window MuseActivelyWorking scans. The working
+// line is the sixth line from the bottom (working line, blank, rule, composer,
+// rule, status bar); ten leaves room for a short multi-line draft without
+// reaching transcript history.
+const museLiveTailLines = 10
+
+// MuseActivelyWorking reports whether a Muse pane shows a live turn. Muse
+// replaces the working line with the reply when the turn ends, so a match in
+// the bounded tail means the turn is still running, even though the "❯"
+// composer is drawn below it.
+func MuseActivelyWorking(output string) bool {
+	tail := util.GetLastNLines(stripANSICodes(output), museLiveTailLines)
+	return museActiveWorkLineRe.MatchString(tail)
+}
+
+// IsMuseOutput reports whether output carries a Muse Code signature: the
+// version banner or the model-led status bar.
+func IsMuseOutput(output string) bool {
+	return museHeaderPattern.MatchString(output) || museStatusBarPattern.MatchString(output)
+}
+
 // Cursor (cursor) patterns.
 var (
 	cursorRateLimitPatterns = []string{
@@ -940,6 +1018,14 @@ func GetPatternSet(agentType AgentType) *PatternSet {
 			IdlePatterns:      kimiIdlePatterns,
 			ErrorPatterns:     kimiErrorPatterns,
 			HeaderPattern:     kimiHeaderPattern,
+		}
+	case AgentTypeMuse:
+		return &PatternSet{
+			RateLimitPatterns: museRateLimitPatterns,
+			WorkingPatterns:   museWorkingPatterns,
+			IdlePatterns:      museIdlePatterns,
+			ErrorPatterns:     museErrorPatterns,
+			HeaderPattern:     museHeaderPattern,
 		}
 	case AgentTypeCursor:
 		return &PatternSet{

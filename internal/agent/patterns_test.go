@@ -105,6 +105,24 @@ func TestMatchAny(t *testing.T) {
 			want:     true,
 		},
 		{
+			name:     "muse rate limit",
+			text:     "Rate limit reached, try again later",
+			patterns: museRateLimitPatterns,
+			want:     true,
+		},
+		{
+			name:     "muse working line",
+			text:     "◇ Thinking (1s · esc to interrupt)",
+			patterns: museWorkingPatterns,
+			want:     true,
+		},
+		{
+			name:     "muse reply is not working",
+			text:     "◆ echo: hello there",
+			patterns: museWorkingPatterns,
+			want:     false,
+		},
+		{
 			name:     "cursor error",
 			text:     "error: connection lost",
 			patterns: cursorErrorPatterns,
@@ -126,6 +144,12 @@ func TestMatchAny(t *testing.T) {
 			name:     "kimi error",
 			text:     "error: connection refused",
 			patterns: kimiErrorPatterns,
+			want:     true,
+		},
+		{
+			name:     "muse error",
+			text:     "Error: connection refused",
+			patterns: museErrorPatterns,
 			want:     true,
 		},
 	}
@@ -199,6 +223,18 @@ func TestMatchAnyRegex(t *testing.T) {
 			text:     "kimi> ",
 			patterns: kimiIdlePatterns,
 			want:     true,
+		},
+		{
+			name:     "muse empty composer",
+			text:     "── Voice input (alt(option)+v to start) ──\n❯\n──────\n  muse-wonder-1.0 · /repo · YOLO",
+			patterns: museIdlePatterns,
+			want:     true,
+		},
+		{
+			name:     "muse composer with draft",
+			text:     "── Voice input (alt(option)+v to start) ──\n❯ draft text here\n──────",
+			patterns: museIdlePatterns,
+			want:     false,
 		},
 	}
 
@@ -522,6 +558,30 @@ func TestHeaderPatterns(t *testing.T) {
 			pattern: kimiHeaderPattern,
 			want:    true,
 		},
+		{
+			name:    "muse banner",
+			text:    "\n  Muse Code 1.4.11\n",
+			pattern: museHeaderPattern,
+			want:    true,
+		},
+		{
+			name:    "muse banner without version",
+			text:    "I read the Muse Code docs",
+			pattern: museHeaderPattern,
+			want:    false,
+		},
+		{
+			name:    "muse status bar",
+			text:    "❯\n──────\n  muse-wonder-full-1.0 · max · /private/tmp · YOLO",
+			pattern: museStatusBarPattern,
+			want:    true,
+		},
+		{
+			name:    "muse model id in prose",
+			text:    "switch to muse-spark-1.3 for speed",
+			pattern: museStatusBarPattern,
+			want:    false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -565,6 +625,13 @@ func TestGetPatternSet(t *testing.T) {
 		},
 		{
 			agentType:         AgentTypeKimi,
+			hasRateLimitPats:  true,
+			hasWorkingPats:    true,
+			hasIdlePats:       true,
+			hasContextPattern: false,
+		},
+		{
+			agentType:         AgentTypeMuse,
 			hasRateLimitPats:  true,
 			hasWorkingPats:    true,
 			hasIdlePats:       true,
@@ -686,6 +753,9 @@ func TestAllPatternsCompile(t *testing.T) {
 		codHeaderPattern,
 		gmiHeaderPattern,
 		kimiHeaderPattern,
+		museHeaderPattern,
+		museStatusBarPattern,
+		museActiveWorkLineRe,
 		cursorHeaderPattern,
 		windsurfHeaderPattern,
 		aiderHeaderPattern,
@@ -704,6 +774,7 @@ func TestAllPatternsCompile(t *testing.T) {
 		codIdlePatterns,
 		gmiIdlePatterns,
 		kimiIdlePatterns,
+		museIdlePatterns,
 		cursorIdlePatterns,
 		windsurfIdlePatterns,
 		aiderIdlePatterns,

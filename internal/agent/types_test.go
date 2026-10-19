@@ -18,6 +18,7 @@ func TestAgentType_String(t *testing.T) {
 		{AgentTypeCodex, "cod"},
 		{AgentTypeGemini, "gmi"},
 		{AgentTypeKimi, "kimi"},
+		{AgentTypeMuse, "muse"},
 		{AgentTypeGrok, "grok"},
 		{AgentTypeOllama, "ollama"},
 		{AgentTypeCursor, "cursor"},
@@ -45,6 +46,8 @@ func TestAgentType_DisplayName(t *testing.T) {
 		{AgentTypeCodex, "Codex CLI"},
 		{AgentTypeGemini, "Gemini CLI"},
 		{AgentTypeKimi, "Kimi CLI"},
+		{AgentTypeMuse, "Muse Code"},
+		{AgentType(" muse-code "), "Muse Code"},
 		{AgentTypeGrok, "Grok Build"},
 		{AgentTypeOllama, "Ollama"},
 		{AgentTypeCursor, "Cursor Agent"},
@@ -96,6 +99,13 @@ func TestAgentType_Canonical(t *testing.T) {
 		{AgentType("moonshot_ai"), AgentTypeKimi},
 		{AgentType("kimi-k2"), AgentTypeKimi},
 		{AgentType("k2"), AgentTypeKimi},
+		{AgentType("muse"), AgentTypeMuse},
+		{AgentType(" MUSE-CODE "), AgentTypeMuse},
+		{AgentType("muse_code"), AgentTypeMuse},
+		{AgentType("musecode"), AgentTypeMuse},
+		{AgentType("muse-cli"), AgentTypeMuse},
+		{AgentType("meta-muse"), AgentTypeMuse},
+		{AgentType("meta"), AgentType("meta")},
 		{AgentType(" Grok-Build "), AgentTypeGrok},
 		{AgentType("xai_grok_build"), AgentTypeGrok},
 		{AgentType("ws"), AgentTypeWindsurf},
@@ -123,6 +133,9 @@ func TestAgentType_IsValid(t *testing.T) {
 		{AgentTypeGemini, true},
 		{AgentTypeKimi, true},
 		{AgentType("moonshot"), true},
+		{AgentTypeMuse, true},
+		{AgentType("meta-muse"), true},
+		{AgentType("meta"), false},
 		{AgentTypeGrok, true},
 		{AgentTypeOllama, true},
 		{AgentTypeCursor, true},
@@ -159,6 +172,8 @@ func TestAgentType_NeedsDoubleEnter(t *testing.T) {
 		{AgentType("gemini"), true},
 		{AgentTypeKimi, false},
 		{AgentType("kimi"), false},
+		{AgentTypeMuse, false},
+		{AgentType("muse-code"), false},
 		{AgentTypeGrok, false},
 		{AgentType("unknown"), false},
 	}
@@ -183,6 +198,23 @@ func TestAgentTypeGrokAliasesAreExact(t *testing.T) {
 	}
 	if got := AgentTypeGrok.ProfileName(); got != "Grok" {
 		t.Errorf("AgentTypeGrok.ProfileName() = %q, want Grok", got)
+	}
+}
+
+func TestAgentTypeMuseAliasesAreExact(t *testing.T) {
+	t.Parallel()
+
+	for _, alias := range []string{"muse", "muse-code", "muse_code", "musecode", "muse-cli", "meta-muse", " MUSE-CODE "} {
+		if got := AgentType(alias).Canonical(); got != AgentTypeMuse {
+			t.Errorf("AgentType(%q).Canonical() = %q, want %q", alias, got, AgentTypeMuse)
+		}
+	}
+	// Bare "meta" is too generic, and words that merely contain "muse" are
+	// unrelated programs.
+	for _, unrelated := range []string{"meta", "amuse", "museum", "musescore", "muse-bin"} {
+		if got := AgentType(unrelated).Canonical(); got == AgentTypeMuse {
+			t.Errorf("unrelated AgentType(%q) canonicalized to Muse", unrelated)
+		}
 	}
 }
 
@@ -430,6 +462,7 @@ func TestAgentType_ProfileName(t *testing.T) {
 		{AgentTypeCodex, "Codex"},
 		{AgentTypeGemini, "Gemini"},
 		{AgentTypeKimi, "Kimi"},
+		{AgentTypeMuse, "Muse"},
 		{AgentTypeCursor, "Agent"},
 		{AgentTypeWindsurf, "Windsurf"},
 		{AgentTypeAider, "Aider"},

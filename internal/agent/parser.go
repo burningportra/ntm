@@ -68,7 +68,14 @@ func (p *parserImpl) ParseWithHint(output string, hint AgentType) (*AgentState, 
 // It checks for agent-specific signatures in priority order.
 func (p *parserImpl) DetectAgentType(output string) AgentType {
 	// Check for explicit headers/signatures in priority order
-	// Priority: Claude > Codex > Gemini (based on specificity of patterns)
+	// Priority: Muse > Claude > Codex > Gemini (based on specificity of patterns)
+
+	// Muse goes first: its screen shares Claude's "❯" composer and "esc to
+	// interrupt" hint, and its status bar prints the cwd, which matches
+	// ccHeaderPattern whenever the path contains "claude".
+	if IsMuseOutput(output) {
+		return AgentTypeMuse
+	}
 
 	if ccHeaderPattern.MatchString(output) {
 		return AgentTypeClaudeCode
@@ -138,6 +145,9 @@ func (p *parserImpl) detectByPatternFrequency(output string) AgentType {
 	scores[AgentTypeWindsurf] = p.countMatches(output, windsurfWorkingPatterns)
 	scores[AgentTypeAider] = p.countMatches(output, aiderWorkingPatterns)
 	scores[AgentTypeOllama] = p.countMatches(output, ollamaWorkingPatterns)
+	// Muse is not scored: its working markers ("thinking (", "esc to
+	// interrupt") also appear in Claude panes, so they are not evidence of
+	// type. Muse is identified by IsMuseOutput or the pane command.
 
 	// Find highest scoring type with deterministic tie-breaking
 	// Priority: Claude > Codex > Gemini > Cursor > Windsurf > Aider > Ollama
@@ -214,7 +224,7 @@ func (p *parserImpl) extractMetrics(output string, state *AgentState) {
 			state.IsContextLow = true
 		}
 
-	case AgentTypePi, AgentTypeKimi, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeOllama:
+	case AgentTypePi, AgentTypeKimi, AgentTypeMuse, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeOllama:
 		// No specific metrics yet for these agents
 	}
 }
@@ -306,6 +316,8 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, piRateLimitPatterns)
 	case AgentTypeKimi:
 		return matchAny(recentOutput, kimiRateLimitPatterns)
+	case AgentTypeMuse:
+		return matchAny(recentOutput, museRateLimitPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorRateLimitPatterns)
 	case AgentTypeWindsurf:
@@ -321,6 +333,7 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 			matchAny(recentOutput, gmiRateLimitPatterns) ||
 			matchAny(recentOutput, piRateLimitPatterns) ||
 			matchAny(recentOutput, kimiRateLimitPatterns) ||
+			matchAny(recentOutput, museRateLimitPatterns) ||
 			matchAny(recentOutput, cursorRateLimitPatterns) ||
 			matchAny(recentOutput, windsurfRateLimitPatterns) ||
 			matchAny(recentOutput, aiderRateLimitPatterns) ||
@@ -345,6 +358,8 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, piWorkingPatterns)
 	case AgentTypeKimi:
 		return matchAny(recentOutput, kimiWorkingPatterns)
+	case AgentTypeMuse:
+		return MuseActivelyWorking(output) || matchAny(recentOutput, museWorkingPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorWorkingPatterns)
 	case AgentTypeWindsurf:
@@ -360,6 +375,7 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 			matchAny(recentOutput, gmiWorkingPatterns) ||
 			matchAny(recentOutput, piWorkingPatterns) ||
 			matchAny(recentOutput, kimiWorkingPatterns) ||
+			matchAny(recentOutput, museWorkingPatterns) ||
 			matchAny(recentOutput, cursorWorkingPatterns) ||
 			matchAny(recentOutput, windsurfWorkingPatterns) ||
 			matchAny(recentOutput, aiderWorkingPatterns) ||
@@ -417,6 +433,13 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		return matchAnyRegex(lastLines, piIdlePatterns)
 	case AgentTypeKimi:
 		return matchAnyRegex(lastLines, kimiIdlePatterns)
+	case AgentTypeMuse:
+		// The "❯" composer stays drawn while a turn runs, so the empty
+		// composer only counts once no live working line is showing.
+		if MuseActivelyWorking(output) {
+			return false
+		}
+		return matchAnyRegex(lastLines, museIdlePatterns)
 	case AgentTypeCursor:
 		return matchAnyRegex(lastLines, cursorIdlePatterns)
 	case AgentTypeWindsurf:
@@ -432,6 +455,7 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 			matchAnyRegex(lastLines, gmiIdlePatterns) ||
 			matchAnyRegex(lastLines, piIdlePatterns) ||
 			matchAnyRegex(lastLines, kimiIdlePatterns) ||
+			matchAnyRegex(lastLines, museIdlePatterns) ||
 			matchAnyRegex(lastLines, cursorIdlePatterns) ||
 			matchAnyRegex(lastLines, windsurfIdlePatterns) ||
 			matchAnyRegex(lastLines, aiderIdlePatterns) ||
@@ -461,6 +485,8 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, piErrorPatterns)
 	case AgentTypeKimi:
 		return matchAny(recentOutput, kimiErrorPatterns)
+	case AgentTypeMuse:
+		return matchAny(recentOutput, museErrorPatterns)
 	case AgentTypeCursor:
 		return matchAny(recentOutput, cursorErrorPatterns)
 	case AgentTypeWindsurf:
@@ -476,6 +502,7 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 			matchAny(recentOutput, gmiErrorPatterns) ||
 			matchAny(recentOutput, piErrorPatterns) ||
 			matchAny(recentOutput, kimiErrorPatterns) ||
+			matchAny(recentOutput, museErrorPatterns) ||
 			matchAny(recentOutput, cursorErrorPatterns) ||
 			matchAny(recentOutput, windsurfErrorPatterns) ||
 			matchAny(recentOutput, aiderErrorPatterns) ||
@@ -499,6 +526,8 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		return collectMatches(recentOutput, piRateLimitPatterns)
 	case AgentTypeKimi:
 		return collectMatches(recentOutput, kimiRateLimitPatterns)
+	case AgentTypeMuse:
+		return collectMatches(recentOutput, museRateLimitPatterns)
 	case AgentTypeCursor:
 		return collectMatches(recentOutput, cursorRateLimitPatterns)
 	case AgentTypeWindsurf:
@@ -514,6 +543,7 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		matches = append(matches, collectMatches(recentOutput, gmiRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, piRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, kimiRateLimitPatterns)...)
+		matches = append(matches, collectMatches(recentOutput, museRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, cursorRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, windsurfRateLimitPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, aiderRateLimitPatterns)...)
@@ -538,6 +568,8 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 		return collectMatches(recentOutput, piWorkingPatterns)
 	case AgentTypeKimi:
 		return collectMatches(recentOutput, kimiWorkingPatterns)
+	case AgentTypeMuse:
+		return collectMatches(recentOutput, museWorkingPatterns)
 	case AgentTypeCursor:
 		return collectMatches(recentOutput, cursorWorkingPatterns)
 	case AgentTypeWindsurf:
@@ -552,6 +584,7 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 		matches = append(matches, collectMatches(recentOutput, gmiWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, piWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, kimiWorkingPatterns)...)
+		matches = append(matches, collectMatches(recentOutput, museWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, cursorWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, windsurfWorkingPatterns)...)
 		matches = append(matches, collectMatches(recentOutput, aiderWorkingPatterns)...)

@@ -182,6 +182,172 @@ func TestParser_DetectAgentType_Kimi(t *testing.T) {
 	}
 }
 
+// Muse Code screens captured from muse 1.4.11 in a 160x45 tmux pane (rules
+// shortened). tmux capture output is whitespace-trimmed, which is why the
+// banner line has lost its indentation.
+const (
+	museCaptureRule     = "──────────────────────────────────────────────────────────────"
+	museCaptureVoiceBar = "── Voice input (alt(option)+v to start) ──────────────────────"
+	museCaptureBanner   = "Muse Code 1.4.11\n\n" +
+		"  Skills: 276 loaded · 40 warnings · 76 details hidden (ctrl+o to expand)\n\n"
+
+	museIdleScreen = museCaptureBanner +
+		museCaptureVoiceBar + "\n❯\n" + museCaptureRule + "\n" +
+		"  muse-wonder-1.0 · /path/to/repo · YOLO"
+
+	museWorkingScreen = museCaptureBanner +
+		"❯ hello there\n\n" +
+		"◇ Thinking (1s · esc to interrupt)\n\n" +
+		museCaptureVoiceBar + "\n❯\n" + museCaptureRule + "\n" +
+		"  muse-wonder-1.0 · /path/to/repo · YOLO"
+
+	museFinishedScreen = museCaptureBanner +
+		"❯ hello there\n\n" +
+		"◆ echo: hello there\n\n" +
+		museCaptureVoiceBar + "\n❯\n" + museCaptureRule + "\n" +
+		"  muse-wonder-1.0 · /path/to/repo · YOLO"
+)
+
+// museScreenInDir rewrites a capture's status-bar cwd. A cwd containing
+// "claude" matches ccHeaderPattern, which is what makes detection order matter.
+func museScreenInDir(screen, dir string) string {
+	return strings.Replace(screen, "/path/to/repo", dir, 1)
+}
+
+func TestParser_DetectAgentType_Muse(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	// After a long session the banner scrolls into history; the status bar
+	// alone still identifies Muse.
+	bannerScrolledOff := "◆ echo: hello there\n\n" +
+		museCaptureVoiceBar + "\n❯\n" + museCaptureRule + "\n" +
+		"  muse-wonder-full-1.0 · max · /private/tmp/claude-501/repo · YOLO" +
+		"                Draft cleared · press ↑ to restore"
+
+	screens := map[string]string{
+		"idle":                museIdleScreen,
+		"working":             museWorkingScreen,
+		"finished":            museFinishedScreen,
+		"idle in claude dir":  museScreenInDir(museIdleScreen, "/private/tmp/claude-501/repo"),
+		"working claude dir":  museScreenInDir(museWorkingScreen, "/Users/x/claude-code/repo"),
+		"banner scrolled off": bannerScrolledOff,
+	}
+
+	for name, screen := range screens {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := p.DetectAgentType(screen); got != AgentTypeMuse {
+				t.Errorf("DetectAgentType() = %v, want %v", got, AgentTypeMuse)
+			}
+		})
+	}
+}
+
+// TestParser_MuseScreensNeverClaude guards the detection order: Muse shares
+// Claude's "❯" composer and "esc to interrupt" hint, and these captures also
+// match ccHeaderPattern through the cwd, so checking Claude first would
+// classify them as cc.
+func TestParser_MuseScreensNeverClaude(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	for _, dir := range []string{"/path/to/repo", "/private/tmp/claude-501/repo", "/Users/x/.claude/worktrees/opus"} {
+		for _, screen := range []string{museIdleScreen, museWorkingScreen, museFinishedScreen} {
+			screen = museScreenInDir(screen, dir)
+			if dir != "/path/to/repo" && !ccHeaderPattern.MatchString(screen) {
+				t.Fatalf("fixture in %s should match ccHeaderPattern so the ordering is exercised", dir)
+			}
+			if got := p.DetectAgentType(screen); got == AgentTypeClaudeCode {
+				t.Errorf("DetectAgentType(Muse screen in %s) = cc", dir)
+			}
+			state, err := p.Parse(screen)
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+			if state.Type == AgentTypeClaudeCode {
+				t.Errorf("Parse(Muse screen in %s).Type = cc", dir)
+			}
+		}
+	}
+}
+
+func TestParser_Parse_MuseStates(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	tests := []struct {
+		name        string
+		output      string
+		wantWorking bool
+		wantIdle    bool
+	}{
+		{name: "idle composer", output: museIdleScreen, wantIdle: true},
+		// The empty composer is still drawn below the live working line.
+		{name: "working above empty composer", output: museWorkingScreen, wantWorking: true},
+		{name: "finished turn", output: museFinishedScreen, wantIdle: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, hint := range []AgentType{AgentTypeUnknown, AgentTypeMuse, AgentType("muse-code")} {
+				state, err := p.ParseWithHint(tt.output, hint)
+				if err != nil {
+					t.Fatalf("ParseWithHint(%q) error: %v", hint, err)
+				}
+				if state.Type != AgentTypeMuse {
+					t.Errorf("hint %q: Type = %v, want %v", hint, state.Type, AgentTypeMuse)
+				}
+				if state.IsWorking != tt.wantWorking {
+					t.Errorf("hint %q: IsWorking = %v, want %v", hint, state.IsWorking, tt.wantWorking)
+				}
+				if state.IsIdle != tt.wantIdle {
+					t.Errorf("hint %q: IsIdle = %v, want %v", hint, state.IsIdle, tt.wantIdle)
+				}
+				if state.IsRateLimited || state.IsInError {
+					t.Errorf("hint %q: IsRateLimited = %v, IsInError = %v, want both false", hint, state.IsRateLimited, state.IsInError)
+				}
+			}
+		})
+	}
+}
+
+func TestMuseActivelyWorking(t *testing.T) {
+	t.Parallel()
+
+	composer := "\n\n" + museCaptureVoiceBar + "\n❯\n" + museCaptureRule + "\n  muse-wonder-1.0 · /repo · YOLO"
+
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "open diamond glyph", output: "◇ Thinking (1s · esc to interrupt)" + composer, want: true},
+		{name: "dotted diamond glyph", output: "◈ Thinking (12s · esc to interrupt)" + composer, want: true},
+		{name: "filled diamond glyph", output: "◆ Thinking (2s · esc to interrupt)" + composer, want: true},
+		{name: "minute timer", output: "◇ Thinking (1m 5s · esc to interrupt)" + composer, want: true},
+		{name: "ansi colored", output: "\x1b[36m◇\x1b[0m Thinking (3s · esc to interrupt)" + composer, want: true},
+		{name: "working line above a draft", output: "◇ Thinking (4s · esc to interrupt)\n\n" + museCaptureVoiceBar + "\n❯ follow up\n  second line\n" + museCaptureRule + "\n  muse-wonder-1.0 · /repo · YOLO", want: true},
+		{name: "finished reply", output: museFinishedScreen},
+		{name: "idle screen", output: museIdleScreen},
+		{name: "prose mention is not the working line", output: "◆ Press esc to interrupt a running turn." + composer},
+		{
+			name:   "stale working line outside live tail",
+			output: "◇ Thinking (1s · esc to interrupt)\n" + strings.Repeat("◆ reply line\n", museLiveTailLines) + "❯",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := MuseActivelyWorking(tt.output); got != tt.want {
+				t.Errorf("MuseActivelyWorking() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParser_DetectAgentType_Ollama(t *testing.T) {
 	t.Parallel()
 	p := NewParser()
@@ -1347,6 +1513,14 @@ Error: quota exceeded. Please try again in 1 minute.`,
 			wantType:    AgentTypeKimi,
 			wantWorking: false,
 			wantIdle:    true,
+			wantLimited: false,
+		},
+		{
+			name:        "muse working above composer",
+			output:      museWorkingScreen,
+			wantType:    AgentTypeMuse,
+			wantWorking: true,
+			wantIdle:    false,
 			wantLimited: false,
 		},
 		{
