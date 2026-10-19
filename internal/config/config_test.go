@@ -604,6 +604,14 @@ func TestGetModelName(t *testing.T) {
 		{"google-gemini", "flash", "gemini-3-flash"},
 		{"xai-grok-build", "account-model", "account-model"},
 		{"  CodEx-Cli  ", "o3", "o3"},
+		{"muse", "", "muse-wonder-1.0"},
+		{"muse", "spark", "muse-spark-1.3"},
+		{"muse", "spark-1.3", "muse-spark-1.3"},
+		{"muse", "spark-1.2", "muse-spark-1.2"},
+		{"muse", "wonder", "muse-wonder-1.0"},
+		{"muse", "wonder-full", "muse-wonder-full-1.0"},
+		{"muse-code", "SPARK", "muse-spark-1.3"},
+		{"muse", "muse-wonder-full-1.0", "muse-wonder-full-1.0"},
 		{"unknown", "", ""},
 	}
 	for _, tt := range tests {
@@ -720,6 +728,75 @@ func TestPrintGrokConfigRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decoded.Models.Grok, cfg.Models.Grok) {
 		t.Fatalf("models.grok = %#v, want %#v", decoded.Models.Grok, cfg.Models.Grok)
+	}
+}
+
+// Muse settings must survive the TOML writer under their own keys and be
+// reachable through `config get` and `config diff`, or an operator's override
+// would be dropped on the next `ntm config init`.
+func TestMuseConfigPrintGetValueAndDiff(t *testing.T) {
+	cfg := Default()
+	if cfg.Agents.Muse == "" {
+		t.Fatal("default agents.muse launch template must not be empty")
+	}
+
+	var buf bytes.Buffer
+	if err := Print(cfg, &buf); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	for _, want := range []string{`muse = "muse --yolo`, `default_muse = "muse-wonder-1.0"`, "[models.muse]", `"spark-1.3" = "muse-spark-1.3"`} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("printed config missing %q", want)
+		}
+	}
+
+	// Round-trip the default alias table, whose "spark-1.3"/"spark-1.2" keys
+	// contain dots, plus operator overrides on every Muse field.
+	cfg.Agents.Muse = "muse --yolo --provider echo"
+	cfg.Models.DefaultMuse = "muse-spark-1.2"
+	cfg.Models.Muse["fast"] = "muse-spark-1.3"
+
+	buf.Reset()
+	if err := Print(cfg, &buf); err != nil {
+		t.Fatalf("Print failed: %v", err)
+	}
+	var decoded Config
+	if _, err := toml.Decode(buf.String(), &decoded); err != nil {
+		t.Fatalf("decode printed config: %v", err)
+	}
+	if decoded.Agents.Muse != cfg.Agents.Muse {
+		t.Errorf("agents.muse = %q, want %q", decoded.Agents.Muse, cfg.Agents.Muse)
+	}
+	if decoded.Models.DefaultMuse != cfg.Models.DefaultMuse {
+		t.Errorf("models.default_muse = %q, want %q", decoded.Models.DefaultMuse, cfg.Models.DefaultMuse)
+	}
+	if !reflect.DeepEqual(decoded.Models.Muse, cfg.Models.Muse) {
+		t.Errorf("models.muse = %#v, want %#v", decoded.Models.Muse, cfg.Models.Muse)
+	}
+
+	for path, want := range map[string]interface{}{
+		"agents.muse":         cfg.Agents.Muse,
+		"models.default_muse": cfg.Models.DefaultMuse,
+		"models.muse":         cfg.Models.Muse,
+	} {
+		got, err := GetValue(cfg, path)
+		if err != nil {
+			t.Errorf("GetValue(%q): %v", path, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("GetValue(%q) = %#v, want %#v", path, got, want)
+		}
+	}
+
+	changed := map[string]bool{}
+	for _, d := range Diff(cfg) {
+		changed[d.Path] = true
+	}
+	for _, path := range []string{"agents.muse", "models.default_muse", "models.muse"} {
+		if !changed[path] {
+			t.Errorf("Diff did not report changed %s", path)
+		}
 	}
 }
 

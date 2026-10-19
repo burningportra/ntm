@@ -839,6 +839,7 @@ type AgentConfig struct {
 	Gemini       string            `toml:"gemini"`
 	Pi           string            `toml:"pi"`
 	Kimi         string            `toml:"kimi"`
+	Muse         string            `toml:"muse"`        // Muse Code (Meta) launch command
 	Antigravity  string            `toml:"antigravity"` // Antigravity (agy) launch command — successor to the Gemini CLI
 	Grok         string            `toml:"grok"`        // Official xAI Grok Build launch command
 	Ollama       string            `toml:"ollama"`
@@ -1080,7 +1081,7 @@ type SessionRecoveryConfig struct {
 
 // DefaultRecoveryTimeout bounds how long spawn waits for recovery sources
 // (beads, Agent Mail, CM memories) before continuing without them.
-const DefaultRecoveryTimeout = 5 * time.Second
+const DefaultRecoveryTimeout = 15 * time.Second
 
 // GetTimeout returns the recovery-gathering window as a duration, falling back
 // to DefaultRecoveryTimeout when timeout_seconds is unset or non-positive.
@@ -1103,7 +1104,7 @@ func DefaultSessionRecoveryConfig() SessionRecoveryConfig {
 		StaleThresholdHours: 24,   // Consider context up to 24 hours old
 		MaxCMRules:          10,   // Max CM rules to include
 		MaxCMSnippets:       3,    // Max CM history snippets
-		TimeoutSeconds:      5,    // Gather recovery sources for at most 5s, then degrade
+		TimeoutSeconds:      15,   // Gather recovery sources for at most 15s, then degrade
 	}
 }
 
@@ -1857,24 +1858,27 @@ func ValidateXFConfig(cfg *XFConfig) error {
 
 // ModelsConfig holds model alias configuration for each agent type
 type ModelsConfig struct {
-	DefaultClaude string            `toml:"default_claude"` // Default model for Claude
-	DefaultCodex  string            `toml:"default_codex"`  // Default model for Codex
-	DefaultGemini string            `toml:"default_gemini"` // Default model for Gemini
-	DefaultPi     string            `toml:"default_pi"`     // Default model for Pi
-	DefaultKimi   string            `toml:"default_kimi"`   // Default model for Kimi
-	DefaultGrok   string            `toml:"default_grok"`   // Optional Grok Build default; empty delegates to the CLI
-	DefaultOllama string            `toml:"default_ollama"` // Default model for Ollama
-	Claude        map[string]string `toml:"claude"`         // Claude model aliases
-	Codex         map[string]string `toml:"codex"`          // Codex model aliases
-	Gemini        map[string]string `toml:"gemini"`         // Gemini model aliases
-	Pi            map[string]string `toml:"pi"`             // Pi model aliases
-	Kimi          map[string]string `toml:"kimi"`           // Kimi model aliases
-	Grok          map[string]string `toml:"grok"`           // Grok Build model aliases
-	Ollama        map[string]string `toml:"ollama"`         // Ollama model aliases
-	Cursor        map[string]string `toml:"cursor"`         // Cursor model aliases
-	Windsurf      map[string]string `toml:"windsurf"`       // Windsurf model aliases
-	Aider         map[string]string `toml:"aider"`          // Aider model aliases
-	Opencode      map[string]string `toml:"opencode"`       // Opencode (oc) model aliases — see ntm#116
+	DefaultClaude   string            `toml:"default_claude"`   // Default model for Claude
+	DefaultCodex    string            `toml:"default_codex"`    // Default model for Codex
+	DefaultGemini   string            `toml:"default_gemini"`   // Default model for Gemini
+	DefaultPi       string            `toml:"default_pi"`       // Default model for Pi
+	DefaultKimi     string            `toml:"default_kimi"`     // Default model for Kimi
+	DefaultMuse     string            `toml:"default_muse"`     // Default model for Muse Code
+	DefaultGrok     string            `toml:"default_grok"`     // Optional Grok Build default; empty delegates to the CLI
+	DefaultOpencode string            `toml:"default_opencode"` // Default model for Opencode (oc); empty delegates to the OpenCode CLI
+	DefaultOllama   string            `toml:"default_ollama"`   // Default model for Ollama
+	Claude          map[string]string `toml:"claude"`           // Claude model aliases
+	Codex           map[string]string `toml:"codex"`            // Codex model aliases
+	Gemini          map[string]string `toml:"gemini"`           // Gemini model aliases
+	Pi              map[string]string `toml:"pi"`               // Pi model aliases
+	Kimi            map[string]string `toml:"kimi"`             // Kimi model aliases
+	Muse            map[string]string `toml:"muse"`             // Muse Code model aliases
+	Grok            map[string]string `toml:"grok"`             // Grok Build model aliases
+	Ollama          map[string]string `toml:"ollama"`           // Ollama model aliases
+	Cursor          map[string]string `toml:"cursor"`           // Cursor model aliases
+	Windsurf        map[string]string `toml:"windsurf"`         // Windsurf model aliases
+	Aider           map[string]string `toml:"aider"`            // Aider model aliases
+	Opencode        map[string]string `toml:"opencode"`         // Opencode (oc) model aliases — see ntm#116
 	// ContextLimits allows overriding built-in context window sizes for models.
 	// Keys are model names (e.g., "claude-opus-4-6"), values are token counts.
 	// These override the built-in defaults in internal/models/registry.go.
@@ -1885,13 +1889,15 @@ type ModelsConfig struct {
 // Model IDs should match those in internal/agents/profiles.go (no date suffixes).
 func DefaultModels() ModelsConfig {
 	return ModelsConfig{
-		DefaultClaude: "claude-opus-4-8",
-		DefaultCodex:  DefaultCodexModel,
-		DefaultGemini: "gemini-3-pro-preview",
-		DefaultPi:     "",
-		DefaultKimi:   "kimi-k2",
-		DefaultGrok:   "",
-		DefaultOllama: "llama3",
+		DefaultClaude:   "claude-opus-4-8",
+		DefaultCodex:    DefaultCodexModel,
+		DefaultGemini:   "gemini-3-pro-preview",
+		DefaultPi:       "",
+		DefaultKimi:     "kimi-k2",
+		DefaultMuse:     "muse-wonder-1.0",
+		DefaultGrok:     "",
+		DefaultOpencode: "vercel/deepseek/deepseek-v4-flash",
+		DefaultOllama:   "llama3",
 		Claude: map[string]string{
 			"opus":      "claude-opus-4-8",
 			"sonnet":    "claude-sonnet-4-6",
@@ -1923,10 +1929,21 @@ func DefaultModels() ModelsConfig {
 			"k2-0905": "kimi-k2-0905",
 			"kimi-k2": "kimi-k2",
 		},
+		Muse: map[string]string{
+			"wonder":      "muse-wonder-1.0",
+			"wonder-full": "muse-wonder-full-1.0",
+			"spark":       "muse-spark-1.3",
+			"spark-1.3":   "muse-spark-1.3",
+			"spark-1.2":   "muse-spark-1.2",
+		},
 		Grok: map[string]string{},
 		Ollama: map[string]string{
 			"llama3": "llama3",
 			"phi3":   "phi3",
+		},
+		Opencode: map[string]string{
+			"deepseek-v4-flash": "vercel/deepseek/deepseek-v4-flash",
+			"flash":             "vercel/deepseek/deepseek-v4-flash",
 		},
 	}
 }
@@ -1942,6 +1959,8 @@ func canonicalModelLookupAgentType(agentType string) string {
 		return "pi"
 	case agent.AgentTypeKimi:
 		return "kimi"
+	case agent.AgentTypeMuse:
+		return "muse"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
 	case agent.AgentTypeGrok:
@@ -1988,6 +2007,8 @@ func (m *ModelsConfig) AliasesFor(agentType string) map[string]string {
 		return m.Pi
 	case "kimi":
 		return m.Kimi
+	case "muse":
+		return m.Muse
 	case "grok":
 		return m.Grok
 	case "ollama":
@@ -2026,8 +2047,12 @@ func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 			return m.DefaultPi
 		case "kimi":
 			return m.DefaultKimi
+		case "muse":
+			return m.DefaultMuse
 		case "grok":
 			return m.DefaultGrok
+		case "opencode":
+			return m.DefaultOpencode
 		case "ollama":
 			return m.DefaultOllama
 		}
@@ -3856,6 +3881,9 @@ func Print(cfg *Config, w io.Writer) error {
 	if cfg.Agents.Kimi != "" {
 		fmt.Fprintf(w, "kimi = %q\n", cfg.Agents.Kimi)
 	}
+	if cfg.Agents.Muse != "" {
+		fmt.Fprintf(w, "muse = %q\n", cfg.Agents.Muse)
+	}
 	if cfg.Agents.Cursor != "" {
 		fmt.Fprintf(w, "cursor = %q\n", cfg.Agents.Cursor)
 	}
@@ -4206,15 +4234,23 @@ func Print(cfg *Config, w io.Writer) error {
 	if cfg.Models.DefaultKimi != "" {
 		fmt.Fprintf(w, "default_kimi = %q\n", cfg.Models.DefaultKimi)
 	}
+	if cfg.Models.DefaultMuse != "" {
+		fmt.Fprintf(w, "default_muse = %q\n", cfg.Models.DefaultMuse)
+	}
 	fmt.Fprintf(w, "default_grok = %q  # Empty delegates model selection to Grok Build\n", cfg.Models.DefaultGrok)
+	if cfg.Models.DefaultOpencode != "" {
+		fmt.Fprintf(w, "default_opencode = %q\n", cfg.Models.DefaultOpencode)
+	}
 	fmt.Fprintln(w)
 
-	// Write Claude model aliases
+	// Write Claude model aliases. Alias keys are quoted in every [models.*]
+	// table because a bare key containing a dot (e.g. Muse's "spark-1.3") is a
+	// dotted TOML key, which makes the written config fail to parse.
 	fmt.Fprintln(w, "[models.claude]")
 	fmt.Fprintln(w, "# Claude model aliases (e.g., --cc=2:opus)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Claude) {
 		fullName := cfg.Models.Claude[alias]
-		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+		fmt.Fprintf(w, "%q = %q\n", alias, fullName)
 	}
 	fmt.Fprintln(w)
 
@@ -4223,7 +4259,7 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# Codex model aliases (e.g., --cod=2:max)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Codex) {
 		fullName := cfg.Models.Codex[alias]
-		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+		fmt.Fprintf(w, "%q = %q\n", alias, fullName)
 	}
 	fmt.Fprintln(w)
 
@@ -4232,7 +4268,7 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# Gemini model aliases (e.g., --gmi=1:flash)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Gemini) {
 		fullName := cfg.Models.Gemini[alias]
-		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+		fmt.Fprintf(w, "%q = %q\n", alias, fullName)
 	}
 	fmt.Fprintln(w)
 
@@ -4242,7 +4278,7 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# Grok Build model aliases (e.g., --grok=1:MODEL_ID)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Grok) {
 		fullName := cfg.Models.Grok[alias]
-		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+		fmt.Fprintf(w, "%q = %q\n", alias, fullName)
 	}
 	fmt.Fprintln(w)
 
@@ -4251,7 +4287,7 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# Pi model aliases (e.g., --pi=1:sonnet)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Pi) {
 		fullName := cfg.Models.Pi[alias]
-		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+		fmt.Fprintf(w, "%q = %q\n", alias, fullName)
 	}
 	fmt.Fprintln(w)
 
@@ -4260,7 +4296,16 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# Kimi model aliases (e.g., --kimi=1:k2)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Kimi) {
 		fullName := cfg.Models.Kimi[alias]
-		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+		fmt.Fprintf(w, "%q = %q\n", alias, fullName)
+	}
+	fmt.Fprintln(w)
+
+	// Write Muse model aliases
+	fmt.Fprintln(w, "[models.muse]")
+	fmt.Fprintln(w, "# Muse Code model aliases (e.g., --muse=1:spark)")
+	for _, alias := range sortedStringMapKeys(cfg.Models.Muse) {
+		fullName := cfg.Models.Muse[alias]
+		fmt.Fprintf(w, "%q = %q\n", alias, fullName)
 	}
 	fmt.Fprintln(w)
 
@@ -5006,6 +5051,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Agents.Pi, nil
 		case "kimi":
 			return cfg.Agents.Kimi, nil
+		case "muse":
+			return cfg.Agents.Muse, nil
 		case "cursor":
 			return cfg.Agents.Cursor, nil
 		case "windsurf":
@@ -5252,6 +5299,10 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Models.DefaultPi, nil
 		case "default_kimi":
 			return cfg.Models.DefaultKimi, nil
+		case "default_muse":
+			return cfg.Models.DefaultMuse, nil
+		case "default_opencode":
+			return cfg.Models.DefaultOpencode, nil
 		case "claude":
 			return cfg.Models.Claude, nil
 		case "codex":
@@ -5264,6 +5315,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Models.Pi, nil
 		case "kimi":
 			return cfg.Models.Kimi, nil
+		case "muse":
+			return cfg.Models.Muse, nil
 		}
 	case "alerts":
 		if len(parts) < 2 {
@@ -6152,6 +6205,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agents.gemini", defaults.Agents.Gemini, cfg.Agents.Gemini)
 	addDiff("agents.pi", defaults.Agents.Pi, cfg.Agents.Pi)
 	addDiff("agents.kimi", defaults.Agents.Kimi, cfg.Agents.Kimi)
+	addDiff("agents.muse", defaults.Agents.Muse, cfg.Agents.Muse)
 	addDiff("agents.grok", defaults.Agents.Grok, cfg.Agents.Grok)
 	addDiff("agents.cursor", defaults.Agents.Cursor, cfg.Agents.Cursor)
 	addDiff("agents.windsurf", defaults.Agents.Windsurf, cfg.Agents.Windsurf)
@@ -6231,12 +6285,15 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("models.default_gemini", defaults.Models.DefaultGemini, cfg.Models.DefaultGemini)
 	addDiff("models.default_pi", defaults.Models.DefaultPi, cfg.Models.DefaultPi)
 	addDiff("models.default_kimi", defaults.Models.DefaultKimi, cfg.Models.DefaultKimi)
+	addDiff("models.default_muse", defaults.Models.DefaultMuse, cfg.Models.DefaultMuse)
 	addDiff("models.default_grok", defaults.Models.DefaultGrok, cfg.Models.DefaultGrok)
+	addDiff("models.default_opencode", defaults.Models.DefaultOpencode, cfg.Models.DefaultOpencode)
 	addDiff("models.claude", defaults.Models.Claude, cfg.Models.Claude)
 	addDiff("models.codex", defaults.Models.Codex, cfg.Models.Codex)
 	addDiff("models.gemini", defaults.Models.Gemini, cfg.Models.Gemini)
 	addDiff("models.pi", defaults.Models.Pi, cfg.Models.Pi)
 	addDiff("models.kimi", defaults.Models.Kimi, cfg.Models.Kimi)
+	addDiff("models.muse", defaults.Models.Muse, cfg.Models.Muse)
 	addDiff("models.grok", defaults.Models.Grok, cfg.Models.Grok)
 
 	// Alerts

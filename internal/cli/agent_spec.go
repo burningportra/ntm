@@ -43,6 +43,7 @@ const (
 	AgentTypeGemini      AgentType = "gmi"
 	AgentTypePi          AgentType = "pi"
 	AgentTypeKimi        AgentType = "kimi"
+	AgentTypeMuse        AgentType = "muse"
 	AgentTypeAntigravity AgentType = "agy"
 	AgentTypeGrok        AgentType = "grok"
 	AgentTypeOllama      AgentType = "ollama"
@@ -115,7 +116,7 @@ func (s *AgentSpecs) Type() string {
 // separator (ntm-mjf7).
 func agentTypeSupportsEffortSuffix(agentType AgentType) bool {
 	switch agentType {
-	case AgentTypeClaude, AgentTypeCodex, AgentTypeGrok:
+	case AgentTypeClaude, AgentTypeCodex, AgentTypeGrok, AgentTypeMuse:
 		return true
 	default:
 		return false
@@ -311,6 +312,8 @@ func ValidateModelAlias(agentType AgentType, alias string) error {
 		aliases = cfg.Models.Pi
 	case AgentTypeKimi:
 		aliases = cfg.Models.Kimi
+	case AgentTypeMuse:
+		aliases = cfg.Models.Muse
 	case AgentTypeGrok:
 		// Grok Build's available model IDs are account- and release-dependent.
 		// Known aliases still resolve through Models.Grok, but an exact model ID

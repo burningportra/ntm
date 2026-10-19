@@ -287,7 +287,7 @@ func parseArgumentReferencesAnyField(node parse.Node, wanted map[string]struct{}
 // the `N:model@effort` spec shorthand for the same set.
 func agentTypeConsumesReasoningEffort(agentType string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentType)) {
-	case "cc", "claude", "cod", "codex", "grok":
+	case "cc", "claude", "cod", "codex", "grok", "muse":
 		return true
 	default:
 		return false
@@ -414,6 +414,10 @@ func DefaultAgentTemplates() AgentConfig {
 		Kimi:     `kimi{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .SystemPromptFile}} --append-system-prompt "$(cat {{shellQuote .SystemPromptFile}})"{{end}}`,
 		Windsurf: `windsurf{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
 		Aider:    `aider{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		// Muse Code: --yolo trusts the workspace and disables approvals so the pane
+		// never stalls on the trust prompt. Muse has no system-prompt-file flag, so
+		// SystemPromptFile is not wired; it reads the repo's AGENTS.md/CLAUDE.md.
+		Muse: `muse --yolo{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .ReasoningEffort}} --reasoning-effort {{shellQuote .ReasoningEffort}}{{end}}`,
 		// Opencode (oc): the upstream `opencode` binary takes `-m/--model
 		// provider/model`. Without the {{.Model}} placeholder a
 		// `--oc=N:provider/model` spawn is rejected ("agent command has no

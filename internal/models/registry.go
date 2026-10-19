@@ -68,6 +68,15 @@ var ContextLimits = map[string]int{
 	// Moonshot Kimi models
 	"kimi-k2":      256000,
 	"kimi-k2-0905": 256000,
+
+	// Meta Muse Code models (context_limit from Muse's own model catalog)
+	"muse-wonder-1.0":      1007997,
+	"muse-wonder-full-1.0": 1007997,
+	"muse-spark-1.3":       1007997,
+	"muse-spark-1.2":       1007997,
+
+	// Vercel-hosted DeepSeek models (used via opencode as vercel/{provider}/{model})
+	"vercel/deepseek/deepseek-v4-flash": 1000000,
 }
 
 // Aliases maps short names and common variants to canonical model names.
@@ -106,6 +115,9 @@ var Aliases = map[string]string{
 
 	// Kimi aliases
 	"kimi": "kimi-k2",
+
+	// Muse aliases
+	"muse": "muse-wonder-1.0",
 }
 
 var (
@@ -225,6 +237,8 @@ var agentTypeBudgetPct = map[string]float64{
 	"agy":      0.10, // Antigravity (Gemini successor): mirrors Gemini's budget
 	"pi":       0.90, // Pi: provider-backed coding harness, use a conservative cloud-agent budget
 	"kimi":     0.90, // Kimi: 90% of limit (cloud coding CLI, similar overhead to Claude)
+	"muse":     0.90, // Muse Code: 90% of limit (cloud coding CLI, same budget as Kimi)
+	"oc":       0.90, // Opencode: provider-agnostic coding harness, conservative cloud-agent budget
 	"cursor":   0.85, // Cursor
 	"windsurf": 0.85, // Windsurf
 	"aider":    0.85, // Aider
@@ -239,6 +253,8 @@ var agentTypeDefaultModels = map[string]string{
 	"agy":      "gemini-3-pro-preview", // Antigravity pins Gemini 3 Pro
 	"pi":       "claude-opus-4",
 	"kimi":     "kimi-k2",
+	"muse":     "muse-wonder-1.0",
+	"oc":       "vercel/deepseek/deepseek-v4-flash",
 	"cursor":   "claude-3.5-sonnet",
 	"windsurf": "claude-3.5-sonnet",
 	"aider":    "claude-3.5-sonnet",

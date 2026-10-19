@@ -107,7 +107,7 @@ func (c *WebhookConfig) ValidateConfig() error {
 
 	for _, t := range c.Filter.AgentType {
 		if !isValidWebhookAgentType(t) {
-			return fmt.Errorf("invalid filter.agent_type %q (supported: claude, codex, gemini, pi, kimi, cursor, windsurf, aider, ollama)", strings.TrimSpace(t))
+			return fmt.Errorf("invalid filter.agent_type %q (supported: claude, codex, gemini, pi, kimi, muse, cursor, windsurf, aider, ollama)", strings.TrimSpace(t))
 		}
 	}
 
@@ -391,6 +391,7 @@ func isValidWebhookAgentType(agentType string) bool {
 		agent.AgentTypeGemini,
 		agent.AgentTypePi,
 		agent.AgentTypeKimi,
+		agent.AgentTypeMuse,
 		agent.AgentTypeCursor,
 		agent.AgentTypeWindsurf,
 		agent.AgentTypeAider,

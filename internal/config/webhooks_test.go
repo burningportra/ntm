@@ -267,6 +267,8 @@ func TestIsValidWebhookAgentType(t *testing.T) {
 		{"claude-code", true},
 		{"codex-cli", true},
 		{"google-gemini", true},
+		{"muse", true},
+		{"muse-code", true},
 		{"", false},
 		{"python", false},
 		{"claude2", false},

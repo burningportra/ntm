@@ -423,6 +423,38 @@ func TestDefaultAgentTemplates(t *testing.T) {
 	if cursorModel != "cursor-agent --yolo --model 'cursor-grok-4.5-high'" {
 		t.Errorf("Cursor model render = %q", cursorModel)
 	}
+
+	// Muse Code: --yolo is always present so the pane never stops at the
+	// workspace-trust prompt; model and effort render only when set.
+	museFull, err := GenerateAgentCommand(templates.Muse, AgentTemplateVars{
+		AgentType: "muse", Model: "muse-spark-1.3", ReasoningEffort: "xhigh",
+	})
+	if err != nil {
+		t.Fatalf("Muse template failed: %v", err)
+	}
+	wantMuse := "muse --yolo --model " + ShellQuote("muse-spark-1.3") + " --reasoning-effort " + ShellQuote("xhigh")
+	if museFull != wantMuse {
+		t.Errorf("Muse model+effort render = %q, want %q", museFull, wantMuse)
+	}
+	if museFull != "muse --yolo --model 'muse-spark-1.3' --reasoning-effort 'xhigh'" {
+		t.Errorf("Muse model+effort render = %q", museFull)
+	}
+	museBare, err := GenerateAgentCommand(templates.Muse, AgentTemplateVars{AgentType: "muse"})
+	if err != nil {
+		t.Fatalf("Muse bare template failed: %v", err)
+	}
+	if museBare != "muse --yolo" {
+		t.Errorf("Muse bare render = %q, want %q", museBare, "muse --yolo")
+	}
+	museSysPrompt, err := GenerateAgentCommand(templates.Muse, AgentTemplateVars{
+		AgentType: "muse", Model: "muse-wonder-1.0", SystemPromptFile: "/tmp/persona.md",
+	})
+	if err != nil {
+		t.Fatalf("Muse system-prompt template failed: %v", err)
+	}
+	if museSysPrompt != "muse --yolo --model 'muse-wonder-1.0'" {
+		t.Errorf("Muse render with SystemPromptFile = %q; Muse has no system-prompt flag, so none should be emitted", museSysPrompt)
+	}
 }
 
 func TestDefaultAgentTemplates_ShellQuoting(t *testing.T) {
@@ -477,6 +509,8 @@ func TestDefaultAgentTemplates_ShellQuoting(t *testing.T) {
 	// Gemini dropped --system-instruction-file in v0.31.0; only model quoting applies.
 	checkModelOnly("gemini", templates.Gemini)
 	checkModelOnly("grok", templates.Grok)
+	// Muse has no system-prompt-file flag; only model quoting applies.
+	checkModelOnly("muse", templates.Muse)
 }
 
 // TestShellQuote_Branches tests both branches of ShellQuote.
@@ -600,6 +634,18 @@ func TestGenerateAgentCommandGuardsDroppedReasoningEffort(t *testing.T) {
 		}
 		if !strings.Contains(got, "model_reasoning_effort='high'") || !strings.Contains(got, "'gpt-5.6-terra'") {
 			t.Fatalf("rendered = %q, want both the model and the effort", got)
+		}
+	})
+
+	t.Run("muse override without the placeholder is rejected", func(t *testing.T) {
+		// Muse's launch command takes --reasoning-effort, so an operator template
+		// that drops .ReasoningEffort must fail loudly like Codex and Grok do.
+		_, err := GenerateAgentCommand(
+			`muse --yolo{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+			AgentTemplateVars{AgentType: "muse", Model: "muse-spark-1.3", ReasoningEffort: "xhigh"},
+		)
+		if err == nil {
+			t.Fatal("muse effort override against a template lacking .ReasoningEffort was accepted")
 		}
 	})
 

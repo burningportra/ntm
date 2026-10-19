@@ -16,6 +16,10 @@ func TestGetContextLimit_ExactMatch(t *testing.T) {
 		{"gemini-pro", 32000},
 		{"o3-mini", 200000},
 		{"o4-mini", 128000},
+		{"muse-wonder-1.0", 1007997},
+		{"muse-wonder-full-1.0", 1007997},
+		{"muse-spark-1.3", 1007997},
+		{"muse-spark-1.2", 1007997},
 	}
 	for _, tt := range tests {
 		got := GetContextLimit(tt.model)
@@ -38,6 +42,7 @@ func TestGetContextLimit_Alias(t *testing.T) {
 		{"gemini", 1000000},
 		{"pro", 1000000},
 		{"flash", 1000000},
+		{"muse", 1007997},
 	}
 	for _, tt := range tests {
 		got := GetContextLimit(tt.model)
@@ -107,6 +112,10 @@ func TestGetTokenBudget(t *testing.T) {
 		{"gmi", 90000, 110000},           // 10% of 1M = 100K
 		{"gemini", 90000, 110000},        // Alias should canonicalize to gmi
 		{"google-gemini", 90000, 110000}, // Long-form alias should canonicalize to gmi
+		{"oc", 800000, 1000000},          // Opencode: 90% of 1M = 900K (vercel/deepseek/deepseek-v4-flash)
+		{"opencode", 800000, 1000000},    // Canonical to oc
+		{"muse", 907197, 907197},         // Muse Code: 90% of 1,007,997 (muse-wonder-1.0)
+		{"muse-code", 907197, 907197},    // Alias should canonicalize to muse
 		{"unknown", 90000, 110000},       // Default
 	}
 	for _, tt := range tests {

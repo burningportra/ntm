@@ -8,6 +8,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/spf13/pflag"
 )
 
 func TestParseAgentSpec_ModelValidation(t *testing.T) {
@@ -745,5 +746,50 @@ func TestEffortAtSuffixOnlyForEffortCapableTypes(t *testing.T) {
 	}
 	if got := codSpecs[len(codSpecs)-1]; got.Model != "gpt-5.6-terra" || got.ReasoningEffort != "high" {
 		t.Fatalf("cod spec did not split @ as effort: %+v", got)
+	}
+}
+
+// `--muse=1:spark` must reach the launch template as muse-spark-1.3, and a
+// bare `--muse=1` must resolve to the pinned default rather than an empty
+// model (which breaks Agent Mail registration).
+func TestMuseAgentSpecResolvesModelAliases(t *testing.T) {
+	oldCfg := cfg
+	defer func() { cfg = oldCfg }()
+	cfg = config.Default()
+
+	var specs AgentSpecs
+	fs := pflag.NewFlagSet("spawn", pflag.ContinueOnError)
+	fs.Var(NewAgentSpecsValue(AgentTypeMuse, &specs), "muse", "Muse Code agents")
+	if err := fs.Parse([]string{"--muse=1:spark", "--muse=2", "--muse=1:wonder-full@xhigh"}); err != nil {
+		t.Fatalf("parse --muse flags: %v", err)
+	}
+
+	flat := specs.Flatten()
+	if len(flat) != 4 {
+		t.Fatalf("flattened %d muse agents, want 4: %+v", len(flat), flat)
+	}
+	want := []struct{ model, effort string }{
+		{"muse-spark-1.3", ""},
+		{"muse-wonder-1.0", ""},
+		{"muse-wonder-1.0", ""},
+		{"muse-wonder-full-1.0", "xhigh"},
+	}
+	for i, a := range flat {
+		if a.Type != AgentTypeMuse {
+			t.Errorf("agent %d type = %q, want %q", i, a.Type, AgentTypeMuse)
+		}
+		if got := ResolveModel(a.Type, a.Model); got != want[i].model {
+			t.Errorf("agent %d (%q) resolved to %q, want %q", i, a.Model, got, want[i].model)
+		}
+		if a.ReasoningEffort != want[i].effort {
+			t.Errorf("agent %d effort = %q, want %q", i, a.ReasoningEffort, want[i].effort)
+		}
+	}
+
+	if err := ValidateModelAlias(AgentTypeMuse, "spark-1.2"); err != nil {
+		t.Errorf("ValidateModelAlias(muse, spark-1.2): %v", err)
+	}
+	if err := ValidateModelAlias(AgentTypeMuse, "nonexistent"); err == nil {
+		t.Error("ValidateModelAlias(muse, nonexistent) accepted an unknown alias")
 	}
 }
