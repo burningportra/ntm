@@ -120,6 +120,8 @@ func TestNormalizedProgramTypeSupportsModernAgents(t *testing.T) {
 		{program: "windsurf", want: "windsurf"},
 		{program: "aider", want: "aider"},
 		{program: "ollama", want: "ollama"},
+		// spawn registers Muse Code panes with Agent Mail program "muse".
+		{program: "muse", want: "muse"},
 		{program: "mystery-cli", want: "unknown"},
 	}
 

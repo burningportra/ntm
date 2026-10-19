@@ -3256,6 +3256,8 @@ func normalizedProgramType(program string) string {
 		return "aider"
 	case "ollama":
 		return "ollama"
+	case "muse":
+		return "muse"
 	case "user":
 		return "user"
 	default:
