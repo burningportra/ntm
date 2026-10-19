@@ -382,7 +382,7 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		promptUsed = source
 
 		// Send the prompt
-		if err := tmux.SendKeys(targetPaneID, promptContent, true); err != nil {
+		if err := sendControllerPrompt(targetPaneID, promptContent, agentTypeFull); err != nil {
 			return nil, fmt.Errorf("sending prompt: %w", err)
 		}
 	}
@@ -397,6 +397,19 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		AgentCount:          agentCount,
 		AgentList:           strings.Join(agentList, "\n"),
 	}, nil
+}
+
+// sendControllerPrompt types the controller prompt into its pane and submits
+// it. A Muse Code controller goes through the agent-aware send, which pastes a
+// multi-line prompt and holds Enter for tmux.MuseEnterDelay: typed with
+// send-keys, the multi-line default prompt stayed an unsent draft in Muse's
+// composer whether Enter followed 100 ms or 300 ms later (0 of 8 live), while
+// pasted it submitted 4 of 4. Other agent types keep the plain send-keys path.
+func sendControllerPrompt(paneID, prompt, agentTypeFull string) error {
+	if agentTypeFull == string(tmux.AgentMuse) {
+		return tmux.SendKeysForAgent(paneID, prompt, true, tmux.AgentMuse)
+	}
+	return tmux.SendKeys(paneID, prompt, true)
 }
 
 func controllerAgentList(panes []tmux.Pane) ([]string, int) {
