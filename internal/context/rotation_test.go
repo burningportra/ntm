@@ -879,6 +879,16 @@ func TestDefaultPaneSpawnerGetAgentCommand(t *testing.T) {
 	if got := spawner2.getAgentCommand("ollama"); got != "custom-ollama" {
 		t.Errorf("expected custom-ollama, got %q", got)
 	}
+
+	// Muse: an unset [agents] muse falls back to the launcher, and a configured
+	// one is used for every Muse alias.
+	if got := spawner2.getAgentCommand("muse-code"); got != "muse" {
+		t.Errorf("expected muse fallback for unset config, got %q", got)
+	}
+	cfg.Agents.Muse = "custom-muse"
+	if got := spawner2.getAgentCommand("muse-code"); got != "custom-muse" {
+		t.Errorf("expected custom-muse, got %q", got)
+	}
 }
 
 func TestSendCompactionCommandToPane_UsesBufferForPrompts(t *testing.T) {

@@ -140,6 +140,8 @@ func agentBadgeMeta(agentType string, t theme.Theme, ic icons.IconSet) (label st
 		return "gemini", t.Gemini, ic.Gemini
 	case agent.AgentTypeGrok:
 		return "grok", t.Pink, ic.Robot
+	case agent.AgentTypeMuse:
+		return "muse", t.Sky, ic.AgentIcon(string(agent.AgentTypeMuse))
 	case agent.AgentTypeAntigravity:
 		return "antigravity", t.Lavender, ic.Gemini
 	case agent.AgentTypeCursor:

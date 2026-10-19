@@ -1352,6 +1352,7 @@ func restartCanonicalAgentType(agentType string) agent.AgentType {
 		agent.AgentTypeGemini,
 		agent.AgentTypeAntigravity,
 		agent.AgentTypeGrok,
+		agent.AgentTypeMuse,
 		agent.AgentTypeCursor,
 		agent.AgentTypeWindsurf,
 		agent.AgentTypeAider,

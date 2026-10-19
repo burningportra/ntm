@@ -264,6 +264,10 @@ func (s *DefaultPaneSpawner) getAgentCommand(agentType string) string {
 			if s.config.Agents.Antigravity != "" {
 				return s.config.Agents.Antigravity
 			}
+		case agent.AgentTypeMuse:
+			if s.config.Agents.Muse != "" {
+				return s.config.Agents.Muse
+			}
 		case agent.AgentTypeCursor:
 			if s.config.Agents.Cursor != "" {
 				return s.config.Agents.Cursor
@@ -297,6 +301,8 @@ func (s *DefaultPaneSpawner) getAgentCommand(agentType string) string {
 		// SpawnAgent rejects Grok before creating a pane. Keep this helper
 		// fail-closed as a second defense against a bare `grok` fallback.
 		return ""
+	case agent.AgentTypeMuse:
+		return "muse"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
@@ -392,6 +398,8 @@ func agentTypeShort(agentType string) string {
 		return "gmi"
 	case agent.AgentTypeAntigravity:
 		return "agy"
+	case agent.AgentTypeMuse:
+		return "muse"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
@@ -418,6 +426,8 @@ func agentTypeLong(shortType string) string {
 		return "gemini"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
+	case agent.AgentTypeMuse:
+		return "muse"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:

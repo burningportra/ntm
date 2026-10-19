@@ -411,7 +411,7 @@ func waitForPaneCommand(paneID, expected string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		current, err := currentPaneCommand(paneID)
-		if err == nil && current == expected {
+		if err == nil && paneCommandMatches(current, expected) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -422,6 +422,16 @@ func waitForPaneCommand(paneID, expected string, timeout time.Duration) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// paneCommandMatches reports whether tmux's pane_current_command shows the
+// launched command. The `muse` launcher execs a versioned muse-bin-* binary,
+// so a pane started with `muse` reports that binary rather than `muse`.
+func paneCommandMatches(current, expected string) bool {
+	if current == expected {
+		return true
+	}
+	return expected == "muse" && looksLikeMuseBinary(current)
 }
 
 func currentPaneCommand(paneID string) (string, error) {
@@ -957,7 +967,7 @@ func restorableAgentCommand(pane PaneState) string {
 	}
 
 	command := strings.TrimSpace(pane.Command)
-	if command != "" && !looksLikeShellCommand(command) {
+	if command != "" && !looksLikeShellCommand(command) && !looksLikeMuseBinary(command) {
 		return command
 	}
 
@@ -968,6 +978,8 @@ func restorableAgentCommand(pane PaneState) string {
 		return "codex"
 	case agent.AgentTypeGemini:
 		return "gemini"
+	case agent.AgentTypeMuse:
+		return "muse"
 	case agent.AgentTypeAntigravity:
 		// agy's launch binary is "agy" (distinct from the gemini CLI).
 		return "agy"
@@ -984,6 +996,20 @@ func restorableAgentCommand(pane PaneState) string {
 	default:
 		return ""
 	}
+}
+
+// looksLikeMuseBinary reports whether command is the versioned binary that the
+// `muse` launcher script execs (muse-bin-1.4.11-R6667.1, which tmux truncates
+// to muse-bin-1.4.11 in pane_current_command). The truncated name is not on
+// PATH and the launcher also handles auth and updates, so a restore relaunches
+// through `muse` instead of replaying the recorded name.
+func looksLikeMuseBinary(command string) bool {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false
+	}
+	name := strings.ToLower(filepath.Base(fields[0]))
+	return name == "muse-bin" || strings.HasPrefix(name, "muse-bin-")
 }
 
 func looksLikeShellCommand(command string) bool {

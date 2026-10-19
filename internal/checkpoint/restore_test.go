@@ -1085,6 +1085,31 @@ func TestRestorableAgentCommand(t *testing.T) {
 			pane: PaneState{AgentType: "user", Command: "bash"},
 			want: "",
 		},
+		{
+			name: "muse pane recorded at a shell relaunches muse",
+			pane: PaneState{AgentType: "muse", Command: "zsh"},
+			want: "muse",
+		},
+		{
+			name: "muse alias without a command relaunches muse",
+			pane: PaneState{AgentType: "muse-code"},
+			want: "muse",
+		},
+		{
+			name: "muse pane recorded as the truncated versioned binary relaunches the launcher",
+			pane: PaneState{AgentType: "muse", Command: "muse-bin-1.4.11"},
+			want: "muse",
+		},
+		{
+			name: "muse pane recorded as the full versioned binary path relaunches the launcher",
+			pane: PaneState{AgentType: "muse", Command: "/Users/me/.local/bin/muse-bin-1.4.11-R6667.1 --yolo"},
+			want: "muse",
+		},
+		{
+			name: "muse pane with a custom launch command keeps it",
+			pane: PaneState{AgentType: "muse", Command: "muse --yolo --model muse-spark-1.3"},
+			want: "muse --yolo --model muse-spark-1.3",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1153,6 +1178,32 @@ func TestExpectedPaneCommand(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := expectedPaneCommand(tt.command); got != tt.want {
 				t.Fatalf("expectedPaneCommand(%q) = %q, want %q", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPaneCommandMatches(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  string
+		expected string
+		want     bool
+	}{
+		{name: "exact match", current: "codex", expected: "codex", want: true},
+		{name: "different command", current: "zsh", expected: "codex", want: false},
+		{name: "muse launcher exec'd its truncated versioned binary", current: "muse-bin-1.4.11", expected: "muse", want: true},
+		{name: "muse launcher exec'd its full versioned binary", current: "muse-bin-1.4.11-R6667.1", expected: "muse", want: true},
+		{name: "muse launcher still running before exec", current: "muse", expected: "muse", want: true},
+		{name: "muse not started yet", current: "zsh", expected: "muse", want: false},
+		{name: "muse binary does not satisfy another agent", current: "muse-bin-1.4.11", expected: "claude", want: false},
+		{name: "unrelated muse-prefixed command", current: "museum", expected: "muse", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := paneCommandMatches(tt.current, tt.expected); got != tt.want {
+				t.Fatalf("paneCommandMatches(%q, %q) = %v, want %v", tt.current, tt.expected, got, tt.want)
 			}
 		})
 	}

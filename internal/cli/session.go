@@ -98,6 +98,10 @@ func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (
 		return string(th.Lavender), ic.AgentIcon(string(agentpkg.AgentTypeAntigravity))
 	case agentpkg.AgentTypeGrok:
 		return string(th.Pink), ic.AgentIcon(string(agentpkg.AgentTypeGrok))
+	case agentpkg.AgentTypeMuse:
+		// Muse Code gets the sky accent, which no other agent type uses
+		// (matching the semantic theme palette).
+		return string(th.Sky), ic.AgentIcon(string(agentpkg.AgentTypeMuse))
 	case agentpkg.AgentTypeCursor:
 		return string(th.Cursor), ic.AgentIcon(string(agentpkg.AgentTypeCursor))
 	case agentpkg.AgentTypeWindsurf:
@@ -1751,6 +1755,10 @@ func modelNameForPane(p tmux.Pane) string {
 			if cfg.Models.DefaultGrok != "" {
 				return cfg.Models.DefaultGrok
 			}
+		case tmux.AgentMuse:
+			if cfg.Models.DefaultMuse != "" {
+				return cfg.Models.DefaultMuse
+			}
 		case tmux.AgentOllama:
 			if cfg.Models.DefaultOllama != "" {
 				return cfg.Models.DefaultOllama
@@ -1769,6 +1777,8 @@ func modelNameForPane(p tmux.Pane) string {
 		return defaults.DefaultGemini
 	case tmux.AgentGrok:
 		return defaults.DefaultGrok
+	case tmux.AgentMuse:
+		return defaults.DefaultMuse
 	case tmux.AgentOllama:
 		return defaults.DefaultOllama
 	default:

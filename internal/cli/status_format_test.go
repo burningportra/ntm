@@ -92,6 +92,9 @@ func TestModelNameForPane(t *testing.T) {
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentGrok}); got != defaults.DefaultGrok {
 		t.Errorf("default grok model = %q, want %q", got, defaults.DefaultGrok)
 	}
+	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentMuse}); got != "muse-wonder-1.0" {
+		t.Errorf("default muse model = %q, want %q", got, "muse-wonder-1.0")
+	}
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentOllama}); got != defaults.DefaultOllama {
 		t.Errorf("default ollama model = %q, want %q", got, defaults.DefaultOllama)
 	}
@@ -104,6 +107,7 @@ func TestModelNameForPane(t *testing.T) {
 	cfg.Models.DefaultCodex = "codex-test"
 	cfg.Models.DefaultGemini = "gemini-test"
 	cfg.Models.DefaultGrok = "grok-test"
+	cfg.Models.DefaultMuse = "muse-test"
 	cfg.Models.DefaultOllama = "ollama-test"
 
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentClaude}); got != "claude-test" {
@@ -117,6 +121,13 @@ func TestModelNameForPane(t *testing.T) {
 	}
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("xai-grok-build")}); got != "grok-test" {
 		t.Errorf("cfg grok alias model = %q", got)
+	}
+	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("muse-code")}); got != "muse-test" {
+		t.Errorf("cfg muse alias model = %q", got)
+	}
+	cfg.Models.DefaultMuse = ""
+	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentMuse}); got != defaults.DefaultMuse {
+		t.Errorf("empty cfg muse model = %q, want compiled-in default %q", got, defaults.DefaultMuse)
 	}
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentOllama}); got != "ollama-test" {
 		t.Errorf("cfg ollama model = %q", got)
@@ -145,6 +156,8 @@ func TestSessionPanePresentationCanonicalizesAliases(t *testing.T) {
 		{name: "codex alias", agentType: tmux.AgentType("openai-codex"), wantColor: string(th.Codex), wantIcon: ic.Codex},
 		{name: "gemini alias", agentType: tmux.AgentType("google-gemini"), wantColor: string(th.Gemini), wantIcon: ic.Gemini},
 		{name: "grok alias", agentType: tmux.AgentType("xai-grok-build"), wantColor: string(th.Pink), wantIcon: ic.Robot},
+		{name: "muse", agentType: tmux.AgentMuse, wantColor: string(th.Sky), wantIcon: ic.Robot},
+		{name: "muse alias", agentType: tmux.AgentType("muse-code"), wantColor: string(th.Sky), wantIcon: ic.Robot},
 		{name: "cursor", agentType: tmux.AgentCursor, wantColor: string(th.Cursor), wantIcon: ic.Cursor},
 		{name: "windsurf alias", agentType: tmux.AgentType("ws"), wantColor: string(th.Windsurf), wantIcon: ic.Windsurf},
 		{name: "aider", agentType: tmux.AgentAider, wantColor: string(th.Aider), wantIcon: ic.Aider},
@@ -182,6 +195,9 @@ func TestModelNameForPaneCanonicalizesAliases(t *testing.T) {
 	}
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("google-gemini")}); got != aliasDefaults.DefaultGemini {
 		t.Fatalf("gemini alias model = %q, want %q", got, aliasDefaults.DefaultGemini)
+	}
+	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("meta-muse")}); got != aliasDefaults.DefaultMuse {
+		t.Fatalf("muse alias model = %q, want %q", got, aliasDefaults.DefaultMuse)
 	}
 }
 

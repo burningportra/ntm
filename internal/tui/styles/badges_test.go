@@ -27,6 +27,8 @@ func TestAgentBadge(t *testing.T) {
 		{"google-gemini", "gemini"},
 		{"grok", "grok"},
 		{"grok-build", "grok"},
+		{"muse", "muse"},
+		{"muse-code", "muse"},
 		{"ws", "windsurf"},
 		{"user", "user"},
 		{"unknown", "unknown"},
@@ -53,6 +55,24 @@ func TestAgentBadgeMeta_Grok(t *testing.T) {
 	label, color, icon := agentBadgeMeta("grok-build", currentTheme, currentIcons)
 	if label != "grok" || color != currentTheme.Pink || icon != currentIcons.Robot {
 		t.Fatalf("agentBadgeMeta(grok-build) = (%q, %q, %q), want (%q, %q, %q)", label, color, icon, "grok", currentTheme.Pink, currentIcons.Robot)
+	}
+}
+
+func TestAgentBadgeMeta_Muse(t *testing.T) {
+	th := theme.CatppuccinMocha
+	ic := icons.ASCII
+
+	label, color, icon := agentBadgeMeta("muse-code", th, ic)
+	if label != "muse" || color != th.Sky || icon != ic.AgentIcon("muse") {
+		t.Fatalf("agentBadgeMeta(muse-code) = (%q, %q, %q), want (%q, %q, %q)", label, color, icon, "muse", th.Sky, ic.AgentIcon("muse"))
+	}
+
+	// Muse's badge color must not collide with any other agent type's.
+	others := []string{"claude", "codex", "gemini", "grok", "antigravity", "cursor", "windsurf", "aider", "ollama", "user"}
+	for _, other := range others {
+		if _, otherColor, _ := agentBadgeMeta(other, th, ic); otherColor == color {
+			t.Errorf("agentBadgeMeta(%q) color %q collides with muse", other, otherColor)
+		}
 	}
 }
 
