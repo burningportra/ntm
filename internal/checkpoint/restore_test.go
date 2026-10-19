@@ -1085,25 +1085,32 @@ func TestRestorableAgentCommand(t *testing.T) {
 			pane: PaneState{AgentType: "user", Command: "bash"},
 			want: "",
 		},
+		// A bare `muse` stops at the workspace trust prompt (--yolo does not
+		// record trust), so every Muse fallback relaunches with --yolo.
 		{
-			name: "muse pane recorded at a shell relaunches muse",
+			name: "muse pane recorded at a shell relaunches muse --yolo",
 			pane: PaneState{AgentType: "muse", Command: "zsh"},
-			want: "muse",
+			want: "muse --yolo",
 		},
 		{
-			name: "muse alias without a command relaunches muse",
+			name: "muse alias without a command relaunches muse --yolo",
 			pane: PaneState{AgentType: "muse-code"},
-			want: "muse",
+			want: "muse --yolo",
+		},
+		{
+			name: "muse pane recorded as the launcher relaunches with --yolo",
+			pane: PaneState{AgentType: "muse", Command: "muse"},
+			want: "muse --yolo",
 		},
 		{
 			name: "muse pane recorded as the truncated versioned binary relaunches the launcher",
 			pane: PaneState{AgentType: "muse", Command: "muse-bin-1.4.11"},
-			want: "muse",
+			want: "muse --yolo",
 		},
 		{
 			name: "muse pane recorded as the full versioned binary path relaunches the launcher",
 			pane: PaneState{AgentType: "muse", Command: "/Users/me/.local/bin/muse-bin-1.4.11-R6667.1 --yolo"},
-			want: "muse",
+			want: "muse --yolo",
 		},
 		{
 			name: "muse pane with a custom launch command keeps it",
@@ -1171,6 +1178,11 @@ func TestExpectedPaneCommand(t *testing.T) {
 			name:    "env and exec prefixes",
 			command: "env FOO=bar exec codex --search",
 			want:    "codex",
+		},
+		{
+			name:    "muse restore command",
+			command: "muse --yolo",
+			want:    "muse",
 		},
 	}
 

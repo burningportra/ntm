@@ -966,8 +966,11 @@ func restorableAgentCommand(pane PaneState) string {
 		return ""
 	}
 
+	// A Muse pane records either the `muse` launcher or the binary it execs;
+	// neither name carries --yolo, so both relaunch through the default below.
 	command := strings.TrimSpace(pane.Command)
-	if command != "" && !looksLikeShellCommand(command) && !looksLikeMuseBinary(command) {
+	bareMuseLauncher := agentType == agent.AgentTypeMuse && strings.EqualFold(command, "muse")
+	if command != "" && !looksLikeShellCommand(command) && !looksLikeMuseBinary(command) && !bareMuseLauncher {
 		return command
 	}
 
@@ -979,7 +982,11 @@ func restorableAgentCommand(pane PaneState) string {
 	case agent.AgentTypeGemini:
 		return "gemini"
 	case agent.AgentTypeMuse:
-		return "muse"
+		// A bare `muse` stops at "Do you trust this workspace?" in any
+		// directory the user has not trusted by hand (--yolo does not record
+		// trust), and runs with approvals on where it has been trusted.
+		// --yolo, as in the spawn template, avoids both.
+		return "muse --yolo"
 	case agent.AgentTypeAntigravity:
 		// agy's launch binary is "agy" (distinct from the gemini CLI).
 		return "agy"
