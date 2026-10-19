@@ -216,7 +216,7 @@ func TestNudgeUnreadMailOnlyForIdlePanesWithCooldown(t *testing.T) {
 		return []agentmail.InboxMessage{{ID: 1}}, nil
 	}
 	var nudged []string
-	c.sendNudgeFn = func(_ context.Context, paneID string) error {
+	c.sendNudgeFn = func(_ context.Context, paneID, _ string) error {
 		nudged = append(nudged, paneID)
 		return nil
 	}
@@ -225,6 +225,38 @@ func TestNudgeUnreadMailOnlyForIdlePanesWithCooldown(t *testing.T) {
 	c.nudgeUnreadMail(t.Context())
 	if len(nudged) != 1 || nudged[0] != "%1" {
 		t.Fatalf("nudged panes = %v, want only idle pane %%1 once", nudged)
+	}
+}
+
+// A Muse Code pane needs the agent-aware send for its 300 ms Enter floor, so
+// the default nudge must carry the pane's agent type down to the send.
+func TestNudgeUnreadMailSendsWithPaneAgentType(t *testing.T) {
+	origSend := sendKeysForAgentContext
+	t.Cleanup(func() { sendKeysForAgentContext = origSend })
+	type sent struct {
+		paneID, keys string
+		enter        bool
+		agentType    tmux.AgentType
+	}
+	var got []sent
+	sendKeysForAgentContext = func(_ context.Context, target, keys string, enter bool, agentType tmux.AgentType) error {
+		got = append(got, sent{target, keys, enter, agentType})
+		return nil
+	}
+
+	c := New("mail-nudge-muse", t.TempDir(), nil, "Coordinator")
+	c.config.MailNudge = true
+	c.agents = map[string]*AgentState{
+		"%3": {PaneID: "%3", AgentType: string(tmux.AgentMuse), AgentMailName: "MuseFox", Status: robot.StateWaiting, ObservationFreshness: status.FreshnessFresh, Healthy: true},
+	}
+	c.fetchInboxFn = func(context.Context, agentmail.FetchInboxOptions) ([]agentmail.InboxMessage, error) {
+		return []agentmail.InboxMessage{{ID: 1}}, nil
+	}
+
+	c.nudgeUnreadMail(t.Context())
+	want := sent{"%3", mailNudgeMessage, true, tmux.AgentMuse}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("nudge sends = %+v, want one agent-aware send %+v", got, want)
 	}
 }
 

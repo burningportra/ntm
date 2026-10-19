@@ -24,9 +24,13 @@ import (
 var (
 	getPanesWithActivity         = tmux.GetPanesWithActivity
 	captureForHealthCheckWithCtx = tmux.CaptureForHealthCheckContext
+	sendKeysForAgentContext      = tmux.SendKeysForAgentContext
 )
 
-const mailNudgeCooldown = 5 * time.Minute
+const (
+	mailNudgeCooldown = 5 * time.Minute
+	mailNudgeMessage  = "You have unread Agent Mail. Please check your inbox when ready."
+)
 
 // SessionCoordinator manages agent coordination for a tmux session.
 type SessionCoordinator struct {
@@ -50,7 +54,7 @@ type SessionCoordinator struct {
 	claimBeadForAssignmentFn    func(context.Context, string, string, string, []string) (bv.BeadClaimResult, error)
 	releaseWorkItemClaimFn      func(context.Context, string, string, string) (bool, error)
 	fetchInboxFn                func(context.Context, agentmail.FetchInboxOptions) ([]agentmail.InboxMessage, error)
-	sendNudgeFn                 func(context.Context, string) error
+	sendNudgeFn                 func(ctx context.Context, paneID, agentType string) error
 	operatorGatedLabels         []string
 
 	// Agent tracking
@@ -195,8 +199,11 @@ func New(session, projectKey string, mailClient *agentmail.Client, agentName str
 	if mailClient != nil {
 		c.fetchInboxFn = mailClient.FetchInbox
 	}
-	c.sendNudgeFn = func(ctx context.Context, paneID string) error {
-		return tmux.SendKeysContext(ctx, paneID, "You have unread Agent Mail. Please check your inbox when ready.", true)
+	// The nudge goes through the agent-aware send so a Muse Code pane gets
+	// its 300 ms Enter floor: typed with the plain 100 ms Enter, the nudge
+	// stayed an unsent draft in Muse's composer in 6 of 6 live trials.
+	c.sendNudgeFn = func(ctx context.Context, paneID, agentType string) error {
+		return sendKeysForAgentContext(ctx, paneID, mailNudgeMessage, true, tmux.AgentType(agentType))
 	}
 	return c
 }
@@ -444,7 +451,7 @@ func (c *SessionCoordinator) nudgeUnreadMail(ctx context.Context) {
 		if !hasUnread {
 			continue
 		}
-		if err := sendNudge(ctx, agent.PaneID); err != nil {
+		if err := sendNudge(ctx, agent.PaneID, agent.AgentType); err != nil {
 			slog.Warn("coordinator could not nudge pane for unread Agent Mail", "session", c.session, "pane", agent.PaneID, "error", err)
 			continue
 		}
