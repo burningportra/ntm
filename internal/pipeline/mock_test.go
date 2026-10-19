@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -361,5 +362,62 @@ func TestExecutorRunUsesMockTmuxClient(t *testing.T) {
 	}
 	if history[0].Content != "hello from mock" || !history[0].Enter {
 		t.Fatalf("PasteHistory[0] = %+v, want entered prompt", history[0])
+	}
+}
+
+// A Muse Code pane needs the agent-aware send, which pastes a multi-line
+// prompt and holds Enter for tmux.MuseEnterDelay; every other agent keeps
+// PasteKeys. Covers the prompt step and the parallel sub-step send paths.
+func TestExecutorSendsMusePromptsThroughAgentAwareSend(t *testing.T) {
+	mock := NewMockTmuxClient(
+		tmux.Pane{ID: "%1", Index: 1, Title: "mock-session__muse_1", Type: tmux.AgentMuse},
+		tmux.Pane{ID: "%2", Index: 2, Title: "mock-session__cod_1", Type: tmux.AgentCodex},
+	)
+	cfg := DefaultExecutorConfig("mock-session")
+	cfg.ProjectDir = t.TempDir()
+	executor := NewExecutor(cfg)
+	executor.SetTmuxClient(mock)
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "muse-send-workflow",
+		Settings:      DefaultWorkflowSettings(),
+		Steps: []Step{
+			{ID: "muse", Prompt: "review the diff\nthen report", Pane: PaneSpec{Index: 1}, Wait: WaitNone},
+			{ID: "codex", Prompt: "review the diff\nthen report", Pane: PaneSpec{Index: 2}, Wait: WaitNone},
+			{ID: "fan", Parallel: ParallelSpec{Steps: []Step{
+				{ID: "fan-muse", Prompt: "fan out\nto muse", Pane: PaneSpec{Index: 1}, Wait: WaitNone},
+			}}},
+		},
+	}
+
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	for _, id := range []string{"muse", "codex", "fan"} {
+		if got := state.Steps[id]; got.Status != StatusCompleted {
+			t.Fatalf("step %s status = %q, want %q; error: %+v", id, got.Status, StatusCompleted, got.Error)
+		}
+	}
+
+	for pane, want := range map[string][]tmux.AgentType{
+		"%1": {tmux.AgentMuse, tmux.AgentMuse},
+		"%2": {""},
+	} {
+		history, err := mock.PasteHistory(pane)
+		if err != nil {
+			t.Fatalf("PasteHistory(%s) returned error: %v", pane, err)
+		}
+		got := make([]tmux.AgentType, len(history))
+		for i, paste := range history {
+			if !paste.Enter {
+				t.Fatalf("PasteHistory(%s)[%d] = %+v, want an entered prompt", pane, i, paste)
+			}
+			got[i] = paste.AgentType
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("pane %s sends used agent types %q, want %q (empty = PasteKeys)", pane, got, want)
+		}
 	}
 }

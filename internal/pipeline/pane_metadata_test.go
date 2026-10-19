@@ -303,6 +303,10 @@ func (c *countingPaneMetadataClient) PasteKeys(string, string, bool) error {
 	return nil
 }
 
+func (c *countingPaneMetadataClient) SendKeysForAgent(string, string, bool, tmux.AgentType) error {
+	return nil
+}
+
 func (c *countingPaneMetadataClient) CapturePaneOutput(string, int) (string, error) {
 	return "", nil
 }
@@ -515,6 +519,9 @@ type erroringTmuxClient struct {
 func (e *erroringTmuxClient) GetPanes(string) ([]tmux.Pane, error)          { return nil, e.err }
 func (e *erroringTmuxClient) PasteKeys(string, string, bool) error          { return nil }
 func (e *erroringTmuxClient) CapturePaneOutput(string, int) (string, error) { return "", nil }
+func (e *erroringTmuxClient) SendKeysForAgent(string, string, bool, tmux.AgentType) error {
+	return nil
+}
 
 // TestLoadPaneMetadataCache_RosterFallbackOnSessionError covers bd-ujk04:
 // a tmux/session lookup failure (resumed-offline session, missing tmux

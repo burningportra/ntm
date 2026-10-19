@@ -19,6 +19,7 @@ import (
 type TmuxClient interface {
 	GetPanes(session string) ([]tmux.Pane, error)
 	PasteKeys(target, content string, enter bool) error
+	SendKeysForAgent(target, content string, enter bool, agentType tmux.AgentType) error
 	CapturePaneOutput(target string, lines int) (string, error)
 }
 
@@ -32,15 +33,33 @@ func (realTmuxClient) PasteKeys(target, content string, enter bool) error {
 	return tmux.PasteKeys(target, content, enter)
 }
 
+func (realTmuxClient) SendKeysForAgent(target, content string, enter bool, agentType tmux.AgentType) error {
+	return tmux.SendKeysForAgent(target, content, enter, agentType)
+}
+
+// sendPrompt types prompt into paneID and submits it. A Muse Code pane goes
+// through the agent-aware send, which pastes a multi-line prompt and holds
+// Enter for tmux.MuseEnterDelay: typed by PasteKeys with a 100 ms Enter, a
+// multi-line prompt stayed an unsent draft in Muse's composer. Other agent
+// types keep PasteKeys.
+func sendPrompt(client TmuxClient, paneID, agentType, prompt string) error {
+	if tmux.AgentType(agentType).Canonical() == tmux.AgentMuse {
+		return client.SendKeysForAgent(paneID, prompt, true, tmux.AgentMuse)
+	}
+	return client.PasteKeys(paneID, prompt, true)
+}
+
 func (realTmuxClient) CapturePaneOutput(target string, lines int) (string, error) {
 	return tmux.CapturePaneOutput(target, lines)
 }
 
-// MockTmuxPaste records one PasteKeys call made against the mock.
+// MockTmuxPaste records one PasteKeys or SendKeysForAgent call made against
+// the mock. AgentType is set only for SendKeysForAgent.
 type MockTmuxPaste struct {
-	Target  string
-	Content string
-	Enter   bool
+	Target    string
+	Content   string
+	Enter     bool
+	AgentType tmux.AgentType
 }
 
 type mockTmuxPaneState struct {
@@ -164,6 +183,16 @@ func (m *MockTmuxClient) GetPanes(session string) ([]tmux.Pane, error) {
 
 // PasteKeys records the prompt and appends it to the target pane's output.
 func (m *MockTmuxClient) PasteKeys(target, content string, enter bool) error {
+	return m.send(target, content, enter, "")
+}
+
+// SendKeysForAgent records the prompt with its agent type and appends it to
+// the target pane's output, exactly as PasteKeys does.
+func (m *MockTmuxClient) SendKeysForAgent(target, content string, enter bool, agentType tmux.AgentType) error {
+	return m.send(target, content, enter, agentType)
+}
+
+func (m *MockTmuxClient) send(target, content string, enter bool, agentType tmux.AgentType) error {
 	m.mu.Lock()
 	_, ok := m.panes[target]
 	scripter := m.scripter
@@ -192,9 +221,10 @@ func (m *MockTmuxClient) PasteKeys(target, content string, enter bool) error {
 		return fmt.Errorf("mock tmux pane %q not found", target)
 	}
 	state.pastes = append(state.pastes, MockTmuxPaste{
-		Target:  target,
-		Content: content,
-		Enter:   enter,
+		Target:    target,
+		Content:   content,
+		Enter:     enter,
+		AgentType: agentType,
 	})
 	state.output += content
 	if enter {

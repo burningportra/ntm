@@ -63,7 +63,7 @@ func Execute(ctx context.Context, p Pipeline) error {
 		}
 
 		// 3. Send prompt
-		if err := tmux.PasteKeys(paneID, prompt, true); err != nil {
+		if err := sendPrompt(realTmuxClient{}, paneID, stage.AgentType, prompt); err != nil {
 			return fmt.Errorf("stage %d sending prompt: %w", i+1, err)
 		}
 
