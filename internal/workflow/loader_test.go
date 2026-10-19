@@ -428,6 +428,11 @@ func TestProfileToAgentType(t *testing.T) {
 		// Aider variants
 		{"aider", "aider"},
 		{"AIDER", "aider"},
+		// Muse Code variants must not fall back to Claude
+		{"muse", "muse"},
+		{"muse-code", "muse"},
+		{"muse-cli", "muse"},
+		{"MUSE", "muse"},
 		// Unknown profiles default to Claude
 		{"tester", "cc"},
 		{"implementer", "cc"},
