@@ -290,8 +290,14 @@ func (p *PromptInjector) sendToPane(sessionPane, agentType string, prompt string
 		return fmt.Errorf("send prompt text: %w", err)
 	}
 
-	// Wait before sending Enter
-	time.Sleep(p.EnterDelay)
+	// Wait before sending Enter. Muse Code takes an Enter that arrives
+	// within MuseEnterDelay of the text as a newline in the draft, so a Muse
+	// pane gets the same floor the agent-aware send applies.
+	enterDelay := p.EnterDelay
+	if aType.Canonical() == tmux.AgentMuse {
+		enterDelay = max(enterDelay, tmux.MuseEnterDelay)
+	}
+	time.Sleep(enterDelay)
 
 	// Send first Enter
 	if err := client.SendKeys(sessionPane, "", true); err != nil {

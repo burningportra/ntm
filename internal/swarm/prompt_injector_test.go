@@ -38,6 +38,49 @@ func (c *countingPromptInjectionTmuxClient) SendKeysForAgent(string, string, boo
 	return nil
 }
 
+// timedPromptInjectionTmuxClient shows an idle Muse composer and records when
+// the prompt text and each Enter were sent.
+type timedPromptInjectionTmuxClient struct {
+	textSentAt  time.Time
+	enterSentAt []time.Time
+}
+
+func (c *timedPromptInjectionTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
+	return "────────\n❯\n────────\n", nil
+}
+
+func (c *timedPromptInjectionTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
+	return nil, nil
+}
+
+func (c *timedPromptInjectionTmuxClient) SendKeys(_ string, keys string, enter bool) error {
+	if keys == "" && enter {
+		c.enterSentAt = append(c.enterSentAt, time.Now())
+	}
+	return nil
+}
+
+func (c *timedPromptInjectionTmuxClient) SendKeysForAgent(string, string, bool, tmux.AgentType) error {
+	c.textSentAt = time.Now()
+	return nil
+}
+
+func TestPromptInjector_MuseEnterWaitsForEnterFloor(t *testing.T) {
+	client := &timedPromptInjectionTmuxClient{}
+	injector := NewPromptInjector()
+	injector.tmuxClientOverride = client
+
+	if err := injector.sendToPane("proj:1.2", "muse-code", "start\nwith the triage"); err != nil {
+		t.Fatalf("sendToPane() error = %v", err)
+	}
+	if client.textSentAt.IsZero() || len(client.enterSentAt) != 1 {
+		t.Fatalf("text sent at %v, Enters %v; want the text then one Enter", client.textSentAt, client.enterSentAt)
+	}
+	if gap := client.enterSentAt[0].Sub(client.textSentAt); gap < tmux.MuseEnterDelay {
+		t.Fatalf("Enter followed the prompt by %v, want at least tmux.MuseEnterDelay (%v)", gap, tmux.MuseEnterDelay)
+	}
+}
+
 func TestNewPromptInjector(t *testing.T) {
 	injector := NewPromptInjector()
 
