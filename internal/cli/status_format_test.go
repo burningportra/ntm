@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/models"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -138,6 +139,46 @@ func TestModelNameForPane(t *testing.T) {
 	}
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("ollama"), Variant: "mistral"}); got != "mistral" {
 		t.Errorf("ollama variant override = %q", got)
+	}
+}
+
+// A Muse pane's title variant is the spawn alias, optionally with "@effort".
+// `ntm status` must resolve it to the Muse model id, or the context registry
+// falls back to the 128K default instead of Muse's 1,007,997-token window.
+func TestModelNameForPaneResolvesMuseVariant(t *testing.T) {
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+
+	tests := []struct {
+		variant string
+		want    string
+	}{
+		{variant: "spark", want: "muse-spark-1.3"},
+		{variant: "SPARK", want: "muse-spark-1.3"},
+		{variant: "spark-1.2@low", want: "muse-spark-1.2"},
+		{variant: "wonder-full@xhigh", want: "muse-wonder-full-1.0"},
+		{variant: "muse-spark-1.2", want: "muse-spark-1.2"},
+	}
+	for _, withCfg := range []bool{false, true} {
+		cfg = nil
+		if withCfg {
+			cfg = config.Default()
+		}
+		for _, tc := range tests {
+			got := modelNameForPane(tmux.Pane{Type: tmux.AgentMuse, Variant: tc.variant})
+			if got != tc.want {
+				t.Errorf("cfg=%v variant %q: model = %q, want %q", withCfg, tc.variant, got, tc.want)
+			}
+			if limit := models.GetContextLimit(got); limit != 1007997 {
+				t.Errorf("cfg=%v variant %q: context limit = %d, want 1007997", withCfg, tc.variant, limit)
+			}
+		}
+	}
+
+	cfg = config.Default()
+	cfg.Models.Muse["fast"] = "muse-spark-1.2"
+	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("muse-code"), Variant: "fast@high"}); got != "muse-spark-1.2" {
+		t.Errorf("operator alias variant = %q, want %q", got, "muse-spark-1.2")
 	}
 }
 

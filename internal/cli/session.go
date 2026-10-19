@@ -1739,10 +1739,13 @@ func formatDuration(d time.Duration) string {
 }
 
 func modelNameForPane(p tmux.Pane) string {
+	agentType := tmux.AgentType(p.Type).Canonical()
 	if p.Variant != "" {
+		if agentType == tmux.AgentMuse {
+			return museModelForVariant(p.Variant)
+		}
 		return p.Variant
 	}
-	agentType := tmux.AgentType(p.Type).Canonical()
 	if cfg != nil {
 		switch agentType {
 		case tmux.AgentClaude:
@@ -1792,6 +1795,20 @@ func modelNameForPane(p tmux.Pane) string {
 	default:
 		return ""
 	}
+}
+
+// museModelForVariant resolves a Muse pane's title variant to a Muse model id.
+// Muse panes are titled with the config alias they were spawned with ("spark")
+// plus an "@effort" suffix when one was given ("wonder-full@xhigh"). Neither is
+// a model id the context registry knows, so passing the raw variant through made
+// `ntm status` report the 128K fallback window instead of Muse's real one.
+func museModelForVariant(variant string) string {
+	alias, _ := tmux.ParsePaneVariant(variant)
+	modelsCfg := config.DefaultModels()
+	if cfg != nil {
+		modelsCfg = cfg.Models
+	}
+	return modelsCfg.GetModelName(string(tmux.AgentMuse), alias)
 }
 
 func paneLabel(session string, pane tmux.Pane) string {

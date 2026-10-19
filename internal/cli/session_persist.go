@@ -125,6 +125,9 @@ func (r *SessionsSaveResult) Text(w io.Writer) error {
 		if r.State.Agents.Grok > 0 {
 			fmt.Fprintf(w, "  Grok: %d\n", r.State.Agents.Grok)
 		}
+		if r.State.Agents.Muse > 0 {
+			fmt.Fprintf(w, "  Muse: %d\n", r.State.Agents.Muse)
+		}
 		if r.State.GitBranch != "" {
 			fmt.Fprintf(w, "  Git: %s\n", r.State.GitBranch)
 		}
@@ -354,6 +357,9 @@ func (r *SessionsShowResult) Text(w io.Writer) error {
 	if s.Agents.Grok > 0 {
 		fmt.Fprintf(w, "  Grok:   %d\n", s.Agents.Grok)
 	}
+	if s.Agents.Muse > 0 {
+		fmt.Fprintf(w, "  Muse:   %d\n", s.Agents.Muse)
+	}
 	if s.Agents.User > 0 {
 		fmt.Fprintf(w, "  User:   %d\n", s.Agents.User)
 	}
@@ -540,6 +546,9 @@ func (r *SessionsRestoreResult) Text(w io.Writer) error {
 			r.State.Agents.Claude, r.State.Agents.Codex, r.State.Agents.Gemini)
 		if r.State.Agents.Grok > 0 {
 			fmt.Fprintf(w, "  Grok: %d\n", r.State.Agents.Grok)
+		}
+		if r.State.Agents.Muse > 0 {
+			fmt.Fprintf(w, "  Muse: %d\n", r.State.Agents.Muse)
 		}
 	}
 	if r.PromptSent > 0 || r.PromptFailed > 0 {

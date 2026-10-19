@@ -141,6 +141,33 @@ func TestSessionRelaunchCommandsMuse(t *testing.T) {
 	}
 }
 
+// The save, show and restore summaries listed only Claude, Codex, Gemini and
+// Grok, so a saved Muse session read "0 Claude, 0 Codex, 0 Gemini" as if it had
+// no agents at all.
+func TestSessionsSummariesCountMusePanes(t *testing.T) {
+	state := &session.SessionState{Name: "demo", Agents: session.AgentConfig{Muse: 3}}
+	results := map[string]interface{ Text(io.Writer) error }{
+		"save":    &SessionsSaveResult{Success: true, Session: "demo", State: state},
+		"show":    &SessionsShowResult{State: state},
+		"restore": &SessionsRestoreResult{Success: true, RestoredAs: "demo", State: state},
+	}
+	for name, result := range results {
+		var buf strings.Builder
+		if err := result.Text(&buf); err != nil {
+			t.Fatalf("%s Text: %v", name, err)
+		}
+		found := false
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if fields := strings.Fields(line); len(fields) == 2 && fields[0] == "Muse:" && fields[1] == "3" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s summary has no \"Muse: 3\" line:\n%s", name, buf.String())
+		}
+	}
+}
+
 // TestApplyModelCommands_NilConfigSafe verifies the helper is a no-op (no panic)
 // when no config is loaded, leaving Command empty so launch falls back cleanly.
 func TestApplyModelCommands_NilConfigSafe(t *testing.T) {
