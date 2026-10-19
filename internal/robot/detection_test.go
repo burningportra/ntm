@@ -307,6 +307,52 @@ func TestDetectFromContent_MuseScreensNeverClaude(t *testing.T) {
 	}
 }
 
+// Claude Code 2.1 screens captured from live panes (rules shortened). Claude
+// draws the same "❯" composer between rules as Muse, and its working footer
+// says "esc to interrupt", so a Muse signature built on either would claim
+// them.
+const (
+	claudeTestRule   = "────────────────────────────────────────────────────────────"
+	claudeTestIdle   = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+	claudeTestBusy   = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt"
+	claudeTestChrome = claudeTestRule + "\n❯\n" + claudeTestRule + "\n"
+
+	claudeTestIdleScreen = "● Tests pass; the change is ready for review.\n\n" +
+		"✻ Cooked for 6m 48s · done 7:21 PM\n" + claudeTestChrome + claudeTestIdle
+
+	claudeTestWorkingScreen = "● Running the integration suite now.\n\n" +
+		"✻ Burrowing… (37s · ↓ 616 tokens)\n" + claudeTestChrome + claudeTestBusy
+
+	// Claude talking about Muse, and showing `muse --version` in a tool result.
+	claudeTestMentionsMuseScreen = "● Muse Code shares the ❯ composer, so muse-spark-1.3 panes need their own idle check.\n\n" +
+		"● Bash(muse --version)\n" +
+		"  ⎿  Muse Code 1.4.11 (1.4.11-R6667.1)\n\n" +
+		"✻ Cooked for 1m 12s · done 7:24 PM\n" + claudeTestChrome + claudeTestIdle
+)
+
+// TestDetectFromContent_ClaudeScreensNeverMuse is the other half of the
+// detection-order guard: Muse is checked first, so its signature must not
+// match a Claude Code screen.
+func TestDetectFromContent_ClaudeScreensNeverMuse(t *testing.T) {
+	for name, screen := range map[string]string{
+		"idle":          claudeTestIdleScreen,
+		"working":       claudeTestWorkingScreen,
+		"mentions muse": claudeTestMentionsMuseScreen,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if detection := detectFromContent(screen); detection.Type == "muse" {
+				t.Fatalf("detectFromContent(%s Claude screen) = muse", name)
+			}
+			// tmux reports a Claude Code 2.1 pane's command as its version,
+			// so an untitled pane falls through to content detection.
+			pane := tmux.Pane{Command: "2.1.303", Title: "claude-port"}
+			if detection := DetectAgentTypeEnhanced(pane, screen); detection.Type == "muse" {
+				t.Fatalf("DetectAgentTypeEnhanced(%s Claude screen) = muse via %s", name, detection.Method)
+			}
+		})
+	}
+}
+
 func TestDetectFromContent_MuseWordsAloneAreNotMuse(t *testing.T) {
 	for _, content := range []string{
 		"$ open museum.html\n$",

@@ -792,4 +792,16 @@ func TestMuseAgentSpecResolvesModelAliases(t *testing.T) {
 	if err := ValidateModelAlias(AgentTypeMuse, "nonexistent"); err == nil {
 		t.Error("ValidateModelAlias(muse, nonexistent) accepted an unknown alias")
 	}
+
+	// A zero or negative count is a usage error, not a request for no panes.
+	for _, bad := range []string{"0", "0:spark", "-1"} {
+		var rejected AgentSpecs
+		value := NewAgentSpecsValue(AgentTypeMuse, &rejected)
+		if err := value.Set(bad); err == nil || !strings.Contains(err.Error(), "count must be at least 1") {
+			t.Errorf("--muse=%s error = %v, want a count error", bad, err)
+		}
+		if len(rejected) != 0 {
+			t.Errorf("--muse=%s recorded %+v, want nothing", bad, rejected)
+		}
+	}
 }
