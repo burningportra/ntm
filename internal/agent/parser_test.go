@@ -262,6 +262,18 @@ func TestParser_DetectAgentType_Muse(t *testing.T) {
 		"idle in claude dir":  museScreenInDir(museIdleScreen, "/private/tmp/claude-501/repo"),
 		"working claude dir":  museScreenInDir(museWorkingScreen, "/Users/x/claude-code/repo"),
 		"banner scrolled off": bannerScrolledOff,
+		// The banner as `tmux capture-pane -e` returns it, still colored.
+		"ansi banner": "\x1b[38;2;103;108;116m  \x1b[1m\x1b[38;2;204;211;219mMuse Code\x1b[0m" +
+			"\x1b[38;2;204;211;219m 1.4.11\x1b[39m\n\n" + museCaptureVoiceBar + "\n❯\n" + museCaptureRule,
+		// The slash-command menu opens between the composer and the bottom
+		// rule; the status bar stays the last line.
+		"slash menu open": "◆ echo: hello there\n\n" +
+			museCaptureVoiceBar + "\n❯ /\n" +
+			"  /bug                Report a bug to the team\n" +
+			"  /clear              Clear terminal and start a fresh session\n" +
+			"  ↓ 345 more\n" +
+			museCaptureRule + "\n" +
+			"  muse-wonder-1.0 · /path/to/repo · YOLO",
 	}
 
 	for name, screen := range screens {
@@ -310,6 +322,9 @@ func TestParser_MuseScreensNeverClaude(t *testing.T) {
 func TestParser_OtherAgentScreensNeverMuse(t *testing.T) {
 	t.Parallel()
 	p := NewParser()
+	claudeIdleBottom := "✻ Cooked for 12s · done 7:24 PM\n" +
+		strings.Repeat("─", 88) + "\n❯ \n" + strings.Repeat("─", 88) + "\n" +
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)"
 
 	for name, screen := range map[string]string{
 		"claude working": "⎿  You've hit your weekly limit · resets Oct 21 at 10pm (America/New_York)\n" +
@@ -337,6 +352,22 @@ func TestParser_OtherAgentScreensNeverMuse(t *testing.T) {
 			"/Volumes/1tb/Projects/ManchesterSquare (main)\n" +
 			"↑166k ↓20k R2.4M CH99.7% $0.181 8.8%/1.0M (auto)            (vercel-ai-gateway) deepseek/d\n" +
 			"🧠 114-manchester · ready ● 🐴 ponytail: ⚡ FULL",
+		// Claude quoting Muse in tool output: `muse --version`, a capture
+		// whose second line is the bare banner, and a capture ending in the
+		// status bar. Tool output continues at a five-space indent.
+		"claude quoting muse --version": "● Bash(which muse && muse --version)\n" +
+			"  ⎿  /Users/x/.local/bin/muse\n" +
+			"     Muse Code 1.4.11 (1.4.11-R6667.1)\n\n" +
+			claudeIdleBottom,
+		"claude quoting the banner": "● Bash(tmux capture-pane -p -t muse:0.0 | grep -v '^$' | head -2)\n" +
+			"  ⎿  $ muse --yolo\n" +
+			"     Muse Code 1.4.11\n\n" +
+			claudeIdleBottom,
+		"claude quoting the status bar": "● Bash(tmux capture-pane -p -t muse:0.0 | tail -3)\n" +
+			"  ⎿  ❯\n" +
+			"     " + strings.Repeat("─", 40) + "\n" +
+			"     muse-wonder-1.0 · /repo · YOLO\n\n" +
+			claudeIdleBottom,
 	} {
 		if IsMuseOutput(screen) {
 			t.Errorf("IsMuseOutput(%s screen) = true", name)

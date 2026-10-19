@@ -445,14 +445,18 @@ var (
 		"timeout",
 	}
 
-	// museHeaderPattern matches the "Muse Code 1.4.11" banner at the top of a
-	// Muse session.
-	museHeaderPattern = regexp.MustCompile(`(?m)^\s*Muse Code \d+\.\d+`)
+	// museHeaderPattern matches the "  Muse Code 1.4.11" banner at the top of
+	// a Muse session, alone on its line. Another agent quoting
+	// `muse --version` prints "Muse Code 1.4.11 (1.4.11-R6667.1)", indented
+	// under its tool call, so neither the build suffix nor a deeper indent
+	// counts.
+	museHeaderPattern = regexp.MustCompile(`(?m)^ {0,2}Muse Code \d+\.\d+(?:\.\d+)?[ \t]*$`)
 
-	// museStatusBarPattern matches the bottom status bar
-	// ("muse-wonder-1.0 · /repo · YOLO" or "muse-wonder-full-1.0 · max · /repo
-	// · YOLO"), which stays on screen after the banner scrolls into history.
-	museStatusBarPattern = regexp.MustCompile(`(?m)^\s*muse-[a-z0-9.-]+ · \S`)
+	// museStatusBarPattern matches the status bar ("muse-wonder-1.0 · /repo ·
+	// YOLO" or "muse-wonder-full-1.0 · max · /repo · YOLO"), which stays on
+	// screen after the banner scrolls into history. IsMuseOutput applies it
+	// only to the bottom lines of a capture, where Muse draws it.
+	museStatusBarPattern = regexp.MustCompile(`^\s*muse-[a-z0-9.-]+ · \S`)
 
 	// museActiveWorkLineRe matches Muse's live working line
 	// (MuseWorkingLinePattern).
@@ -614,10 +618,33 @@ func MuseIdlePromptShowing(output string) bool {
 	return matchAnyRegex(tail, museIdlePatterns)
 }
 
+// museStatusBarScanLines is how many non-empty lines at the bottom of a
+// capture IsMuseOutput checks for the status bar. Muse always draws it last,
+// below the composer and any slash or @ menu; the second line covers a status
+// bar that wraps in a narrow pane.
+const museStatusBarScanLines = 2
+
 // IsMuseOutput reports whether output carries a Muse Code signature: the
-// version banner or the model-led status bar.
+// version banner, or the model-led status bar on the bottom lines. The status
+// bar counts only at the bottom so that another agent's transcript quoting a
+// Muse screen (a capture-pane dump, a README) is not read as Muse.
 func IsMuseOutput(output string) bool {
-	return museHeaderPattern.MatchString(output) || museStatusBarPattern.MatchString(output)
+	clean := stripANSICodes(output)
+	if museHeaderPattern.MatchString(clean) {
+		return true
+	}
+	lines := strings.Split(clean, "\n")
+	seen := 0
+	for i := len(lines) - 1; i >= 0 && seen < museStatusBarScanLines; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		seen++
+		if museStatusBarPattern.MatchString(lines[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // Cursor (cursor) patterns.

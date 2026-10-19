@@ -601,8 +601,9 @@ func TestHeaderPatterns(t *testing.T) {
 			want:    false,
 		},
 		{
+			// IsMuseOutput applies the status-bar pattern line by line.
 			name:    "muse status bar",
-			text:    "❯\n──────\n  muse-wonder-full-1.0 · max · /private/tmp · YOLO",
+			text:    "  muse-wonder-full-1.0 · max · /private/tmp · YOLO",
 			pattern: museStatusBarPattern,
 			want:    true,
 		},
