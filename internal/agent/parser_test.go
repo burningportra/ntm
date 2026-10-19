@@ -301,6 +301,51 @@ func TestParser_MuseScreensNeverClaude(t *testing.T) {
 	}
 }
 
+// TestParser_OtherAgentScreensNeverMuse is the reverse guard: Muse is checked
+// first, so a Claude Code, Codex or Pi screen that matched a Muse signature
+// would be reported as Muse. The screens are the bottoms of live captures from
+// other agents' tmux panes on the review host (Claude Code 2.1.30x, Codex,
+// Pi), including Claude's "❯" composer and "esc to interrupt" footer.
+func TestParser_OtherAgentScreensNeverMuse(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	for name, screen := range map[string]string{
+		"claude working": "⎿  You've hit your weekly limit · resets Oct 21 at 10pm (America/New_York)\n" +
+			"✻ Churned for 49s · done 7:08 PM\n\n" +
+			"❯ continue\n\n" +
+			"✳ Levitating… (3m 28s · deep in thought with high effort)\n" +
+			"                                                ✔ Update installed · /restart to apply\n" +
+			strings.Repeat("─", 88) + "\n❯ \n" + strings.Repeat("─", 88) + "\n" +
+			"  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt",
+		"claude idle": "✻ Cogitated for 18m 54s · done 1:58 PM\n" +
+			"                    new task? /clear to save 249.9k tokens · ✔ Update installed · /restart t\n" +
+			strings.Repeat("─", 140) + "\n❯ \n" + strings.Repeat("─", 140) + "\n" +
+			"  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+		"claude fresh": " ▐▛███▛█   Claude Code v2.1.304\n" +
+			"▝▜██████▀  Opus 4.7 with high effort · Claude Max\n" +
+			" ▝▝   ▝▝   /Volumes/1tb/Projects/agent-flywheel-plugin\n" +
+			strings.Repeat("─", 140) + "\n❯ Try \"refactor compliance-audit.test.ts\"\n" + strings.Repeat("─", 140) + "\n" +
+			"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+		"codex idle": "■ You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits.\n\n" +
+			"› Ask Codex to do anything\n\n" +
+			"  GPT-5.6-Sol max · ~/Github/hoyehh-shop · Review unpaid account moderation · Main [default]\n" +
+			"  ? for shortcuts                                                    ⚠ 5 warnings · f2 to view",
+		"pi working": " Elapsed 1m 2s\n ⠧ Working\n" +
+			strings.Repeat("─", 140) + "\n" + strings.Repeat("─", 140) + "\n" +
+			"/Volumes/1tb/Projects/ManchesterSquare (main)\n" +
+			"↑166k ↓20k R2.4M CH99.7% $0.181 8.8%/1.0M (auto)            (vercel-ai-gateway) deepseek/d\n" +
+			"🧠 114-manchester · ready ● 🐴 ponytail: ⚡ FULL",
+	} {
+		if IsMuseOutput(screen) {
+			t.Errorf("IsMuseOutput(%s screen) = true", name)
+		}
+		if got := p.DetectAgentType(screen); got == AgentTypeMuse {
+			t.Errorf("DetectAgentType(%s screen) = muse", name)
+		}
+	}
+}
+
 func TestParser_Parse_MuseStates(t *testing.T) {
 	t.Parallel()
 	p := NewParser()

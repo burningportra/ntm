@@ -1252,12 +1252,18 @@ func TestMusePatterns_DoNotLeakToClaude(t *testing.T) {
 }
 
 // museTestTrustPromptScreen is Muse's first screen in an untrusted workspace
-// when launched without --yolo or --trust-workspace.
-const museTestTrustPromptScreen = "  Muse Code 1.4.11\n\n" +
-	"  Do you trust this workspace?\n" +
-	"  /private/tmp/claude-501/claude-port\n\n" +
-	"  1  Trust and continue\n" +
-	"  2  Quit\n"
+// when launched without --yolo or --trust-workspace, captured live from muse
+// 1.4.11 (`muse --provider echo`) in a 120-column pane, trimmed the way
+// tmux.Client returns captures, with the workspace path shortened. It carries
+// no "Muse Code" banner and no status bar.
+const museTestTrustPromptScreen = "Do you trust this workspace?\n" +
+	"Workspace:\n" +
+	"/private/tmp/claude-501/claude-port/untrusted\n\n" +
+	"Trusting allows project-local skills, rules, hooks, and plugin config to load before the model runs.\n" +
+	"Only trust this workspace when you trust its contents.\n" +
+	"⟩ 1  Trust and continue\n" +
+	"  2  Quit\n\n" +
+	"Use Up/Down or 1/2, then Enter. Esc quits."
 
 const (
 	// museTestTipScreen is the bottom of a capture from a muse 1.4.11 echo
