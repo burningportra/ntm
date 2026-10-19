@@ -1611,6 +1611,15 @@ func restartAgentLaunchCommandWithOverride(cfg *config.Config, agentType, varian
 			if strings.TrimSpace(tmpl) == "" {
 				tmpl = config.DefaultOpencodeCommand
 			}
+		case "muse":
+			// There is no shell alias carrying Muse's flags, so the bare
+			// `muse` fallback stops at "Do you trust this workspace?" in an
+			// untrusted directory. Fall back to the default template
+			// (`muse --yolo --model ...`) when [agents] muse is unset.
+			tmpl = cfg.Agents.Muse
+			if strings.TrimSpace(tmpl) == "" {
+				tmpl = config.DefaultAgentTemplates().Muse
+			}
 		case "ollama":
 			tmpl = cfg.Agents.Ollama
 		}

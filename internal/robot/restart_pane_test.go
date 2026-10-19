@@ -1466,6 +1466,32 @@ func TestRestartAgentLaunchCommandRejectsControlCharacters(t *testing.T) {
 	}
 }
 
+func TestRestartAgentLaunchCommandMuseUsesConfiguredCommand(t *testing.T) {
+	// bd-3l5df: a bare `muse` stops at "Do you trust this workspace?" in an
+	// untrusted directory, so a restart renders the configured Muse command,
+	// falling back to the default template when [agents] muse is unset.
+	tests := []struct {
+		name     string
+		override string
+		variant  string
+		want     string
+	}{
+		{"unset uses default template", "", "", "muse --yolo --model 'muse-wonder-1.0'"},
+		{"model pin from variant", "", "spark", "muse --yolo --model 'muse-spark-1.3'"},
+		{"model and effort pin", "", "spark@low", "muse --yolo --model 'muse-spark-1.3' --reasoning-effort 'low'"},
+		{"agents muse override", "muse --provider echo --yolo", "", "muse --provider echo --yolo"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Agents.Muse = tt.override
+			if got := restartAgentLaunchCommand(cfg, "muse", tt.variant); got != tt.want {
+				t.Errorf("restartAgentLaunchCommand(cfg, muse, %q) = %q, want %q", tt.variant, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRestartPaneOutputAgentRelaunchedJSON(t *testing.T) {
 	output := RestartPaneOutput{
 		RobotResponse:       NewRobotResponse(true),

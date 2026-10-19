@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
@@ -81,6 +82,10 @@ type SmartRestartOptions struct {
 	HardKillOnly   bool          // Skip soft exit entirely and use kill -9 immediately
 	promptDispatch smartRestartPromptDispatcher
 	executor       smartRestartExecutor
+
+	// Config supplies the relaunch command for Muse panes; nil loads the
+	// merged config the way --robot-restart-pane does.
+	Config *config.Config
 }
 
 type smartRestartPromptDispatcher interface {
@@ -898,8 +903,10 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 		}
 	}
 
-	// Step 4: Launch new agent using the canonical agent alias/command name.
+	// Step 4: Launch new agent using the canonical agent alias/command name
+	// (for Muse, its configured command; see smartRestartLaunchCommand).
 	alias := restartLaunchAlias(agentType)
+	launchCmd := smartRestartLaunchCommand(opts, agentType)
 	if err := ctx.Err(); err != nil {
 		return seq, err
 	}
@@ -907,7 +914,7 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 	attemptedActions = append(attemptedActions, "launch-"+alias)
 	seq.LaunchAttempted = true
 	seq.AgentLaunchStatus = SmartRestartLaunchUnknown
-	launchErr := executor.sendKeys(ctx, session, win, pane, alias+"\n")
+	launchErr := executor.sendKeys(ctx, session, win, pane, launchCmd+"\n")
 	if launchErr != nil {
 		if cancelErr := restartPaneCancellationError(ctx, launchErr); cancelErr != nil {
 			observeSmartRestartLaunchAfterCancellation(ctx, session, win, pane, agentType, target, executor, seq)
@@ -1375,6 +1382,27 @@ func restartLaunchAlias(agentType string) string {
 	default:
 		return string(canonical)
 	}
+}
+
+// smartRestartLaunchCommand returns the command smart restart types to
+// relaunch an agent. Most agents relaunch through their launch alias (cc, cod
+// and gmi are shell aliases that carry the configured flags). Muse has no such
+// alias, and a bare `muse` stops at "Do you trust this workspace?" in an
+// untrusted directory, so a Muse pane relaunches with its configured command,
+// the same one --robot-restart-pane uses (bd-3l5df).
+func smartRestartLaunchCommand(opts SmartRestartOptions, agentType string) string {
+	if restartCanonicalAgentType(agentType) != agent.AgentTypeMuse {
+		return restartLaunchAlias(agentType)
+	}
+	cfg := opts.Config
+	if cfg == nil {
+		loaded, err := config.LoadMerged(mustGetwd(), config.DefaultPath())
+		if err != nil {
+			loaded = config.Default()
+		}
+		cfg = loaded
+	}
+	return restartAgentLaunchCommand(cfg, agentType, "")
 }
 
 // verifyRestart checks the post-restart state of a pane. win is the pane's real

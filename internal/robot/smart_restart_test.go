@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -1214,6 +1215,43 @@ func TestRestartLaunchAlias(t *testing.T) {
 		t.Run(tt.input, func(t *testing.T) {
 			if got := restartLaunchAlias(tt.input); got != tt.want {
 				t.Errorf("restartLaunchAlias(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExecuteRestartLaunchesMuseWithConfiguredCommand(t *testing.T) {
+	// bd-3l5df: Muse has no shell alias carrying its flags, so smart restart
+	// types the configured Muse command; a bare `muse` would stop at the
+	// workspace trust prompt. Other agents keep their launch alias.
+	echoCfg := config.Default()
+	echoCfg.Agents.Muse = "muse --provider echo --yolo"
+	unsetCfg := config.Default()
+	unsetCfg.Agents.Muse = ""
+
+	tests := []struct {
+		name      string
+		agentType string
+		cfg       *config.Config
+		want      string
+	}{
+		{"muse override", "muse", echoCfg, "0.2:muse --provider echo --yolo\n"},
+		{"muse default template", "muse", unsetCfg, "0.2:muse --yolo --model 'muse-wonder-1.0'\n"},
+		{"claude keeps alias", "cc", echoCfg, "0.2:cc\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &deterministicSmartRestartExecutor{}
+			seq, err := executeRestart(t.Context(), "proj", 0, 2, tt.agentType, SmartRestartOptions{
+				PostWaitTime: time.Millisecond,
+				Config:       tt.cfg,
+				executor:     executor,
+			})
+			if err != nil || seq == nil || !seq.AgentLaunched {
+				t.Fatalf("executeRestart() seq=%+v err=%v, want launched agent", seq, err)
+			}
+			if len(executor.launches) != 1 || executor.launches[0] != tt.want {
+				t.Fatalf("launches = %q, want [%q]", executor.launches, tt.want)
 			}
 		})
 	}

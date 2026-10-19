@@ -20,6 +20,7 @@ import (
 // - Claude Code (cc): Double Ctrl+C with CRITICAL 0.1s timing
 // - Codex (cod): /exit command
 // - Gemini (gmi): Escape (exit shell mode if active) then /exit
+// - Muse: Escape, then three Ctrl+Cs (the last one 500ms after the second)
 // - Unknown: Try Ctrl+C as fallback
 
 // exitAgent exits the current agent using the appropriate method. win is the
@@ -33,6 +34,8 @@ func exitAgent(ctx context.Context, session string, win, pane int, agentType str
 		return exitCodex(ctx, session, win, pane, seq)
 	case "gmi":
 		return exitGemini(ctx, session, win, pane, seq)
+	case "muse":
+		return exitMuse(ctx, session, win, pane, seq)
 	default:
 		return exitUnknown(ctx, session, win, pane, seq)
 	}
@@ -89,6 +92,51 @@ func exitGemini(ctx context.Context, session string, win, pane int, seq *Restart
 	// Send /exit command
 	if err := sendKeys(ctx, session, win, pane, "/exit\n"); err != nil {
 		return wrapError("exit failed", err)
+	}
+
+	return nil
+}
+
+// exitMuse exits Muse Code. A single Ctrl+C only clears the draft, and when a
+// draft is present the double Ctrl+C that quits an empty composer is spent
+// clearing it and arming "Press Ctrl-C again to quit". Verified against muse
+// 1.4.11 (bd-3l5df):
+//   - Escape interrupts a running turn, whose prompt comes back as a draft,
+//     and does nothing at an idle composer.
+//   - The first Ctrl+C clears any draft; on an empty composer it arms quit.
+//   - The second Ctrl+C quits an empty composer, or arms quit after a draft.
+//   - The third Ctrl+C quits when the second only armed it. When Muse already
+//     quit it lands on the shell prompt, where it is harmless; the 500ms gap
+//     keeps it from reaching Muse while it tears down.
+//
+// /exit and /quit also quit an idle Muse, but typed after a draft they are
+// submitted as part of a prompt; Ctrl+D does nothing.
+func exitMuse(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
+	seq.ExitMethod = "escape_then_triple_ctrl_c"
+
+	if err := sendEscape(ctx, session, win, pane); err != nil {
+		return wrapError("escape failed", err)
+	}
+	if err := waitForExitSequenceDelay(ctx, 100*time.Millisecond); err != nil {
+		return err
+	}
+
+	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+		return wrapError("first ctrl-c failed", err)
+	}
+	if err := waitForExitSequenceDelay(ctx, 100*time.Millisecond); err != nil {
+		return err
+	}
+
+	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+		return wrapError("second ctrl-c failed", err)
+	}
+	if err := waitForExitSequenceDelay(ctx, 500*time.Millisecond); err != nil {
+		return err
+	}
+
+	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+		return wrapError("third ctrl-c failed", err)
 	}
 
 	return nil
