@@ -710,6 +710,8 @@ func TestAgentTypeShort(t *testing.T) {
 		{string(tmux.AgentCursor), "cursor"},
 		{"ws", "windsurf"},
 		{string(tmux.AgentAider), "aider"},
+		{string(tmux.AgentMuse), "muse"},
+		{"muse-code", "muse"},
 		{string(tmux.AgentUser), "user"},
 	}
 
@@ -751,6 +753,11 @@ func TestIsAgentReady_Patterns(t *testing.T) {
 		// Gemini indicators
 		{"gemini_prompt", "gemini>", "gemini", true},
 		{"gemini_help", "How can I help you today?", "gemini", true},
+
+		// Muse indicators: the last line is the status bar, not a prompt.
+		{"muse_idle_screen", museTestIdleScreen, "muse", true},
+		{"muse_status_bar_only", "◆ echo: done\n\n❯ draft\n" + museTestRule + "\n" + museTestStatusBar, "muse", true},
+		{"muse_command_echo_only", "% muse --yolo --model 'muse-wonder-1.0'", "muse", false},
 
 		// Generic shell prompts
 		{"shell_dollar", "$ ", "claude", true},
@@ -835,6 +842,73 @@ func TestGetAgentCommands(t *testing.T) {
 		t.Logf("[E2E-SPAWN] Operation=GetAgentCommands_Partial | Claude=%q | Codex=%q",
 			cmds["claude"], cmds["codex"])
 	})
+
+	t.Run("Muse", func(t *testing.T) {
+		// Without a config Muse still launches with --yolo, so the pane does
+		// not stop at the workspace-trust prompt.
+		if got := getAgentCommands(nil)["muse"]; got != "muse --yolo" {
+			t.Errorf("getAgentCommands(nil)[muse] = %q, want %q", got, "muse --yolo")
+		}
+
+		// The default config renders the launch template with the pinned
+		// default model.
+		if got, want := getAgentCommands(config.Default())["muse"], "muse --yolo --model 'muse-wonder-1.0'"; got != want {
+			t.Errorf("getAgentCommands(default)[muse] = %q, want %q", got, want)
+		}
+
+		cfg := config.Default()
+		cfg.Agents.Muse = "muse --provider echo --yolo"
+		if got := getAgentCommands(cfg)["muse"]; got != "muse --provider echo --yolo" {
+			t.Errorf("getAgentCommands(custom)[muse] = %q, want the configured command", got)
+		}
+	})
+}
+
+func TestSpawnOptions_DryRunMuse(t *testing.T) {
+	opts := SpawnOptions{
+		Session:    "test_dryrun_muse",
+		CCCount:    1,
+		MuseCount:  2,
+		NoUserPane: true,
+		DryRun:     true,
+	}
+
+	resp, err := GetSpawn(t.Context(), opts, config.Default())
+	if err != nil {
+		t.Fatalf("GetSpawn returned error: %v", err)
+	}
+	if !resp.Success || resp.Error != "" {
+		t.Fatalf("dry-run failed: success=%v error=%q", resp.Success, resp.Error)
+	}
+	if len(resp.WouldCreate) != 3 {
+		t.Fatalf("WouldCreate = %+v, want 1 claude and 2 muse panes", resp.WouldCreate)
+	}
+	for i, want := range []SpawnedAgent{
+		{Pane: "0.1", Type: "muse", Title: "test_dryrun_muse__muse_1"},
+		{Pane: "0.2", Type: "muse", Title: "test_dryrun_muse__muse_2"},
+	} {
+		got := resp.WouldCreate[i+1]
+		if got.Pane != want.Pane || got.Type != want.Type || got.Title != want.Title {
+			t.Errorf("WouldCreate[%d] = (%q, %q, %q), want (%q, %q, %q)",
+				i+1, got.Pane, got.Type, got.Title, want.Pane, want.Type, want.Title)
+		}
+		if got.Name == "" {
+			t.Errorf("WouldCreate[%d] has no agent name", i+1)
+		}
+	}
+	if resp.Admission == nil || resp.Admission.RequestedAgents != 3 {
+		t.Fatalf("Admission = %+v, want 3 requested agents", resp.Admission)
+	}
+}
+
+func TestSpawnOptions_RejectsNegativeMuseCount(t *testing.T) {
+	resp, err := GetSpawn(t.Context(), SpawnOptions{Session: "test_negative_muse", CCCount: 1, MuseCount: -1, DryRun: true}, config.Default())
+	if err != nil {
+		t.Fatalf("GetSpawn returned error: %v", err)
+	}
+	if resp.Success || !strings.Contains(resp.Error, "--spawn-muse must be zero or greater") {
+		t.Fatalf("response = success:%v error:%q, want --spawn-muse validation error", resp.Success, resp.Error)
+	}
 }
 
 // TestSpawnOptions_DryRunMode validates dry-run returns correct structure without creating session
@@ -1053,7 +1127,7 @@ func TestSpawnOptions_NoAgentsSpecified(t *testing.T) {
 	if resp.Error == "" {
 		t.Error("[E2E-SPAWN] Expected error for no agents specified")
 	}
-	if resp.Error != "no agents specified (use cc, cod, gmi, pi, kimi, agy, or grok counts)" {
+	if resp.Error != "no agents specified (use cc, cod, gmi, pi, kimi, muse, agy, or grok counts)" {
 		t.Errorf("[E2E-SPAWN] Unexpected error message: %s", resp.Error)
 	}
 

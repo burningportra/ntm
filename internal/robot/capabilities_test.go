@@ -291,6 +291,22 @@ func TestSpawnCapabilitiesAdvertiseGrokPhaseOne(t *testing.T) {
 	t.Fatal("spawn capabilities omit --spawn-grok")
 }
 
+func TestSpawnCapabilitiesAdvertiseMuse(t *testing.T) {
+	output, err := GetCapabilitiesWithOptions(CapabilitiesOptions{Command: "spawn"})
+	if err != nil || !output.Success || len(output.Commands) != 1 {
+		t.Fatalf("spawn capabilities output=%+v err=%v", output, err)
+	}
+	for _, parameter := range output.Commands[0].Parameters {
+		if parameter.Flag == "--spawn-muse" {
+			if parameter.Type != "int" || !strings.Contains(parameter.Description, "Muse") {
+				t.Fatalf("spawn-muse parameter = %+v, want an int Muse Code count", parameter)
+			}
+			return
+		}
+	}
+	t.Fatal("spawn capabilities omit --spawn-muse")
+}
+
 func TestActivityCapabilitiesAdvertiseGrok(t *testing.T) {
 	output, err := GetCapabilitiesWithOptions(CapabilitiesOptions{Command: "activity"})
 	if err != nil || !output.Success || len(output.Commands) != 1 {

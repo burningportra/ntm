@@ -33,6 +33,8 @@ func TestNormalizeEnsembleAgentType_Aliases(t *testing.T) {
 		{"windsurf", "windsurf"},
 		{"aider", "aider"},
 		{"ollama", "ollama"},
+		{"muse", "muse"},
+		{"muse-code", "muse"},
 		{"unknown", ""},
 		{"", ""},
 	}

@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -1098,3 +1099,87 @@ func TestAgyTrustPromptClassifiesAsError(t *testing.T) {
 		}
 	}
 }
+
+// TestMusePatterns_ComposerIdleUnlessWorkingLineLive covers Muse's screen
+// shape: the "❯" composer is drawn for the whole turn, so only the live
+// "(… esc to interrupt)" working line separates a busy pane from an idle one.
+func TestMusePatterns_ComposerIdleUnlessWorkingLineLive(t *testing.T) {
+	lib := NewPatternLibrary()
+
+	for name, screen := range map[string]string{
+		"idle":        museTestIdleScreen,
+		"finished":    museTestFinishedScreen,
+		"interrupted": museTestInterruptedScreen,
+	} {
+		if !lib.HasIdlePrompt(screen, "muse") {
+			t.Errorf("%s Muse screen has no idle pattern match", name)
+		}
+		if lib.HasThinkingIndicator(screen, "muse") {
+			t.Errorf("%s Muse screen matched a thinking pattern", name)
+		}
+		if IsLiveBusy(screen, "muse") {
+			t.Errorf("IsLiveBusy(%s Muse screen) = true, want false", name)
+		}
+		if lib.HasError(screen, "muse") {
+			t.Errorf("%s Muse screen matched an error pattern", name)
+		}
+	}
+
+	if !lib.HasThinkingIndicator(museTestWorkingScreen, "muse") {
+		t.Fatal("working Muse screen has no thinking pattern match")
+	}
+	if !IsLiveBusy(museTestWorkingScreen, "muse-code") {
+		t.Fatal("IsLiveBusy(working Muse screen) = false, want true")
+	}
+	if got := lib.MatchFirst(museTestWorkingScreen, "muse"); got == nil || got.Pattern != "muse_working" {
+		t.Fatalf("MatchFirst(working Muse screen) = %+v, want muse_working ahead of the composer", got)
+	}
+}
+
+func TestMusePatterns_ClassifierStates(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		screen string
+		want   AgentState
+	}{
+		{name: "idle", screen: museTestIdleScreen, want: StateWaiting},
+		{name: "working", screen: museTestWorkingScreen, want: StateThinking},
+		{name: "trust prompt", screen: museTestTrustPromptScreen, want: StateError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := NewStateClassifier("%1", &ClassifierConfig{AgentType: "muse", HysteresisDuration: 0})
+			if _, err := sc.ClassifyWithOutput(tc.screen); err != nil {
+				t.Fatalf("baseline: %v", err)
+			}
+			activity, err := sc.ClassifyWithOutput(tc.screen)
+			if err != nil {
+				t.Fatalf("ClassifyWithOutput: %v", err)
+			}
+			if activity.State != tc.want {
+				t.Fatalf("State = %q, want %q (patterns %v)", activity.State, tc.want, activity.DetectedPatterns)
+			}
+		})
+	}
+}
+
+func TestMusePatterns_DoNotLeakToClaude(t *testing.T) {
+	lib := NewPatternLibrary()
+	for _, screen := range []string{museTestWorkingScreen, museTestTrustPromptScreen} {
+		for _, m := range lib.Match(screen, "claude") {
+			if strings.HasPrefix(m.Pattern, "muse_") {
+				t.Errorf("%s leaked to a claude pane", m.Pattern)
+			}
+		}
+	}
+	if !isKnownAgentPatternType("muse") || !isKnownAgentPatternType("muse-code") {
+		t.Fatal("muse should be a known agent pattern type so shell prompts in its pane are not idle")
+	}
+}
+
+// museTestTrustPromptScreen is Muse's first screen in an untrusted workspace
+// when launched without --yolo or --trust-workspace.
+const museTestTrustPromptScreen = "  Muse Code 1.4.11\n\n" +
+	"  Do you trust this workspace?\n" +
+	"  /private/tmp/claude-501/claude-port\n\n" +
+	"  1  Trust and continue\n" +
+	"  2  Quit\n"

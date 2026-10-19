@@ -22,6 +22,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/privacy"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
@@ -191,8 +192,12 @@ func TestDetectAgentType(t *testing.T) {
 		{"gmi short form", "myproject__gmi_1", "gemini"},
 		{"gmi short form double underscore", "test__gmi__2", "gemini"},
 		{"ws short form", "myproject__ws_1", "windsurf"},
+		{"muse short form", "myproject__muse_1", "muse"},
+		{"muse short form double underscore", "test__muse__2", "muse"},
 
 		// Should NOT match short forms inside words
+		{"museum not muse", "museum__notes", "unknown"},
+		{"amuse not muse", "amuse_muse_pane", "unknown"},
 		{"success not cc", "success_test", "unknown"},
 		{"accord not cc", "accord_pane", "unknown"},
 		{"decode not cod", "decode_pane", "unknown"},
@@ -1940,6 +1945,7 @@ func TestAgentTypeString(t *testing.T) {
 		{tmux.AgentCodex, "codex"},
 		{tmux.AgentGemini, "gemini"},
 		{tmux.AgentGrok, "grok"},
+		{tmux.AgentMuse, "muse"},
 		{tmux.AgentCursor, "cursor"},
 		{tmux.AgentWindsurf, "windsurf"},
 		{tmux.AgentAider, "aider"},
@@ -2001,6 +2007,26 @@ func TestModelNameForPane(t *testing.T) {
 			},
 			want: "account/grok-override",
 		},
+		{
+			name: "muse config default",
+			pane: tmux.Pane{Type: tmux.AgentMuse},
+			cfg: &config.Config{
+				Models: config.ModelsConfig{DefaultMuse: "muse-spark-1.3"},
+			},
+			want: "muse-spark-1.3",
+		},
+		{
+			name: "muse builtin fallback",
+			pane: tmux.Pane{Type: tmux.AgentType("muse-code")},
+			cfg:  nil,
+			want: "muse-wonder-1.0",
+		},
+		{
+			name: "muse variant wins",
+			pane: tmux.Pane{Type: tmux.AgentMuse, Variant: "muse-spark-1.2"},
+			cfg:  &config.Config{},
+			want: "muse-spark-1.2",
+		},
 	}
 
 	for _, tt := range tests {
@@ -2009,6 +2035,30 @@ func TestModelNameForPane(t *testing.T) {
 				t.Fatalf("modelNameForPane(%+v) = %q, want %q", tt.pane, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestMuseRobotDeliveryMappings checks that robot send and ack resolve a Muse
+// pane, by pane type or by its NTM title, to Muse, and plan the double-Enter
+// protocol live tests showed Muse accepts.
+func TestMuseRobotDeliveryMappings(t *testing.T) {
+	for _, pane := range []tmux.Pane{
+		{Type: tmux.AgentMuse, Title: "claude-port"},
+		{Type: tmux.AgentUnknown, Title: "proj__muse_1"},
+	} {
+		if got := paneAgentType(pane); got != "muse" {
+			t.Errorf("paneAgentType(%+v) = %q, want muse", pane, got)
+		}
+		if got := ackPaneTMUXAgentType(pane); got != tmux.AgentMuse {
+			t.Errorf("ackPaneTMUXAgentType(%+v) = %q, want muse", pane, got)
+		}
+		plan, err := robotDispatchProtocolPlanner{}.PlanDelivery(context.Background(), dispatchsvc.Target{Pane: pane, AgentType: pane.Type}, true)
+		if err != nil {
+			t.Fatalf("PlanDelivery(%+v): %v", pane, err)
+		}
+		if plan.Protocol != dispatchsvc.ProtocolDoubleEnter {
+			t.Errorf("PlanDelivery(%+v) protocol = %s, want double enter", pane, plan.Protocol)
+		}
 	}
 }
 
@@ -2048,6 +2098,12 @@ func TestResolveAgentType(t *testing.T) {
 		{"grok-build", "grok"},
 		{"xai_grok_build", "grok"},
 		{"GROK", "grok"},
+
+		// Muse Code aliases
+		{"muse", "muse"},
+		{"muse-code", "muse"},
+		{" MUSE-CODE ", "muse"},
+		{"meta-muse", "muse"},
 
 		// Other known types
 		{"cursor", "cursor"},
@@ -4390,6 +4446,10 @@ func TestDetectModel(t *testing.T) {
 		{"gemini default", "gemini", "ai session", "gemini"},
 		{"unknown agent", "unknown", "random session", "unknown"},
 
+		// Muse runs only Muse models; vendor hints in the session name are ignored.
+		{"muse default", "muse", "myproject__muse_1", "muse"},
+		{"muse ignores opus hint", "muse", "opus-port__muse_2", "muse"},
+
 		// Empty/edge cases
 		{"empty title", "claude", "", "sonnet"},
 		{"empty agent and title", "", "", "unknown"},
@@ -4805,9 +4865,11 @@ func TestParseAgentTypes(t *testing.T) {
 		{"pi", "pi", []string{"pi"}},
 		{"kimi", "kimi", []string{"kimi"}},
 		{"kimi alias", "moonshot", []string{"kimi"}},
-		{"multiple", "cc,cod,gmi,pi,kimi", []string{"claude", "codex", "gemini", "pi", "kimi"}},
-		{"all agents", "all", []string{"claude", "codex", "gemini", "pi", "kimi", "grok"}},
-		{"agents keyword", "agents", []string{"claude", "codex", "gemini", "pi", "kimi", "grok"}},
+		{"muse", "muse", []string{"muse"}},
+		{"muse alias", "muse-code", []string{"muse"}},
+		{"multiple", "cc,cod,gmi,pi,kimi,muse", []string{"claude", "codex", "gemini", "pi", "kimi", "muse"}},
+		{"all agents", "all", []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "grok"}},
+		{"agents keyword", "agents", []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "grok"}},
 		{"cursor", "cursor", []string{"cursor"}},
 		{"windsurf", "windsurf", []string{"windsurf"}},
 		{"windsurf short alias", "ws", []string{"windsurf"}},

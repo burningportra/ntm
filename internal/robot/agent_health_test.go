@@ -639,6 +639,7 @@ func TestFindPTState_NormalizesAgentAliases(t *testing.T) {
 	geminiState := &pt.AgentState{Classification: pt.ClassUseful}
 	windsurfState := &pt.AgentState{Classification: pt.ClassUnknown}
 	ollamaState := &pt.AgentState{Classification: pt.ClassUseful}
+	museState := &pt.AgentState{Classification: pt.ClassUseful}
 
 	states := map[string]*pt.AgentState{
 		"proj__cc_1":       claudeState,
@@ -646,6 +647,7 @@ func TestFindPTState_NormalizesAgentAliases(t *testing.T) {
 		"proj__gmi_3":      geminiState,
 		"proj__windsurf_4": windsurfState,
 		"proj__ollama_5":   ollamaState,
+		"proj__muse_6":     museState,
 	}
 
 	tests := []struct {
@@ -659,6 +661,7 @@ func TestFindPTState_NormalizesAgentAliases(t *testing.T) {
 		{"gemini alias", "3", "google-gemini", geminiState},
 		{"windsurf alias", "4", "ws", windsurfState},
 		{"ollama canonical", "5", "ollama", ollamaState},
+		{"muse alias", "6", "muse-code", museState},
 	}
 
 	for _, tc := range tests {

@@ -106,6 +106,8 @@ func GetDashboard() (*DashboardOutput, error) {
 							// Pi is represented in AgentsByType; StatusSummary has no per-provider field.
 						case "kimi":
 							// Kimi is represented in AgentsByType; StatusSummary has no per-provider field.
+						case "muse":
+							// Muse is represented in AgentsByType; StatusSummary has no per-provider field.
 						case "antigravity":
 							output.Summary.AntigravityCount++
 						case "grok":
@@ -260,6 +262,7 @@ func printDashboardMarkdown(output DashboardOutput) error {
 	fmt.Fprintf(&sb, "| Gemini | %d |\n", typeCounts["gemini"])
 	fmt.Fprintf(&sb, "| Pi | %d |\n", typeCounts["pi"])
 	fmt.Fprintf(&sb, "| Kimi | %d |\n", typeCounts["kimi"])
+	fmt.Fprintf(&sb, "| Muse | %d |\n", typeCounts["muse"])
 	fmt.Fprintf(&sb, "| Antigravity | %d |\n", typeCounts["antigravity"])
 	fmt.Fprintf(&sb, "| Grok Build | %d |\n", typeCounts["grok"])
 	fmt.Fprintf(&sb, "| Cursor | %d |\n", typeCounts["cursor"])
@@ -296,12 +299,12 @@ func printDashboardMarkdown(output DashboardOutput) error {
 	if len(output.Agents) == 0 {
 		sb.WriteString("_No tmux sessions detected._\n\n")
 	} else {
-		sb.WriteString("| Session | Attached | Panes | User | Claude | Codex | Gemini | Pi | Kimi | Antigravity | Grok | Cursor | Windsurf | Aider | Ollama | Other |\n")
-		sb.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+		sb.WriteString("| Session | Attached | Panes | User | Claude | Codex | Gemini | Pi | Kimi | Muse | Antigravity | Grok | Cursor | Windsurf | Aider | Ollama | Other |\n")
+		sb.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 		for _, sess := range output.Agents {
 			sessTotal, sessUsers, sessCounts := dashboardCounts([]SnapshotSession{sess})
 			sessOther := dashboardOtherAgentCount(sessTotal, sessUsers, sessCounts)
-			fmt.Fprintf(&sb, "| %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |\n",
+			fmt.Fprintf(&sb, "| %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |\n",
 				escapeMarkdownCell(sess.Name, 80),
 				yesNo(sess.Attached),
 				sessTotal,
@@ -311,6 +314,7 @@ func printDashboardMarkdown(output DashboardOutput) error {
 				sessCounts["gemini"],
 				sessCounts["pi"],
 				sessCounts["kimi"],
+				sessCounts["muse"],
 				sessCounts["antigravity"],
 				sessCounts["grok"],
 				sessCounts["cursor"],
@@ -448,6 +452,7 @@ func dashboardCounts(sessions []SnapshotSession) (int, int, map[string]int) {
 		"gemini":      0,
 		"pi":          0,
 		"kimi":        0,
+		"muse":        0,
 		"antigravity": 0,
 		"grok":        0,
 		"cursor":      0,
@@ -478,7 +483,7 @@ func dashboardCounts(sessions []SnapshotSession) (int, int, map[string]int) {
 
 func dashboardOtherAgentCount(totalPanes, userPanes int, typeCounts map[string]int) int {
 	otherPanes := totalPanes - userPanes
-	for _, agentType := range []string{"claude", "codex", "gemini", "pi", "kimi", "antigravity", "grok", "cursor", "windsurf", "aider", "oc", "ollama"} {
+	for _, agentType := range []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "antigravity", "grok", "cursor", "windsurf", "aider", "oc", "ollama"} {
 		otherPanes -= typeCounts[agentType]
 	}
 	if otherPanes < 0 {

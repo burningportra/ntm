@@ -3798,6 +3798,8 @@ func detectAgentType(title string) string {
 		return "pi"
 	case containsShortForm(titleLower, "kimi"):
 		return "kimi"
+	case containsShortForm(titleLower, "muse"):
+		return "muse"
 	case containsShortForm(titleLower, "agy"):
 		return "antigravity"
 	case containsShortForm(titleLower, "grok"):
@@ -3812,8 +3814,8 @@ func detectAgentType(title string) string {
 }
 
 // DetectAgentType detects the agent type from a pane title.
-// Returns one of: "claude", "codex", "gemini", "pi", "kimi", "cursor", "windsurf",
-// "aider", "oc" (opencode), "ollama", or "unknown".
+// Returns one of: "claude", "codex", "gemini", "pi", "kimi", "muse", "cursor",
+// "windsurf", "aider", "oc" (opencode), "ollama", or "unknown".
 func DetectAgentType(title string) string {
 	return detectAgentType(title)
 }
@@ -3843,6 +3845,8 @@ func ResolveAgentType(t string) string {
 		return "pi"
 	case agent.AgentTypeKimi:
 		return "kimi"
+	case agent.AgentTypeMuse:
+		return "muse"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
 	case agent.AgentTypeGrok:
@@ -3868,6 +3872,12 @@ func ResolveAgentType(t string) string {
 
 // detectModel attempts to detect the model from agent type and pane title.
 func detectModel(agentType, title string) string {
+	// Muse Code only runs Muse models, all with the same context window, and
+	// the title checks below would read a session name such as "myproject"
+	// ("pro") as another vendor's model.
+	if agentType == "muse" {
+		return "muse"
+	}
 	titleLower := strings.ToLower(title)
 	// Check for specific model mentions in title
 	switch {
@@ -6045,6 +6055,8 @@ func agentTypeString(t tmux.AgentType) string {
 		return "pi"
 	case tmux.AgentKimi:
 		return "kimi"
+	case tmux.AgentMuse:
+		return "muse"
 	case tmux.AgentAntigravity:
 		return "antigravity"
 	case tmux.AgentGrok:
@@ -6108,6 +6120,10 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 			if cfg.Models.DefaultGrok != "" {
 				return cfg.Models.DefaultGrok
 			}
+		case tmux.AgentMuse:
+			if cfg.Models.DefaultMuse != "" {
+				return cfg.Models.DefaultMuse
+			}
 		case tmux.AgentOllama:
 			if cfg.Models.DefaultOllama != "" {
 				return cfg.Models.DefaultOllama
@@ -6126,6 +6142,8 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 		return defaults.DefaultGemini
 	case tmux.AgentGrok:
 		return defaults.DefaultGrok
+	case tmux.AgentMuse:
+		return defaults.DefaultMuse
 	case tmux.AgentCursor:
 		return "cursor"
 	case tmux.AgentWindsurf:
@@ -6897,8 +6915,8 @@ func (robotDispatchProtocolPlanner) PlanDelivery(_ context.Context, target dispa
 			SecondEnterDelay: tmux.DoubleEnterSecondDelay,
 		}, nil
 	}
-	enterDelay := tmux.DefaultEnterDelay
-	if target.Pane.Type == tmux.AgentUser || resolvedType == "user" || resolvedType == "unknown" {
+	enterDelay := tmux.EnterDelayForAgent(tmux.AgentType(resolvedType))
+	if target.Pane.Type == tmux.AgentUser {
 		enterDelay = tmux.ShellEnterDelay
 	}
 	return dispatchsvc.ProtocolPlan{Protocol: dispatchsvc.ProtocolSingleEnter, EnterDelay: enterDelay}, nil

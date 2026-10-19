@@ -56,6 +56,7 @@ type SpawnOptions struct {
 	GmiCount           int           // Gemini agents
 	PiCount            int           // Pi agents
 	KimiCount          int           // Kimi agents
+	MuseCount          int           // Muse Code agents
 	AgyCount           int           // Antigravity agents
 	GrokCount          int           // Grok Build agents
 	Preset             string        // Recipe/preset name
@@ -189,6 +190,7 @@ func validateSpawnRequest(opts SpawnOptions) (string, error) {
 		{flag: "--spawn-gmi", value: opts.GmiCount},
 		{flag: "--spawn-pi", value: opts.PiCount},
 		{flag: "--spawn-kimi", value: opts.KimiCount},
+		{flag: "--spawn-muse", value: opts.MuseCount},
 		{flag: "--spawn-agy", value: opts.AgyCount},
 		{flag: "--spawn-grok", value: opts.GrokCount},
 	}
@@ -197,8 +199,8 @@ func validateSpawnRequest(opts SpawnOptions) (string, error) {
 			return "", fmt.Errorf("%s must be zero or greater, got %d", count.flag, count.value)
 		}
 	}
-	if opts.CCCount+opts.CodCount+opts.GmiCount+opts.PiCount+opts.KimiCount+opts.AgyCount+opts.GrokCount <= 0 {
-		return "", errors.New("no agents specified (use cc, cod, gmi, pi, kimi, agy, or grok counts)")
+	if opts.CCCount+opts.CodCount+opts.GmiCount+opts.PiCount+opts.KimiCount+opts.MuseCount+opts.AgyCount+opts.GrokCount <= 0 {
+		return "", errors.New("no agents specified (use cc, cod, gmi, pi, kimi, muse, agy, or grok counts)")
 	}
 	if opts.GrokCount > 0 && opts.WaitReady {
 		return "", errGrokSpawnWaitUnavailable
@@ -470,7 +472,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	_ = audit.LogEvent(opts.Session, audit.EventTypeSpawn, audit.ActorSystem, "robot.spawn", map[string]interface{}{
 		"phase":           "start",
 		"session":         opts.Session,
-		"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.AgyCount + opts.GrokCount,
+		"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.MuseCount + opts.AgyCount + opts.GrokCount,
 		"preset":          opts.Preset,
 		"no_user_pane":    opts.NoUserPane,
 		"dry_run":         opts.DryRun,
@@ -488,7 +490,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		payload := map[string]interface{}{
 			"phase":           "finish",
 			"session":         opts.Session,
-			"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.AgyCount + opts.GrokCount,
+			"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.MuseCount + opts.AgyCount + opts.GrokCount,
 			"preset":          opts.Preset,
 			"no_user_pane":    opts.NoUserPane,
 			"dry_run":         opts.DryRun,
@@ -618,7 +620,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	// handoffCtx is available for use in work prompts below
 	_ = handoffCtx // silence unused warning when not in orchestrator mode
 
-	totalAgents := opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.AgyCount + opts.GrokCount
+	totalAgents := opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.MuseCount + opts.AgyCount + opts.GrokCount
 
 	// Calculate total panes needed
 	totalPanes := totalAgents
@@ -755,6 +757,17 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 				Name:  dryRunNameMap.AssignNew("kimi", kimiPane),
 				Type:  "kimi",
 				Title: fmt.Sprintf("%s__kimi_%d", opts.Session, i+1),
+			})
+			paneIdx++
+		}
+
+		for i := 0; i < opts.MuseCount; i++ {
+			musePane := fmt.Sprintf("0.%d", paneIdx)
+			output.WouldCreate = append(output.WouldCreate, SpawnedAgent{
+				Pane:  musePane,
+				Name:  dryRunNameMap.AssignNew("muse", musePane),
+				Type:  "muse",
+				Title: fmt.Sprintf("%s__muse_%d", opts.Session, i+1),
 			})
 			paneIdx++
 		}
@@ -946,6 +959,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		{agentType: "grok", count: opts.GrokCount},
 		{agentType: "pi", count: opts.PiCount},
 		{agentType: "kimi", count: opts.KimiCount},
+		{agentType: "muse", count: opts.MuseCount},
 	} {
 		for i := 0; i < spec.count; i++ {
 			launchRequests = append(launchRequests, launchRequest{agentType: spec.agentType, number: i + 1})
@@ -1272,6 +1286,13 @@ func isAgentReady(output, _ string) bool {
 		}
 	}
 
+	// Muse Code's last line is its status bar, not a prompt, so the prompt
+	// patterns below never match it; its banner or status bar means the TUI
+	// is up and taking input.
+	if agentpkg.IsMuseOutput(output) {
+		return true
+	}
+
 	// "ready" needs a word boundary: as a bare substring it also matched
 	// "already", so ordinary output such as "Already up to date." counted as an
 	// agent coming up.
@@ -1301,6 +1322,8 @@ func agentTypeShort(agentType string) string {
 		return "pi"
 	case tmux.AgentKimi:
 		return "kimi"
+	case tmux.AgentMuse:
+		return "muse"
 	case tmux.AgentAntigravity:
 		return "agy"
 	case tmux.AgentGrok:
@@ -1328,6 +1351,7 @@ func getAgentCommands(cfg *config.Config) map[string]string {
 		"gemini":      "gemini",
 		"pi":          "pi",
 		"kimi":        "kimi",
+		"muse":        "muse --yolo",
 		"antigravity": "agy",
 		"grok":        "grok --always-approve",
 	}
@@ -1346,6 +1370,9 @@ func getAgentCommands(cfg *config.Config) map[string]string {
 	}
 	if cfg != nil && cfg.Agents.Kimi != "" {
 		defaults["kimi"] = cfg.Agents.Kimi
+	}
+	if cfg != nil && cfg.Agents.Muse != "" {
+		defaults["muse"] = cfg.Agents.Muse
 	}
 	if cfg != nil && cfg.Agents.Antigravity != "" {
 		defaults["antigravity"] = cfg.Agents.Antigravity

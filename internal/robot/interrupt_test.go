@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -266,5 +267,85 @@ func TestObserveInterruptPollRefreshesActivityAndFailsClosed(t *testing.T) {
 	)
 	if unavailable.Current.Freshness != status.FreshnessUnavailable || unavailable.Current.Error == "" {
 		t.Fatalf("activity failure authorized current state: %+v", unavailable.Current)
+	}
+}
+
+// TestClearRestoredMuseDrafts covers the follow-up message after an
+// interrupt: Ctrl+C or Esc cancels a Muse turn and puts the prompt back in the
+// composer, so interrupted Muse panes get a verified C-u before the follow-up
+// is typed, while other panes are left alone.
+func TestClearRestoredMuseDrafts(t *testing.T) {
+	panes := []tmux.Pane{
+		{ID: "%1", Index: 1, Type: tmux.AgentMuse},   // interrupted, clears
+		{ID: "%2", Index: 2, Type: tmux.AgentMuse},   // already idle, not interrupted
+		{ID: "%3", Index: 3, Type: tmux.AgentClaude}, // interrupted, not Muse
+		{ID: "%4", Index: 4, Type: tmux.AgentMuse},   // interrupted, draft survives
+		{ID: "%5", Index: 5, Type: tmux.AgentMuse},   // interrupted, tmux error
+	}
+	interrupted := map[string]bool{"1": true, "3": true, "4": true, "5": true}
+
+	var cleared []string
+	clear := func(_ context.Context, target string, agentType tmux.AgentType) (bool, bool, error) {
+		if agentType != tmux.AgentMuse {
+			t.Errorf("clear(%s) agent type = %q, want muse", target, agentType)
+		}
+		cleared = append(cleared, target)
+		switch target {
+		case "%4":
+			return false, true, nil
+		case "%5":
+			return false, false, errors.New("tmux gone")
+		default:
+			return true, true, nil
+		}
+	}
+
+	kept, failed := clearRestoredMuseDrafts(
+		context.Background(),
+		panes,
+		interrupted,
+		func(p tmux.Pane) string { return paneTargetKey(p, false) },
+		clear,
+	)
+
+	if got, want := strings.Join(cleared, ","), "%1,%4,%5"; got != want {
+		t.Fatalf("cleared panes = %s, want %s", got, want)
+	}
+	var keptIDs []string
+	for _, p := range kept {
+		keptIDs = append(keptIDs, p.ID)
+	}
+	if got, want := strings.Join(keptIDs, ","), "%1,%2,%3"; got != want {
+		t.Fatalf("follow-up targets = %s, want %s", got, want)
+	}
+	if len(failed) != 2 || failed[0].Pane != "4" || failed[1].Pane != "5" {
+		t.Fatalf("failed = %+v, want panes 4 and 5", failed)
+	}
+	if !strings.Contains(failed[0].Reason, "still holds the interrupted prompt") {
+		t.Errorf("pane 4 reason = %q, want the leftover-draft reason", failed[0].Reason)
+	}
+	if !strings.Contains(failed[1].Reason, "tmux gone") {
+		t.Errorf("pane 5 reason = %q, want the tmux error", failed[1].Reason)
+	}
+}
+
+func TestSendInterruptMessagesUsesMuseEnterDelay(t *testing.T) {
+	var delays []time.Duration
+	errs := sendInterruptMessages(
+		[]interruptMessageTarget{
+			{Pane: "1", Target: "%1", AgentType: tmux.AgentMuse},
+			{Pane: "2", Target: "%2", AgentType: tmux.AgentClaude},
+		},
+		"continue",
+		func(_, _ string, _ bool, enterDelay time.Duration, _ tmux.AgentType) error {
+			delays = append(delays, enterDelay)
+			return nil
+		},
+	)
+	if len(errs) != 0 {
+		t.Fatalf("errors = %+v", errs)
+	}
+	if len(delays) != 2 || delays[0] != tmux.MuseEnterDelay || delays[1] != tmux.DefaultEnterDelay {
+		t.Fatalf("enter delays = %v, want [%s %s]", delays, tmux.MuseEnterDelay, tmux.DefaultEnterDelay)
 	}
 }

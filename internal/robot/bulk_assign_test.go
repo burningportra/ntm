@@ -2965,6 +2965,9 @@ func TestValidateBulkAssignPromptDeliveryRejectsMixedGrokBatch(t *testing.T) {
 	if got := bulkAssignTMUXAgentType("grok-build"); got != tmux.AgentGrok {
 		t.Fatalf("bulkAssignTMUXAgentType(grok-build) = %s, want grok", got)
 	}
+	if got := bulkAssignTMUXAgentType("muse-code"); got != tmux.AgentMuse {
+		t.Fatalf("bulkAssignTMUXAgentType(muse-code) = %s, want muse", got)
+	}
 
 	assignments[1].Status = "failed"
 	if err := validateBulkAssignPromptDelivery(assignments); err != nil {

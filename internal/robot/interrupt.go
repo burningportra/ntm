@@ -325,6 +325,20 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 			}
 		}
 
+		interrupted := make(map[string]bool, len(output.Interrupted))
+		for _, paneKey := range output.Interrupted {
+			interrupted[paneKey] = true
+		}
+		var clearFailures []InterruptError
+		messageTargets, clearFailures = clearRestoredMuseDrafts(
+			context.Background(),
+			messageTargets,
+			interrupted,
+			func(pane tmux.Pane) string { return paneTargetKey(pane, multiWindow) },
+			tmux.ClearComposerContext,
+		)
+		output.Failed = append(output.Failed, clearFailures...)
+
 		if len(messageTargets) > 0 {
 			dispatchPanes := make([]tmux.Pane, len(panes))
 			for i, pane := range panes {
@@ -570,6 +584,48 @@ func interruptPaneTMUXAgentType(pane tmux.Pane) tmux.AgentType {
 	return tmux.AgentType(interruptPaneAgentType(pane)).Canonical()
 }
 
+// clearRestoredMuseDrafts clears the composer of every interrupted Muse Code
+// pane before the follow-up message is typed. Interrupting a Muse turn (Ctrl+C
+// or Esc) puts the interrupted prompt back in the composer as a draft, so the
+// follow-up would otherwise be appended to the old prompt. Muse's clear is a
+// lone C-u (Escape and a second Ctrl+C are not safe there), verified against
+// the "❯" composer line. A pane whose composer still holds text is reported
+// as failed and gets no follow-up. Other agents, and Muse panes that were
+// already idle and so were not interrupted, pass through untouched.
+func clearRestoredMuseDrafts(
+	ctx context.Context,
+	targets []tmux.Pane,
+	interrupted map[string]bool,
+	keyOf func(tmux.Pane) string,
+	clear func(context.Context, string, tmux.AgentType) (cleared, verified bool, err error),
+) ([]tmux.Pane, []InterruptError) {
+	kept := make([]tmux.Pane, 0, len(targets))
+	var failed []InterruptError
+	for _, pane := range targets {
+		key := keyOf(pane)
+		if pane.Type.Canonical() != tmux.AgentMuse || !interrupted[key] {
+			kept = append(kept, pane)
+			continue
+		}
+		cleared, verified, err := clear(ctx, pane.ID, tmux.AgentMuse)
+		switch {
+		case err != nil:
+			failed = append(failed, InterruptError{
+				Pane:   key,
+				Reason: fmt.Sprintf("failed to clear the interrupted Muse prompt before the follow-up message: %v", err),
+			})
+		case verified && !cleared:
+			failed = append(failed, InterruptError{
+				Pane:   key,
+				Reason: "Muse composer still holds the interrupted prompt after C-u; follow-up message not sent (inspect with --robot-tail)",
+			})
+		default:
+			kept = append(kept, pane)
+		}
+	}
+	return kept, failed
+}
+
 type interruptMessageTarget struct {
 	Pane      string
 	Target    string
@@ -583,10 +639,7 @@ func sendInterruptMessages(
 ) []InterruptError {
 	var errors []InterruptError
 	for _, target := range targets {
-		enterDelay := tmux.DefaultEnterDelay
-		if target.AgentType == tmux.AgentUser || target.AgentType == tmux.AgentUnknown {
-			enterDelay = tmux.ShellEnterDelay
-		}
+		enterDelay := tmux.EnterDelayForAgent(target.AgentType)
 		if err := send(target.Target, message, true, enterDelay, target.AgentType); err != nil {
 			errors = append(errors, InterruptError{
 				Pane:   target.Pane,

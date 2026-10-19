@@ -7,8 +7,50 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/tokens"
 )
+
+// museContextLimit is the context window of every Muse model in Muse's own
+// model catalog.
+const museContextLimit = 1007997
+
+// TestMusePaneContextEstimateUsesMuseWindow covers both robot paths that size
+// a pane's context: --robot-context (detectModel) and --robot-status
+// (modelNameForPane feeding tokens.GetUsageInfo). The session name holds
+// "pro", which detectModel would otherwise read as a Gemini model.
+func TestMusePaneContextEstimateUsesMuseWindow(t *testing.T) {
+	pane := tmux.Pane{Type: tmux.AgentMuse, Title: "myproject__muse_1"}
+
+	model := detectModel(paneAgentType(pane), pane.Title)
+	if got := getContextLimit(model); got != museContextLimit {
+		t.Errorf("--robot-context limit for model %q = %d, want %d", model, got, museContextLimit)
+	}
+
+	for name, cfg := range map[string]*config.Config{"nil config": nil, "default config": config.Default()} {
+		usage := tokens.GetUsageInfo(museTestIdleScreen, modelNameForPane(pane, cfg))
+		if usage.ContextLimit != museContextLimit {
+			t.Errorf("%s: --robot-status limit for model %q = %d, want %d", name, usage.Model, usage.ContextLimit, museContextLimit)
+		}
+		if usage.EstimatedTokens <= 0 {
+			t.Errorf("%s: estimated tokens = %d, want > 0", name, usage.EstimatedTokens)
+		}
+	}
+}
+
+func TestParseAgentTypes_Muse(t *testing.T) {
+	for _, input := range []string{"muse", "muse-code", "MUSE_CODE", "meta-muse"} {
+		got := parseAgentTypes(input)
+		if len(got) != 1 || got[0] != "muse" {
+			t.Errorf("parseAgentTypes(%q) = %v, want [muse]", input, got)
+		}
+	}
+	if !isTrackedAgentType("muse") {
+		t.Error("muse should be a tracked agent type for --robot-tokens")
+	}
+}
 
 // =============================================================================
 // splitJSONLines tests
@@ -318,7 +360,7 @@ func TestParseAgentTypes_GrokAndLegacyAll(t *testing.T) {
 		{input: "grok", want: []string{"grok"}},
 		{input: "grok-build", want: []string{"grok"}},
 		{input: "xai_grok_build", want: []string{"grok"}},
-		{input: "all", want: []string{"claude", "codex", "gemini", "pi", "kimi", "grok"}},
+		{input: "all", want: []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "grok"}},
 	}
 
 	for _, tt := range tests {

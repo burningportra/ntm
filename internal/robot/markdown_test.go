@@ -341,6 +341,16 @@ func TestCountAgentsByType(t *testing.T) {
 				"cursor": 1, "windsurf": 1, "aider": 1, "ollama": 1, "other": 0,
 			},
 		},
+		{
+			name: "muse aliases count as muse",
+			panes: []tmux.Pane{
+				{Type: tmux.AgentMuse},
+				{Type: tmux.AgentType("muse-code")},
+			},
+			expect: map[string]int{
+				"muse": 2, "claude": 0, "other": 0,
+			},
+		},
 	}
 
 	for _, tt := range tests {

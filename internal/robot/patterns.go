@@ -136,6 +136,19 @@ func defaultPatterns() []Pattern {
 		{Name: "kimi_banner", RegexStr: `(?i)kimi\s+(code|cli)`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Kimi code/cli banner"},
 		{Name: "kimi_moonshot", RegexStr: `(?i)moonshot(\s+ai)?\b`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Moonshot AI banner"},
 
+		// Muse Code patterns. Muse keeps its "❯" composer drawn under the live
+		// "◇ Thinking (3s · esc to interrupt)" line for the whole turn, so
+		// muse_working must outrank the composer; it is a thinking pattern and
+		// so only counts in the live tail, where Muse replaces the working line
+		// with the reply once the turn ends.
+		{Name: "muse_banner", RegexStr: `(?m)^\s*Muse Code \d+\.\d+`, Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Muse Code version banner"},
+		{Name: "muse_composer", RegexStr: `(?m)^\s*❯[\s\x{00a0}]*$`, Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Muse Code empty composer"},
+		{Name: "muse_working", RegexStr: `(?i)\([^()]*\besc\s+to\s+interrupt\s*\)`, Agent: "muse", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "Muse Code live working line (e.g. ◇ Thinking (3s · esc to interrupt))"},
+		// Muse asks "Do you trust this workspace?" before its first turn in an
+		// untrusted directory unless launched with --yolo or --trust-workspace;
+		// like agy's dialog, the pane is alive but blocked on a keystroke.
+		{Name: "muse_trust_prompt", RegexStr: `(?i)do\s+you\s+trust\s+this\s+workspace\?`, Agent: "muse", State: StateError, Category: CategoryError, Priority: 210, Description: "Muse Code workspace-trust prompt (pane blocked on keystroke)"},
+
 		// Antigravity (agy) first-run workspace-trust dialog: the pane is
 		// alive but permanently stalled on a menu waiting for a keystroke.
 		// Without these, health reported such panes as OK — the worst
@@ -455,7 +468,7 @@ func isGenericShellIdlePattern(name string) bool {
 
 func isKnownAgentPatternType(agentType string) bool {
 	switch normalizeAgentType(agentType) {
-	case "claude", "codex", "gemini", "pi", "kimi", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "pi", "kimi", "muse", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama":
 		return true
 	default:
 		return false

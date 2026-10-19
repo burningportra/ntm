@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1977,11 +1978,21 @@ func isAgentIdlePrompt(output, agentType string) bool {
 		return strings.HasSuffix(lastLine, ">")
 	case "pi":
 		return strings.HasSuffix(lastLine, ">")
+	case "muse":
+		// Muse's last line is its status bar, and its "❯" composer stays drawn
+		// while a turn runs, so the composer means idle only once the live
+		// working line is gone. After an interrupt Muse restores the prompt
+		// into the composer as a draft; that composer is still taking input.
+		return !agent.MuseActivelyWorking(output) && museComposerLineRe.MatchString(output)
 	default:
 		// Generic check for common prompt patterns
 		return strings.HasSuffix(lastLine, ">") || strings.HasSuffix(lastLine, "$") || strings.HasSuffix(lastLine, "%")
 	}
 }
+
+// museComposerLineRe matches Muse Code's composer line, empty or holding a
+// draft.
+var museComposerLineRe = regexp.MustCompile(`(?m)^\s*❯`)
 
 // isShellPrompt checks if the output shows a shell prompt
 func isShellPrompt(output string) bool {
@@ -2036,6 +2047,10 @@ func isAgentRunning(output, agentType string) bool {
 		return strings.Contains(outputLower, "kimi") ||
 			strings.Contains(outputLower, "moonshot") ||
 			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
+	case "muse":
+		// The "Muse Code 1.4.11" banner or the "<model> · <cwd>" status bar.
+		// "muse" alone would match words such as "museum" in the shell.
+		return agent.IsMuseOutput(output)
 	case "cursor":
 		return strings.Contains(outputLower, "cursor") ||
 			(len(lastLine) < 50 && strings.HasSuffix(lastLine, ">"))
@@ -2072,6 +2087,10 @@ func getAgentCommand(agentType string) string {
 		return "pi"
 	case "kimi":
 		return "kimi"
+	case "muse":
+		// --yolo trusts the workspace, as the spawn launch template does, so the
+		// relaunched pane does not stop at Muse's trust prompt.
+		return "muse --yolo"
 	case "antigravity":
 		return "agy"
 	case "cursor":

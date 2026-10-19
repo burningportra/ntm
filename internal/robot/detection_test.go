@@ -27,6 +27,14 @@ func TestDetectFromProcess(t *testing.T) {
 		{"cursor process", "cursor", "cursor", 0.95},
 		{"windsurf process", "windsurf", "windsurf", 0.95},
 		{"ollama process", "ollama serve", "ollama", 0.95},
+		{"muse launcher", "muse --yolo --model muse-wonder-1.0", "muse", 0.95},
+		{"muse binary as tmux reports it", "muse-bin-1.4.11", "muse", 0.95},
+		{"muse binary absolute path", "/Users/x/.local/bin/muse-bin-1.4.11-R6667.1", "muse", 0.95},
+		{"muse launcher under a claude dir", "/tmp/claude-501/bin/muse --yolo", "muse", 0.95},
+		{"amuse is unrelated", "amuse", "unknown", 0.0},
+		{"museum is unrelated", "museum --open", "unknown", 0.0},
+		{"musescore is unrelated", "/Applications/musescore", "unknown", 0.0},
+		{"muse argument is unrelated", "rg muse", "unknown", 0.0},
 		{"unknown process", "vim", "unknown", 0.0},
 		{"bash shell", "bash", "unknown", 0.0},
 		{"zsh shell", "zsh", "unknown", 0.0},
@@ -64,6 +72,7 @@ func TestDetectFromContent(t *testing.T) {
 		{"cursor ai", "Cursor AI ready", "cursor"},
 		{"windsurf codeium", "Powered by Codeium", "windsurf"},
 		{"ollama serve", "ollama serve llama3.2", "ollama"},
+		{"muse idle screen", museTestIdleScreen, "muse"},
 		{"plain shell", "$ ls -la\nREADME.md", "unknown"},
 	}
 
@@ -121,6 +130,8 @@ func TestDetectFromNTMTitle(t *testing.T) {
 		{"NTM ws pane", "session__ws_2", "windsurf", 0.9},
 		{"NTM aider pane", "session__aider_3", "aider", 0.9},
 		{"NTM ollama pane", "session__ollama_4", "ollama", 0.9},
+		{"NTM muse pane", "session__muse_1", "muse", 0.9},
+		{"museum session is not muse", "museum__notes", "unknown", 0.0},
 		{"non-NTM title", "Terminal", "unknown", 0.0},
 		{"partial match", "code_cc", "unknown", 0.0},
 	}
@@ -202,6 +213,28 @@ func TestDetectAgentTypeEnhanced(t *testing.T) {
 			wantType:   "unknown",
 			wantMethod: MethodUnknown,
 		},
+		{
+			name:       "muse pane type",
+			pane:       tmux.Pane{Type: tmux.AgentMuse, Command: "muse-bin-1.4.11", Title: "proj"},
+			content:    museTestIdleScreen,
+			wantType:   "muse",
+			wantMethod: MethodTmuxPane,
+		},
+		{
+			// Muse titles its pane with the cwd basename.
+			name:       "muse process with cwd title",
+			pane:       tmux.Pane{Command: "muse-bin-1.4.11", Title: "claude-port"},
+			content:    museTestWorkingScreen,
+			wantType:   "muse",
+			wantMethod: MethodProcess,
+		},
+		{
+			name:       "muse screen behind a shell command",
+			pane:       tmux.Pane{Command: "zsh", Title: "claude-port"},
+			content:    museTestFinishedScreen,
+			wantType:   "muse",
+			wantMethod: MethodContent,
+		},
 	}
 
 	for _, tt := range tests {
@@ -215,4 +248,87 @@ func TestDetectAgentTypeEnhanced(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Muse Code screens captured from muse 1.4.11 (echo provider) in a 160x45
+// tmux pane, rules shortened. The cwd sits under /private/tmp/claude-501, as
+// ntm scratch projects do, and the prompt mentions Claude Code, so the
+// screens carry the same words Claude detection keys on.
+const (
+	museTestRule      = "────────────────────────────────────────────────────────────"
+	museTestVoiceBar  = "── Voice input (alt(option)+v to start) ──────────────────────"
+	museTestStatusBar = "  muse-wonder-1.0 · /private/tmp/claude-501/claude-port · YOLO"
+	museTestBanner    = "  Muse Code 1.4.11\n\n" +
+		"  Skills: 276 loaded · 40 warnings · 76 details hidden (ctrl+o to expand)\n\n"
+	museTestChrome = museTestVoiceBar + "\n❯\n" + museTestRule + "\n" + museTestStatusBar
+
+	museTestIdleScreen = museTestBanner + museTestChrome
+
+	museTestWorkingScreen = museTestBanner +
+		"❯ port the Claude Code hooks\n\n" +
+		"◆ Thinking (0s · esc to interrupt)\n\n" +
+		museTestChrome
+
+	museTestFinishedScreen = museTestBanner +
+		"❯ port the Claude Code hooks\n\n" +
+		"◆ echo: port the Claude Code hooks\n\n" +
+		museTestChrome
+
+	// After Ctrl+C or Esc cancels a turn, Muse puts the prompt back in the
+	// composer as a draft.
+	museTestInterruptedScreen = museTestBanner +
+		museTestVoiceBar + "\n❯ port the Claude Code hooks\n" + museTestRule + "\n" + museTestStatusBar
+)
+
+// TestDetectFromContent_MuseScreensNeverClaude guards the detection order:
+// Muse shares Claude Code's "❯" composer and "esc to interrupt" hint, and a
+// transcript that mentions Claude Code matches Claude's content patterns, so
+// checking those first would report a Muse pane as claude.
+func TestDetectFromContent_MuseScreensNeverClaude(t *testing.T) {
+	screens := map[string]string{
+		"idle":        museTestIdleScreen,
+		"working":     museTestWorkingScreen,
+		"finished":    museTestFinishedScreen,
+		"interrupted": museTestInterruptedScreen,
+	}
+	for name, screen := range screens {
+		t.Run(name, func(t *testing.T) {
+			if name != "idle" && !matchesContentPatternsFor("claude", screen) {
+				t.Fatalf("fixture %q should match a claude content pattern so the ordering is exercised", name)
+			}
+			detection := detectFromContent(screen)
+			if detection.Type != "muse" {
+				t.Fatalf("detectFromContent(%s Muse screen) = %q, want muse", name, detection.Type)
+			}
+			if detection.Method != MethodContent {
+				t.Fatalf("detectFromContent(%s Muse screen) method = %q, want %q", name, detection.Method, MethodContent)
+			}
+		})
+	}
+}
+
+func TestDetectFromContent_MuseWordsAloneAreNotMuse(t *testing.T) {
+	for _, content := range []string{
+		"$ open museum.html\n$",
+		"amuse-bouche recipes\n%",
+		"muse: a source of inspiration",
+	} {
+		if detection := detectFromContent(content); detection.Type == "muse" {
+			t.Errorf("detectFromContent(%q) = muse, want not muse", content)
+		}
+	}
+}
+
+func matchesContentPatternsFor(agentType, content string) bool {
+	for _, cp := range contentPatterns {
+		if cp.agentType != agentType {
+			continue
+		}
+		for _, pattern := range cp.patterns {
+			if pattern.MatchString(content) {
+				return true
+			}
+		}
+	}
+	return false
 }

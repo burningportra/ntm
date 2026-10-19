@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -215,6 +216,18 @@ func detectFromProcess(command string) AgentDetection {
 		}
 	}
 
+	// "muse" is part of words such as amuse and museum, so Muse Code is also
+	// matched by executable basename only. It is checked before the substring
+	// table so a launcher path such as /tmp/claude-501/bin/muse is not taken
+	// for Claude.
+	if museProcessExecutable(command) {
+		return AgentDetection{
+			Type:       "muse",
+			Confidence: 0.95,
+			Method:     MethodProcess,
+		}
+	}
+
 	for pattern, agentType := range processPatterns {
 		if strings.Contains(command, pattern) {
 			return AgentDetection{
@@ -229,22 +242,48 @@ func detectFromProcess(command string) AgentDetection {
 }
 
 func exactProcessExecutable(command, executable string) bool {
+	return strings.EqualFold(processExecutableBase(command), executable)
+}
+
+// processExecutableBase returns the basename of command's first token, without
+// quotes or a ".exe" suffix, or "" for an empty command.
+func processExecutableBase(command string) string {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
-		return false
+		return ""
 	}
 	first := strings.Trim(fields[0], "'\"")
 	if i := strings.LastIndexAny(first, "/\\"); i >= 0 {
 		first = first[i+1:]
 	}
-	first = strings.TrimSuffix(first, ".exe")
-	return strings.EqualFold(first, executable)
+	return strings.TrimSuffix(first, ".exe")
+}
+
+// museProcessExecutable reports whether command runs Muse Code. The `muse`
+// launcher execs a versioned binary such as muse-bin-1.4.11-R6667.1, which
+// tmux truncates to muse-bin-1.4.11 in pane_current_command, so both
+// basenames count.
+func museProcessExecutable(command string) bool {
+	base := strings.ToLower(processExecutableBase(command))
+	return base == "muse" || base == "muse-bin" || strings.HasPrefix(base, "muse-bin-")
 }
 
 // detectFromContent analyzes pane content for agent signatures
 func detectFromContent(content string) AgentDetection {
 	// Strip ANSI codes for cleaner matching
 	content = status.StripANSI(content)
+
+	// Muse Code shares Claude Code's "❯" composer and "esc to interrupt"
+	// hint, and its status bar shows the cwd, which may contain "claude".
+	// Its banner and status bar are checked before any other agent's
+	// signature so a Muse screen is never reported as Claude.
+	if agent.IsMuseOutput(content) {
+		return AgentDetection{
+			Type:       "muse",
+			Confidence: 0.75,
+			Method:     MethodContent,
+		}
+	}
 
 	for _, cp := range contentPatterns {
 		for _, pattern := range cp.patterns {
@@ -265,6 +304,9 @@ func detectFromContent(content string) AgentDetection {
 func DetectFromTitle(title string) AgentDetection {
 	title = strings.ToLower(title)
 
+	// Muse is left out: it titles its pane with the cwd basename, and "muse"
+	// is a substring of unrelated words (amuse, museum). NTM's "__muse_N"
+	// titles are matched by DetectFromNTMTitle.
 	agents := []string{"claude", "codex", "gemini", "pi", "kimi", "cursor", "windsurf", "aider", "ollama"}
 	for _, agent := range agents {
 		if strings.Contains(title, agent) {
@@ -296,6 +338,8 @@ func DetectFromNTMTitle(title string) AgentDetection {
 		return AgentDetection{Type: "pi", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "kimi"):
 		return AgentDetection{Type: "kimi", Confidence: 0.9, Method: MethodTitle}
+	case containsShortForm(lower, "muse"):
+		return AgentDetection{Type: "muse", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "grok"):
 		return AgentDetection{Type: "grok", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "cursor"):

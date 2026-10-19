@@ -366,6 +366,14 @@ func TestIsAgentIdlePrompt(t *testing.T) {
 		{"gemini cli alias with > prompt", "Gemini output\n>", "google-gemini", true},
 		{"gemini no prompt", "Gemini output\nWorking...", "gemini", false},
 
+		// Muse agent: the composer stays drawn during a turn and the last line
+		// is the status bar.
+		{"muse idle composer", museTestIdleScreen, "muse", true},
+		{"muse alias idle composer", museTestIdleScreen, "muse-code", true},
+		{"muse restored draft after interrupt", museTestInterruptedScreen, "muse", true},
+		{"muse working line live", museTestWorkingScreen, "muse", false},
+		{"muse status bar without composer", "◆ echo: hi\n" + museTestStatusBar, "muse", false},
+
 		// Unknown/default agent
 		{"unknown with > prompt", "Output\n>", "unknown", true},
 		{"unknown with $ prompt", "Output\n$", "unknown", true},
@@ -472,6 +480,9 @@ func TestIsAgentRunning(t *testing.T) {
 		{"windsurf alias", "windsurf ready", "ws", true},
 		{"aider mentioned", "Aider watching repo", "aider", true},
 		{"ollama mentioned", "ollama serving model", "ollama", true},
+		{"muse banner", museTestIdleScreen, "muse", true},
+		{"muse status bar after banner scrolled off", "◆ echo: hi\n" + museTestRule + "\n" + museTestStatusBar, "muse-code", true},
+		{"muse word in shell is not muse", "$ open museum.html\n%", "muse", false},
 
 		// Unknown type
 		{"unknown with > prompt", "Output\n>", "unknown", true},
@@ -513,6 +524,8 @@ func TestGetAgentCommand(t *testing.T) {
 		{"ws", "windsurf"},
 		{"aider", "aider"},
 		{"ollama", "ollama"},
+		{"muse", "muse --yolo"},
+		{"muse-code", "muse --yolo"},
 		{"unknown", ""},
 		{"", ""},
 		{"other", ""},
