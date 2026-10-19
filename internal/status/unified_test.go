@@ -1208,6 +1208,32 @@ const (
 		"◈ Thinking (12s · esc to interrupt)\n\n" +
 		museTestVoiceRule + "\n❯ follow up\n" + museTestRule + "\n" + museTestStatusBar
 
+	// A 480-character follow-up typed one second into a turn, captured live
+	// in a 60-column pane: the draft wraps to nine lines and puts the working
+	// line fourteen lines above the bottom.
+	museWorkingWithLongDraftCapture = "❯ start a turn\n\n" +
+		"◆ Thinking (1s · esc to interrupt)\n\n" +
+		museTestVoiceRule + "\n" +
+		"❯ word00 word01 word02 word03 word04 word05 word06 word07\n" +
+		"  word08 word09 word10 word11 word12 word13 word14 word15\n" +
+		"  word16 word17 word18 word19 word20 word21 word22 word23\n" +
+		"  word24 word25 word26 word27 word28 word29 word30 word31\n" +
+		"  word32 word33 word34 word35 word36 word37 word38 word39\n" +
+		"  word40 word41 word42 word43 word44 word45 word46 word47\n" +
+		"  word48 word49 word50 word51 word52 word53 word54 word55\n" +
+		"  word56 word57 word58 word59 word60 word61 word62 word63\n" +
+		"  word64 word65 word66 word67 word68 word69\n" +
+		museTestRule + "\n" + museTestStatusBar
+
+	// A turn in a 26-column pane, captured live: Muse cuts the working line
+	// at the pane edge.
+	museNarrowWorkingCapture = "❯ go\n\n" +
+		"◈ Thinking (1s · esc to in\n\n" +
+		"── Voice input (alt(opti…\n" +
+		"❯\n" +
+		"──────────────────────────\n" +
+		"  echo · …/ws · YOLO"
+
 	// Without --yolo or --trust-workspace Muse opens on its trust prompt,
 	// which has no composer.
 	museTrustPromptCapture = "Do you trust this workspace?\n" +
@@ -1238,6 +1264,8 @@ func TestDetermineStateMuseLiveTailOutranksVelocity(t *testing.T) {
 	}{
 		{"working composer under thinking line", museWorkingCapture, StateWorking},
 		{"working with a follow-up draft", museWorkingWithDraftCapture, StateWorking},
+		{"working with a long follow-up draft", museWorkingWithLongDraftCapture, StateWorking},
+		{"working in a pane too narrow for the working line", museNarrowWorkingCapture, StateWorking},
 		{"idle empty composer", museIdleCapture, StateIdle},
 		{"idle composer showing a feature tip", museIdleTipCapture, StateIdle},
 		{"idle composer holding a draft", museDraftCapture, StateIdle},

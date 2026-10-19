@@ -145,7 +145,7 @@ func defaultPatterns() []Pattern {
 		// with the reply once the turn ends.
 		{Name: "muse_banner", RegexStr: `(?m)^\s*Muse Code \d+\.\d+`, Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Muse Code version banner"},
 		{Name: "muse_composer", RegexStr: museComposerRegex(), Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Muse Code empty composer, or one showing a dim tip"},
-		{Name: "muse_working", RegexStr: `(?i)\([^()]*\besc\s+to\s+interrupt\s*\)`, Agent: "muse", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "Muse Code live working line (e.g. ◇ Thinking (3s · esc to interrupt))"},
+		{Name: "muse_working", RegexStr: agent.MuseWorkingLinePattern, Agent: "muse", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "Muse Code live working line (e.g. ◇ Thinking (3s · esc to interrupt))"},
 		// Muse asks "Do you trust this workspace?" before its first turn in an
 		// untrusted directory unless launched with --yolo or --trust-workspace;
 		// like agy's dialog, the pane is alive but blocked on a keystroke.

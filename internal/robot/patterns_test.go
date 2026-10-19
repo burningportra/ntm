@@ -1237,6 +1237,38 @@ func TestMusePatterns_TipComposerIsIdle(t *testing.T) {
 	}
 }
 
+// TestMusePatterns_BusyScreensReadBusy covers two live busy screens the robot
+// layer read as idle: a long draft typed during the turn pushes the working
+// line out of the fixed 15-line live window, and a pane too narrow for the
+// working line cuts it before its closing parenthesis.
+func TestMusePatterns_BusyScreensReadBusy(t *testing.T) {
+	longDraft := "❯ start a turn\n\n" +
+		"◆ Thinking (1s · esc to interrupt)\n\n" +
+		museTestVoiceBar + "\n" +
+		"❯ " + strings.Repeat("word ", 9) + "\n" +
+		strings.Repeat("  "+strings.Repeat("word ", 9)+"\n", 13) +
+		museTestRule + "\n" +
+		"  echo · /private/tmp/claude-501/claude-port · YOLO"
+	narrow := "❯ go\n\n" +
+		"◈ Thinking (1s · esc to in\n\n" +
+		"── Voice input (alt(opti…\n" +
+		"❯\n" +
+		"──────────────────────────\n" +
+		"  echo · …/ws · YOLO"
+
+	for name, screen := range map[string]string{"long draft": longDraft, "26 columns": narrow} {
+		if !IsLiveBusy(screen, "muse") {
+			t.Errorf("%s: IsLiveBusy = false, want true", name)
+		}
+		if got := determineState(screen, "muse"); got != "active" {
+			t.Errorf("%s: determineState = %q, want active", name, got)
+		}
+	}
+	if !HasThinkingPattern(narrow, "muse") {
+		t.Error("26 columns: muse_working did not match the cut working line")
+	}
+}
+
 func TestMusePatterns_DoNotLeakToClaude(t *testing.T) {
 	lib := NewPatternLibrary()
 	for _, screen := range []string{museTestWorkingScreen, museTestTrustPromptScreen} {

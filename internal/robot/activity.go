@@ -874,6 +874,12 @@ func IsLiveBusy(scrollback string, agentType string) bool {
 	if normalizeAgentType(agentType) == "claude" {
 		return agent.ClaudeActivelyWorking(scrollback)
 	}
+	// Muse panes likewise defer to the Muse recognizer: it looks for the
+	// working line just above the composer, where a long draft typed during
+	// the turn can push it out of the fixed live window below.
+	if normalizeAgentType(agentType) == "muse" {
+		return agent.MuseActivelyWorking(scrollback)
+	}
 
 	live := lastNLines(scrollback, liveThinkingWindowLines)
 	if live == "" {

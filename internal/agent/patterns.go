@@ -454,12 +454,25 @@ var (
 	// · YOLO"), which stays on screen after the banner scrolls into history.
 	museStatusBarPattern = regexp.MustCompile(`(?m)^\s*muse-[a-z0-9.-]+ · \S`)
 
-	// museActiveWorkLineRe matches the parenthetical on Muse's live working
-	// line ("(1s · esc to interrupt)", "(1m 5s · esc to interrupt)"). It is
-	// glyph- and verb-agnostic because the spinner glyph cycles ◇/◈/◆ and a
-	// missed working line would make a busy pane look idle.
-	museActiveWorkLineRe = regexp.MustCompile(`(?i)\([^()]*\besc\s+to\s+interrupt\s*\)`)
+	// museActiveWorkLineRe matches Muse's live working line
+	// (MuseWorkingLinePattern).
+	museActiveWorkLineRe = regexp.MustCompile(MuseWorkingLinePattern)
 )
+
+// MuseWorkingLinePattern matches Muse's live working line, whole or cut short
+// by a narrow pane. The first alternative is the parenthetical of the whole
+// line ("(1s · esc to interrupt)", "(1m 5s · esc to interrupt)"); it is
+// verb-agnostic because the label varies (Thinking, Working, Calling tools,
+// Compacting context) and a missed working line makes a busy pane look idle.
+// The second is the line Muse truncates at the pane edge, with no ellipsis,
+// when the pane is narrower than it (measured on muse 1.4.11: "◈ Thinking
+// (1s · esc to in" at 26 columns, "◆ Thinking (3s" at 14): a spinner glyph
+// (◇/◈/◆), a label and the elapsed time, with the line ending before the
+// closing parenthesis. A reply line that only starts with ◆ does not match:
+// it needs "(" and an elapsed time, and a reply such as "◆ Done (3s)" closes
+// the parenthesis.
+const MuseWorkingLinePattern = `(?im)\([^()]*\besc\s+to\s+interrupt\s*\)` +
+	`|^[ \t\x{00a0}]*[◇◈◆] [^\n()]*\(\d+(?:\.\d+)?[hms](?: \d+(?:\.\d+)?[hms])*(?: \d+(?:\.\d+)?)?(?: ·[^\n()]*|[ \t]*)$`
 
 // MuseComposerTipPrefixes are the leading words of the feature tips Muse
 // draws in an empty composer. About seven seconds after a turn ends, an idle
@@ -536,11 +549,17 @@ func IsMuseComposerTip(text string) bool {
 	return museComposerTipTextRe.MatchString(text)
 }
 
-// museLiveTailLines bounds the window MuseActivelyWorking scans. The working
-// line is the sixth line from the bottom (working line, blank, rule, composer,
-// rule, status bar); ten leaves room for a short multi-line draft without
-// reaching transcript history.
+// museLiveTailLines bounds the window MuseActivelyWorking scans when no
+// composer line is on screen. The working line is the sixth line from the
+// bottom (working line, blank, rule, composer, rule, status bar); ten leaves
+// room to spare without reaching transcript history.
 const museLiveTailLines = 10
+
+// museWorkingLinesAboveComposer bounds how far above the composer's "❯" line
+// MuseActivelyWorking looks for the live working line. The working line sits
+// three lines above it (working line, blank, voice-input rule), so seven
+// leaves four lines of slack, as the ten-line tail did.
+const museWorkingLinesAboveComposer = 7
 
 // museIdleScanLines is the trailing window MuseIdlePromptShowing searches for
 // the idle composer (composer line, rule, status bar, with room to spare). It
@@ -549,12 +568,35 @@ const museLiveTailLines = 10
 const museIdleScanLines = 5
 
 // MuseActivelyWorking reports whether a Muse pane shows a live turn. Muse
-// replaces the working line with the reply when the turn ends, so a match in
-// the bounded tail means the turn is still running, even though the "❯"
-// composer is drawn below it.
+// replaces the working line with the reply when the turn ends, so a match
+// just above the composer means the turn is still running, even though the
+// "❯" composer is drawn below it. The window is anchored on the composer, not
+// on the bottom of the capture: text sent while a turn runs stays in the
+// composer as a draft, and a draft that wraps (a 480-character one took nine
+// lines in a 60-column pane) pushed the working line out of a fixed bottom
+// window, so a busy pane read as idle.
 func MuseActivelyWorking(output string) bool {
-	tail := util.GetLastNLines(stripANSICodes(output), museLiveTailLines)
-	return museActiveWorkLineRe.MatchString(tail)
+	clean := stripANSICodes(output)
+	lines := strings.Split(clean, "\n")
+	composer := museComposerLine(lines)
+	if composer < 0 {
+		return museActiveWorkLineRe.MatchString(util.GetLastNLines(clean, museLiveTailLines))
+	}
+	start := max(0, composer-museWorkingLinesAboveComposer)
+	return museActiveWorkLineRe.MatchString(strings.Join(lines[start:composer], "\n"))
+}
+
+// museComposerLine returns the index of the bottom-most line led by the "❯"
+// composer marker, or -1 when there is none. Submitted prompts echoed into
+// the transcript also start with "❯", but Muse draws its composer below them,
+// and the continuation lines of a wrapped draft are indented.
+func museComposerLine(lines []string) int {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.HasPrefix(strings.TrimLeft(lines[i], " \t "), "❯") {
+			return i
+		}
+	}
+	return -1
 }
 
 // MuseIdlePromptShowing reports whether a Muse pane is waiting for input at

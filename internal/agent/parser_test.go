@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestNewParser(t *testing.T) {
@@ -557,6 +558,104 @@ func TestMuseIdlePromptShowing_NarrowPaneTip(t *testing.T) {
 		if MuseIdlePromptShowing(strings.Replace(museNarrowTipScreen, narrowTip, draft, 1)) {
 			t.Errorf("draft %q: MuseIdlePromptShowing = true, want false", draft)
 		}
+	}
+}
+
+// Live captures of busy muse 1.4.11 echo panes (`--echo-delay-ms 5000`),
+// trimmed the way tmux.Client returns captures.
+const (
+	// museLongDraftWorkingScreen: a 60-column pane one second into a turn,
+	// with a 480-character prompt typed meanwhile. Muse keeps it in the
+	// composer as a draft, which wraps to nine lines and puts the working line
+	// fourteen lines above the bottom.
+	museLongDraftWorkingScreen = "❯ start a turn\n\n" +
+		"◆ Thinking (1s · esc to interrupt)\n\n" +
+		"── Voice input (alt(option)+v to start) ────────────────────\n" +
+		"❯ word00 word01 word02 word03 word04 word05 word06 word07\n" +
+		"  word08 word09 word10 word11 word12 word13 word14 word15\n" +
+		"  word16 word17 word18 word19 word20 word21 word22 word23\n" +
+		"  word24 word25 word26 word27 word28 word29 word30 word31\n" +
+		"  word32 word33 word34 word35 word36 word37 word38 word39\n" +
+		"  word40 word41 word42 word43 word44 word45 word46 word47\n" +
+		"  word48 word49 word50 word51 word52 word53 word54 word55\n" +
+		"  word56 word57 word58 word59 word60 word61 word62 word63\n" +
+		"  word64 word65 word66 word67 word68 word69\n" +
+		"────────────────────────────────────────────────────────────\n" +
+		"  echo · /p/t/c/-/c/s/review-detection/ws · YOLO"
+
+	// museNarrowWorkingScreen: a 26-column pane one second into a turn. Muse
+	// cuts the working line at the pane edge, losing the closing parenthesis.
+	museNarrowWorkingScreen = "❯ go\n\n" +
+		"◈ Thinking (1s · esc to in\n\n" +
+		"── Voice input (alt(opti…\n" +
+		"❯\n" +
+		"──────────────────────────\n" +
+		"  echo · …/ws · YOLO"
+)
+
+// TestMuseActivelyWorking_DraftAndNarrowPane covers two busy screens that read
+// as idle when the working line was searched for in the bottom ten lines
+// with the whole "(… esc to interrupt)" parenthetical required: a long draft
+// typed during the turn, and a pane too narrow for the working line.
+func TestMuseActivelyWorking_DraftAndNarrowPane(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	for name, screen := range map[string]string{
+		"long draft": museLongDraftWorkingScreen,
+		"26 columns": museNarrowWorkingScreen,
+	} {
+		if !MuseActivelyWorking(screen) {
+			t.Errorf("%s: MuseActivelyWorking = false, want true", name)
+		}
+		if MuseIdlePromptShowing(screen) {
+			t.Errorf("%s: MuseIdlePromptShowing = true, want false", name)
+		}
+		state, err := p.ParseWithHint(screen, AgentTypeMuse)
+		if err != nil {
+			t.Fatalf("ParseWithHint: %v", err)
+		}
+		if !state.IsWorking || state.IsIdle {
+			t.Errorf("%s: IsWorking=%v IsIdle=%v, want working", name, state.IsWorking, state.IsIdle)
+		}
+	}
+
+	// Every cut Muse makes from 14 columns up (measured: "◆ Thinking (3s" at
+	// 14, "◇ Thinking (3s · e" at 18, "◇ Thinking (2s · esc to interr" at 30).
+	const whole = "◇ Calling tools (1m 5s · esc to interrupt)"
+	for cut := len("◇ Calling tools (1m"); cut <= len(whole); cut++ {
+		line := whole[:cut]
+		if !utf8.ValidString(line) {
+			continue
+		}
+		screen := strings.Replace(museNarrowWorkingScreen, "◈ Thinking (1s · esc to in", line, 1)
+		if !MuseActivelyWorking(screen) {
+			t.Errorf("working line %q: MuseActivelyWorking = false, want true", line)
+		}
+	}
+
+	// Once the turn ends the reply takes the working line's place; reply
+	// lines that start with ◆ and hold a parenthesis are not a working line.
+	for _, reply := range []string{
+		"◆ Done (3s)",
+		"◆ Wrote /tmp/drive.mjs (+191) · ctrl+o",
+		"◆ Edited /tmp/drive.mjs (+3 −1)",
+		"◆ Ran command · Mail report · ✓ · 5.3s · ctrl+o",
+		"◆ Worked for 1h 22m 31s · 4:36 PM · 19/Oct",
+	} {
+		screen := strings.Replace(museNarrowWorkingScreen, "◈ Thinking (1s · esc to in", reply, 1)
+		if MuseActivelyWorking(screen) {
+			t.Errorf("reply %q above the composer: MuseActivelyWorking = true, want false", reply)
+		}
+		if !MuseIdlePromptShowing(screen) {
+			t.Errorf("reply %q above the composer: MuseIdlePromptShowing = false, want true", reply)
+		}
+	}
+
+	// A draft left after the turn ended is not work, however long it is.
+	finished := strings.Replace(museLongDraftWorkingScreen, "◆ Thinking (1s · esc to interrupt)", "◆ echo: start a turn", 1)
+	if MuseActivelyWorking(finished) {
+		t.Error("long draft after the turn: MuseActivelyWorking = true, want false")
 	}
 }
 
