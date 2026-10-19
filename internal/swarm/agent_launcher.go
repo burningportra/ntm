@@ -20,6 +20,7 @@ const (
 	AgentCOD  = "cod"  // Codex alias
 	AgentGMI  = "gmi"  // Gemini-CLI alias
 	AgentKimi = "kimi" // Kimi CLI alias
+	AgentMuse = "muse" // Muse Code CLI alias
 )
 
 // LaunchResult represents the result of launching an agent in a pane.
@@ -531,11 +532,11 @@ func (l *AgentLauncher) LaunchAgentWithContext(session string, pane int, agentTy
 // ValidateAgentType checks if the given agent type is valid.
 func ValidateAgentType(agentType string) error {
 	switch normalizedSwarmLaunchableAgentType(agentType) {
-	case AgentCC, AgentCOD, AgentGMI, AgentKimi, "grok", "cursor", "windsurf", "aider", "ollama":
+	case AgentCC, AgentCOD, AgentGMI, AgentKimi, AgentMuse, "grok", "cursor", "windsurf", "aider", "ollama":
 		return nil
 	default:
-		return fmt.Errorf("invalid agent type %q: must resolve to one of %s, %s, %s, grok, cursor, windsurf, aider, ollama",
-			agentType, AgentCC, AgentCOD, AgentGMI)
+		return fmt.Errorf("invalid agent type %q: must resolve to one of %s, %s, %s, %s, %s, grok, cursor, windsurf, aider, ollama",
+			agentType, AgentCC, AgentCOD, AgentGMI, AgentKimi, AgentMuse)
 	}
 }
 
@@ -545,6 +546,7 @@ var DefaultAgentCommands = map[string]string{
 	"cod":      "codex",        // OpenAI Codex CLI
 	"gmi":      "gemini",       // Google Gemini CLI
 	"kimi":     "kimi",         // Moonshot Kimi CLI
+	"muse":     "muse",         // Meta Muse Code CLI
 	"grok":     "grok",         // xAI Grok Build CLI
 	"cursor":   "cursor-agent", // Cursor Agent CLI (not the GUI `cursor` launcher)
 	"windsurf": "windsurf",     // Windsurf CLI
@@ -563,6 +565,7 @@ var DefaultAgentArgs = map[string][]string{
 	"cod":      {},
 	"gmi":      {},
 	"kimi":     {},
+	"muse":     {"--yolo"},
 	"grok":     {"--always-approve"},
 	"cursor":   {"--yolo"},
 	"windsurf": {},
@@ -825,6 +828,7 @@ func normalizedSwarmLaunchableAgentType(agentType string) string {
 		agent.AgentTypeCodex,
 		agent.AgentTypeGemini,
 		agent.AgentTypeKimi,
+		agent.AgentTypeMuse,
 		agent.AgentTypeGrok,
 		agent.AgentTypeCursor,
 		agent.AgentTypeWindsurf,
@@ -842,6 +846,8 @@ func interactiveSwarmLaunchCommand(agentType string) string {
 		return "grok --always-approve"
 	case agent.AgentTypeCursor:
 		return "cursor-agent --yolo"
+	case agent.AgentTypeMuse:
+		return "muse --yolo"
 	}
 	return defaultSwarmLaunchCommand(agentType)
 }

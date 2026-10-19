@@ -306,6 +306,10 @@ func TestValidateAgentType(t *testing.T) {
 		{"google-gemini", false},
 		{"grok", false},
 		{"xai_grok_build", false},
+		{AgentKimi, false},
+		{AgentMuse, false},
+		{"muse-code", false},
+		{"meta-muse", false},
 		{"CC", false},
 		{"cursor", false},
 		{"ws", false},
@@ -334,6 +338,9 @@ func TestAgentConstants(t *testing.T) {
 	}
 	if AgentGMI != "gmi" {
 		t.Errorf("AgentGMI = %q, want %q", AgentGMI, "gmi")
+	}
+	if AgentMuse != "muse" {
+		t.Errorf("AgentMuse = %q, want %q", AgentMuse, "muse")
 	}
 }
 
@@ -894,6 +901,7 @@ func TestDefaultAgentCommands(t *testing.T) {
 		{"gmi", "gemini"},
 		{"grok", "grok"},
 		{"cursor", "cursor-agent"},
+		{"muse", "muse"},
 	}
 
 	for _, tt := range tests {
@@ -920,6 +928,7 @@ func TestDefaultAgentArgs(t *testing.T) {
 		{"gmi", []string{}},
 		{"grok", []string{"--always-approve"}},
 		{"cursor", []string{"--yolo"}},
+		{"muse", []string{"--yolo"}},
 	}
 
 	for _, tt := range tests {
@@ -945,6 +954,16 @@ func TestDefaultAgentArgs(t *testing.T) {
 func TestInteractiveSwarmLaunchCommandUsesCursorAgent(t *testing.T) {
 	if got, want := interactiveSwarmLaunchCommand("cursor"), "cursor-agent --yolo"; got != want {
 		t.Errorf("interactiveSwarmLaunchCommand(cursor) = %q, want %q", got, want)
+	}
+}
+
+// Muse stops at "Do you trust this workspace?" without --yolo, so every
+// swarm launch path must pass it.
+func TestInteractiveSwarmLaunchCommandUsesMuseYolo(t *testing.T) {
+	for _, alias := range []string{"muse", "muse-code", "meta-muse", "MUSE"} {
+		if got, want := interactiveSwarmLaunchCommand(alias), "muse --yolo"; got != want {
+			t.Errorf("interactiveSwarmLaunchCommand(%q) = %q, want %q", alias, got, want)
+		}
 	}
 }
 
@@ -1207,6 +1226,22 @@ func TestBuildLaunchCommand(t *testing.T) {
 			useFullPaths:   true,
 			expectedBinary: "cursor-agent",
 			expectedType:   "cursor",
+			expectedArgs:   []string{"--yolo"},
+		},
+		{
+			name:           "Muse alias launches muse with yolo",
+			agentType:      "muse-code",
+			useFullPaths:   false,
+			expectedBinary: "muse",
+			expectedType:   "muse",
+			expectedArgs:   []string{"--yolo"},
+		},
+		{
+			name:           "Muse full path launches muse with yolo",
+			agentType:      "muse",
+			useFullPaths:   true,
+			expectedBinary: "muse",
+			expectedType:   "muse",
 			expectedArgs:   []string{"--yolo"},
 		},
 		{

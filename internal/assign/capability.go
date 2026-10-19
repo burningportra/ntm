@@ -101,6 +101,18 @@ var DefaultCapabilities = map[tmux.AgentType]map[TaskType]float64{
 		TaskChore:         0.80,
 		TaskEpic:          0.75,
 	},
+	tmux.AgentMuse: {
+		TaskRefactor:      0.85,
+		TaskAnalysis:      0.85,
+		TaskDocs:          0.80,
+		TaskDocumentation: 0.80,
+		TaskBug:           0.85,
+		TaskFeature:       0.85,
+		TaskTesting:       0.85,
+		TaskTask:          0.85,
+		TaskChore:         0.80,
+		TaskEpic:          0.75,
+	},
 	tmux.AgentCursor: {
 		TaskRefactor:      0.85,
 		TaskAnalysis:      0.85,
@@ -272,7 +284,7 @@ func GetAgentScoreByString(agentType string, taskType string) float64 {
 }
 
 // ParseAgentType converts a string to AgentType.
-// Supports both short codes (cc, cod, gmi, pi, kimi) and full names (claude, codex, gemini, pi, kimi).
+// Supports both short codes (cc, cod, gmi, pi, kimi, muse) and full names (claude, codex, gemini, pi, kimi, muse).
 func ParseAgentType(s string) tmux.AgentType {
 	trimmed := strings.TrimSpace(s)
 	switch agent.AgentType(trimmed).Canonical() {
@@ -288,6 +300,8 @@ func ParseAgentType(s string) tmux.AgentType {
 		return tmux.AgentPi
 	case agent.AgentTypeKimi:
 		return tmux.AgentKimi
+	case agent.AgentTypeMuse:
+		return tmux.AgentMuse
 	case agent.AgentTypeCursor:
 		return tmux.AgentCursor
 	case agent.AgentTypeWindsurf:

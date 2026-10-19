@@ -11,12 +11,37 @@ func TestDefaultCapabilities(t *testing.T) {
 	// Verify all agent types have capabilities
 	agents := []tmux.AgentType{
 		tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini,
+		tmux.AgentPi, tmux.AgentKimi, tmux.AgentMuse,
 		tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOllama,
 	}
 	for _, agent := range agents {
 		if _, ok := DefaultCapabilities[agent]; !ok {
 			t.Errorf("DefaultCapabilities missing agent %s", agent)
 		}
+	}
+}
+
+func TestDefaultCapabilities_MuseMatchesKimi(t *testing.T) {
+	kimi := DefaultCapabilities[tmux.AgentKimi]
+	muse := DefaultCapabilities[tmux.AgentMuse]
+	if len(muse) != len(kimi) {
+		t.Fatalf("Muse has %d task scores, Kimi has %d", len(muse), len(kimi))
+	}
+	for task, want := range kimi {
+		if got, ok := muse[task]; !ok || got != want {
+			t.Errorf("Muse %s score = %v (present=%v), want Kimi's %v", task, got, ok, want)
+		}
+	}
+
+	for _, alias := range []string{"muse", "muse-code", "meta-muse"} {
+		got := GetAgentScoreByString(alias, "bug")
+		want := GetAgentScoreByString("kimi", "bug")
+		if got != want {
+			t.Errorf("GetAgentScoreByString(%q, bug) = %v, want Kimi's %v", alias, got, want)
+		}
+	}
+	if got := GetAgentScoreByString("muse", "bug"); got != 0.85 {
+		t.Errorf("GetAgentScoreByString(muse, bug) = %v, want 0.85", got)
 	}
 }
 
@@ -152,6 +177,10 @@ func TestParseAgentType(t *testing.T) {
 		{"google-gemini", tmux.AgentGemini},
 		{"Gemini", tmux.AgentGemini},
 		{"GMI", tmux.AgentGemini}, // uppercase short code
+		{"muse", tmux.AgentMuse},
+		{"muse-code", tmux.AgentMuse},
+		{"muse_code", tmux.AgentMuse},
+		{"Muse", tmux.AgentMuse},
 		{"ws", tmux.AgentWindsurf},
 		{"  codex-cli  ", tmux.AgentCodex},
 	}

@@ -11,10 +11,10 @@ import (
 func TestNewProfileMatcher(t *testing.T) {
 	pm := NewProfileMatcher()
 
-	// Should have all default profiles (claude, codex, gemini, antigravity, Pi, Kimi)
+	// Should have all default profiles (claude, codex, gemini, antigravity, Pi, Kimi, Muse)
 	profiles := pm.AllProfiles()
-	if len(profiles) != 6 {
-		t.Errorf("expected 6 profiles, got %d", len(profiles))
+	if len(profiles) != 7 {
+		t.Errorf("expected 7 profiles, got %d", len(profiles))
 	}
 
 	// Check Claude profile
@@ -69,6 +69,19 @@ func TestNewProfileMatcher(t *testing.T) {
 	if kimi.ContextBudget != expectedKimi {
 		t.Errorf("Kimi context budget should be %d, got %d", expectedKimi, kimi.ContextBudget)
 	}
+
+	// Check Muse profile
+	muse := pm.GetProfile(AgentTypeMuse)
+	if muse == nil {
+		t.Fatal("Muse profile should exist")
+	}
+	if muse.Model != "muse-wonder-1.0" {
+		t.Errorf("Muse model should be muse-wonder-1.0, got %q", muse.Model)
+	}
+	expectedMuse := models.GetTokenBudget("muse")
+	if muse.ContextBudget != expectedMuse {
+		t.Errorf("Muse context budget should be %d, got %d", expectedMuse, muse.ContextBudget)
+	}
 }
 
 func TestGetProfileByName(t *testing.T) {
@@ -91,6 +104,10 @@ func TestGetProfileByName(t *testing.T) {
 		{"kimi", AgentTypeKimi},
 		{"kimi-k2", AgentTypeKimi},
 		{"moonshot", AgentTypeKimi},
+		{"muse", AgentTypeMuse},
+		{"muse-code", AgentTypeMuse},
+		{"meta-muse", AgentTypeMuse},
+		{"muse-wonder-1.0", AgentTypeMuse},
 		{"CLAUDE", AgentTypeClaude}, // Case insensitive
 	}
 
@@ -377,6 +394,15 @@ func TestNormalizeAgentType(t *testing.T) {
 		{"google", "gemini"},
 		{"google-gemini", "gemini"},
 		{"gemini-3-pro-preview", "gemini"},
+		{"muse", "muse"},
+		{"muse-code", "muse"},
+		{"muse_code", "muse"},
+		{"meta-muse", "muse"},
+		{"muse-wonder-1.0", "muse"},
+		{"muse-wonder-full-1.0", "muse"},
+		{"Muse-Spark-1.3", "muse"},
+		{"muse-spark-1.2", "muse"},
+		{"meta", "meta"}, // bare "meta" is too generic to mean Muse
 		{" ws ", "windsurf"},
 		{"unknown", "unknown"},
 	}
@@ -433,6 +459,9 @@ func TestParseAgentType(t *testing.T) {
 		{"openai-codex", AgentTypeCodex},
 		{"gemini", AgentTypeGemini},
 		{"google_gemini", AgentTypeGemini},
+		{"muse", AgentTypeMuse},
+		{"musecode", AgentTypeMuse},
+		{"muse-spark-1.3", AgentTypeMuse},
 		{"ws", AgentType("windsurf")},
 	}
 
