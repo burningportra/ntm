@@ -841,8 +841,8 @@ func TestBuildRecoveryContext_CancellationStaysTerminal(t *testing.T) {
 }
 
 func TestSessionRecoveryConfig_GetTimeout(t *testing.T) {
-	if got := (config.SessionRecoveryConfig{}).GetTimeout(); got != 5*time.Second {
-		t.Fatalf("unset recovery timeout=%s, want 5s default", got)
+	if got := (config.SessionRecoveryConfig{}).GetTimeout(); got != 15*time.Second {
+		t.Fatalf("unset recovery timeout=%s, want 15s default", got)
 	}
 	if got := (config.SessionRecoveryConfig{TimeoutSeconds: 12}).GetTimeout(); got != 12*time.Second {
 		t.Fatalf("configured recovery timeout=%s, want 12s", got)
