@@ -159,6 +159,20 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 		}
 	}
 
+	// Muse Code draws its "❯" composer under the live "◇ Thinking (3s · esc
+	// to interrupt)" line for the whole turn, so the composer alone says
+	// nothing, and a long turn adds no scrollback (low velocity). The live
+	// working line decides first; with no turn running, the composer chrome
+	// means the pane is waiting for input, whatever velocity says.
+	if agentType == string(agent.AgentTypeMuse) {
+		if agent.MuseActivelyWorking(output) {
+			return StateWorking, ErrorNone
+		}
+		if museComposerShowing(output) {
+			return StateIdle, ErrorNone
+		}
+	}
+
 	// Check if at prompt (idle) - prioritize this when velocity is low
 	isAtPrompt := DetectIdleFromOutput(output, agentType)
 	if isAtPrompt && isLowVelocity {
@@ -240,6 +254,47 @@ func isKnownAgentType(agentType string) bool {
 	default:
 		return false
 	}
+}
+
+// museComposerScanLines bounds how far up from the bottom museComposerShowing
+// looks: status bar, composer rule, a composer holding a few draft lines, and
+// the voice-input rule above it.
+const museComposerScanLines = 12
+
+// museComposerShowing reports whether a Muse pane's input chrome is drawn at
+// the bottom of the capture: a composer line led by "❯" with the composer
+// rule below it. Muse keeps this chrome while a turn runs, so callers rule
+// out agent.MuseActivelyWorking first. The composer counts whether it is
+// empty, shows one of Muse's dim feature tips ("❯ Type @ to search and
+// insert workspace file paths", drawn about seven seconds after a turn
+// ends), or holds a draft; in each case Muse is waiting for input.
+// Submitted prompts also start with "❯" in the transcript, so only the
+// bottom-most such line is the composer, and it must have a rule below it.
+func museComposerShowing(output string) bool {
+	lines := strings.Split(StripANSI(output), "\n")
+	start := max(0, len(lines)-museComposerScanLines)
+	ruleBelow := false
+	for i := len(lines) - 1; i >= start; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "❯") {
+			return ruleBelow
+		}
+		if line != "" && strings.Trim(line, "─") == "" {
+			ruleBelow = true
+		}
+	}
+	return false
+}
+
+// idlePromptShowing reports whether output shows the agent's own idle prompt,
+// as opposed to only passing the fallback idle heuristics. Muse is decided
+// here because DetectIdleFromOutput's prompt-line scan has no Muse pattern
+// and its composer shows feature tips that no prompt pattern could list.
+func idlePromptShowing(output, agentType string) bool {
+	if agent.AgentType(agentType).Canonical() == agent.AgentTypeMuse {
+		return !agent.MuseActivelyWorking(output) && museComposerShowing(output)
+	}
+	return DetectIdleFromOutput(output, agentType)
 }
 
 // looksLikeIdle applies heuristics to detect likely idle state when
@@ -840,7 +895,7 @@ func observationConfidence(status AgentStatus, output string) float64 {
 	if status.State == StateUnknown {
 		return 0.25
 	}
-	if status.State == StateIdle && !DetectIdleFromOutput(output, status.AgentType) {
+	if status.State == StateIdle && !idlePromptShowing(output, status.AgentType) {
 		// The detector's fallback idle heuristics intentionally improve display
 		// quality for quiet panes, but a short line or a generic "done" marker is
 		// not strong enough evidence to authorize dispatching more work.

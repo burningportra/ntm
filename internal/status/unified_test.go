@@ -1166,6 +1166,157 @@ func TestDetermineStateCodexIdleBeatsWindowVelocity(t *testing.T) {
 	}
 }
 
+// Muse Code screens captured from muse 1.4.11 (echo provider) in a 160x45
+// tmux pane, rules shortened. ntm's captures are whitespace-trimmed, so the
+// banner has lost its indentation.
+const (
+	museTestVoiceRule = "── Voice input (alt(option)+v to start) ──────────────────────"
+	museTestRule      = "──────────────────────────────────────────────────────────────"
+	museTestStatusBar = "  echo · /private/tmp/claude-501/scratchpad/musews · YOLO"
+	museTestBanner    = "Muse Code 1.4.11\n\n" +
+		"  Skills: 276 loaded · 40 warnings · 76 details hidden (ctrl+o to expand)\n\n"
+
+	// Mid-turn: the empty composer stays drawn under the live working line.
+	museWorkingCapture = museTestBanner +
+		"❯ double enter probe\n\n" +
+		"◇ Thinking (3s · esc to interrupt)\n\n" +
+		museTestVoiceRule + "\n❯\n" + museTestRule + "\n" + museTestStatusBar
+
+	// Just after the turn: the reply replaces the working line.
+	museIdleCapture = museTestBanner +
+		"❯ double enter probe\n\n" +
+		"◆ echo: double enter probe\n\n" +
+		museTestVoiceRule + "\n❯\n" + museTestRule + "\n" + museTestStatusBar
+
+	// About seven seconds later Muse draws a dim feature tip in the empty
+	// composer; a plain capture cannot tell it from typed text.
+	museIdleTipCapture = museTestBanner +
+		"❯ double enter probe\n\n" +
+		"◆ echo: double enter probe\n\n" +
+		museTestVoiceRule + "\n❯ Type @ to search and insert workspace file paths\n" +
+		museTestRule + "\n" + museTestStatusBar
+
+	// A multi-line draft left in the composer (no turn running).
+	museDraftCapture = museTestBanner +
+		"◆ echo: double enter probe\n\n" +
+		museTestVoiceRule + "\n❯ draft one\n  draft two\n  draft three\n" +
+		museTestRule + "\n" + museTestStatusBar
+
+	// A follow-up typed while the turn is still running.
+	museWorkingWithDraftCapture = museTestBanner +
+		"❯ double enter probe\n\n" +
+		"◈ Thinking (12s · esc to interrupt)\n\n" +
+		museTestVoiceRule + "\n❯ follow up\n" + museTestRule + "\n" + museTestStatusBar
+
+	// Without --yolo or --trust-workspace Muse opens on its trust prompt,
+	// which has no composer.
+	museTrustPromptCapture = "Do you trust this workspace?\n" +
+		"Workspace: /private/tmp/claude-501/scratchpad/musetrust\n\n" +
+		"Trusting allows project-local skills, rules, hooks, and plugin config to load before the model runs.\n" +
+		"Only trust this workspace when you trust its contents.\n" +
+		"⟩ 1  Trust and continue\n" +
+		"  2  Quit\n\n" +
+		"Use Up/Down or 1/2, then Enter. Esc quits."
+)
+
+// TestDetermineStateMuseLiveTailOutranksVelocity mirrors the Claude and Codex
+// arms for Muse Code: its "❯" composer stays drawn while a turn runs, so the
+// live working line must decide working before velocity, and an idle composer
+// must read as idle even when a busy sibling keeps the window activity fresh.
+func TestDetermineStateMuseLiveTailOutranksVelocity(t *testing.T) {
+	t.Parallel()
+
+	d := NewDetector()
+	observedAt := time.Date(2026, 10, 19, 21, 0, 0, 0, time.UTC)
+	fresh := observedAt
+	quiet := observedAt.Add(-time.Hour)
+
+	tests := []struct {
+		name   string
+		output string
+		want   AgentState
+	}{
+		{"working composer under thinking line", museWorkingCapture, StateWorking},
+		{"working with a follow-up draft", museWorkingWithDraftCapture, StateWorking},
+		{"idle empty composer", museIdleCapture, StateIdle},
+		{"idle composer showing a feature tip", museIdleTipCapture, StateIdle},
+		{"idle composer holding a draft", museDraftCapture, StateIdle},
+	}
+	for _, tt := range tests {
+		for _, agentType := range []string{"muse", "muse-code"} {
+			for _, activity := range []struct {
+				name string
+				at   time.Time
+			}{{"fresh", fresh}, {"quiet", quiet}} {
+				t.Run(tt.name+"/"+agentType+"/"+activity.name, func(t *testing.T) {
+					state, errType := d.determineStateAt(tt.output, agentType, activity.at, observedAt)
+					if state != tt.want || errType != ErrorNone {
+						t.Fatalf("determineStateAt() = %v/%v, want %v/none", state, errType, tt.want)
+					}
+				})
+			}
+		}
+	}
+
+	// The trust prompt has no composer, so the Muse arm must not call it idle;
+	// with fresh activity it falls through to the generic working verdict.
+	if state, _ := d.determineStateAt(museTrustPromptCapture, "muse", fresh, observedAt); state == StateIdle {
+		t.Fatalf("Muse trust prompt classified idle")
+	}
+}
+
+func TestMuseComposerShowing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"empty composer", museIdleCapture, true},
+		{"feature tip", museIdleTipCapture, true},
+		{"multi-line draft", museDraftCapture, true},
+		{"composer under working line", museWorkingCapture, true},
+		{"ansi colored composer", "\x1b[38;2;90;160;255m❯\x1b[0m \x1b[38;2;103;108;116mType @ to search and insert workspace file paths\x1b[39m\n" + museTestRule + "\n" + museTestStatusBar, true},
+		{"trust prompt", museTrustPromptCapture, false},
+		{"submitted prompt with no composer below", "❯ double enter probe\n\n◆ echo: double enter probe", false},
+		{"voice rule is not the composer rule", "❯ double enter probe\n" + museTestVoiceRule, false},
+		{"composer scrolled out of the tail", "❯\n" + museTestRule + "\n" + strings.Repeat("◆ output line\n", museComposerScanLines), false},
+		{"empty output", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := museComposerShowing(tt.output); got != tt.want {
+				t.Errorf("museComposerShowing() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestObservationConfidenceTrustsMuseComposer guards dispatch safety: an idle
+// Muse pane is recognized by its own composer, not by the fallback heuristics,
+// so its observation must be confident enough to authorize dispatch.
+func TestObservationConfidenceTrustsMuseComposer(t *testing.T) {
+	t.Parallel()
+
+	for _, output := range []string{museIdleCapture, museIdleTipCapture} {
+		status := AgentStatus{AgentType: "muse", State: StateIdle}
+		if got := observationConfidence(status, output); !ObservationConfidenceIsActionable(got) {
+			t.Errorf("idle Muse composer confidence = %.2f, want actionable", got)
+		}
+	}
+	// A Muse pane called idle only by the short-last-line heuristic is not
+	// strong evidence.
+	status := AgentStatus{AgentType: "muse", State: StateIdle}
+	if got := observationConfidence(status, "some output\nok"); ObservationConfidenceIsActionable(got) {
+		t.Errorf("heuristic-idle Muse confidence = %.2f, want below the dispatch threshold", got)
+	}
+	// A live turn is never idle evidence, even with the composer drawn.
+	if idlePromptShowing(museWorkingCapture, "muse") {
+		t.Errorf("idlePromptShowing(working Muse) = true")
+	}
+}
+
 // TestSessionObserverAppliesPaneLocalActivityBound covers the second half of
 // #234: the pane-content fingerprint bound from ntm#213 lived only in
 // UnifiedDetector.Detect, not in SessionObserver.buildPaneObservation — and the

@@ -436,6 +436,10 @@ func TestDefaultProtocolPlannerCharacterization(t *testing.T) {
 		testPane("%2", 0, 1, tmux.AgentUser, ""),
 		testPane("%3", 0, 2, tmux.AgentUnknown, ""),
 		testPane("%4", 0, 3, tmux.AgentType("future-agent"), ""),
+		// Muse keeps the double Enter: live checks against a muse 1.4.11 echo
+		// pane showed the second Enter is a no-op mid-turn and on an idle
+		// composer, and it submits a prompt whose first Enter became a newline.
+		testPane("%5", 0, 4, tmux.AgentMuse, ""),
 	}
 	var deliveries []Delivery
 	service, err := NewService(Ports{
@@ -463,6 +467,10 @@ func TestDefaultProtocolPlannerCharacterization(t *testing.T) {
 		{Protocol: ProtocolSingleEnter, EnterDelay: tmux.ShellEnterDelay},
 		{Protocol: ProtocolSingleEnter, EnterDelay: tmux.ShellEnterDelay},
 		{Protocol: ProtocolSingleEnter, EnterDelay: tmux.ShellEnterDelay},
+		{Protocol: ProtocolDoubleEnter, EnterDelay: tmux.DoubleEnterFirstDelay, SecondEnterDelay: tmux.DoubleEnterSecondDelay},
+	}
+	if len(deliveries) != len(want) {
+		t.Fatalf("got %d deliveries, want %d", len(deliveries), len(want))
 	}
 	for i, delivery := range deliveries {
 		got := ProtocolPlan{Protocol: delivery.Protocol, EnterDelay: delivery.EnterDelay, SecondEnterDelay: delivery.SecondEnterDelay}
@@ -485,6 +493,32 @@ func TestDefaultProtocolPlannerCharacterization(t *testing.T) {
 	for i, delivery := range deliveries {
 		if delivery.Protocol != ProtocolStageOnly || delivery.EnterDelay != 0 || delivery.SecondEnterDelay != 0 {
 			t.Fatalf("staged delivery %d = %+v", i, delivery)
+		}
+	}
+}
+
+func TestDefaultProtocolPlannerMuseKeepsDoubleEnter(t *testing.T) {
+	t.Parallel()
+	want := ProtocolPlan{Protocol: ProtocolDoubleEnter, EnterDelay: tmux.DoubleEnterFirstDelay, SecondEnterDelay: tmux.DoubleEnterSecondDelay}
+	for _, agentType := range []tmux.AgentType{tmux.AgentMuse, "muse-code", " MUSE ", "meta-muse"} {
+		got, err := DefaultProtocolPlanner{}.PlanDelivery(context.Background(), Target{AgentType: agentType}, true)
+		if err != nil {
+			t.Fatalf("PlanDelivery(%q) error = %v", agentType, err)
+		}
+		if got != want {
+			t.Errorf("PlanDelivery(%q) = %+v, want %+v", agentType, got, want)
+		}
+		if err := validateProtocolPlan(got, true); err != nil {
+			t.Errorf("PlanDelivery(%q) plan is invalid: %v", agentType, err)
+		}
+		// The first Enter of the double-Enter protocol must clear Muse's
+		// typed-burst window by a wide margin.
+		if got.EnterDelay < tmux.MuseEnterDelay {
+			t.Errorf("PlanDelivery(%q) first Enter after %v, below MuseEnterDelay %v", agentType, got.EnterDelay, tmux.MuseEnterDelay)
+		}
+		staged, err := DefaultProtocolPlanner{}.PlanDelivery(context.Background(), Target{AgentType: agentType}, false)
+		if err != nil || staged != (ProtocolPlan{Protocol: ProtocolStageOnly}) {
+			t.Errorf("PlanDelivery(%q, submit=false) = %+v, %v; want stage-only", agentType, staged, err)
 		}
 	}
 }

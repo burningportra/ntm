@@ -2362,6 +2362,31 @@ func TestNeedsBufferSend(t *testing.T) {
 			content:   strings.Repeat("z", 513),
 			want:      true,
 		},
+		// Muse cases - uses buffer for multi-line content only
+		{
+			name:      "muse single line",
+			agentType: AgentMuse,
+			content:   "review @internal/tmux/session.go then README.md",
+			want:      false,
+		},
+		{
+			name:      "muse with newline",
+			agentType: AgentMuse,
+			content:   "line one\nline two\nline three",
+			want:      true,
+		},
+		{
+			name:      "muse long content no newline",
+			agentType: AgentMuse,
+			content:   strings.Repeat("m", 5000),
+			want:      false,
+		},
+		{
+			name:      "muse code alias with newline",
+			agentType: AgentType(" Muse-Code "),
+			content:   "a\nb",
+			want:      true,
+		},
 		// User pane - never uses buffer
 		{
 			name:      "user single line",
@@ -2410,6 +2435,150 @@ func TestNeedsBufferSend(t *testing.T) {
 					tt.agentType, truncateForLog(tt.content), got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEnterDelayForAgent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		agentType AgentType
+		want      time.Duration
+	}{
+		{AgentMuse, MuseEnterDelay},
+		{AgentType(" Muse-Code "), MuseEnterDelay},
+		{AgentType("muse_code"), MuseEnterDelay},
+		{AgentClaude, DefaultEnterDelay},
+		{AgentCodex, DefaultEnterDelay},
+		{AgentGemini, DefaultEnterDelay},
+		{AgentKimi, DefaultEnterDelay},
+		{AgentUser, ShellEnterDelay},
+		{AgentUnknown, ShellEnterDelay},
+		{AgentType(""), ShellEnterDelay},
+		{AgentType("future-agent"), ShellEnterDelay},
+		// "amuse" is not Muse; unrecognized types are treated as shells.
+		{AgentType("amuse"), ShellEnterDelay},
+	}
+	for _, tt := range tests {
+		if got := EnterDelayForAgent(tt.agentType); got != tt.want {
+			t.Errorf("EnterDelayForAgent(%q) = %v, want %v", tt.agentType, got, tt.want)
+		}
+	}
+	if MuseEnterDelay <= DefaultEnterDelay {
+		t.Fatalf("MuseEnterDelay = %v must exceed DefaultEnterDelay = %v: Muse took a %v Enter as a newline", MuseEnterDelay, DefaultEnterDelay, DefaultEnterDelay)
+	}
+}
+
+func TestEnterDelayWithFloor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		agentType AgentType
+		delay     time.Duration
+		want      time.Duration
+	}{
+		{"muse default delay raised", AgentMuse, DefaultEnterDelay, MuseEnterDelay},
+		{"muse zero delay raised", AgentMuse, 0, MuseEnterDelay},
+		{"muse shell delay raised", AgentMuse, ShellEnterDelay, MuseEnterDelay},
+		{"muse alias raised", AgentType("muse-cli"), DefaultEnterDelay, MuseEnterDelay},
+		{"muse exact floor kept", AgentMuse, MuseEnterDelay, MuseEnterDelay},
+		{"muse longer delay kept", AgentMuse, time.Second, time.Second},
+		{"muse negative passes through for validation", AgentMuse, -time.Millisecond, -time.Millisecond},
+		{"claude default kept", AgentClaude, DefaultEnterDelay, DefaultEnterDelay},
+		{"codex zero kept", AgentCodex, 0, 0},
+		{"user shell delay kept", AgentUser, ShellEnterDelay, ShellEnterDelay},
+		{"unknown default kept", AgentUnknown, DefaultEnterDelay, DefaultEnterDelay},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := enterDelayWithFloor(tt.agentType, tt.delay); got != tt.want {
+				t.Errorf("enterDelayWithFloor(%q, %v) = %v, want %v", tt.agentType, tt.delay, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSendKeysForAgentMuseEnterFloorHelper runs inside the subprocess started
+// by TestSendKeysForAgentMuseEnterFloor, where NTM_TMUX_BINARY points at a
+// fake tmux that only records its arguments.
+func TestSendKeysForAgentMuseEnterFloorHelper(t *testing.T) {
+	if os.Getenv("NTM_TEST_MUSE_ENTER_FLOOR_HELPER") != "1" {
+		return
+	}
+	client := NewClient("")
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{name: "send-keys", content: "single line prompt"},
+		{name: "buffer", content: "line one\nline two\nline three"},
+	} {
+		started := time.Now()
+		if err := client.SendKeysForAgentWithDelayContext(context.Background(), "%1", tc.content, true, DefaultEnterDelay, AgentMuse); err != nil {
+			t.Fatalf("%s: SendKeysForAgentWithDelayContext() error = %v", tc.name, err)
+		}
+		if elapsed := time.Since(started); elapsed < MuseEnterDelay {
+			t.Fatalf("%s: Muse send with DefaultEnterDelay returned after %v, want at least MuseEnterDelay (%v) before Enter", tc.name, elapsed, MuseEnterDelay)
+		}
+	}
+	// Staging without Enter must still type the text and never press Enter.
+	if err := client.SendKeysForAgentWithDelayContext(context.Background(), "%1", "staged", false, 0, AgentMuse); err != nil {
+		t.Fatalf("stage-only SendKeysForAgentWithDelayContext() error = %v", err)
+	}
+}
+
+// TestSendKeysForAgentMuseEnterFloor drives the real agent-aware send path
+// against a fake tmux: a caller passing DefaultEnterDelay for a Muse pane
+// (as the robot ack and interrupt paths do) still waits MuseEnterDelay before
+// Enter, on both the send-keys path and the paste-buffer path.
+func TestSendKeysForAgentMuseEnterFloor(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "tmux")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$NTM_TEST_MUSE_ENTER_FLOOR_ROOT/tmux.log"
+case "$1" in
+  load-buffer)
+    cat >/dev/null
+    ;;
+esac
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSendKeysForAgentMuseEnterFloorHelper$")
+	cmd.Env = append(os.Environ(),
+		"NTM_TEST_MUSE_ENTER_FLOOR_HELPER=1",
+		"NTM_TEST_MUSE_ENTER_FLOOR_ROOT="+root,
+		"NTM_TEST_TMUX_ENV_OWNED=1",
+		"NTM_TMUX_BINARY="+scriptPath,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Muse Enter floor helper failed: %v output=%s", err, output)
+	}
+	logData, err := os.ReadFile(filepath.Join(root, "tmux.log"))
+	if err != nil {
+		t.Fatalf("read fake tmux log: %v", err)
+	}
+	calls := strings.Split(strings.TrimSpace(string(logData)), "\n")
+	var verbs []string
+	for _, call := range calls {
+		fields := strings.Fields(call)
+		if len(fields) == 0 {
+			continue
+		}
+		verb := fields[0]
+		if verb == "send-keys" && fields[len(fields)-1] == "Enter" {
+			verb = "Enter"
+		}
+		verbs = append(verbs, verb)
+	}
+	want := []string{"send-keys", "Enter", "load-buffer", "paste-buffer", "Enter", "send-keys"}
+	if strings.Join(verbs, ",") != strings.Join(want, ",") {
+		t.Fatalf("fake tmux calls = %q, want %q (single line typed, multi-line pasted, staged text never submitted)", calls, want)
 	}
 }
 
@@ -2937,6 +3106,49 @@ func TestComposerLineEmpty_PlaceholderCountsAsEmpty(t *testing.T) {
 	}
 	if empty {
 		t.Fatalf("residue starting with placeholder-adjacent text must not be empty unless it matches the exact placeholder prefix")
+	}
+}
+
+// An idle Muse pane shows a dim feature tip in its empty composer about seven
+// seconds after each turn (captured live from muse 1.4.11). Without the tip
+// prefixes, every verified --clear-input send to an idle Muse pane failed
+// with COMPOSER_NOT_CLEARED.
+func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
+	t.Parallel()
+
+	screen := func(composer string) string {
+		return "❯ follow up probe\n\n◆ echo: follow up probe\n\n" +
+			"── Voice input (alt(option)+v to start) ──────────\n" +
+			composer + "\n" +
+			"──────────────────────────────────────────────────\n" +
+			"  echo · /private/tmp/claude-501/musews · YOLO"
+	}
+	prefixes := composerPlaceholderPrefixes(AgentType("muse-code"))
+
+	for _, tip := range []string{
+		"❯ Type @ to search and insert workspace file paths",
+		"❯ Start a message with ! to run a shell command yourself",
+		"❯ Tab queues or steers while a run is active",
+		"❯ /loop 10m <prompt> schedules a recurring prompt",
+		// A narrow pane cuts the tip short.
+		"❯ Press ? on an empty composer to see keyb…",
+		"❯",
+	} {
+		found, empty := composerLineEmpty(screen(tip), "❯", prefixes)
+		if !found || !empty {
+			t.Errorf("Muse composer %q: got (found=%v, empty=%v), want (true, true)", tip, found, empty)
+		}
+	}
+
+	for _, residue := range []string{
+		"❯ draft text here",
+		"❯ Type a summary of the bug",
+		"❯ /fork",
+	} {
+		found, empty := composerLineEmpty(screen(residue), "❯", prefixes)
+		if !found || empty {
+			t.Errorf("Muse composer residue %q: got (found=%v, empty=%v), want (true, false)", residue, found, empty)
+		}
 	}
 }
 

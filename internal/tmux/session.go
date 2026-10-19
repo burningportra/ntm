@@ -1597,7 +1597,46 @@ const (
 	// time to process pasted text before receiving Enter. Shell input handling
 	// can vary based on readline, prompt configuration, and system load.
 	ShellEnterDelay = 150 * time.Millisecond
+
+	// MuseEnterDelay is the shortest gap Muse Code reliably accepts between
+	// typed text and the submitting Enter. Muse treats keys that arrive in a
+	// fast burst as a paste, so an Enter inside that burst becomes a newline
+	// in the draft instead of a submit. Measured against muse 1.4.11 with the
+	// echo provider (tmux send-keys -l, then Enter): a 100 ms gap submitted
+	// 2 of 5 prompts (twice), while 200, 300 and 500 ms gaps submitted 8 of 8
+	// and 300 ms submitted 5 of 5 on a recheck. The agent-aware send path
+	// raises any shorter Enter delay to this floor for Muse panes.
+	MuseEnterDelay = 300 * time.Millisecond
 )
+
+// EnterDelayForAgent returns the delay a single-Enter submission should wait
+// between typing the prompt and pressing Enter in a pane of agentType: the
+// shell delay for user, unknown and unrecognized panes, MuseEnterDelay for
+// Muse Code, and DefaultEnterDelay for every other agent TUI. Protocol
+// planners use it so the delay they report matches the delay the send path
+// actually waits.
+func EnterDelayForAgent(agentType AgentType) time.Duration {
+	canonical := canonicalAgentType(agentType)
+	switch {
+	case canonical == AgentUser, canonical == AgentUnknown, !canonical.IsValid():
+		return ShellEnterDelay
+	case canonical == AgentMuse:
+		return MuseEnterDelay
+	default:
+		return DefaultEnterDelay
+	}
+}
+
+// enterDelayWithFloor returns the Enter delay the agent-aware send path
+// waits: the caller's delay, raised to MuseEnterDelay for Muse Code panes.
+// Other agents keep the caller's delay, including a deliberate zero, and a
+// negative delay passes through so the send still rejects it.
+func enterDelayWithFloor(agentType AgentType, enterDelay time.Duration) time.Duration {
+	if enterDelay >= 0 && enterDelay < MuseEnterDelay && canonicalAgentType(agentType) == AgentMuse {
+		return MuseEnterDelay
+	}
+	return enterDelay
+}
 
 // SendKeys sends keys to a pane with the default Enter delay.
 func (c *Client) SendKeys(target, keys string, enter bool) error {
@@ -1993,8 +2032,13 @@ func (c *Client) SendKeysForAgentWithDelay(target, keys string, enter bool, ente
 }
 
 // SendKeysForAgentWithDelayContext sends keys using the appropriate mechanism
-// with cancellation covering all subprocesses and delays.
+// with cancellation covering all subprocesses and delays. When enter is true,
+// an Enter delay below the agent's floor (MuseEnterDelay for Muse Code) is
+// raised to it, so callers passing DefaultEnterDelay still submit.
 func (c *Client) SendKeysForAgentWithDelayContext(ctx context.Context, target, keys string, enter bool, enterDelay time.Duration, agentType AgentType) error {
+	if enter {
+		enterDelay = enterDelayWithFloor(agentType, enterDelay)
+	}
 	// Use buffer-based paste when the agent/content combination needs it.
 	// This avoids newline interpretation issues and large-paste truncation quirks.
 	if needsBufferSend(agentType, keys) {
@@ -2056,6 +2100,16 @@ func needsBufferSend(agentType AgentType, content string) bool {
 	case AgentGemini, AgentAntigravity:
 		// agy (Antigravity) reuses Gemini's TUI send behavior: use buffer if
 		// content contains newlines.
+		return strings.Contains(content, "\n")
+	case AgentMuse:
+		// Muse binds Ctrl+J to newline, so on tmux 3.7b a 3-line prompt
+		// arrived intact both typed with send-keys -l and as a bracketed
+		// paste. Multi-line prompts use the buffer anyway: the paste is one
+		// atomic write Muse marks as pasted text, so it does not depend on how
+		// tmux encodes "\n" for send-keys -l, and an Enter 100 ms after a
+		// paste submitted 5 of 5 where typed text needs MuseEnterDelay. Large
+		// pastes show as "[Pasted Content N chars]" in the composer and still
+		// submit in full (a 40-line, 1619-char prompt came back complete).
 		return strings.Contains(content, "\n")
 	case AgentCodex:
 		// Use buffer for Codex when content contains newlines or is large (>512 chars)
@@ -2200,9 +2254,44 @@ func composerPlaceholderPrefixes(agentType AgentType) []string {
 		return []string{`Try "`}
 	case AgentCodex:
 		return []string{"Ask Codex"}
+	case AgentMuse:
+		return museComposerTipPrefixes
 	default:
 		return nil
 	}
+}
+
+// museComposerTipPrefixes are the leading words of the feature tips Muse
+// draws in an empty composer. About seven seconds after a turn ends, an idle
+// Muse pane shows one tip ("❯ Type @ to search and insert workspace file
+// paths" in a live echo pane) and keeps it while the composer stays empty.
+// The list covers every tip text in the muse 1.4.11 binary's tip table. Only
+// leading words are matched so a tip cut short by a narrow pane still counts
+// as empty.
+var museComposerTipPrefixes = []string{
+	"Type @ to search and insert",
+	"Start a message with ! to run",
+	"Paste an image with Ctrl+V",
+	"Press Alt+V to dictate",
+	"Tab queues or steers",
+	"Press ? on an empty composer",
+	"Press Ctrl+O to expand",
+	"/side asks a quick question",
+	"/fork branches the conversation",
+	"/goal pins a session objective",
+	"/resume reopens a past session",
+	"Ask to 'use a workflow'",
+	"Say 'use a workflow'",
+	"Ask to monitor a running",
+	"/agent opens the subagent",
+	"/tasks shows workflows",
+	"/loop 10m <prompt>",
+	"Ctrl+B sends the selected task",
+	"/skills browses ready-made",
+	"/plugins marketplace installs",
+	"/effort adjusts reasoning",
+	"/usage shows this session",
+	"/export saves the conversation",
 }
 
 // composerLineEmpty reports whether the bottom-most marker line in the

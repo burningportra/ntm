@@ -284,6 +284,21 @@ func (DefaultProtocolPlanner) PlanDelivery(_ context.Context, target Target, sub
 	switch {
 	case canonical == tmux.AgentUser, canonical == tmux.AgentUnknown, !canonical.IsValid():
 		return ProtocolPlan{Protocol: ProtocolSingleEnter, EnterDelay: tmux.ShellEnterDelay}, nil
+	case canonical == tmux.AgentMuse:
+		// Muse submits on a single Enter, but keeps the double Enter on
+		// purpose. Against a live muse 1.4.11 echo pane, the second Enter is a
+		// no-op both mid-turn (it lands under "◇ Thinking", no empty turn is
+		// queued, the turn is not interrupted, and the next prompt arrives
+		// without a stray newline) and on an idle empty composer. The first
+		// Enter comes DoubleEnterFirstDelay after the text, far past the
+		// 100 ms gap at which Muse took Enter as a newline, and when the first
+		// Enter was forced into a newline (sent right after the text, 4 of 4
+		// tries) the second Enter submitted the prompt.
+		return ProtocolPlan{
+			Protocol:         ProtocolDoubleEnter,
+			EnterDelay:       tmux.DoubleEnterFirstDelay,
+			SecondEnterDelay: tmux.DoubleEnterSecondDelay,
+		}, nil
 	default:
 		return ProtocolPlan{
 			Protocol:         ProtocolDoubleEnter,
