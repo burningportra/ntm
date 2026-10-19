@@ -307,6 +307,28 @@ func TestSpawnCapabilitiesAdvertiseMuse(t *testing.T) {
 	t.Fatal("spawn capabilities omit --spawn-muse")
 }
 
+// TestControllerSpawnCapabilitiesListMuse: --robot-controller-spawn accepts
+// --controller-agent-type=muse, so capabilities must not advertise only the
+// original three types.
+func TestControllerSpawnCapabilitiesListMuse(t *testing.T) {
+	output, err := GetCapabilitiesWithOptions(CapabilitiesOptions{Command: "controller-spawn"})
+	if err != nil || !output.Success || len(output.Commands) != 1 {
+		t.Fatalf("controller-spawn capabilities output=%+v err=%v", output, err)
+	}
+	for _, parameter := range output.Commands[0].Parameters {
+		if parameter.Flag != "--controller-agent-type" {
+			continue
+		}
+		for _, want := range []string{"cc", "cod", "gmi", "pi", "kimi", "muse", "agy"} {
+			if !strings.Contains(parameter.Description, " "+want+",") {
+				t.Errorf("--controller-agent-type description = %q, want it to list %q", parameter.Description, want)
+			}
+		}
+		return
+	}
+	t.Fatal("controller-spawn capabilities omit --controller-agent-type")
+}
+
 // TestSendCapabilitiesTypeFilterListsEveryAgentType keeps the --robot-send
 // --type description in step with the agent types the filter accepts.
 func TestSendCapabilitiesTypeFilterListsEveryAgentType(t *testing.T) {

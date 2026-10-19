@@ -200,7 +200,7 @@ func getCommandsContent() *DocsContent {
 			{
 				Heading: "Agent Control",
 				Body: `--robot-send=SESSION: Send message to panes
---robot-interrupt=SESSION: Send Ctrl+C to agents
+--robot-interrupt=SESSION: Send Ctrl+C (Escape to Muse Code panes) to agents
 --robot-restart-pane=SESSION: Immediate tmux respawn-pane -k restart with optional prompt/bead follow-up and --restart-model/--restart-agent-args relaunch overrides
 --robot-exit-cli=SESSION: Graceful agent-CLI exit (double Ctrl+C choreography) preserving the pane and shell; optional --relaunch
 --robot-kill-agent=SESSION: SIGTERM/SIGKILL the agent process tree, pane and shell preserved; optional --relaunch

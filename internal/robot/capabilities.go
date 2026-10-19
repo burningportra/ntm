@@ -1242,7 +1242,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Description: "Launch a controller agent pane inside an existing session.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-controller-spawn", Type: "string", Required: true, Description: "Session name"},
-				{Name: "controller-agent-type", Flag: "--controller-agent-type", Type: "string", Required: false, Default: "cc", Description: "Controller agent type: cc, cod, gmi"},
+				{Name: "controller-agent-type", Flag: "--controller-agent-type", Type: "string", Required: false, Default: "cc", Description: "Controller agent type: cc, cod, gmi, pi, kimi, muse, agy, cursor, windsurf|ws, aider, oc, or ollama"},
 				{Name: "controller-prompt", Flag: "--controller-prompt", Type: "string", Required: false, Description: "Custom initial prompt file"},
 				{Name: "controller-no-prompt", Flag: "--controller-no-prompt", Type: "bool", Required: false, Description: "Skip sending the initial prompt"},
 			},
