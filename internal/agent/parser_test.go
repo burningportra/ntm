@@ -363,6 +363,12 @@ func TestParser_OtherAgentScreensNeverMuse(t *testing.T) {
 			"  ⎿  $ muse --yolo\n" +
 			"     Muse Code 1.4.11\n\n" +
 			claudeIdleBottom,
+		// The live Codex footer with a lowercase model id and no effort: a
+		// "<model> · <cwd>" line at the bottom, so only the muse- prefix
+		// tells Muse's status bar apart.
+		"codex lowercase model footer": "› Ask Codex to do anything\n\n" +
+			"  gpt-5.5-codex · ~/Github/hoyehh-shop · Main [default]\n" +
+			"  ? for shortcuts",
 		"claude quoting the status bar": "● Bash(tmux capture-pane -p -t muse:0.0 | tail -3)\n" +
 			"  ⎿  ❯\n" +
 			"     " + strings.Repeat("─", 40) + "\n" +
