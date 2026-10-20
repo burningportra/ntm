@@ -3165,14 +3165,13 @@ func GetBlockedListContext(ctx context.Context, dir string, limit int) ([]BeadPr
 		return nil, fmt.Errorf("list blocked beads: %w", err)
 	}
 
-	var issues []struct {
-		ID    string `json:"id"`
-		Title string `json:"title"`
+	type blockedIssue struct {
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		BlockedBy []string `json:"blocked_by"`
 	}
-	if issues, err = UnmarshalBdList[struct {
-		ID    string `json:"id"`
-		Title string `json:"title"`
-	}](output); err != nil {
+	issues, err := UnmarshalBdList[blockedIssue](output)
+	if err != nil {
 		return nil, fmt.Errorf("parse blocked beads: %w", err)
 	}
 
@@ -3182,8 +3181,9 @@ func GetBlockedListContext(ctx context.Context, dir string, limit int) ([]BeadPr
 			break
 		}
 		items = append(items, BeadPreview{
-			ID:    issue.ID,
-			Title: issue.Title,
+			ID:        issue.ID,
+			Title:     issue.Title,
+			BlockedBy: issue.BlockedBy,
 		})
 	}
 

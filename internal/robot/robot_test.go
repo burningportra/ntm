@@ -7184,3 +7184,84 @@ func TestProjectionBackedSessionsRequireEveryLiveSession(t *testing.T) {
 		t.Fatalf("snapshot rejected a projection covering every live session: %v", err)
 	}
 }
+
+// fakeBRBlockedScript answers like br on a project with one ready bead, one
+// in progress and two blocked beads, in the reply shapes br sends.
+const fakeBRBlockedScript = `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    stats) echo '{"summary":{"total_issues":4,"open_issues":3,"in_progress_issues":1,"blocked_issues":2,"ready_issues":1,"closed_issues":0}}'; exit 0 ;;
+    ready) echo '[{"id":"bd-r","title":"Ready bead","priority":1,"status":"open","issue_type":"task"}]'; exit 0 ;;
+    list) echo '[{"id":"bd-p","title":"Bead in progress","status":"in_progress","assignee":"BlueLake","updated_at":"2026-10-19T00:00:00Z"}]'; exit 0 ;;
+    blocked) echo '[{"id":"bd-b1","title":"Blocked once","priority":2,"status":"open","issue_type":"task","blocked_by":["bd-r"],"blocked_by_count":1},{"id":"bd-b2","title":"Blocked twice","priority":2,"status":"open","issue_type":"epic","blocked_by":["bd-r","bd-p"],"blocked_by_count":2}]'; exit 0 ;;
+  esac
+done
+exit 1
+`
+
+// bd-9k16u: blockers reached the projection only through bv triage, which
+// seldom recommends a blocked bead, so the beads from br blocked were saved
+// as open with no blockers and --robot-status and --robot-snapshot counted
+// them as ready work: ready_work said 3 where br ready said 1.
+func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
+	projectDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(projectDir, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	binDir := t.TempDir()
+	// bv fails, as it does when triage overruns its budget.
+	for name, script := range map[string]string{"br": fakeBRBlockedScript, "bv": "#!/bin/sh\nexit 1\n"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o700); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	batch, err := adapters.NewWorkAdapter(adapters.DefaultWorkCoordinationAdapterConfig(projectDir)).Collect(ctx)
+	if err != nil {
+		t.Fatalf("collect work: %v", err)
+	}
+	const brReady = 1
+
+	store := newTestAttentionStore(t)
+	now := time.Now().UTC()
+	for _, row := range buildRuntimeWorkRows(batch.Work, now, now.Add(time.Hour)) {
+		if err := store.UpsertRuntimeWork(row); err != nil {
+			t.Fatalf("UpsertRuntimeWork(%s): %v", row.BeadID, err)
+		}
+	}
+	oldListLive := listProjectionLiveSessions
+	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
+	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
+
+	status, err := buildProjectionBackedStatus(store, config.Default(), PaginationOptions{})
+	if err != nil {
+		t.Fatalf("buildProjectionBackedStatus: %v", err)
+	}
+	if status.Summary.ReadyWork != brReady || status.Summary.InProgress != 1 {
+		t.Fatalf("status ready_work = %d, in_progress = %d; want %d and 1 as br reports", status.Summary.ReadyWork, status.Summary.InProgress, brReady)
+	}
+
+	rows, err := store.ListFreshRuntimeWork("", 0)
+	if err != nil {
+		t.Fatalf("ListFreshRuntimeWork: %v", err)
+	}
+	work := snapshotWorkFromRuntime(rows, 0)
+	if work.Summary.Ready != brReady || work.Summary.Blocked != 2 || len(work.Ready) != brReady || work.Ready[0].ID != "bd-r" {
+		t.Fatalf("snapshot work summary = %+v, ready = %+v; want only bd-r ready and two blocked", work.Summary, work.Ready)
+	}
+	beads, err := snapshotBeadsSummaryFromRuntime(store, projectDir, 0)
+	if err != nil {
+		t.Fatalf("snapshotBeadsSummaryFromRuntime: %v", err)
+	}
+	if beads.Ready != brReady || beads.Blocked != 2 {
+		t.Fatalf("snapshot beads summary ready = %d, blocked = %d; want %d and 2", beads.Ready, beads.Blocked, brReady)
+	}
+	for _, row := range rows {
+		if want := map[string]int{"bd-b1": 1, "bd-b2": 2}[row.BeadID]; row.BlockedByCount != want {
+			t.Fatalf("%s blocked_by_count = %d, want %d", row.BeadID, row.BlockedByCount, want)
+		}
+	}
+}

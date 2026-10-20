@@ -137,6 +137,8 @@ type BeadPreview struct {
 	Title    string `json:"title"`
 	Priority string `json:"priority"`       // e.g., "P0", "P1"
 	Type     string `json:"type,omitempty"` // task, bug, feature, epic, etc.
+	// BlockedBy lists the beads blocking this one; GetBlockedList sets it.
+	BlockedBy []string `json:"blocked_by,omitempty"`
 }
 
 // BeadInProgress represents an in-progress bead with assignee

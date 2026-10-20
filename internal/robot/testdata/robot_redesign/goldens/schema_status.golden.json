@@ -145,6 +145,13 @@
       },
       "BeadPreview": {
         "properties": {
+          "blocked_by": {
+            "description": "Blocked by",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "id": {
             "description": "I d",
             "type": "string"

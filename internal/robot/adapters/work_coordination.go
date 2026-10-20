@@ -879,13 +879,19 @@ func workItemFromPreview(preview bv.BeadPreview, rec bv.TriageRecommendation) Wo
 		Title:           title,
 		TitleDisclosure: disclosure,
 		Priority:        parsePriorityLabel(preview.Priority),
+		// br blocked names the blockers itself. Triage seldom recommends a
+		// blocked bead, so without them a blocked item read as ready work
+		// (bd-9k16u).
+		BlockedBy: append([]string(nil), preview.BlockedBy...),
 	}
 	if rec.ID == "" {
 		return item
 	}
 	item.Type = rec.Type
 	item.Labels = append([]string{}, rec.Labels...)
-	item.BlockedBy = append([]string{}, rec.BlockedBy...)
+	if len(item.BlockedBy) == 0 {
+		item.BlockedBy = append([]string{}, rec.BlockedBy...)
+	}
 	item.Unblocks = len(rec.UnblocksIDs)
 	item.Score = floatPointer(rec.Score)
 	if item.Title == "" {
