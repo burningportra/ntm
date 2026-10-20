@@ -124,6 +124,16 @@ ntm zoom payments 3
 ntm attach payments
 ```
 
+Use labels when you want multiple coordinated swarms on the same project while
+keeping a shared project directory:
+
+```bash
+ntm quick payments --template=go
+ntm spawn payments --label backend --cc=2 --cod=1
+ntm spawn payments --label frontend --cc=2
+ntm add payments --label frontend --cc=1
+```
+
 #### Grok Build (phase one)
 
 NTM recognizes the official xAI Grok Build CLI as the canonical `grok` agent
@@ -175,16 +185,6 @@ ntm --robot-spawn=research --spawn-muse=1
 
 Override the launch command with `[agents] muse`, the default model with
 `[models] default_muse`, and the aliases under `[models.muse]`.
-
-Use labels when you want multiple coordinated swarms on the same project while
-keeping a shared project directory:
-
-```bash
-ntm quick payments --template=go
-ntm spawn payments --label backend --cc=2 --cod=1
-ntm spawn payments --label frontend --cc=2
-ntm add payments --label frontend --cc=1
-```
 
 #### Worktree isolation and reservations
 
