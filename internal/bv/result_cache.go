@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 
@@ -62,6 +63,13 @@ var resultCacheStartMu sync.Mutex
 // errResultCacheFiles means the cache directory took no new files, so the
 // caller runs bv without the cache.
 var errResultCacheFiles = errors.New("bv result cache files unavailable")
+
+// resultCacheTestRoot is the cache root inside a test binary. Tests in every
+// package reach bv, often with a fake bv against a real checkout, and must
+// neither touch the user's cache dir nor get answers from it, so in a test
+// binary the cache is off unless a test in this package sets this to a temp
+// dir. Tests that set it run sequentially, before any parallel test starts.
+var resultCacheTestRoot string
 
 // resultCache addresses one command's entry for one project and data state.
 type resultCache struct {
@@ -184,9 +192,21 @@ func newResultCache(dir string, args []string) (*resultCache, bool) {
 	}, true
 }
 
-// resultCacheRoot honors XDG_CACHE_HOME on every platform, the way the
-// ensemble context-pack cache does, so tests can sandbox it.
+// resultCacheRoot is resultCacheTestRoot in a test binary and
+// userResultCacheRoot everywhere else.
 func resultCacheRoot() (string, error) {
+	if testing.Testing() {
+		if resultCacheTestRoot == "" {
+			return "", errors.New("bv result cache is off in tests")
+		}
+		return resultCacheTestRoot, nil
+	}
+	return userResultCacheRoot()
+}
+
+// userResultCacheRoot honors XDG_CACHE_HOME on every platform, the way the
+// ensemble context-pack cache does.
+func userResultCacheRoot() (string, error) {
 	if xdg := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); xdg != "" {
 		return filepath.Join(xdg, "ntm", "bv"), nil
 	}

@@ -2188,8 +2188,20 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// The suite runs ntm from PATH, whose caches would otherwise land in the
+	// developer's cache dir.
+	cleanupCache, err := testutil.IsolateCacheHomeProcess()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "isolate E2E cache dir: %v\n", err)
+		os.Exit(1)
+	}
+
 	code := m.Run()
 
+	if err := cleanupCache(); err != nil {
+		fmt.Fprintf(os.Stderr, "clean up isolated E2E cache dir: %v\n", err)
+		code = 1
+	}
 	if err := cleanupTmux(); err != nil {
 		fmt.Fprintf(os.Stderr, "clean up isolated E2E tmux: %v\n", err)
 		code = 1

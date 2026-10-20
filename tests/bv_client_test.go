@@ -247,6 +247,8 @@ func TestBVClientCachingUsesCache(t *testing.T) {
 		t.Fatalf("expected 1 call within TTL, got %d", calls)
 	}
 
+	// bv's shared result cache is off in test binaries, so a fetch past the
+	// client's TTL runs bv again; internal/bv covers the two caches together.
 	time.Sleep(250 * time.Millisecond)
 	_, err = client.GetRecommendations(bv.RecommendationOpts{})
 	if err != nil {

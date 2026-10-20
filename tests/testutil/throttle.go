@@ -131,6 +131,31 @@ func AcquireGlobalTmuxTestLockForTest(t *testing.T) {
 	acquireGlobalTmuxTestLock(t)
 }
 
+// IsolateCacheHomeProcess points XDG_CACHE_HOME at an empty process-private
+// dir, so ntm binaries a test package runs keep their caches, the shared bv
+// result cache among them, out of the developer's cache dir and never answer
+// from it. Code running inside a test binary needs no help: internal/bv keeps
+// that cache off there. Go's build cache defaults to XDG_CACHE_HOME on Linux,
+// so GOCACHE is pinned first to keep tests that run `go build` warm. Call from
+// TestMain before m.Run(); the returned cleanup removes the private dir.
+func IsolateCacheHomeProcess() (func() error, error) {
+	if os.Getenv("GOCACHE") == "" {
+		if base, err := os.UserCacheDir(); err == nil {
+			if err := os.Setenv("GOCACHE", filepath.Join(base, "go-build")); err != nil {
+				return nil, fmt.Errorf("pin GOCACHE: %w", err)
+			}
+		}
+	}
+	dir, err := os.MkdirTemp("", "ntm-test-cache-")
+	if err != nil {
+		return nil, fmt.Errorf("create private cache dir: %w", err)
+	}
+	if err := os.Setenv("XDG_CACHE_HOME", dir); err != nil {
+		return nil, errors.Join(fmt.Errorf("set XDG_CACHE_HOME: %w", err), os.RemoveAll(dir))
+	}
+	return func() error { return os.RemoveAll(dir) }, nil
+}
+
 // IsolateTmuxTestProcess gives a package test binary its own tmux server and
 // IsolateGitConfigProcess points git's global and system configuration at
 // empty process-private locations so neither tests nor code under test that

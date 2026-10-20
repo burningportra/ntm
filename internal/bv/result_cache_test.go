@@ -43,12 +43,20 @@ func newResultCacheFixture(t *testing.T) *resultCacheFixture {
 		t.Fatalf("write fake bv: %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("XDG_CACHE_HOME", f.cacheRoot)
+	useResultCacheRoot(t, f.cacheRoot)
 	t.Setenv("BEADS_DIR", "")
 	t.Setenv("BEADS_DB", "")
 	t.Setenv("FAKE_BV_SLEEP", "0")
 	t.Setenv("FAKE_BV_EXIT", "")
 	return f
+}
+
+// useResultCacheRoot turns the shared cache on for one test, rooted at root.
+func useResultCacheRoot(t *testing.T, root string) {
+	t.Helper()
+	previous := resultCacheTestRoot
+	resultCacheTestRoot = root
+	t.Cleanup(func() { resultCacheTestRoot = previous })
 }
 
 func (f *resultCacheFixture) writeIssues(t *testing.T, content string) {
@@ -109,7 +117,7 @@ func waitForRuns(t *testing.T, f *resultCacheFixture, want int) {
 
 func cachePartials(t *testing.T, f *resultCacheFixture) []string {
 	t.Helper()
-	partials, err := filepath.Glob(filepath.Join(f.cacheRoot, "ntm", "bv", "*", "*.partial"))
+	partials, err := filepath.Glob(filepath.Join(f.cacheRoot, "*", "*.partial"))
 	if err != nil {
 		t.Fatalf("glob partials: %v", err)
 	}
@@ -196,7 +204,7 @@ func TestResultCacheExpiresEntriesAfterMaxAge(t *testing.T) {
 	if run := f.mustInsights(t); run != 1 {
 		t.Fatalf("first call served run %d, want 1", run)
 	}
-	entries, err := filepath.Glob(filepath.Join(f.cacheRoot, "ntm", "bv", "*", "robot-insights-*.json"))
+	entries, err := filepath.Glob(filepath.Join(f.cacheRoot, "*", "robot-insights-*.json"))
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("cache entries = %v (err %v), want one", entries, err)
 	}
@@ -334,5 +342,84 @@ func TestResultCacheAppliesOnlyWithBeadsDataAndCachedCommands(t *testing.T) {
 	}
 	if _, ok := newResultCache(empty, []string{"--robot-insights"}); ok {
 		t.Fatal("cache applied without any .beads/*.jsonl file")
+	}
+}
+
+// Tests in every package reach bv, many with a fake bv against a real
+// checkout. In a test binary the cache must neither write to nor answer from
+// the user's cache dir, wherever XDG_CACHE_HOME or HOME point it.
+func TestResultCacheIsOffInTestBinariesUnlessATestRootsIt(t *testing.T) {
+	f := newResultCacheFixture(t)
+	useResultCacheRoot(t, "")
+	userCache := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", userCache)
+	t.Setenv("HOME", home)
+
+	if run := f.mustInsights(t); run != 1 {
+		t.Fatalf("first call served run %d, want 1", run)
+	}
+	if run := f.mustInsights(t); run != 2 {
+		t.Fatalf("second call served run %d, want a fresh run 2 with the cache off", run)
+	}
+	for _, dir := range []string{userCache, home} {
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("%s holds %v (err %v), want nothing written", dir, entries, err)
+		}
+	}
+}
+
+func TestUserResultCacheRootHonorsXDGCacheHome(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", xdg)
+	if root, err := userResultCacheRoot(); err != nil || root != filepath.Join(xdg, "ntm", "bv") {
+		t.Fatalf("root with XDG_CACHE_HOME = %q (err %v), want %q", root, err, filepath.Join(xdg, "ntm", "bv"))
+	}
+
+	t.Setenv("XDG_CACHE_HOME", "")
+	base, err := os.UserCacheDir()
+	if err != nil {
+		t.Skipf("no user cache dir: %v", err)
+	}
+	if root, err := userResultCacheRoot(); err != nil || root != filepath.Join(base, "ntm", "bv") {
+		t.Fatalf("root without XDG_CACHE_HOME = %q (err %v), want %q", root, err, filepath.Join(base, "ntm", "bv"))
+	}
+}
+
+// BVClient keeps its own copy for CacheTTL. Past the TTL it asks bv again,
+// and the shared cache answers that while the beads data is unchanged.
+func TestBVClientTTLExpiryRereadsTheSharedCache(t *testing.T) {
+	f := newResultCacheFixture(t)
+	const ttl = 500 * time.Millisecond
+	client := NewBVClientWithOptions(f.dir, ttl, DefaultTimeout)
+	fetch := func(step string) string {
+		t.Helper()
+		resp, err := client.getTriage()
+		if err != nil {
+			t.Fatalf("%s: getTriage: %v", step, err)
+		}
+		return resp.DataHash
+	}
+
+	first := fetch("first fetch")
+	if got := f.runs(t); got != 1 {
+		t.Fatalf("bv ran %d times for the first fetch, want 1", got)
+	}
+
+	f.writeIssues(t, `{"id":"bd-1","status":"closed"}`+"\n")
+	if hash := fetch("fetch within the TTL"); hash != first || f.runs(t) != 1 {
+		t.Fatalf("fetch within the TTL got data %q after %d runs, want the client's copy %q from 1 run", hash, f.runs(t), first)
+	}
+
+	time.Sleep(ttl + 100*time.Millisecond)
+	changed := fetch("fetch past the TTL after a data change")
+	if changed == first || f.runs(t) != 2 {
+		t.Fatalf("fetch past the TTL got data %q after %d runs, want new data from run 2", changed, f.runs(t))
+	}
+
+	time.Sleep(ttl + 100*time.Millisecond)
+	if hash := fetch("fetch past the TTL on unchanged data"); hash != changed || f.runs(t) != 2 {
+		t.Fatalf("fetch past the TTL on unchanged data got %q after %d runs, want %q from the shared cache", hash, f.runs(t), changed)
 	}
 }

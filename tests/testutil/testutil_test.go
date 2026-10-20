@@ -251,6 +251,43 @@ func TestIsolateTmuxTestProcess(t *testing.T) {
 	}
 }
 
+func TestIsolateCacheHomeProcess(t *testing.T) {
+	ambient := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", ambient)
+	t.Setenv("GOCACHE", "")
+	wantGoCache := ""
+	if base, err := os.UserCacheDir(); err == nil {
+		wantGoCache = filepath.Join(base, "go-build")
+	}
+
+	cleanupCache, err := IsolateCacheHomeProcess()
+	if err != nil {
+		t.Fatalf("IsolateCacheHomeProcess() error = %v", err)
+	}
+	cacheHome := os.Getenv("XDG_CACHE_HOME")
+	if cacheHome == "" || cacheHome == ambient {
+		t.Fatalf("XDG_CACHE_HOME = %q, want a new private directory", cacheHome)
+	}
+	entries, err := os.ReadDir(cacheHome)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("private cache dir holds %v (err %v), want an empty directory", entries, err)
+	}
+	if got := os.Getenv("GOCACHE"); got != wantGoCache {
+		t.Fatalf("GOCACHE = %q, want the build cache from before isolation %q", got, wantGoCache)
+	}
+	// Binaries a test runs inherit the private dir.
+	out, err := exec.Command("/bin/sh", "-c", `printf %s "$XDG_CACHE_HOME"`).Output()
+	if err != nil || string(out) != cacheHome {
+		t.Fatalf("child process saw XDG_CACHE_HOME = %q (err %v), want %q", out, err, cacheHome)
+	}
+	if err := cleanupCache(); err != nil {
+		t.Fatalf("cleanup IsolateCacheHomeProcess(): %v", err)
+	}
+	if _, err := os.Stat(cacheHome); !os.IsNotExist(err) {
+		t.Fatalf("cache cleanup left %q behind; stat error = %v", cacheHome, err)
+	}
+}
+
 func TestIsolateTmuxTestProcessPreservesConfiguredFakeBinaryEnvironment(t *testing.T) {
 	fakeDir := t.TempDir()
 	invoked := filepath.Join(fakeDir, "invoked")

@@ -56,7 +56,22 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// The suite runs a freshly built ntm, whose caches would otherwise land
+	// in the developer's cache dir.
+	cleanupCache, err := testutil.IsolateCacheHomeProcess()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "E2E: failed to isolate the cache dir: %v\n", err)
+		if cleanupErr := cleanupTmux(); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "E2E: failed to clean up isolated tmux: %v\n", cleanupErr)
+		}
+		os.Exit(1)
+	}
+
 	code := m.Run()
+	if err := cleanupCache(); err != nil {
+		fmt.Fprintf(os.Stderr, "E2E: failed to clean up the isolated cache dir: %v\n", err)
+		code = 1
+	}
 	if err := cleanupTmux(); err != nil {
 		fmt.Fprintf(os.Stderr, "E2E: failed to clean up isolated tmux: %v\n", err)
 		code = 1
