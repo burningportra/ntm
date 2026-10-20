@@ -8761,6 +8761,8 @@ func (s *spawnAssignmentMCPStub) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 
 	switch request.Method {
+	case "ping":
+		s.writeResult(w, request.ID, map[string]any{})
 	case "tools/call":
 		var params struct {
 			Name      string         `json:"name"`
@@ -8790,11 +8792,6 @@ func (s *spawnAssignmentMCPStub) handleTool(w http.ResponseWriter, id any, name 
 	defer s.mu.Unlock()
 
 	switch name {
-	case "health_check":
-		s.writeResult(w, id, map[string]any{
-			"status":    "ok",
-			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-		})
 	case "ensure_project":
 		if got, _ := args["human_key"].(string); got != s.projectDir {
 			s.failRPCLocked(w, id, -32602, fmt.Sprintf("ensure_project human_key=%q want=%q", got, s.projectDir))

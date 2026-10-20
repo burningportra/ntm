@@ -43,6 +43,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/scanner"
 	sessionpkg "github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/startup"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
@@ -7827,5 +7828,51 @@ func TestOpenAPIGenerateRejectsPositionalArgumentBeforeWritingOutput(t *testing.
 	}
 	if _, statErr := os.Stat(output); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("output file stat error = %v, want not exist", statErr)
+	}
+}
+
+// bd-izmjq: every robot command waited on the projection refresh at startup,
+// including commands like --robot-tail that never read the projection. Startup
+// now only registers the refresh, and it runs once, on the first read.
+func TestInitializeRobotPersistenceDefersProjectionRefreshToFirstRead(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, nil, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("NTM_CONFIG", cfgPath)
+	oldCfgFile := cfgFile
+	cfgFile = ""
+	t.Cleanup(func() { cfgFile = oldCfgFile })
+
+	calls := 0
+	var gotBudget time.Duration
+	oldRefresh := robotRefreshNormalizedProjection
+	robotRefreshNormalizedProjection = func(_ context.Context, _ *state.Store, _, _ string, sourceBudget time.Duration) error {
+		calls++
+		gotBudget = sourceBudget
+		return nil
+	}
+	t.Cleanup(func() { robotRefreshNormalizedProjection = oldRefresh })
+	prevFeed := robot.PeekAttentionFeed()
+	t.Cleanup(func() { robot.SetAttentionFeed(prevFeed) })
+
+	if err := initializeRobotPersistence(context.Background()); err != nil {
+		t.Fatalf("initializeRobotPersistence: %v", err)
+	}
+	t.Cleanup(closeRobotPersistence)
+	if calls != 0 {
+		t.Fatalf("startup ran the projection refresh %d times; it must wait for a projection read", calls)
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := robot.GetSnapshotDelta(time.Now().Add(-time.Minute)); err != nil {
+			t.Fatalf("GetSnapshotDelta: %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("projection refresh ran %d times across two reads, want once", calls)
+	}
+	if gotBudget != robotProjectionSourceBudget {
+		t.Fatalf("refresh source budget = %v, want %v", gotBudget, robotProjectionSourceBudget)
 	}
 }

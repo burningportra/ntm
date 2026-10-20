@@ -369,20 +369,14 @@ func TestGetMailCheck_DefaultsZeroLimit(t *testing.T) {
 		}
 
 		switch req.Method {
+		case "ping":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
 		case "tools/call":
 			params, ok := req.Params.(map[string]interface{})
 			if !ok {
 				t.Fatalf("expected params map, got %T", req.Params)
 			}
 			switch params["name"] {
-			case "health_check":
-				resp := agentmail.JSONRPCResponse{
-					JSONRPC: "2.0",
-					ID:      req.ID,
-					Result:  json.RawMessage(`{"status":"ok"}`),
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(resp)
 			case "fetch_inbox":
 				args, _ := params["arguments"].(map[string]interface{})
 				if got := int(args["limit"].(float64)); got != 21 {
@@ -440,20 +434,14 @@ func TestGetMailCheck_HasMoreUsesOverfetch(t *testing.T) {
 		}
 
 		switch req.Method {
+		case "ping":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
 		case "tools/call":
 			params, ok := req.Params.(map[string]interface{})
 			if !ok {
 				t.Fatalf("expected params map, got %T", req.Params)
 			}
 			switch params["name"] {
-			case "health_check":
-				resp := agentmail.JSONRPCResponse{
-					JSONRPC: "2.0",
-					ID:      req.ID,
-					Result:  json.RawMessage(`{"status":"ok"}`),
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(resp)
 			case "fetch_inbox":
 				args, _ := params["arguments"].(map[string]interface{})
 				fetchLimits = append(fetchLimits, int(args["limit"].(float64)))
@@ -520,10 +508,12 @@ func TestGetMailCheck_UsesFullInboxWindowForCounts(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
 		}
+		if req.Method == "ping" {
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
+			return
+		}
 		params := req.Params.(map[string]interface{})
 		switch params["name"] {
-		case "health_check":
-			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{"status":"ok"}`)})
 		case "fetch_inbox":
 			args := params["arguments"].(map[string]interface{})
 			limit := int(args["limit"].(float64))
@@ -701,20 +691,14 @@ func TestGetMailCheck_AggregatesProjectAgentsWhenAgentOmitted(t *testing.T) {
 		}
 
 		switch req.Method {
+		case "ping":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
 		case "tools/call":
 			params, ok := req.Params.(map[string]interface{})
 			if !ok {
 				t.Fatalf("expected params map, got %T", req.Params)
 			}
 			switch params["name"] {
-			case "health_check":
-				resp := agentmail.JSONRPCResponse{
-					JSONRPC: "2.0",
-					ID:      req.ID,
-					Result:  json.RawMessage(`{"status":"ok"}`),
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(resp)
 			case "fetch_inbox":
 				args, _ := params["arguments"].(map[string]interface{})
 				agentName, _ := args["agent_name"].(string)
@@ -810,20 +794,14 @@ func TestGetMailCheck_BackfillsWhenThreadFilterNeedsOlderMatches(t *testing.T) {
 		}
 
 		switch req.Method {
+		case "ping":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
 		case "tools/call":
 			params, ok := req.Params.(map[string]interface{})
 			if !ok {
 				t.Fatalf("expected params map, got %T", req.Params)
 			}
 			switch params["name"] {
-			case "health_check":
-				resp := agentmail.JSONRPCResponse{
-					JSONRPC: "2.0",
-					ID:      req.ID,
-					Result:  json.RawMessage(`{"status":"ok"}`),
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(resp)
 			case "fetch_inbox":
 				args, _ := params["arguments"].(map[string]interface{})
 				limit := int(args["limit"].(float64))

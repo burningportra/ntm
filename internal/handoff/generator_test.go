@@ -1219,8 +1219,8 @@ func TestEnrichWithAgentMailPreservesMidflightCancellation(t *testing.T) {
 
 				var result json.RawMessage
 				switch method {
-				case "health_check":
-					result = json.RawMessage(`{"status":"ok"}`)
+				case "ping":
+					result = json.RawMessage(`{}`)
 				case "fetch_inbox":
 					result = json.RawMessage(`[]`)
 				case "resources/read":

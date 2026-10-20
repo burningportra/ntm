@@ -3185,14 +3185,32 @@ func initializeRobotPersistence(ctx context.Context) error {
 		return nil
 	}
 
-	refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_ = robot.RefreshNormalizedProjection(refreshCtx, store, "", "")
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+	// The refresh captures every pane and queries bv, br and Agent Mail, so
+	// it runs only when the command first reads the projection (bd-izmjq).
+	// Commands that never read it, like --robot-tail or --robot-is-working,
+	// skip it entirely.
+	robot.SetProjectionRefresh(func() {
+		refreshCtx, cancel := context.WithTimeout(ctx, robotProjectionRefreshTimeout)
+		defer cancel()
+		_ = robotRefreshNormalizedProjection(refreshCtx, store, "", "", robotProjectionSourceBudget)
+	})
 	return nil
 }
+
+const (
+	// robotProjectionRefreshTimeout bounds the whole lazy projection refresh,
+	// including the tmux capture of every pane.
+	robotProjectionRefreshTimeout = 10 * time.Second
+	// robotProjectionSourceBudget bounds the bv, br and Agent Mail sources
+	// inside that refresh. On a large or busy project they can take tens of
+	// seconds; past this budget the refresh records them as degraded and
+	// still saves the sessions it captured.
+	robotProjectionSourceBudget = 3 * time.Second
+)
+
+// robotRefreshNormalizedProjection is the projection refresh the robot
+// persistence layer registers; tests replace it to observe when it runs.
+var robotRefreshNormalizedProjection = robot.RefreshNormalizedProjection
 
 func closeRobotPersistence() {
 	if robotStateStore == nil {

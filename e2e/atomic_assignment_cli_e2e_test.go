@@ -445,14 +445,16 @@ func (s *atomicAssignmentMailStub) handle(w http.ResponseWriter, r *http.Request
 		})
 		return
 	}
+	if request.JSONRPC == "2.0" && request.Method == "ping" {
+		writeResult(map[string]any{})
+		return
+	}
 	if request.JSONRPC != "2.0" || request.Method != "tools/call" {
 		http.Error(w, "expected JSON-RPC tools/call", http.StatusBadRequest)
 		return
 	}
 	now := time.Now().UTC()
 	switch request.Params.Name {
-	case "health_check":
-		writeResult(map[string]any{"status": "ok", "timestamp": now.Format(time.RFC3339Nano)})
 	case "ensure_project":
 		humanKey, _ := request.Params.Arguments["human_key"].(string)
 		if humanKey != s.projectDir {
@@ -1086,17 +1088,19 @@ func TestE2EAtomicAssignmentReservationRecoveryBuiltProcess(t *testing.T) {
 			})
 			return
 		}
-		if request.JSONRPC != "2.0" || request.Method != "tools/call" {
-			http.Error(w, "expected JSON-RPC tools/call", http.StatusBadRequest)
-			return
-		}
 		writeResult := func(result any) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 		}
+		if request.JSONRPC == "2.0" && request.Method == "ping" {
+			writeResult(map[string]any{})
+			return
+		}
+		if request.JSONRPC != "2.0" || request.Method != "tools/call" {
+			http.Error(w, "expected JSON-RPC tools/call", http.StatusBadRequest)
+			return
+		}
 		switch request.Params.Name {
-		case "health_check":
-			writeResult(map[string]any{"status": "ok", "timestamp": time.Now().UTC().Format(time.RFC3339Nano)})
 		case "ensure_project":
 			if request.Params.Arguments["human_key"] != fixture.projectDir {
 				http.Error(w, fmt.Sprintf("unexpected ensure project args: %#v", request.Params.Arguments), http.StatusBadRequest)
@@ -2173,12 +2177,9 @@ func TestE2EAtomicAssignmentClearPaneLeaseFailureIsDurable(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if request.JSONRPC == "2.0" && request.Method == "tools/call" && request.Params.Name == "health_check" {
+		if request.JSONRPC == "2.0" && request.Method == "ping" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"jsonrpc": "2.0", "id": request.ID,
-				"result": map[string]any{"status": "ok", "timestamp": time.Now().UTC().Format(time.RFC3339Nano)},
-			})
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": map[string]any{}})
 			return
 		}
 		if request.JSONRPC != "2.0" || request.Method != "tools/call" {
@@ -3693,12 +3694,9 @@ esac
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if request.Method == "tools/call" && request.Params.Name == "health_check" {
+		if request.Method == "ping" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"jsonrpc": "2.0", "id": request.ID,
-				"result": map[string]any{"status": "ok", "timestamp": time.Now().UTC().Format(time.RFC3339Nano)},
-			})
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": map[string]any{}})
 			return
 		}
 		if request.Method != "tools/call" {
@@ -6799,13 +6797,15 @@ func TestE2EAtomicAssignmentReassignTransfersReservation(t *testing.T) {
 			})
 			return
 		}
+		if request.Method == "ping" {
+			writeResult(map[string]any{})
+			return
+		}
 		if request.Method != "tools/call" {
 			http.Error(w, "expected JSON-RPC tools/call", http.StatusBadRequest)
 			return
 		}
 		switch request.Params.Name {
-		case "health_check":
-			writeResult(map[string]any{"status": "ok", "timestamp": time.Now().UTC().Format(time.RFC3339Nano)})
 		case "ensure_project":
 			if request.Params.Arguments["human_key"] != fixture.projectDir {
 				http.Error(w, fmt.Sprintf("unexpected reassign ensure project args: %#v", request.Params.Arguments), http.StatusBadRequest)

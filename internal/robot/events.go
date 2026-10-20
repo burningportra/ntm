@@ -116,6 +116,8 @@ func PrintEvents(opts EventsOptions) error {
 
 // BuildEventsOutput resolves a robot attention replay request and returns the JSON payload plus suggested HTTP status.
 func BuildEventsOutput(opts EventsOptions) (EventsOutput, int) {
+	// The replay includes attention the projection refresh derives.
+	runProjectionRefresh()
 	feed := GetAttentionFeed()
 	if feed == nil {
 		return EventsOutput{
@@ -763,6 +765,8 @@ func printDigestResponse(output DigestResponse) error {
 // PrintDigest outputs a token-efficient digest of what changed since a cursor.
 // This is the default delta surface for operators that don't need raw event replay.
 func PrintDigest(opts DigestOptions) error {
+	// The digest includes attention the projection refresh derives.
+	runProjectionRefresh()
 	feed := GetAttentionFeed()
 	if feed == nil {
 		return printDigestResponse(DigestResponse{
@@ -888,6 +892,8 @@ func PrintDigest(opts DigestOptions) error {
 // GetDigest returns a token-efficient digest of what changed since a cursor.
 // This returns the data struct directly for REST/API parity with CLI.
 func GetDigest(opts DigestOptions) (*DigestResponse, error) {
+	// The digest includes attention the projection refresh derives.
+	runProjectionRefresh()
 	feed := GetAttentionFeed()
 	if feed == nil {
 		return &DigestResponse{
@@ -1124,6 +1130,9 @@ func PrintAttention(opts AttentionOptions) int {
 		opts.BackgroundLimit = 0
 	}
 
+	// Attention the projection refresh derives must be in the feed before
+	// the wait takes its starting cursor.
+	runProjectionRefresh()
 	feed := GetAttentionFeed()
 	if feed == nil {
 		return printAttentionResponse(AttentionResponse{

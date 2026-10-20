@@ -312,6 +312,10 @@ type FetchInboxOptions struct {
 	SinceTS       *time.Time
 	Limit         int
 	IncludeBodies bool
+	// Peek reads the inbox without marking the returned messages read. The
+	// server marks fetched messages read by default, so callers that observe
+	// another agent's inbox (status, snapshots, projections) must peek.
+	Peek bool
 }
 
 // FileReservationOptions contains options for reserving file paths.

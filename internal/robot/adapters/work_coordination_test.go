@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -513,12 +514,12 @@ func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 		}
 
 		switch req.Method {
+		case "ping":
+			writeJSONRPCResult(t, w, req.ID, map[string]any{})
 		case "tools/call":
 			params, _ := req.Params.(map[string]interface{})
 			name, _ := params["name"].(string)
 			switch name {
-			case "health_check":
-				writeJSONRPCResult(t, w, req.ID, agentmail.HealthStatus{Status: "ok"})
 			case "fetch_inbox":
 				t.Fatalf("fetch_inbox should not be called when list_agents fails")
 			default:
@@ -569,6 +570,71 @@ func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 	}
 	if !strings.Contains(section.Reason, "list_agents failed") {
 		t.Fatalf("reason = %q, want list_agents failure context", section.Reason)
+	}
+}
+
+// TestCollectCoordinationPeeksAtInboxes guards bd-izmjq: the projection refresh
+// observes every agent's inbox, and fetch_inbox marks messages read unless told
+// otherwise, so a status call would consume other agents' mail.
+func TestCollectCoordinationPeeksAtInboxes(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	markReadByAgent := map[string]any{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		switch req.Method {
+		case "ping":
+			writeJSONRPCResult(t, w, req.ID, map[string]any{})
+		case "resources/read":
+			uri, _ := params["uri"].(string)
+			text := "[]"
+			if strings.HasPrefix(uri, "resource://agents/") {
+				text = mustJSONText(t, []agentmail.Agent{{Name: "BlueLake"}, {Name: "GreenStone"}})
+			}
+			writeJSONRPCResult(t, w, req.ID, map[string]any{"contents": []map[string]string{{"text": text}}})
+		case "tools/call":
+			name, _ := params["name"].(string)
+			args, _ := params["arguments"].(map[string]interface{})
+			if name == "fetch_inbox" {
+				mu.Lock()
+				markRead, set := args["mark_read"]
+				if !set {
+					markRead = "<unset>"
+				}
+				markReadByAgent[args["agent_name"].(string)] = markRead
+				mu.Unlock()
+			}
+			writeJSONRPCResult(t, w, req.ID, []any{})
+		default:
+			t.Errorf("unexpected method %q", req.Method)
+		}
+	}))
+	defer server.Close()
+
+	adapter := NewWorkCoordinationAdapter(WorkCoordinationAdapterConfig{
+		ProjectDir:      t.TempDir(),
+		AgentMailClient: agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/")),
+	})
+	section := adapter.collectCoordination(context.Background(), time.Now())
+	if section == nil || !section.Available {
+		t.Fatalf("coordination section = %+v, want available", section)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(markReadByAgent) != 2 {
+		t.Fatalf("fetched inboxes for %v, want BlueLake and GreenStone", markReadByAgent)
+	}
+	for agent, markRead := range markReadByAgent {
+		if markRead != false {
+			t.Fatalf("fetch_inbox for %s sent mark_read=%v, want false", agent, markRead)
+		}
 	}
 }
 

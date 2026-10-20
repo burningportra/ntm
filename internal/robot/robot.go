@@ -1535,6 +1535,7 @@ func SetOutputFormat(f RobotFormat) {
 var (
 	projectionStoreMu sync.RWMutex
 	projectionStore   *state.Store
+	projectionRefresh func()
 )
 
 const (
@@ -1544,17 +1545,68 @@ const (
 )
 
 // SetProjectionStore configures the shared runtime projection store used by
-// store-backed robot surfaces such as --robot-status.
+// store-backed robot surfaces such as --robot-status. It drops any refresh
+// registered for the previous store.
 func SetProjectionStore(store *state.Store) {
 	projectionStoreMu.Lock()
 	defer projectionStoreMu.Unlock()
 	projectionStore = store
+	projectionRefresh = nil
 }
 
+// SetProjectionRefresh registers the work that brings the projection store up
+// to date. It runs at most once, when a command first reads projection or
+// attention state, so commands that never read it (tail, send, is-working)
+// never wait on bv, br, Agent Mail, or the all-session tmux capture behind it.
+func SetProjectionRefresh(refresh func()) {
+	projectionStoreMu.Lock()
+	defer projectionStoreMu.Unlock()
+	projectionRefresh = nil
+	if refresh != nil {
+		projectionRefresh = sync.OnceFunc(refresh)
+	}
+}
+
+// runProjectionRefresh runs the registered refresh if it has not run yet.
+// Concurrent readers wait for it to finish. The refresh itself must not read
+// projection state, because that nested read would wait on itself.
+func runProjectionRefresh() {
+	projectionStoreMu.RLock()
+	refresh := projectionRefresh
+	projectionStoreMu.RUnlock()
+	if refresh != nil {
+		refresh()
+	}
+}
+
+// currentProjectionStore returns the projection store for a read, running the
+// pending refresh first.
 func currentProjectionStore() *state.Store {
+	runProjectionRefresh()
 	projectionStoreMu.RLock()
 	defer projectionStoreMu.RUnlock()
 	return projectionStore
+}
+
+// listProjectionLiveSessions lists the running tmux sessions that a
+// projection-backed status must account for.
+var listProjectionLiveSessions = tmux.ListSessions
+
+// checkProjectionCoversLiveSessions fails unless the projection holds a fresh
+// row for every running tmux session. A refresh that timed out or could not
+// save leaves no fresh rows, and a status built from them reports the running
+// sessions as gone (bd-izmjq), so callers fall back to a live read instead.
+func checkProjectionCoversLiveSessions(rows []state.RuntimeSession, live []tmux.Session) error {
+	fresh := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		fresh[row.Name] = true
+	}
+	for _, sess := range live {
+		if !fresh[sess.Name] {
+			return fmt.Errorf("runtime projection has no fresh row for live session %q", sess.Name)
+		}
+	}
+	return nil
 }
 
 // SessionInfo contains machine-readable session information
@@ -2383,6 +2435,11 @@ func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, opts Pa
 	sessions, err := store.GetFreshRuntimeSessions()
 	if err != nil {
 		return nil, fmt.Errorf("status sessions: %w", err)
+	}
+	if live, err := listProjectionLiveSessions(); err == nil {
+		if err := checkProjectionCoversLiveSessions(sessions, live); err != nil {
+			return nil, err
+		}
 	}
 	agentsBySession := make(map[string][]state.RuntimeAgent, len(sessions))
 	for _, sess := range sessions {
@@ -4494,17 +4551,19 @@ func splitLines(s string) []string {
 // fetchAgentMailData retrieves Agent Mail state for the project.
 // Returns the summary, raw agent list, and per-agent stats map.
 func fetchAgentMailData(projectKey string) (*SnapshotAgentMail, []agentmail.Agent, map[string]SnapshotAgentMailStats) {
-	return fetchAgentMailDataContext(context.Background(), projectKey)
+	return fetchAgentMailDataContext(context.Background(), agentmail.NewClient(agentmail.WithProjectKey(projectKey)), projectKey)
 }
 
-func fetchAgentMailDataContext(parent context.Context, projectKey string) (*SnapshotAgentMail, []agentmail.Agent, map[string]SnapshotAgentMailStats) {
+// fetchAgentMailDataContext reads Agent Mail state through client. It peeks
+// at each agent's inbox: the server marks fetched messages read by default,
+// and an observer must not consume other agents' mail.
+func fetchAgentMailDataContext(parent context.Context, client *agentmail.Client, projectKey string) (*SnapshotAgentMail, []agentmail.Agent, map[string]SnapshotAgentMailStats) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	if parent.Err() != nil {
 		return nil, nil, nil
 	}
-	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
 
 	if !client.IsAvailableContext(parent) {
 		return nil, nil, nil
@@ -4563,6 +4622,7 @@ func fetchAgentMailDataContext(parent context.Context, projectKey string) (*Snap
 			AgentName:     agent.Name,
 			Limit:         25,
 			IncludeBodies: false,
+			Peek:          true,
 		})
 		if err != nil {
 			continue
@@ -4859,6 +4919,9 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 	output := newSnapshotOutput(cfg)
 	attachSnapshotResourcePressure(output)
 
+	// Refresh before reading the feed so its metadata and the projection rows
+	// read below describe the same moment.
+	runProjectionRefresh()
 	feed := GetAttentionFeed()
 	populateSnapshotFeedMetadata(output, feed)
 
@@ -5537,6 +5600,9 @@ func buildProjectionBackedSnapshotSessions(store *state.Store, tmuxSessions []tm
 	rows, err := store.GetFreshRuntimeSessions()
 	if err != nil {
 		return nil, fmt.Errorf("snapshot sessions: %w", err)
+	}
+	if err := checkProjectionCoversLiveSessions(rows, tmuxSessions); err != nil {
+		return nil, err
 	}
 
 	agentsBySession := make(map[string][]state.RuntimeAgent, len(rows))
@@ -7681,7 +7747,14 @@ const (
 // RefreshNormalizedProjection collects normalized work/coordination state,
 // persists the current runtime projection slice atomically, and publishes
 // durable attention events derived from the normalized result.
-func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projectDir, sessionName string) error {
+//
+// The work/coordination sources (bv, br, Agent Mail) run alongside the tmux
+// capture. On a large or busy project they can take tens of seconds, so a
+// positive sourceBudget bounds them separately from ctx: a slow source then
+// degrades its own section instead of holding the refresh until ctx expires
+// and discarding the tmux slice with it. A zero sourceBudget bounds them by
+// ctx alone.
+func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projectDir, sessionName string, sourceBudget time.Duration) error {
 	if store == nil {
 		return fmt.Errorf("refresh normalized projection: nil state store")
 	}
@@ -7694,22 +7767,42 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 		return err
 	}
 
-	aggregator := adapters.NewSignalAggregator(0)
-	aggregator.RegisterAdapter(adapters.NewWorkCoordinationAdapter(
-		adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir),
-	))
-
-	signals, err := aggregator.Collect(ctx)
-	if err != nil {
-		return fmt.Errorf("collect normalized projection: %w", err)
+	sourceCtx := ctx
+	if sourceBudget > 0 {
+		var cancelSources context.CancelFunc
+		sourceCtx, cancelSources = context.WithTimeout(ctx, sourceBudget)
+		defer cancelSources()
 	}
+
+	// One Agent Mail client serves the whole refresh, so its availability
+	// probe runs once rather than once per consumer.
+	mailClient := agentmail.NewClient(agentmail.WithProjectKey(resolvedProjectDir))
+	adapterConfig := adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir)
+	adapterConfig.AgentMailClient = mailClient
+	aggregator := adapters.NewSignalAggregator(0)
+	aggregator.RegisterAdapter(adapters.NewWorkCoordinationAdapter(adapterConfig))
+
+	type collectedSignals struct {
+		signals *adapters.AggregatedSignals
+		err     error
+	}
+	signalsDone := make(chan collectedSignals, 1)
+	go func() {
+		signals, err := aggregator.Collect(sourceCtx)
+		signalsDone <- collectedSignals{signals: signals, err: err}
+	}()
+
+	tmuxSnapshot, tmuxErr := collectNormalizedTmuxProjectionContext(ctx, sourceCtx, mailClient, resolvedProjectDir, normalizedProjectionStaleAfter)
+	collected := <-signalsDone
+	if collected.err != nil {
+		return fmt.Errorf("collect normalized projection: %w", collected.err)
+	}
+	signals := collected.signals
 	if signals == nil {
 		return nil
 	}
-
-	tmuxSnapshot, err := collectNormalizedTmuxProjectionContext(ctx, resolvedProjectDir, normalizedProjectionStaleAfter)
-	if err != nil {
-		return fmt.Errorf("collect tmux projection: %w", err)
+	if tmuxErr != nil {
+		return fmt.Errorf("collect tmux projection: %w", tmuxErr)
 	}
 
 	if err := persistNormalizedProjection(store, signals, tmuxSnapshot, normalizedProjectionStaleAfter); err != nil {
@@ -7736,12 +7829,20 @@ func resolveNormalizedProjectDir(projectDir string) (string, error) {
 }
 
 func collectNormalizedTmuxProjection(projectDir string, staleAfter time.Duration) (*NormalizedSnapshot, error) {
-	return collectNormalizedTmuxProjectionContext(context.Background(), projectDir, staleAfter)
+	mailClient := agentmail.NewClient(agentmail.WithProjectKey(projectDir))
+	return collectNormalizedTmuxProjectionContext(context.Background(), context.Background(), mailClient, projectDir, staleAfter)
 }
 
-func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir string, staleAfter time.Duration) (*NormalizedSnapshot, error) {
+// collectNormalizedTmuxProjectionContext captures every tmux pane into a
+// normalized snapshot. Agent Mail names and unread counts enrich the agents;
+// that lookup runs alongside the tmux capture under mailCtx, so a slow or
+// unreachable server leaves the agents unenriched instead of delaying them.
+func collectNormalizedTmuxProjectionContext(ctx, mailCtx context.Context, mailClient *agentmail.Client, projectDir string, staleAfter time.Duration) (*NormalizedSnapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if mailCtx == nil {
+		mailCtx = ctx
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -7751,10 +7852,17 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 		cfg = config.Default()
 	}
 
-	_, mailAgents, mailStats := fetchAgentMailDataContext(ctx, projectDir)
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	type agentMailEnrichment struct {
+		agents []agentmail.Agent
+		stats  map[string]SnapshotAgentMailStats
 	}
+	mailCtx, cancelMail := context.WithCancel(mailCtx)
+	defer cancelMail()
+	mailDone := make(chan agentMailEnrichment, 1)
+	go func() {
+		_, agents, stats := fetchAgentMailDataContext(mailCtx, mailClient, projectDir)
+		mailDone <- agentMailEnrichment{agents: agents, stats: stats}
+	}()
 
 	sessions, err := tmux.ListSessionsContext(ctx)
 	if err != nil {
@@ -7814,6 +7922,9 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 	if err != nil {
 		return nil, err
 	}
+
+	mail := <-mailDone
+	mailAgents, mailStats := mail.agents, mail.stats
 
 	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
 	parser := agent.NewParser()

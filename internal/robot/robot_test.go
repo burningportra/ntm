@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -329,6 +330,8 @@ func TestGetMail_DegradesOnAgentMailListAgentsError(t *testing.T) {
 		}
 
 		switch req.Method {
+		case "ping":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{}})
 		case "tools/call":
 			var params struct {
 				Name string `json:"name"`
@@ -337,15 +340,6 @@ func TestGetMail_DegradesOnAgentMailListAgentsError(t *testing.T) {
 				t.Fatalf("decode tool params: %v", err)
 			}
 			switch params.Name {
-			case "health_check":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"jsonrpc": "2.0",
-					"id":      req.ID,
-					"result": map[string]interface{}{
-						"status":    "ok",
-						"timestamp": time.Now().UTC().Format(time.RFC3339),
-					},
-				})
 			case "ensure_project":
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"jsonrpc": "2.0",
@@ -3017,6 +3011,11 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 		SetProjectionStore(oldStore)
 		_ = store.Close()
 	})
+	oldListLive := listProjectionLiveSessions
+	listProjectionLiveSessions = func() ([]tmux.Session, error) {
+		return []tmux.Session{{Name: "alpha", Attached: true}}, nil
+	}
+	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
 
 	now := time.Now().UTC()
 	staleAfter := now.Add(time.Hour)
@@ -6231,6 +6230,7 @@ func TestFetchAgentMailDataIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 	threadRead := "bd-read"
 	threadUnread := "bd-unread"
 	readAt := &agentmail.FlexTime{Time: time.Now()}
+	var inboxMarkRead atomic.Value
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -6246,6 +6246,8 @@ func TestFetchAgentMailDataIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 		}
 
 		switch req.Method {
+		case "ping":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{}})
 		case "tools/call":
 			var params struct {
 				Name      string                 `json:"name"`
@@ -6255,14 +6257,6 @@ func TestFetchAgentMailDataIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 				t.Fatalf("decode tool params: %v", err)
 			}
 			switch params.Name {
-			case "health_check":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"jsonrpc": "2.0",
-					"id":      req.ID,
-					"result": map[string]interface{}{
-						"status": "ok",
-					},
-				})
 			case "ensure_project":
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"jsonrpc": "2.0",
@@ -6274,6 +6268,11 @@ func TestFetchAgentMailDataIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 					},
 				})
 			case "fetch_inbox":
+				markRead, set := params.Arguments["mark_read"]
+				if !set {
+					markRead = "<unset>"
+				}
+				inboxMarkRead.Store(markRead)
 				result, err := json.Marshal([]agentmail.InboxMessage{
 					{ID: 1, Subject: "read message", ThreadID: &threadRead, ReadAt: readAt},
 					{ID: 2, Subject: "unread message", ThreadID: &threadUnread},
@@ -6328,6 +6327,11 @@ func TestFetchAgentMailDataIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 	if got := statsMap["BlueLake"].Unread; got != 1 {
 		t.Fatalf("statsMap[BlueLake].Unread = %d, want 1", got)
 	}
+	// bd-izmjq: snapshots and every projection refresh count unread mail; a
+	// fetch that marked it read would consume the agents' mail.
+	if got := inboxMarkRead.Load(); got != false {
+		t.Fatalf("fetch_inbox sent mark_read=%v, want false", got)
+	}
 }
 
 func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *testing.T) {
@@ -6363,6 +6367,8 @@ func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *t
 		}
 
 		switch req.Method {
+		case "ping":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{}})
 		case "tools/call":
 			var params struct {
 				Name      string                 `json:"name"`
@@ -6372,14 +6378,6 @@ func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *t
 				t.Fatalf("decode tool params: %v", err)
 			}
 			switch params.Name {
-			case "health_check":
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"jsonrpc": "2.0",
-					"id":      req.ID,
-					"result": map[string]interface{}{
-						"status": "ok",
-					},
-				})
 			case "ensure_project":
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"jsonrpc": "2.0",
@@ -6793,5 +6791,192 @@ func TestGetSnapshotDelta_NoStoreIsHonest(t *testing.T) {
 	}
 	if output.ErrorCode != ErrCodeNotImplemented {
 		t.Fatalf("error_code = %q, want %q", output.ErrorCode, ErrCodeNotImplemented)
+	}
+}
+
+// bd-izmjq: robot commands paid for the projection refresh at startup even
+// when they never read the projection. The refresh now runs on the first
+// projection read and at most once per process.
+func TestProjectionRefreshRunsOnceOnFirstRead(t *testing.T) {
+	store := newTestAttentionStore(t)
+	prev := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(prev) })
+
+	var runs atomic.Int32
+	SetProjectionRefresh(func() { runs.Add(1) })
+	if got := runs.Load(); got != 0 {
+		t.Fatalf("registering the refresh ran it %d times; it must wait for a projection read", got)
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := GetSnapshotDelta(time.Now().Add(-time.Minute)); err != nil {
+			t.Fatalf("GetSnapshotDelta: %v", err)
+		}
+	}
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("refresh ran %d times across two projection reads, want exactly once", got)
+	}
+}
+
+func TestProjectionRefreshConcurrentReadersWaitForIt(t *testing.T) {
+	store := newTestAttentionStore(t)
+	prev := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(prev) })
+
+	var refreshed atomic.Bool
+	SetProjectionRefresh(func() {
+		time.Sleep(50 * time.Millisecond)
+		refreshed.Store(true)
+	})
+
+	var wg sync.WaitGroup
+	var stale atomic.Int32
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if currentProjectionStore() != store || !refreshed.Load() {
+				stale.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := stale.Load(); got != 0 {
+		t.Fatalf("%d readers saw the projection before the refresh finished", got)
+	}
+}
+
+func TestSetProjectionStoreDropsPendingRefresh(t *testing.T) {
+	store := newTestAttentionStore(t)
+	prev := currentProjectionStore()
+	t.Cleanup(func() { SetProjectionStore(prev) })
+
+	var runs atomic.Int32
+	SetProjectionStore(store)
+	SetProjectionRefresh(func() { runs.Add(1) })
+	SetProjectionStore(nil)
+	SetProjectionStore(store)
+	_ = currentProjectionStore()
+	if got := runs.Load(); got != 0 {
+		t.Fatalf("a refresh registered for a replaced store ran %d times", got)
+	}
+}
+
+// --robot-events replays attention that the refresh derives from work and
+// coordination signals, so the refresh must run before the replay.
+func TestBuildEventsOutputRunsPendingProjectionRefreshFirst(t *testing.T) {
+	store := newTestAttentionStore(t)
+	prevStore := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(prevStore) })
+
+	feed := NewAttentionFeed(DefaultAttentionFeedConfig(), WithAttentionStore(store))
+	prevFeed := PeekAttentionFeed()
+	SetAttentionFeed(feed)
+	t.Cleanup(func() { SetAttentionFeed(prevFeed) })
+
+	SetProjectionRefresh(func() {
+		feed.Append(AttentionEvent{
+			Category:      EventCategorySystem,
+			Type:          EventTypeSystemHealthChange,
+			Actionability: ActionabilityInteresting,
+			Severity:      SeverityWarning,
+			Summary:       "derived by the projection refresh",
+		})
+	})
+
+	output, status := BuildEventsOutput(EventsOptions{})
+	if status != 200 || !output.Success {
+		t.Fatalf("BuildEventsOutput status=%d output=%+v", status, output.RobotResponse)
+	}
+	for _, event := range output.Events {
+		if event.Summary == "derived by the projection refresh" {
+			return
+		}
+	}
+	t.Fatalf("events %+v do not include the event the pending refresh published", output.Events)
+}
+
+// bd-izmjq: bv took 25 s on a large project, so the work source held the
+// whole refresh until its deadline and the tmux slice was thrown away with it
+// (--robot-status then reported zero sessions). Sources now run alongside the
+// tmux capture under their own budget and degrade their own section.
+func TestRefreshNormalizedProjectionBoundsSlowSources(t *testing.T) {
+	projectDir := t.TempDir()
+	for _, name := range []string{".git", ".beads"} {
+		if err := os.Mkdir(filepath.Join(projectDir, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "bv"), []byte("#!/bin/sh\nexec /bin/sleep 30\n"), 0o700); err != nil {
+		t.Fatalf("write blocking bv: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	t.Setenv("AGENT_MAIL_URL", closed.URL+"/")
+
+	store := newTestAttentionStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := RefreshNormalizedProjection(ctx, store, projectDir, "", 200*time.Millisecond); err != nil {
+		t.Fatalf("refresh failed after %v: %v", time.Since(started), err)
+	}
+	if elapsed := time.Since(started); elapsed >= 15*time.Second {
+		t.Fatalf("refresh waited %v on a source with a 200ms budget", elapsed)
+	}
+
+	rows, err := store.GetAllSourceHealth()
+	if err != nil {
+		t.Fatalf("GetAllSourceHealth: %v", err)
+	}
+	for _, row := range rows {
+		if row.SourceName != "work_coordination" {
+			continue
+		}
+		if row.Healthy || !strings.Contains(row.LastError, "deadline") {
+			t.Fatalf("work_coordination health = %+v, want unhealthy with the deadline as its error", row)
+		}
+		return
+	}
+	t.Fatalf("refresh persisted no work_coordination health row: %+v", rows)
+}
+
+// bd-izmjq: a refresh that timed out or failed to save left no fresh session
+// rows, and --robot-status and --robot-snapshot then reported zero sessions
+// while sessions were running. A projection that misses a live session must
+// hand the answer to the live read.
+func TestProjectionBackedSessionsRequireEveryLiveSession(t *testing.T) {
+	store := newTestAttentionStore(t)
+	now := time.Now().UTC()
+	if err := store.UpsertRuntimeSession(&state.RuntimeSession{
+		Name:        "alpha",
+		CollectedAt: now,
+		StaleAfter:  now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSession: %v", err)
+	}
+
+	oldListLive := listProjectionLiveSessions
+	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
+	live := []tmux.Session{{Name: "alpha"}, {Name: "beta"}}
+	listProjectionLiveSessions = func() ([]tmux.Session, error) { return live, nil }
+
+	if output, err := buildProjectionBackedStatus(store, config.Default(), PaginationOptions{}); err == nil {
+		t.Fatalf("status answered from a projection missing live session beta: %+v", output.Sessions)
+	}
+	if sessions, err := buildProjectionBackedSnapshotSessions(store, live); err == nil {
+		t.Fatalf("snapshot answered from a projection missing live session beta: %+v", sessions)
+	}
+
+	// TestGetStatusWithProjectionStoreUsesRuntimeProjection covers a status
+	// answered from a projection that accounts for every live session.
+	live = []tmux.Session{{Name: "alpha"}}
+	if _, err := buildProjectionBackedSnapshotSessions(store, live); err != nil {
+		t.Fatalf("snapshot rejected a projection covering every live session: %v", err)
 	}
 }

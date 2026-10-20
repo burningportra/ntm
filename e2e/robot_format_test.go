@@ -469,17 +469,15 @@ func TestE2ERobotCapabilitiesBuiltBinaryBudgets(t *testing.T) {
 	assertInvalidFilter(t, "--robot-capabilities", "--capability-category=not-a-category", "--capability-compact")
 }
 
-func validateAgentMailHealthCheckRequest(r *http.Request) error {
+// validateAgentMailPingRequest accepts only the JSON-RPC ping that Agent Mail
+// availability probes send.
+func validateAgentMailPingRequest(r *http.Request) error {
 	var request agentmail.JSONRPCRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		return fmt.Errorf("decode JSON-RPC request: %w", err)
 	}
-	if request.JSONRPC != "2.0" || request.Method != "tools/call" {
-		return fmt.Errorf("unexpected JSON-RPC health request: version=%q method=%q", request.JSONRPC, request.Method)
-	}
-	params, ok := request.Params.(map[string]any)
-	if !ok || params["name"] != "health_check" {
-		return fmt.Errorf("unexpected Agent Mail tool params: %v", request.Params)
+	if request.JSONRPC != "2.0" || request.Method != "ping" {
+		return fmt.Errorf("unexpected JSON-RPC availability probe: version=%q method=%q", request.JSONRPC, request.Method)
 	}
 	return nil
 }
@@ -490,7 +488,7 @@ func TestE2EMailInboxPermanentUnauthorizedFailsFast(t *testing.T) {
 
 	var requestCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := validateAgentMailHealthCheckRequest(r); err != nil {
+		if err := validateAgentMailPingRequest(r); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -533,7 +531,7 @@ func TestE2EMailReadPermanentUnauthorizedSurfacesDiagnostic(t *testing.T) {
 
 	var requestCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := validateAgentMailHealthCheckRequest(r); err != nil {
+		if err := validateAgentMailPingRequest(r); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -568,7 +566,7 @@ func TestE2EMailSendPermanentUnauthorizedSurfacesDiagnostic(t *testing.T) {
 
 	var requestCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := validateAgentMailHealthCheckRequest(r); err != nil {
+		if err := validateAgentMailPingRequest(r); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -652,13 +650,8 @@ func TestE2EMailInboxRecoversFromTransientFailure(t *testing.T) {
 		}
 		var result json.RawMessage
 		switch request.Method {
-		case "tools/call":
-			params, ok := request.Params.(map[string]any)
-			if !ok || params["name"] != "health_check" {
-				http.Error(w, "unexpected tool call", http.StatusBadRequest)
-				return
-			}
-			result = json.RawMessage(`{"status":"ok"}`)
+		case "ping":
+			result = json.RawMessage(`{}`)
 		case "resources/read":
 			params, ok := request.Params.(map[string]any)
 			expectedURI := "resource://agents/" + url.PathEscape(fixture.projectDir)

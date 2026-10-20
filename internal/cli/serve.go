@@ -189,8 +189,10 @@ func runServe(opts serveOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The server refreshes in the background, so its sources may use the
+	// whole refresh bound rather than a separate, shorter budget.
 	refreshCtx, refreshCancel := context.WithTimeout(ctx, 10*time.Second)
-	if err := robot.RefreshNormalizedProjection(refreshCtx, stateStore, "", ""); err != nil {
+	if err := robot.RefreshNormalizedProjection(refreshCtx, stateStore, "", "", 0); err != nil {
 		slog.Warn("normalized projection refresh failed", "err", err)
 	}
 	refreshCancel()
@@ -205,7 +207,7 @@ func runServe(opts serveOptions) error {
 				return
 			case <-ticker.C:
 				refreshCtx, refreshCancel := context.WithTimeout(ctx, 10*time.Second)
-				if err := robot.RefreshNormalizedProjection(refreshCtx, stateStore, "", ""); err != nil {
+				if err := robot.RefreshNormalizedProjection(refreshCtx, stateStore, "", "", 0); err != nil {
 					slog.Warn("normalized projection refresh failed", "err", err)
 				}
 				refreshCancel()

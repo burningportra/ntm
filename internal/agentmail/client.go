@@ -36,7 +36,7 @@ const (
 	// AvailabilityCacheTTL is how long to cache IsAvailable() results.
 	AvailabilityCacheTTL = 30 * time.Second
 
-	// availabilityProbeBudget bounds all health attempts and backoffs. Keep the
+	// availabilityProbeBudget bounds all liveness attempts and backoffs. Keep the
 	// probe below two seconds so optional Agent Mail discovery cannot stall CLI
 	// startup when the service is unavailable.
 	availabilityProbeBudget   = 1250 * time.Millisecond
@@ -216,9 +216,12 @@ func (c *Client) IsAvailable() bool {
 	return c.IsAvailableContext(context.Background())
 }
 
-// IsAvailableContext checks Agent Mail health while honoring caller
-// cancellation. IsAvailable remains the compatibility entry point for callers
-// without a lifecycle context.
+// IsAvailableContext reports whether the Agent Mail server answers an MCP ping
+// at the configured endpoint, honoring caller cancellation. It deliberately
+// does not call the health_check tool: that tool runs the server's full
+// diagnostics (integrity, archive parity, pool pressure) and takes seconds on a
+// busy server, which made a live server look unavailable to every caller.
+// IsAvailable remains the entry point for callers without a lifecycle context.
 func (c *Client) IsAvailableContext(ctx context.Context) bool {
 	if ctx == nil {
 		return false
@@ -271,7 +274,7 @@ func (c *Client) IsAvailableContext(ctx context.Context) bool {
 	available := false
 probeLoop:
 	for attempt := 1; attempt <= availabilityProbeAttempts; attempt++ {
-		_, err = c.HealthCheck(probeCtx)
+		err = c.ping(probeCtx)
 		if ctx.Err() != nil {
 			return false
 		}
@@ -410,8 +413,8 @@ func HasArchiveForProject(projectKey string) bool {
 	return false
 }
 
-// HealthCheck performs a health check against the Agent Mail server.
-// This uses the MCP health_check tool via JSON-RPC.
+// HealthCheck runs the server's health_check tool and returns its report. The
+// tool performs full diagnostics, so use IsAvailableContext for reachability.
 func (c *Client) HealthCheck(ctx context.Context) (*HealthStatus, error) {
 	result, err := c.callTool(ctx, "health_check", nil)
 	if err != nil {
@@ -529,26 +532,52 @@ type ToolCallParams struct {
 
 // callTool makes a JSON-RPC call to the Agent Mail server.
 func (c *Client) callTool(ctx context.Context, toolName string, args map[string]interface{}) (json.RawMessage, error) {
-	reqID := c.requestID.Add(1)
+	result, err := c.rpc(ctx, toolName, "tools/call", ToolCallParams{
+		Name:      toolName,
+		Arguments: args,
+	})
+	if err != nil {
+		return nil, err
+	}
 
+	// Extract actual content from MCP envelope
+	content, err := extractMCPContent(result)
+	if err != nil {
+		return nil, NewAPIError(toolName, 0, err)
+	}
+
+	return content, nil
+}
+
+// ping sends the MCP ping request, which servers answer without touching their
+// database. A server that answers with "method not found" is up but predates
+// ping, so it counts as reachable too.
+func (c *Client) ping(ctx context.Context) error {
+	_, err := c.rpc(ctx, "ping", "ping", map[string]interface{}{})
+	if errors.Is(err, ErrNotImplemented) {
+		return nil
+	}
+	return err
+}
+
+// rpc posts one JSON-RPC request to the MCP endpoint and returns its raw
+// result. operation names the call in returned errors.
+func (c *Client) rpc(ctx context.Context, operation, method string, params interface{}) (json.RawMessage, error) {
 	rpcReq := JSONRPCRequest{
 		JSONRPC: "2.0",
-		ID:      reqID,
-		Method:  "tools/call",
-		Params: ToolCallParams{
-			Name:      toolName,
-			Arguments: args,
-		},
+		ID:      c.requestID.Add(1),
+		Method:  method,
+		Params:  params,
 	}
 
 	body, err := json.Marshal(rpcReq)
 	if err != nil {
-		return nil, NewAPIError(toolName, 0, err)
+		return nil, NewAPIError(operation, 0, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, NewAPIError(toolName, 0, err)
+		return nil, NewAPIError(operation, 0, err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -559,44 +588,38 @@ func (c *Client) callTool(ctx context.Context, toolName string, args map[string]
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, NewAPIError(toolName, 0, ErrTimeout)
+			return nil, NewAPIError(operation, 0, ErrTimeout)
 		}
-		return nil, NewAPIError(toolName, 0, ErrServerUnavailable)
+		return nil, NewAPIError(operation, 0, ErrServerUnavailable)
 	}
 	defer resp.Body.Close()
 
 	// Read response body (limit to 10MB to prevent DoS/OOM)
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
-		return nil, responseBodyReadError(ctx, toolName, err)
+		return nil, responseBodyReadError(ctx, operation, err)
 	}
 
 	// Check HTTP status
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, NewAPIError(toolName, resp.StatusCode, ErrUnauthorized)
+		return nil, NewAPIError(operation, resp.StatusCode, ErrUnauthorized)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, NewAPIError(toolName, resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
+		return nil, NewAPIError(operation, resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
 	}
 
 	// Parse JSON-RPC response
 	var rpcResp JSONRPCResponse
 	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
-		return nil, NewAPIError(toolName, 0, err)
+		return nil, NewAPIError(operation, 0, err)
 	}
 
 	// Check for JSON-RPC error
 	if rpcResp.Error != nil {
-		return nil, NewAPIError(toolName, 0, mapJSONRPCError(rpcResp.Error))
+		return nil, NewAPIError(operation, 0, mapJSONRPCError(rpcResp.Error))
 	}
 
-	// Extract actual content from MCP envelope
-	content, err := extractMCPContent(rpcResp.Result)
-	if err != nil {
-		return nil, NewAPIError(toolName, 0, err)
-	}
-
-	return content, nil
+	return rpcResp.Result, nil
 }
 
 // callToolWithTimeout calls a tool with a specific timeout.
@@ -637,67 +660,9 @@ func (c *Client) callToolWithBusyRetry(ctx context.Context, toolName string, arg
 
 // ReadResource reads a resource from the Agent Mail server.
 func (c *Client) ReadResource(ctx context.Context, uri string) (json.RawMessage, error) {
-	reqID := c.requestID.Add(1)
-
-	rpcReq := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      reqID,
-		Method:  "resources/read",
-		Params: map[string]string{
-			"uri": uri,
-		},
-	}
-
-	body, err := json.Marshal(rpcReq)
-	if err != nil {
-		return nil, NewAPIError("resources/read", 0, err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, NewAPIError("resources/read", 0, err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	if c.bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, NewAPIError("resources/read", 0, ErrTimeout)
-		}
-		return nil, NewAPIError("resources/read", 0, ErrServerUnavailable)
-	}
-	defer resp.Body.Close()
-
-	// Read response body (limit to 10MB to prevent DoS/OOM)
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return nil, responseBodyReadError(ctx, "resources/read", err)
-	}
-
-	// Check HTTP status
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, NewAPIError("resources/read", resp.StatusCode, ErrUnauthorized)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, NewAPIError("resources/read", resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
-	}
-
-	// Parse JSON-RPC response
-	var rpcResp JSONRPCResponse
-	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
-		return nil, NewAPIError("resources/read", 0, err)
-	}
-
-	// Check for JSON-RPC error
-	if rpcResp.Error != nil {
-		return nil, NewAPIError("resources/read", 0, mapJSONRPCError(rpcResp.Error))
-	}
-
-	return rpcResp.Result, nil
+	return c.rpc(ctx, "resources/read", "resources/read", map[string]string{
+		"uri": uri,
+	})
 }
 
 // httpBaseURL returns the HTTP REST API base URL derived from the MCP base URL.

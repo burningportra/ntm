@@ -218,6 +218,11 @@ func newMailStub(t *testing.T, inbox []agentmail.InboxMessage) *mailStub {
 			_ = json.NewEncoder(w).Encode(&resp)
 		}
 
+		if rpc.Method == "ping" {
+			writeResponse(map[string]interface{}{})
+			return
+		}
+
 		if rpc.Method == "resources/read" {
 			params, _ := rpc.Params.(map[string]interface{})
 			uri := toString(params["uri"])

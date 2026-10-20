@@ -249,6 +249,9 @@ func (c *Client) FetchInbox(ctx context.Context, opts FetchInboxOptions) ([]Inbo
 	if opts.IncludeBodies {
 		args["include_bodies"] = true
 	}
+	if opts.Peek {
+		args["mark_read"] = false
+	}
 
 	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "fetch_inbox", args)

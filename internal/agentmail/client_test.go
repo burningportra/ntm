@@ -191,6 +191,89 @@ func TestIsAvailableContextRetriesTransientProbeFailures(t *testing.T) {
 	}
 }
 
+// TestIsAvailableContextProbesWithPing guards bd-izmjq: the availability probe
+// must not run the health_check tool, which performs full server diagnostics
+// and took 11-13 s on a busy server, so a live server always looked down.
+func TestIsAvailableContextProbesWithPing(t *testing.T) {
+	var mu sync.Mutex
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		methods = append(methods, req.Method)
+		mu.Unlock()
+		if req.Method != "ping" {
+			// A diagnostic call slower than the whole probe budget.
+			time.Sleep(2 * availabilityProbeBudget)
+		}
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
+	}))
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	started := time.Now()
+	if !client.IsAvailableContext(context.Background()) {
+		t.Fatalf("reachable server reported unavailable: %v", client.LastAvailabilityError())
+	}
+	if elapsed := time.Since(started); elapsed >= availabilityProbeBudget {
+		t.Fatalf("availability probe took %v, want well under the %v budget", elapsed, availabilityProbeBudget)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(methods) != 1 || methods[0] != "ping" {
+		t.Fatalf("availability probe sent %v, want exactly one ping", methods)
+	}
+}
+
+// TestIsAvailableContextRetriesOverloadedServer covers the JSON-RPC rejection a
+// saturated Agent Mail server sends while it sheds load: it is transient, so the
+// bounded probe retries instead of declaring the server down.
+func TestIsAvailableContextRetriesOverloadedServer(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if calls.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{
+				Code:    -32603,
+				Message: "Server overloaded, too many concurrent requests (limit=128, method=ping)",
+			}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
+	}))
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	if !client.IsAvailableContext(context.Background()) {
+		t.Fatalf("overloaded-then-ready server reported unavailable: %v", client.LastAvailabilityError())
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected one overloaded rejection and one successful ping, got %d calls", got)
+	}
+}
+
+func TestIsAvailableContextTreatsUnknownPingAsReachable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{
+			Code:    -32601,
+			Message: "Method not found: ping",
+		}})
+	}))
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	if !client.IsAvailableContext(context.Background()) {
+		t.Fatalf("server answering JSON-RPC without ping support reported unavailable: %v", client.LastAvailabilityError())
+	}
+}
+
 func TestIsAvailableContextRetriesResponseBodyTransportFailure(t *testing.T) {
 	var calls atomic.Int32
 	client := NewClient(

@@ -1343,6 +1343,37 @@ func TestFetchInbox_WithAllOptions(t *testing.T) {
 	if receivedArgs["since_ts"] == nil {
 		t.Error("expected since_ts to be set")
 	}
+	if _, set := receivedArgs["mark_read"]; set {
+		t.Errorf("mark_read = %v, want it left to the server default when not peeking", receivedArgs["mark_read"])
+	}
+}
+
+// TestFetchInbox_PeekDoesNotMarkRead guards observers such as the robot
+// projection refresh: fetch_inbox marks messages read by default, so reading
+// another agent's inbox for status must send mark_read=false.
+func TestFetchInbox_PeekDoesNotMarkRead(t *testing.T) {
+	t.Parallel()
+
+	var receivedArgs map[string]interface{}
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"fetch_inbox": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			receivedArgs = args
+			return []InboxMessage{}, nil
+		},
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	if _, err := c.FetchInbox(context.Background(), FetchInboxOptions{
+		ProjectKey: "/test",
+		AgentName:  "TestAgent",
+		Peek:       true,
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if markRead, set := receivedArgs["mark_read"]; !set || markRead != false {
+		t.Fatalf("mark_read = %v (set=%t), want false", markRead, set)
+	}
 }
 
 func TestCallTool_ServerDown(t *testing.T) {

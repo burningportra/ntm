@@ -388,6 +388,7 @@ func (a *WorkCoordinationAdapter) collectCoordination(ctx context.Context, now t
 				AgentName:     agent.Name,
 				Limit:         25,
 				IncludeBodies: true,
+				Peek:          true,
 			})
 			if err != nil {
 				continue
