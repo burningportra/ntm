@@ -133,6 +133,9 @@ func runWithContextTimeout(parent context.Context, dir string, timeout time.Dura
 	if err != nil {
 		return "", err
 	}
+	if output, handled, err := runCachedRobotCommand(parent, normalizedDir, timeout, args); handled {
+		return output, err
+	}
 
 	const maxAttempts = 3
 	deadline := time.Now().Add(timeout)
