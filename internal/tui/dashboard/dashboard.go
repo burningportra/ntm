@@ -755,9 +755,10 @@ func (m *Model) fetchAgentMailStatus() tea.Cmd {
 			}
 		}
 
-		// Ensure project exists
-		_, err := client.EnsureProject(ctx, projectKey)
-		if err != nil {
+		// The dashboard only reads, so it looks the project up rather than
+		// calling ensure_project, which would register every directory it
+		// is opened in.
+		if _, err := client.LookupProject(ctx, projectKey); err != nil {
 			return AgentMailUpdateMsg{Available: true, Connected: false, Gen: gen}
 		}
 

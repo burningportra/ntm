@@ -562,9 +562,18 @@ func (s *Server) handleListMailProjects(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	project, err := client.EnsureProject(ctx, s.projectDirSnapshot())
+	// A GET only reads, so it looks the project up rather than calling
+	// ensure_project, which would register the served directory.
+	project, err := client.LookupProject(ctx, s.projectDirSnapshot())
+	if agentmail.IsNotFound(err) {
+		writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+			"projects": []interface{}{},
+			"count":    0,
+		}, reqID)
+		return
+	}
 	if err != nil {
-		writeAgentMailHandlerError(w, reqID, err, ErrCodeNotFound, agentmail.IsNotFound, "project inspection is not supported by the configured Agent Mail server", "")
+		writeAgentMailHandlerError(w, reqID, err, ErrCodeNotFound, nil, "project inspection is not supported by the configured Agent Mail server", "")
 		return
 	}
 

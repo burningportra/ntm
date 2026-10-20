@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -646,6 +647,76 @@ func TestHandleConflictAction_ForceRegistersDashboardAgent(t *testing.T) {
 	wantCalls := []string{"register_agent", "force_release_file_reservation"}
 	if !slices.Equal(gotCalls, wantCalls) {
 		t.Fatalf("tool call order = %v, want %v", gotCalls, wantCalls)
+	}
+}
+
+// TestFetchAgentMailStatusDoesNotRegisterProject locks bd-5g66p: the
+// dashboard's Agent Mail refresh reports a directory as connected only when
+// its project already exists, and never calls ensure_project to create one.
+func TestFetchAgentMailStatusDoesNotRegisterProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	registered := t.TempDir()
+
+	var (
+		mu    sync.Mutex
+		tools []any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req["params"].(map[string]any)
+		resp := map[string]any{"jsonrpc": "2.0", "id": req["id"], "result": map[string]any{}}
+		switch req["method"] {
+		case "tools/call":
+			mu.Lock()
+			tools = append(tools, params["name"])
+			mu.Unlock()
+		case "resources/read":
+			switch params["uri"] {
+			case "resource://project/" + url.PathEscape(registered):
+				resp["result"] = map[string]any{"contents": []map[string]any{{
+					"text": fmt.Sprintf(`{"id":5,"slug":"registered","human_key":%q}`, registered),
+				}}}
+			case "resource://file_reservations/" + url.PathEscape(registered) + "?active_only=true&format=json":
+				resp["result"] = map[string]any{"contents": []map[string]any{{"text": "[]"}}}
+			default:
+				delete(resp, "result")
+				resp["error"] = map[string]any{"code": -32602, "message": "Project not found"}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	for _, tc := range []struct {
+		name          string
+		dir           string
+		wantConnected bool
+	}{
+		{name: "unregistered", dir: t.TempDir(), wantConnected: false},
+		{name: "registered", dir: registered, wantConnected: true},
+	} {
+		t.Chdir(tc.dir)
+		m := newTestModel(120)
+		m.session = ""
+		m.projectDir = tc.dir
+		update, ok := m.fetchAgentMailStatus()().(AgentMailUpdateMsg)
+		if !ok || !update.Available || update.Connected != tc.wantConnected {
+			t.Fatalf("%s: update = %+v, want available with connected=%v", tc.name, update, tc.wantConnected)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tools) != 0 {
+		t.Fatalf("tool calls = %v, want none (the dashboard must not call ensure_project)", tools)
 	}
 }
 

@@ -17,11 +17,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1450,6 +1452,80 @@ func TestHandleListMailProjects_NotImplemented(t *testing.T) {
 	}
 	if resp.ErrorCode != ErrCodeNotImplemented {
 		t.Fatalf("error_code = %q, want %q", resp.ErrorCode, ErrCodeNotImplemented)
+	}
+}
+
+// TestHandleListMailProjects_DoesNotRegisterProject locks bd-5g66p: GET
+// /api/v1/mail/projects reports the served directory's project only when it
+// already exists, and never calls ensure_project to create one.
+func TestHandleListMailProjects_DoesNotRegisterProject(t *testing.T) {
+	registered := t.TempDir()
+	var (
+		mu    sync.Mutex
+		tools []string
+	)
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{}}
+		switch req.Method {
+		case "tools/call":
+			name, _ := params["name"].(string)
+			mu.Lock()
+			tools = append(tools, name)
+			mu.Unlock()
+		case "resources/read":
+			if uri, _ := params["uri"].(string); uri == "resource://project/"+url.PathEscape(registered) {
+				resp["result"] = map[string]interface{}{"contents": []map[string]interface{}{{
+					"text": fmt.Sprintf(`{"id":4,"slug":"registered","human_key":%q}`, registered),
+				}}}
+			} else {
+				delete(resp, "result")
+				resp["error"] = map[string]interface{}{"code": -32602, "message": "Project not found"}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer mock.Close()
+
+	for _, tc := range []struct {
+		name      string
+		dir       string
+		wantCount int
+	}{
+		{name: "unregistered", dir: t.TempDir(), wantCount: 0},
+		{name: "registered", dir: registered, wantCount: 1},
+	} {
+		srv, _ := setupTestServer(t)
+		srv.projectDir = tc.dir
+		srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL(mock.URL + "/"))
+
+		rec := httptest.NewRecorder()
+		srv.handleListMailProjects(rec, httptest.NewRequest(http.MethodGet, "/api/v1/mail/projects", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200; body: %s", tc.name, rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Count    int                 `json:"count"`
+			Projects []agentmail.Project `json:"projects"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatalf("%s: decode response: %v", tc.name, err)
+		}
+		if body.Count != tc.wantCount || len(body.Projects) != tc.wantCount {
+			t.Fatalf("%s: response = %+v, want %d project(s)", tc.name, body, tc.wantCount)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tools) != 0 {
+		t.Fatalf("tool calls = %v, want none (listing projects must not call ensure_project)", tools)
 	}
 }
 
