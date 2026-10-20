@@ -355,7 +355,9 @@ func PaletteHelpSections() []HelpSection {
 			Title: "Actions",
 			Hints: []KeyHint{
 				{Key: "Enter", Desc: "Select command"},
-				{Key: "1-4", Desc: "Select target (in target phase)"},
+				{Key: "1-5", Desc: "Send to all, cc, cod, gmi or agy (in target phase)"},
+				{Key: "6", Desc: "Pick specific panes (in target phase)"},
+				{Key: "7", Desc: "Pick one agent type present (in target phase)"},
 				{Key: "e", Desc: "Edit prompt before sending (in target phase)"},
 				{Key: "Ctrl+S", Desc: "Save edit and return to target selection"},
 				{Key: "Ctrl+P", Desc: "Pin / unpin command"},

@@ -2,6 +2,7 @@ package palette
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/history"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/components"
+	"github.com/Dicklesworthstone/ntm/internal/tui/layout"
 )
 
 // stripANSI removes ANSI escape sequences from text for test comparison.
@@ -1463,5 +1465,251 @@ func TestTargetPhaseOffersSelectAgents(t *testing.T) {
 	view := stripANSI(m.View())
 	if !strings.Contains(view, "Select agents") {
 		t.Fatalf("expected target phase to offer granular selection, got: %q", view)
+	}
+}
+
+// --- bd-eccc9: "By type…" picker on 7 ---
+
+// typePickerSession returns a session with panesOf(i) panes of the i-th type
+// in agent.AgentTypes(), a user pane and a pane of no known type, plus the
+// type rows the picker should list for it, in agent.AgentTypes() order.
+func typePickerSession(panesOf func(i int) int) ([]tmux.Pane, []typeTarget) {
+	panes := []tmux.Pane{{ID: "%0", Index: 0, Title: "shell", Type: tmux.AgentUser}}
+	var want []typeTarget
+	for i, agentType := range agent.AgentTypes() {
+		n := panesOf(i)
+		row := typeTarget{agentType: agentType, count: n}
+		for j := 1; j <= n; j++ {
+			title := fmt.Sprintf("s__%s_%d", agentType, j)
+			panes = append(panes, tmux.Pane{ID: fmt.Sprintf("%%%d", len(panes)), Index: len(panes), Title: title, Type: agentType})
+			row.samples = append(row.samples, title)
+		}
+		if n > 0 {
+			want = append(want, row)
+		}
+	}
+	panes = append(panes, tmux.Pane{ID: fmt.Sprintf("%%%d", len(panes)), Index: len(panes), Title: "mystery", Type: tmux.AgentType("mystery")})
+	return panes, want
+}
+
+// someTypesAbsent gives the i-th agent type i%3 panes, so every third type,
+// Claude Code first, has none. everyTypePresent gives each one or two.
+func someTypesAbsent(i int) int  { return i % 3 }
+func everyTypePresent(i int) int { return i%2 + 1 }
+
+func newTypePickerModel(t *testing.T, panes []tmux.Pane) Model {
+	t.Helper()
+	m := New("test-session", testCommands)
+	m.selected = &testCommands[0]
+	m.phase = PhaseTarget
+	m.width = 220
+	m.height = 60
+	m.tier = layout.TierForWidth(m.width)
+	model, _ := m.enterSelectTypePhaseWith(func(session string) ([]tmux.Pane, error) {
+		if session != "test-session" {
+			t.Fatalf("getPanes session = %q, want test-session", session)
+		}
+		return panes, nil
+	})
+	return model.(Model)
+}
+
+// The picker lists every agent type with panes in the session, in
+// agent.AgentTypes() order, with its pane count, and nothing for types with
+// no panes, user panes or panes of no known type.
+func TestSelectTypeListsEveryPresentTypeWithItsPaneCount(t *testing.T) {
+	panes, want := typePickerSession(someTypesAbsent)
+	m := newTypePickerModel(t, panes)
+
+	if m.phase != PhaseSelectType {
+		t.Fatalf("phase = %v, want PhaseSelectType", m.phase)
+	}
+	if !reflect.DeepEqual(m.typeTargets, want) {
+		t.Fatalf("typeTargets = %+v\nwant %+v", m.typeTargets, want)
+	}
+
+	view := stripANSI(m.viewSelectTypePhase())
+	present := make(map[agent.AgentType]bool)
+	for _, row := range want {
+		present[row.agentType] = true
+		label := fmt.Sprintf(" %s (%d) ", components.AgentCountLabel(row.agentType), row.count)
+		if !strings.Contains(view, label) || !strings.Contains(view, row.agentType.DisplayName()) {
+			t.Errorf("view lacks the %s row %q / %q:\n%s", row.agentType, label, row.agentType.DisplayName(), view)
+		}
+	}
+	for _, agentType := range append(agent.AgentTypes(), agent.AgentTypeUser) {
+		if present[agentType] {
+			continue
+		}
+		if label := " " + components.AgentCountLabel(agentType) + " ("; strings.Contains(view, label) {
+			t.Errorf("view lists %s, which has no panes (%q):\n%s", agentType, label, view)
+		}
+	}
+	if strings.Contains(view, "mystery") {
+		t.Errorf("view lists the pane of no known type:\n%s", view)
+	}
+}
+
+// Choosing a type sends to exactly that type's panes, walking every type.
+func TestSelectTypeSendsOnlyToTheChosenTypesPanes(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	panes, want := typePickerSession(everyTypePresent)
+	if len(want) != len(agent.AgentTypes()) {
+		t.Fatalf("fixture lists %d types, want all %d", len(want), len(agent.AgentTypes()))
+	}
+
+	for i, row := range want {
+		m := newTypePickerModel(t, panes)
+		if !m.selectTypeTarget(i) {
+			t.Fatalf("selectTypeTarget(%d) = false for %s", i, row.agentType)
+		}
+		if m.target != TargetType || m.targetType != row.agentType {
+			t.Fatalf("after selectTypeTarget(%d): target %v/%q, want TargetType/%q", i, m.target, m.targetType, row.agentType)
+		}
+
+		var wantIDs []string
+		for _, p := range panes {
+			if p.Type == row.agentType {
+				wantIDs = append(wantIDs, p.ID)
+			}
+		}
+		var sentIDs []string
+		model, _ := m.sendWith(
+			func(string) ([]tmux.Pane, error) { return panes, nil },
+			func(target, prompt string, agentType tmux.AgentType) error {
+				if agentType != row.agentType {
+					t.Errorf("%s: sent to %s as %q", row.agentType, target, agentType)
+				}
+				sentIDs = append(sentIDs, target)
+				return nil
+			},
+		)
+		got := model.(Model)
+
+		if row.agentType == agent.AgentTypeGrok {
+			if !errors.Is(got.err, agent.ErrAutomatedPromptDeliveryNotImplemented) || len(sentIDs) != 0 {
+				t.Errorf("grok: err %v, sent %v; want the prompt-delivery refusal and no sends", got.err, sentIDs)
+			}
+			continue
+		}
+		if got.err != nil || !reflect.DeepEqual(sentIDs, wantIDs) || got.sentCount != len(wantIDs) {
+			t.Errorf("%s: err %v, sent %v (count %d), want %v", row.agentType, got.err, sentIDs, got.sentCount, wantIDs)
+		}
+	}
+}
+
+func TestSelectTypeKeys(t *testing.T) {
+	panes, _ := typePickerSession(someTypesAbsent)
+	m := newTypePickerModel(t, panes)
+	rows := len(m.typeTargets)
+
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = newModel.(Model)
+	if m.typeCursor != 0 {
+		t.Fatalf("up at the top moved the cursor to %d", m.typeCursor)
+	}
+	for range rows + 2 {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = newModel.(Model)
+	}
+	if m.typeCursor != rows-1 {
+		t.Fatalf("down past the bottom left the cursor at %d, want %d", m.typeCursor, rows-1)
+	}
+
+	// A digit past the last row does nothing.
+	if rows >= 9 {
+		t.Fatalf("fixture has %d rows; the out-of-range digit check needs fewer than 9", rows)
+	}
+	digit := rune('1' + rows)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{digit}})
+	m = newModel.(Model)
+	if m.phase != PhaseSelectType || m.quitting || m.target == TargetType {
+		t.Fatalf("digit %q past %d rows: phase %v quitting %v target %v", digit, rows, m.phase, m.quitting, m.target)
+	}
+
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(Model)
+	if m.phase != PhaseTarget {
+		t.Fatalf("esc: phase %v, want PhaseTarget", m.phase)
+	}
+}
+
+func TestSelectTypeWithNoAgentPanes(t *testing.T) {
+	m := New("test-session", testCommands)
+	m.selected = &testCommands[0]
+	model, _ := m.enterSelectTypePhaseWith(func(string) ([]tmux.Pane, error) {
+		return []tmux.Pane{{ID: "%0", Index: 0, Type: tmux.AgentUser}}, nil
+	})
+	m = model.(Model)
+	if len(m.typeTargets) != 0 {
+		t.Fatalf("typeTargets = %+v, want none", m.typeTargets)
+	}
+	if view := stripANSI(m.viewSelectTypePhase()); !strings.Contains(view, "No agent panes in this session.") {
+		t.Fatalf("empty picker view:\n%s", view)
+	}
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(Model)
+	if m.phase != PhaseSelectType || m.quitting {
+		t.Fatalf("enter with no types: phase %v quitting %v", m.phase, m.quitting)
+	}
+}
+
+// Key 7 is "By type…" in the target step, and its row says how many agent
+// types the session has and which.
+func TestTargetPhaseOffersByType(t *testing.T) {
+	panes, want := typePickerSession(someTypesAbsent)
+	m := New("test-session", testCommands)
+	m.phase = PhaseTarget
+	m.selected = &testCommands[0]
+	m.paneCountsKnown = true
+	m.paneCounts = paneCounts{totalAgents: len(panes) - 1, types: paneTypeTargets(panes, maxTypeSamples)}
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 220, Height: 60})
+	m = newModel.(Model)
+
+	view := stripANSI(m.View())
+	for _, wantText := range []string{
+		"By type…",
+		fmt.Sprintf("%d types present", len(want)),
+		fmt.Sprintf("e.g. %s %d, %s %d", components.AgentCountLabel(want[0].agentType), want[0].count, components.AgentCountLabel(want[1].agentType), want[1].count),
+	} {
+		if !strings.Contains(view, wantText) {
+			t.Errorf("target phase lacks %q:\n%s", wantText, view)
+		}
+	}
+	if help := stripANSI(m.renderTargetHelpBar()); !strings.Contains(help, " 7 ") || !strings.Contains(help, "by type") {
+		t.Errorf("target help bar lacks 7 / by type: %q", help)
+	}
+}
+
+// Reloading the palette without the selected command returns to the command
+// list from either picker instead of rendering a picker with no selection.
+func TestReloadMsgLeavesPickersWhenSelectedCommandRemoved(t *testing.T) {
+	for _, phase := range []Phase{PhaseSelectAgents, PhaseSelectType} {
+		m := New("test-session", testCommands)
+		m.selected = &m.commands[0]
+		m.phase = phase
+
+		updated, _ := m.Update(ReloadMsg{Commands: []config.PaletteCmd{
+			{Key: "other", Label: "Other", Category: "Quick Actions", Prompt: "Something else"},
+		}})
+		result := updated.(Model)
+		if result.selected != nil || result.phase != PhaseCommand {
+			t.Fatalf("phase %v: after reload selected %v phase %v, want nil/PhaseCommand", phase, result.selected, result.phase)
+		}
+		_ = result.View()
+	}
+}
+
+func TestViewQuittingNamesTheChosenType(t *testing.T) {
+	m := New("test-session", testCommands)
+	m.quitting = true
+	m.sent = true
+	m.sentCount = 2
+	m.target = TargetType
+	m.targetType = agent.AgentTypeCursor
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Sent to") || !strings.Contains(view, "Cursor (2 panes)") {
+		t.Fatalf("quitting view = %q, want it to name Cursor and 2 panes", view)
 	}
 }

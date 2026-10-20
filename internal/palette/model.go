@@ -39,6 +39,7 @@ const (
 	PhaseXFSearch
 	PhaseXFResults
 	PhaseSelectAgents // granular per-agent multi-select (#205)
+	PhaseSelectType   // pick one agent type present in the session (bd-eccc9)
 )
 
 // Target represents the send target
@@ -51,6 +52,7 @@ const (
 	TargetGemini
 	TargetAntigravity
 	TargetSelected // explicit per-pane selection (#205)
+	TargetType     // every pane of the agent type picked under 7 (bd-eccc9)
 )
 
 // ReloadMsg is emitted when palette commands are reloaded from config changes.
@@ -71,6 +73,53 @@ type paneCounts struct {
 	codexSamples       []string
 	geminiSamples      []string
 	antigravitySamples []string
+
+	// Agent types with panes, for the "By type…" target row.
+	types []typeTarget
+}
+
+// typeTarget is one row of the "By type…" picker: an agent type with panes in
+// the session, its pane count and up to maxTypeSamples of their titles.
+type typeTarget struct {
+	agentType agent.AgentType
+	count     int
+	samples   []string
+}
+
+// maxTypeSamples is how many pane titles the target views keep per agent type.
+const maxTypeSamples = 2
+
+// paneTypeTargets returns a typeTarget for each agent type with panes, in
+// agent.AgentTypes() order. Panes resolve through components.PaneAgentType as
+// the dashboard counts them, so user panes and panes of no known type, which
+// it draws as user panes, get no row.
+func paneTypeTargets(panes []tmux.Pane, maxSamples int) []typeTarget {
+	counts := make(map[agent.AgentType]int)
+	samples := make(map[agent.AgentType][]string)
+	for _, p := range panes {
+		paneType := components.PaneAgentType(p.Type)
+		if paneType == agent.AgentTypeUser {
+			continue
+		}
+		counts[paneType]++
+		if len(samples[paneType]) < maxSamples {
+			samples[paneType] = append(samples[paneType], paneTitle(p))
+		}
+	}
+
+	var targets []typeTarget
+	for _, c := range components.AgentCountsInOrder(counts) {
+		targets = append(targets, typeTarget{agentType: c.Type, count: c.Count, samples: samples[c.Type]})
+	}
+	return targets
+}
+
+// paneTitle returns the pane's title, or "pane N" when it has none.
+func paneTitle(p tmux.Pane) string {
+	if title := strings.TrimSpace(p.Title); title != "" {
+		return title
+	}
+	return fmt.Sprintf("pane %d", p.Index)
 }
 
 type paneCountsMsg struct {
@@ -168,6 +217,12 @@ type Model struct {
 	agentPanes   []tmux.Pane     // agent panes (excludes the user pane)
 	agentCursor  int             // cursor position within agentPanes
 	agentChecked map[string]bool // pane ID -> selected for send
+
+	// "By type…" picker state (bd-eccc9), loaded when the user presses 7 in
+	// the target phase. targetType is the type a TargetType send reaches.
+	typeTargets []typeTarget
+	typeCursor  int
+	targetType  agent.AgentType
 }
 
 // KeyMap defines the keybindings
@@ -451,11 +506,8 @@ func (m Model) fetchPaneCounts() tea.Cmd {
 			return paneCountsMsg{err: err}
 		}
 
-		var counts paneCounts
-		const (
-			maxAllSamples  = 3
-			maxTypeSamples = 2
-		)
+		counts := paneCounts{types: paneTypeTargets(panes, maxTypeSamples)}
+		const maxAllSamples = 3
 		addSample := func(dst *[]string, value string, max int) {
 			if value == "" || len(*dst) >= max {
 				return
@@ -468,10 +520,7 @@ func (m Model) fetchPaneCounts() tea.Cmd {
 				continue
 			}
 
-			title := strings.TrimSpace(p.Title)
-			if title == "" {
-				title = fmt.Sprintf("pane %d", p.Index)
-			}
+			title := paneTitle(p)
 
 			counts.totalAgents++
 			addSample(&counts.allSamples, title, maxAllSamples)
@@ -704,6 +753,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateTargetPhase(msg)
 		case PhaseSelectAgents:
 			return m.updateSelectAgentsPhase(msg)
+		case PhaseSelectType:
+			return m.updateSelectTypePhase(msg)
 		case PhaseEdit:
 			return m.updateEditPhase(msg)
 		case PhaseXFSearch:
@@ -1012,9 +1063,79 @@ func (m *Model) updateTargetPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Num6):
 		return m.enterSelectAgentsPhase()
+
+	case key.Matches(msg, keys.Num7):
+		return m.enterSelectTypePhaseWith(tmux.GetPanes)
 	}
 
 	return *m, nil
+}
+
+// enterSelectTypePhaseWith loads the session's panes and opens the "By type…"
+// picker (bd-eccc9), one row per agent type present with its pane count.
+func (m *Model) enterSelectTypePhaseWith(getPanes func(string) ([]tmux.Pane, error)) (tea.Model, tea.Cmd) {
+	panes, err := getPanes(m.session)
+	if err != nil {
+		m.err = err
+		return *m, tea.Quit
+	}
+
+	m.typeTargets = paneTypeTargets(panes, maxTypeSamples)
+	m.typeCursor = 0
+	m.phase = PhaseSelectType
+	return *m, nil
+}
+
+// updateSelectTypePhase handles key events in the "By type…" picker: ↑/↓ and
+// Enter, or 1-9 to send to that row's type at once.
+func (m *Model) updateSelectTypePhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	row := -1
+	switch {
+	case key.Matches(msg, keys.Back):
+		m.phase = PhaseTarget
+		return *m, nil
+
+	case key.Matches(msg, keys.Quit):
+		m.quitting = true
+		return *m, tea.Quit
+
+	case key.Matches(msg, keys.Up):
+		if m.typeCursor > 0 {
+			m.typeCursor--
+		}
+		return *m, nil
+
+	case key.Matches(msg, keys.Down):
+		if m.typeCursor < len(m.typeTargets)-1 {
+			m.typeCursor++
+		}
+		return *m, nil
+
+	case key.Matches(msg, keys.Select):
+		row = m.typeCursor
+
+	default:
+		if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+			row = int(s[0] - '1')
+		}
+	}
+
+	if m.selectTypeTarget(row) {
+		return m.send()
+	}
+	return *m, nil
+}
+
+// selectTypeTarget aims the send at every pane of the i-th picker row's type,
+// reporting false when there is no such row.
+func (m *Model) selectTypeTarget(i int) bool {
+	if i < 0 || i >= len(m.typeTargets) {
+		return false
+	}
+	m.typeCursor = i
+	m.target = TargetType
+	m.targetType = m.typeTargets[i].agentType
+	return true
 }
 
 // enterSelectAgentsPhase loads the current agent panes and opens the granular
@@ -1203,7 +1324,8 @@ func (m *Model) reconcileSelectionAfterReload() {
 
 	m.selected = nil
 	m.editDraft = ""
-	if m.phase == PhaseTarget || m.phase == PhaseEdit {
+	switch m.phase {
+	case PhaseTarget, PhaseEdit, PhaseSelectAgents, PhaseSelectType:
 		m.phase = PhaseCommand
 	}
 }
@@ -1482,6 +1604,10 @@ func (m *Model) sendWith(
 		case TargetSelected:
 			// Explicit per-pane selection (#205): send only to checked agent panes.
 			shouldSend = p.Type != tmux.AgentUser && m.agentChecked[p.ID]
+		case TargetType:
+			// Every pane of the type picked under 7, resolved as the picker
+			// counted it (bd-eccc9).
+			shouldSend = components.PaneAgentType(p.Type) == m.targetType
 		}
 
 		if shouldSend {
@@ -1633,6 +1759,8 @@ func (m Model) View() string {
 		return m.viewTargetPhase()
 	case PhaseSelectAgents:
 		return m.viewSelectAgentsPhase()
+	case PhaseSelectType:
+		return m.viewSelectTypePhase()
 	case PhaseEdit:
 		return m.viewEditPhase()
 	case PhaseXFSearch:
@@ -1680,6 +1808,10 @@ func (m Model) viewQuitting() string {
 			targetName = "selected agents"
 			targetColor = string(t.Mauve)
 			targetIcon = ic.Target
+		case TargetType:
+			targetName = m.targetType.ProfileName()
+			targetColor = string(components.AgentTypeColor(m.targetType, t))
+			targetIcon = ic.AgentIcon(string(m.targetType))
 		}
 
 		checkStyle := lipgloss.NewStyle().Foreground(t.Success).Bold(true)
@@ -2137,6 +2269,11 @@ func (m Model) samplePaneTitlesForTargetKey(key string, max int) []string {
 		src = m.paneCounts.geminiSamples
 	case "5":
 		src = m.paneCounts.antigravitySamples
+	case "7":
+		// The types "By type…" offers, with their pane counts.
+		for _, tt := range m.paneCounts.types {
+			src = append(src, fmt.Sprintf("%s %d", components.AgentCountLabel(tt.agentType), tt.count))
+		}
 	}
 
 	if len(src) > max {
@@ -2272,7 +2409,7 @@ func (m Model) renderHelpBar() string {
 			struct {
 				key  string
 				desc string
-			}{"Enter→", "targets 1-4"},
+			}{"Enter→", "targets 1-7"},
 			struct {
 				key  string
 				desc string
@@ -2288,28 +2425,27 @@ func (m Model) renderHelpBar() string {
 	return strings.Join(parts, "  ")
 }
 
+// targetDialogWidth is the responsive width of the target step and its pickers.
+func (m Model) targetDialogWidth() int {
+	switch styles.GetLayoutMode(m.width) {
+	case styles.LayoutUltraWide:
+		return 80
+	case styles.LayoutSpacious:
+		return 70
+	case styles.LayoutDefault:
+		return 60
+	default:
+		return max(m.width-10, 40)
+	}
+}
+
 func (m Model) viewTargetPhase() string {
 	t := m.theme
 	ic := m.icons
 
 	var b strings.Builder
 
-	// Responsive box dimensions based on layout mode
-	layoutMode := styles.GetLayoutMode(m.width)
-	var boxWidth int
-	switch layoutMode {
-	case styles.LayoutUltraWide:
-		boxWidth = 80
-	case styles.LayoutSpacious:
-		boxWidth = 70
-	case styles.LayoutDefault:
-		boxWidth = 60
-	default:
-		boxWidth = m.width - 10
-		if boxWidth < 40 {
-			boxWidth = 40
-		}
-	}
+	boxWidth := m.targetDialogWidth()
 
 	b.WriteString("\n")
 
@@ -2356,9 +2492,17 @@ func (m Model) viewTargetPhase() string {
 		{"4", ic.Gemini, "Gemini (gmi)", "Google agents (legacy)", t.Gemini, t.Surface0},
 		{"5", ic.Gemini, "Antigravity (agy)", "Google agents", t.Lavender, t.Surface0},
 		{"6", ic.Target, "Select agents…", "pick specific panes", t.Mauve, t.Surface0},
+		{"7", ic.Filter, "By type…", "pick one agent type", t.Teal, t.Surface0},
 	}
 
 	for _, target := range targets {
+		if target.key == "7" && m.paneCountsKnown {
+			target.desc = fmt.Sprintf("%d types present", len(m.paneCounts.types))
+			if len(m.paneCounts.types) == 1 {
+				target.desc = "1 type present"
+			}
+		}
+
 		// Count suffixes (best-effort)
 		countSuffix := ""
 		if m.paneCountsKnown {
@@ -2478,6 +2622,7 @@ func (m Model) renderTargetHelpBar() string {
 	}{
 		{"1-5", "select target"},
 		{"6", "pick agents"},
+		{"7", "by type"},
 		{"e", "edit prompt"},
 		{"?", "help"},
 		{"Esc", "back"},
@@ -2499,22 +2644,7 @@ func (m Model) viewSelectAgentsPhase() string {
 
 	var b strings.Builder
 
-	// Responsive box width, mirroring the target phase.
-	layoutMode := styles.GetLayoutMode(m.width)
-	var boxWidth int
-	switch layoutMode {
-	case styles.LayoutUltraWide:
-		boxWidth = 80
-	case styles.LayoutSpacious:
-		boxWidth = 70
-	case styles.LayoutDefault:
-		boxWidth = 60
-	default:
-		boxWidth = m.width - 10
-		if boxWidth < 40 {
-			boxWidth = 40
-		}
-	}
+	boxWidth := m.targetDialogWidth()
 
 	b.WriteString("\n")
 
@@ -2567,10 +2697,7 @@ func (m Model) viewSelectAgentsPhase() string {
 			box = checkStyle.Render("[x]")
 		}
 
-		title := strings.TrimSpace(p.Title)
-		if title == "" {
-			title = fmt.Sprintf("pane %d", p.Index)
-		}
+		title := paneTitle(p)
 		nameBudget := boxWidth - 20
 		if nameBudget < 10 {
 			nameBudget = 10
@@ -2622,6 +2749,152 @@ func (m Model) renderSelectAgentsHelpBar() string {
 	var parts []string
 	for _, item := range items {
 		parts = append(parts, keyStyle.Render(item.key)+" "+descStyle.Render(item.desc))
+	}
+
+	return strings.Join(parts, "  ")
+}
+
+// viewSelectTypePhase renders the "By type…" picker (bd-eccc9): one row per
+// agent type present in the session, in agent.AgentTypes() order, with its
+// pane count in the color, icon and short label the dashboard's count badges
+// use for that type.
+func (m Model) viewSelectTypePhase() string {
+	t := m.theme
+	ic := m.icons
+
+	var b strings.Builder
+
+	boxWidth := m.targetDialogWidth()
+
+	b.WriteString("\n")
+
+	titleText := ic.Filter + "  Send By Type"
+	animatedTitle := styles.Shimmer(titleText, m.animTick, string(t.Blue), string(t.Mauve), string(t.Pink))
+	b.WriteString("  " + animatedTitle + "\n")
+	b.WriteString("  " + styles.GradientDivider(boxWidth, string(t.Blue), string(t.Mauve)) + "\n\n")
+
+	dimStyle := lipgloss.NewStyle().Foreground(t.Subtext)
+	cmdBadge := lipgloss.NewStyle().
+		Background(t.Surface0).
+		Foreground(t.Text).
+		Padding(0, 1).
+		Render(m.selected.Label)
+	if m.editDraft != "" {
+		editedBadge := lipgloss.NewStyle().Foreground(t.Yellow).Italic(true).Render("(edited)")
+		b.WriteString("  " + dimStyle.Render("Sending:") + " " + cmdBadge + " " + editedBadge + "\n\n")
+	} else {
+		b.WriteString("  " + dimStyle.Render("Sending:") + " " + cmdBadge + "\n\n")
+	}
+
+	if len(m.typeTargets) == 0 {
+		b.WriteString("  " + dimStyle.Render("No agent panes in this session.") + "\n\n")
+		b.WriteString("  " + styles.GradientDivider(boxWidth, string(t.Surface2), string(t.Surface1)) + "\n\n")
+		b.WriteString("  " + m.renderSelectTypeHelpBar() + "\n")
+		return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Center, b.String())
+	}
+
+	labelStyle := lipgloss.NewStyle().Foreground(t.Text).Bold(true).Width(10)
+	descStyle := lipgloss.NewStyle().Foreground(t.Overlay).Italic(true)
+	sampleStyle := lipgloss.NewStyle().Foreground(t.Subtext).Italic(true)
+
+	// Representative pane titles, width-tier aware as in the target phase.
+	maxSamples := 0
+	switch {
+	case m.tier >= layout.TierWide:
+		maxSamples = maxTypeSamples
+	case m.tier >= layout.TierSplit:
+		maxSamples = 1
+	}
+
+	paneTotal := 0
+	for i, tt := range m.typeTargets {
+		paneTotal += tt.count
+		color := components.AgentTypeColor(tt.agentType, t)
+
+		pointer := "  "
+		if i == m.typeCursor {
+			pointer = styles.Shimmer(ic.Pointer, m.animTick, string(t.Pink), string(t.Mauve)) + " "
+		}
+
+		// Rows past the ninth have no digit; ↑/↓ and Enter reach them.
+		keyText := " "
+		if i < 9 {
+			keyText = fmt.Sprint(i + 1)
+		}
+		keyBadge := lipgloss.NewStyle().
+			Background(color).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(keyText)
+		iconStyled := lipgloss.NewStyle().
+			Foreground(color).
+			Bold(true).
+			Render(ic.AgentIcon(string(tt.agentType)))
+		label := fmt.Sprintf("%s (%d)", components.AgentCountLabel(tt.agentType), tt.count)
+
+		b.WriteString(fmt.Sprintf("  %s%s  %s  %s %s\n",
+			pointer,
+			keyBadge,
+			iconStyled,
+			labelStyle.Render(label),
+			descStyle.Render(tt.agentType.DisplayName())))
+
+		if samples := tt.samples; maxSamples > 0 && len(samples) > 0 {
+			if len(samples) > maxSamples {
+				samples = samples[:maxSamples]
+			}
+			sampleIndent := "        "
+			sampleText := layout.TruncateWidthDefault("e.g. "+strings.Join(samples, ", "), max(boxWidth-2-len(sampleIndent), 10))
+			b.WriteString("  " + sampleIndent + sampleStyle.Render(sampleText) + "\n")
+		}
+	}
+
+	b.WriteString("\n")
+	typesWord, panesWord := "types", "panes"
+	if len(m.typeTargets) == 1 {
+		typesWord = "type"
+	}
+	if paneTotal == 1 {
+		panesWord = "pane"
+	}
+	b.WriteString("  " + dimStyle.Render(fmt.Sprintf("%d agent %s, %d %s", len(m.typeTargets), typesWord, paneTotal, panesWord)) + "\n\n")
+
+	b.WriteString("  " + styles.GradientDivider(boxWidth, string(t.Surface2), string(t.Surface1)) + "\n\n")
+	b.WriteString("  " + m.renderSelectTypeHelpBar() + "\n")
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Center, b.String())
+}
+
+func (m Model) renderSelectTypeHelpBar() string {
+	t := m.theme
+
+	keyStyle := lipgloss.NewStyle().
+		Background(t.Surface0).
+		Foreground(t.Text).
+		Bold(true).
+		Padding(0, 1)
+
+	descStyle := lipgloss.NewStyle().
+		Foreground(t.Overlay)
+
+	type item struct {
+		key  string
+		desc string
+	}
+	var items []item
+	if len(m.typeTargets) > 0 {
+		digits := "1"
+		if n := min(len(m.typeTargets), 9); n > 1 {
+			digits = fmt.Sprintf("1-%d", n)
+		}
+		items = append(items, item{"↑/↓", "move"}, item{digits, "send to type"}, item{"Enter", "send"})
+	}
+	items = append(items, item{"Esc", "back"}, item{"q", "quit"})
+
+	var parts []string
+	for _, it := range items {
+		parts = append(parts, keyStyle.Render(it.key)+" "+descStyle.Render(it.desc))
 	}
 
 	return strings.Join(parts, "  ")
