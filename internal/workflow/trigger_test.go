@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func TestTriggerRegistryCreatesStandardTriggers(t *testing.T) {
@@ -134,7 +136,6 @@ func TestFileModifiedTriggerWatchesNewNestedDirectories(t *testing.T) {
 	if err := os.MkdirAll(nested, 0o755); err != nil {
 		t.Fatalf("create nested directory: %v", err)
 	}
-	waitForDirectoryWatch(t, trigger, nested)
 	path := filepath.Join(nested, "trigger.go")
 	if err := os.WriteFile(path, []byte("package workflow\n"), 0o644); err != nil {
 		t.Fatalf("create nested file: %v", err)
@@ -143,6 +144,71 @@ func TestFileModifiedTriggerWatchesNewNestedDirectories(t *testing.T) {
 		t.Fatalf("modify nested file: %v", err)
 	}
 	waitForTrigger(t, trigger, ctx)
+}
+
+// A directory moved into the project already holds its files, so no watch
+// can see them being created or written. The triggers have to find them when
+// they start watching the new directory.
+func TestFileTriggersReportFilesInMovedInDirectories(t *testing.T) {
+	for _, kind := range []TriggerType{TriggerFileCreated, TriggerFileModified} {
+		t.Run(string(kind), func(t *testing.T) {
+			staging := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(staging, "internal", "workflow"), 0o755); err != nil {
+				t.Fatalf("create staged directory: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(staging, "internal", "workflow", "trigger.go"), []byte("package workflow\n"), 0o644); err != nil {
+				t.Fatalf("write staged file: %v", err)
+			}
+			dir := t.TempDir()
+			trigger, err := NewTriggerRegistry().Create(Trigger{Type: kind, Pattern: "internal/**/*.go"})
+			if err != nil {
+				t.Fatalf("Create(): %v", err)
+			}
+			t.Cleanup(func() {
+				if err := trigger.Stop(); err != nil {
+					t.Errorf("Stop(): %v", err)
+				}
+			})
+			ctx := &TriggerContext{ProjectRoot: dir}
+			if err := trigger.Start(ctx); err != nil {
+				t.Fatalf("Start(): %v", err)
+			}
+			if err := os.Rename(filepath.Join(staging, "internal"), filepath.Join(dir, "internal")); err != nil {
+				t.Fatalf("move staged tree into project: %v", err)
+			}
+			waitForTrigger(t, trigger, ctx)
+		})
+	}
+}
+
+// kqueue reports a new file's Create but starts watching the file only after
+// that, so content written straight after the create can arrive with no Write
+// event at all. Delivering only the Create reproduces that deterministically.
+func TestFileModifiedTriggerCountsWritesMissedAfterCreate(t *testing.T) {
+	dir := t.TempDir()
+	runtimeTrigger, err := NewTriggerRegistry().Create(Trigger{Type: TriggerFileModified, Pattern: "*.go"})
+	if err != nil {
+		t.Fatalf("Create(): %v", err)
+	}
+	trigger, ok := runtimeTrigger.(*fileTrigger)
+	if !ok {
+		t.Fatalf("trigger type = %T, want *fileTrigger", runtimeTrigger)
+	}
+	trigger.root = dir
+	path := filepath.Join(dir, "new.go")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("create empty file: %v", err)
+	}
+	trigger.observe(nil, fsnotify.Event{Name: path, Op: fsnotify.Create})
+	if fired, err := trigger.Check(nil); err != nil || fired {
+		t.Fatalf("Check after creating an empty file = (%v, %v), want (false, nil)", fired, err)
+	}
+	if err := os.WriteFile(path, []byte("package example\n"), 0o644); err != nil {
+		t.Fatalf("write new file: %v", err)
+	}
+	if fired, err := trigger.Check(nil); err != nil || !fired {
+		t.Fatalf("Check after an unreported write = (%v, %v), want (true, nil)", fired, err)
+	}
 }
 
 func TestCommandTriggers(t *testing.T) {
@@ -273,27 +339,4 @@ func waitForTrigger(t *testing.T, trigger RuntimeTrigger, ctx *TriggerContext) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("trigger did not fire before deadline")
-}
-
-func waitForDirectoryWatch(t *testing.T, trigger RuntimeTrigger, dir string) {
-	t.Helper()
-	file, ok := trigger.(*fileTrigger)
-	if !ok {
-		t.Fatalf("trigger type = %T, want *fileTrigger", trigger)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		file.mu.Lock()
-		watcher := file.watcher
-		file.mu.Unlock()
-		if watcher != nil {
-			for _, watched := range watcher.WatchList() {
-				if watched == dir {
-					return
-				}
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("directory %q was not watched before deadline", dir)
 }

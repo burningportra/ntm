@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,6 +122,10 @@ type fileTrigger struct {
 	watcher *fsnotify.Watcher
 	done    chan struct{}
 	wg      sync.WaitGroup
+	// pending holds matching files that were still empty when they appeared.
+	// Check looks at them again, because a write that lands before kqueue
+	// watches the new file is never reported as an event.
+	pending map[string]struct{}
 }
 
 func newFileCreatedTrigger(config Trigger) (RuntimeTrigger, error) {
@@ -145,7 +150,7 @@ func (t *fileTrigger) Start(ctx *TriggerContext) error {
 	if err != nil {
 		return fmt.Errorf("create filesystem watcher: %w", err)
 	}
-	if err := addDirectoryTree(watcher, root); err != nil {
+	if err := addDirectoryTree(watcher, root, nil); err != nil {
 		_ = watcher.Close()
 		return fmt.Errorf("watch project tree: %w", err)
 	}
@@ -158,6 +163,7 @@ func (t *fileTrigger) Start(ctx *TriggerContext) error {
 	t.root = root
 	t.fired = false
 	t.err = nil
+	t.pending = nil
 	t.watcher = watcher
 	t.done = make(chan struct{})
 	done := t.done
@@ -178,21 +184,7 @@ func (t *fileTrigger) run(watcher *fsnotify.Watcher, done <-chan struct{}) {
 			if !ok {
 				return
 			}
-			if event.Op&fsnotify.Create != 0 {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					if err := addDirectoryTree(watcher, event.Name); err != nil {
-						t.mu.Lock()
-						t.err = fmt.Errorf("watch created directory %q: %w", event.Name, err)
-						t.mu.Unlock()
-					}
-				}
-			}
-			if event.Op&t.op == 0 || !t.matches(event.Name) {
-				continue
-			}
-			t.mu.Lock()
-			t.fired = true
-			t.mu.Unlock()
+			t.observe(watcher, event)
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
@@ -202,6 +194,54 @@ func (t *fileTrigger) run(watcher *fsnotify.Watcher, done <-chan struct{}) {
 			t.mu.Unlock()
 		}
 	}
+}
+
+// observe records what one filesystem event means for the trigger.
+func (t *fileTrigger) observe(watcher *fsnotify.Watcher, event fsnotify.Event) {
+	if event.Op&fsnotify.Create != 0 {
+		if info, err := os.Stat(event.Name); err == nil {
+			switch {
+			case info.IsDir():
+				// Files created in a new directory before its watch exists
+				// produce no events, so the walk reports the ones already there.
+				if err := addDirectoryTree(watcher, event.Name, t.fileAppeared); err != nil {
+					t.mu.Lock()
+					t.err = fmt.Errorf("watch created directory %q: %w", event.Name, err)
+					t.mu.Unlock()
+				}
+			case info.Mode().IsRegular():
+				t.fileAppeared(event.Name, info)
+			}
+		}
+	}
+	if event.Op&t.op == 0 || !t.matches(event.Name) {
+		return
+	}
+	t.mu.Lock()
+	t.fired = true
+	t.mu.Unlock()
+}
+
+// fileAppeared records a regular file that showed up after Start, whether
+// fsnotify reported its Create or the walk of a new directory found it. A
+// file that already holds content counts as written: kqueue (macOS, BSD)
+// watches each file separately and fsnotify opens a new file's watch only
+// after reporting its Create, so the writes that follow straight away may
+// never arrive as Write events. An empty file waits in pending for Check.
+func (t *fileTrigger) fileAppeared(path string, info os.FileInfo) {
+	if !t.matches(path) {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.op == fsnotify.Create || info.Size() > 0 {
+		t.fired = true
+		return
+	}
+	if t.pending == nil {
+		t.pending = make(map[string]struct{})
+	}
+	t.pending[path] = struct{}{}
 }
 
 func (t *fileTrigger) matches(name string) bool {
@@ -220,20 +260,33 @@ func (t *fileTrigger) matches(name string) bool {
 	return matched
 }
 
-// addDirectoryTree registers every existing directory beneath root. fsnotify
-// watches directories individually, so watching only the project root misses
-// events produced in nested source trees.
-func addDirectoryTree(watcher *fsnotify.Watcher, root string) error {
+// addDirectoryTree registers every existing directory beneath root and, when
+// found is non-nil, passes it each regular file. fsnotify watches directories
+// individually, so watching only the project root misses events produced in
+// nested source trees. Each directory is watched before it is listed, so a
+// file created during the walk is either listed or reported by the watch.
+func addDirectoryTree(watcher *fsnotify.Watcher, root string, found func(string, os.FileInfo)) error {
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if !entry.IsDir() {
+		if entry.IsDir() {
+			if err := watcher.Add(path); err != nil {
+				return fmt.Errorf("watch %q: %w", path, err)
+			}
 			return nil
 		}
-		if err := watcher.Add(path); err != nil {
-			return fmt.Errorf("watch %q: %w", path, err)
+		if found == nil || !entry.Type().IsRegular() {
+			return nil
 		}
+		info, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found(path, info)
 		return nil
 	})
 }
@@ -268,6 +321,18 @@ func (t *fileTrigger) Check(_ *TriggerContext) (bool, error) {
 	defer t.mu.Unlock()
 	if t.err != nil {
 		return false, fmt.Errorf("watch filesystem: %w", t.err)
+	}
+	for path := range t.pending {
+		if t.fired {
+			break
+		}
+		info, err := os.Stat(path)
+		switch {
+		case err == nil && info.Size() > 0:
+			t.fired = true
+		case errors.Is(err, fs.ErrNotExist):
+			delete(t.pending, path)
+		}
 	}
 	return t.fired, nil
 }
