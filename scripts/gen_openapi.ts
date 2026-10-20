@@ -755,8 +755,20 @@ const errorResponses = (descriptions) => {
   return out;
 };
 
+// agentMailTokenHeader is the header every serve route that acts as an Agent
+// Mail agent reads that agent's token from.
+const agentMailTokenHeader = {
+  name: "X-Agent-Mail-Token",
+  in: "header",
+  required: false,
+  description:
+    "Registration token of the agent the request acts as. serve sends it to Agent Mail for this request only and never stores it. Without it serve sends the token ntm saved for that agent when it spawned it, if there is one. The Python Agent Mail server refuses an agent-scoped call without the agent's token; the Rust server ignores it.",
+  schema: { type: "string" },
+};
+
 // operationOverrides carries what a parity entry cannot say, keyed by
-// endpoint id: typed path parameters, query parameters and error responses.
+// endpoint id: typed path parameters, query and header parameters and error
+// responses.
 const operationOverrides = {
   "message.read": {
     parameters: [
@@ -772,13 +784,14 @@ const operationOverrides = {
         in: "query",
         required: false,
         description:
-          "The reading agent. The Python Agent Mail server returns a message only to its sender or a recipient and authenticates that agent with its registration token, which serve sends only when its mail client has one cached; the Rust server ignores both.",
+          "The reading agent, whose token goes in X-Agent-Mail-Token. The Python Agent Mail server authenticates it and returns a message only to its sender or a recipient; the Rust server ignores both.",
         schema: { type: "string" },
       },
+      agentMailTokenHeader,
     ],
     responses: errorResponses({
       "400": "BAD_REQUEST: the id is not an integer, or Agent Mail rejected the request.",
-      "401": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or the reader: the Python server refuses a request without agent_name, or an agent_name serve holds no registration token for.",
+      "401": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or the reader: the Python server refuses a request without agent_name, with a wrong X-Agent-Mail-Token, or without one for an agent ntm saved no token for.",
       "403": "FORBIDDEN: the caller's role lacks the mail:read permission.",
       "404": "MESSAGE_NOT_FOUND when Agent Mail has no such message in this project (or, on the Python server, the reader is neither its sender nor a recipient), AGENT_NOT_FOUND when agent_name is not registered.",
       "500": "INTERNAL_ERROR: serve could not build its mail client, or Agent Mail failed in a way that is none of the above.",
@@ -796,10 +809,11 @@ const operationOverrides = {
         description: "Agent Mail file reservation id.",
         schema: { type: "integer" },
       },
+      agentMailTokenHeader,
     ],
     responses: errorResponses({
       "400": "BAD_REQUEST: the id is not an integer, the body is not JSON, agent_name is missing, or Agent Mail rejected the request.",
-      "401": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or agent_name: the Python server refuses an agent_name serve holds no registration token for.",
+      "401": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or agent_name: the Python server refuses a wrong X-Agent-Mail-Token, or a request without one for an agent ntm saved no token for.",
       "403": "FORBIDDEN: the caller's role lacks the dangerous:force_release permission.",
       "404": "AGENT_NOT_FOUND when agent_name is not registered, NOT_FOUND when Agent Mail has no such reservation.",
       "409": "CONFLICT: Agent Mail refused because the reservation still shows recent activity (both servers) or was renewed or released while it decided (Rust server), or it released nothing without saying the reservation was already released (details carries notified, previous_holder and path_pattern).",

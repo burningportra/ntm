@@ -354,6 +354,9 @@ type SearchOptions struct {
 	ProjectKey string
 	Query      string
 	Limit      int
+	// AgentName is the agent searching. The Python server refuses a search
+	// that names no agent it can authenticate; the Rust server ignores it.
+	AgentName string
 }
 
 // SearchResult represents a message search result.
@@ -519,6 +522,9 @@ type SummarizeThreadOptions struct {
 	IncludeExamples *bool
 	LLMMode         *bool
 	LLMModel        string
+	// AgentName is the agent asking. The Python server refuses a summary
+	// that names no agent it can authenticate; the Rust server ignores it.
+	AgentName string
 }
 
 // ThreadSummaryResponse contains the summarize_thread response for a single thread.

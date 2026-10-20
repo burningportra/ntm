@@ -1725,6 +1725,255 @@ func TestForceReleaseReservation_PythonServerNeedsRegistrationToken(t *testing.T
 	}
 }
 
+// TestWithAgentToken_SendsTheCallersTokenWithoutCachingIt: a token a caller
+// supplies with WithAgentToken authenticates only the calls made with that
+// context, as the agent it names, and the client never keeps it (bd-6m68a).
+func TestWithAgentToken_SendsTheCallersTokenWithoutCachingIt(t *testing.T) {
+	t.Parallel()
+
+	replay := &pythonToolReplay{
+		tool:   "whois",
+		params: []string{"project_key", "agent_name", "registration_token", "include_recent_commits", "commit_limit", "format"},
+		issued: "TOK-GREEN",
+		reply:  capturedPythonWhoisReply,
+	}
+	server := httptest.NewServer(replay)
+	defer server.Close()
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	whois := func(ctx context.Context) error {
+		_, err := c.Whois(ctx, "/p", "GreenCastle", false)
+		return err
+	}
+	background := context.Background()
+
+	if err := whois(WithAgentToken(background, "GreenCastle", "TOK-GREEN")); err != nil {
+		t.Fatalf("whois with the caller's token: %v", err)
+	}
+	if cached := c.RegistrationToken("/p", "GreenCastle"); cached != "" {
+		t.Fatalf("client cached the caller's token %q", cached)
+	}
+	if err := whois(background); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("whois after the caller's call, with no token: err = %v, want ErrUnauthorized", err)
+	}
+	if err := whois(WithAgentToken(background, "GreenCastle", "TOK-WRONG")); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("whois with a wrong caller token: err = %v, want ErrUnauthorized", err)
+	}
+
+	c.SetRegistrationToken("/p", "GreenCastle", "TOK-GREEN")
+	if err := whois(WithAgentToken(background, "BlueLake", "TOK-BLUE")); err != nil {
+		t.Fatalf("whois with another agent's caller token: %v (the cached token should go)", err)
+	}
+	if err := whois(WithAgentToken(background, "GreenCastle", "")); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("whois with an empty caller token: err = %v, want ErrUnauthorized (no cached token either)", err)
+	}
+
+	var sent []interface{}
+	for _, args := range replay.argsOfCalls() {
+		sent = append(sent, args["registration_token"])
+	}
+	want := []interface{}{"TOK-GREEN", nil, "TOK-WRONG", "TOK-GREEN", nil}
+	if fmt.Sprint(sent) != fmt.Sprint(want) {
+		t.Errorf("registration_token per call = %v, want %v", sent, want)
+	}
+}
+
+// TestRegisterAgent_WithAgentTokenCachesNothing: the token register_agent
+// hands back on a caller's call is the caller's, so the client keeps it only
+// for its own calls.
+func TestRegisterAgent_WithAgentTokenCachesNothing(t *testing.T) {
+	t.Parallel()
+
+	var sent []interface{}
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			sent = append(sent, args["registration_token"])
+			name, _ := args["name"].(string)
+			if name == "" {
+				name = "AmberFox"
+			}
+			return map[string]interface{}{"id": 1, "name": name, "program": "p", "model": "m", "registration_token": "TOK-" + name}, nil
+		},
+	}))
+	defer server.Close()
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	register := func(ctx context.Context, name string) {
+		t.Helper()
+		if _, err := c.RegisterAgent(ctx, RegisterAgentOptions{ProjectKey: "/p", Program: "p", Model: "m", Name: name}); err != nil {
+			t.Fatalf("RegisterAgent(%q): %v", name, err)
+		}
+	}
+
+	register(WithAgentToken(context.Background(), "", ""), "")
+	register(WithAgentToken(context.Background(), "GreenCastle", "TOK-GREEN"), "GreenCastle")
+	for _, name := range []string{"AmberFox", "GreenCastle"} {
+		if cached := c.RegistrationToken("/p", name); cached != "" {
+			t.Errorf("client cached %s's token %q from a caller's registration", name, cached)
+		}
+	}
+
+	register(context.Background(), "RedStone")
+	if cached := c.RegistrationToken("/p", "RedStone"); cached != "TOK-RedStone" {
+		t.Errorf("client's own registration cached %q, want TOK-RedStone", cached)
+	}
+	// A caller re-registering RedStone without its token must not borrow the
+	// client's.
+	register(WithAgentToken(context.Background(), "RedStone", ""), "RedStone")
+
+	want := []interface{}{nil, "TOK-GREEN", nil, nil}
+	if fmt.Sprint(sent) != fmt.Sprint(want) {
+		t.Errorf("registration_token per call = %v, want %v", sent, want)
+	}
+}
+
+// TestPeekInboxes_IgnoresASuppliedToken: a peek's read answers every caller
+// waiting on it, so it authenticates with the client's cached token, never a
+// token one caller supplied.
+func TestPeekInboxes_IgnoresASuppliedToken(t *testing.T) {
+	t.Parallel()
+
+	replay := &pythonToolReplay{
+		tool:   "fetch_inbox",
+		params: []string{"project_key", "agent_name", "limit", "mark_read", "registration_token"},
+		issued: "TOK-GREEN",
+		reply:  capturedPythonFetchInboxReply,
+	}
+	server := httptest.NewServer(replay)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	c.SetRegistrationToken("/p", "GreenCastle", "TOK-GREEN")
+	ctx := WithAgentToken(context.Background(), "GreenCastle", "TOK-CALLER")
+	peek := c.PeekInboxes(ctx, FetchInboxOptions{ProjectKey: "/p", Limit: 1}, []string{"GreenCastle"})["GreenCastle"]
+	if peek.Err != nil {
+		t.Fatalf("peek: %v", peek.Err)
+	}
+	for _, args := range replay.argsOfCalls() {
+		if args["registration_token"] != "TOK-GREEN" {
+			t.Errorf("peek sent registration_token %v, want the cached TOK-GREEN", args["registration_token"])
+		}
+	}
+}
+
+// TestSearchAndSummarize_ActAsAnAgent: the Python server refuses both without
+// an agent it can authenticate, so a named agent goes along with its token.
+func TestSearchAndSummarize_ActAsAnAgent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		tool  string
+		reply string
+		call  func(*Client, context.Context) error
+	}{
+		{
+			tool:  "search_messages",
+			reply: mcpTextReply(capturedRustSearchMessagesReply),
+			call: func(c *Client, ctx context.Context) error {
+				_, err := c.SearchMessages(ctx, SearchOptions{ProjectKey: "/p", Query: "fixture", AgentName: "GreenCastle"})
+				return err
+			},
+		},
+		{
+			tool:  "summarize_thread",
+			reply: mcpTextReply(`{"thread_id":"T-1","summary":{"participants":["GreenCastle"],"key_points":[],"action_items":[]}}`),
+			call: func(c *Client, ctx context.Context) error {
+				_, err := c.SummarizeThread(ctx, SummarizeThreadOptions{ProjectKey: "/p", ThreadID: "T-1", AgentName: "GreenCastle"})
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.tool, func(t *testing.T) {
+			t.Parallel()
+			replay := &pythonToolReplay{
+				tool:   tt.tool,
+				params: []string{"project_key", "query", "thread_id", "limit", "agent_name", "registration_token"},
+				issued: "TOK-GREEN",
+				reply:  tt.reply,
+			}
+			server := httptest.NewServer(replay)
+			defer server.Close()
+			c := NewClient(WithBaseURL(server.URL + "/"))
+
+			if err := tt.call(c, context.Background()); !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("without a token: err = %v, want ErrUnauthorized", err)
+			}
+			if err := tt.call(c, WithAgentToken(context.Background(), "GreenCastle", "TOK-GREEN")); err != nil {
+				t.Fatalf("with the caller's token: %v", err)
+			}
+			if calls := replay.argsOfCalls(); len(calls) != 2 || calls[1]["agent_name"] != "GreenCastle" {
+				t.Errorf("calls = %v, want the second to name GreenCastle", calls)
+			}
+		})
+	}
+}
+
+// TestRefusalsQuotingATokenRedactIt: the Python server's pydantic report
+// quotes a rejected argument's value, and FastMCP's masked resource error
+// quotes the URI, agent_token included. Neither token may reach the error
+// text, and the error still classifies.
+func TestRefusalsQuotingATokenRedactIt(t *testing.T) {
+	t.Parallel()
+
+	t.Run("tool argument", func(t *testing.T) {
+		t.Parallel()
+		// A whois without a registration_token parameter, as on a server
+		// that predates it.
+		replay := &pythonToolReplay{
+			tool:   "whois",
+			params: []string{"project_key", "agent_name", "include_recent_commits"},
+			reply:  capturedPythonWhoisReply,
+		}
+		server := httptest.NewServer(replay)
+		defer server.Close()
+		c := NewClient(WithBaseURL(server.URL + "/"))
+		c.SetRegistrationToken("/p", "BlueLake", "TOK-CACHED-BLUE")
+
+		for agent, ctx := range map[string]context.Context{
+			"GreenCastle": WithAgentToken(context.Background(), "GreenCastle", "TOK-CALLER-GREEN"),
+			"BlueLake":    context.Background(),
+		} {
+			_, err := c.Whois(ctx, "/p", agent, false)
+			if !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("whois %s: err = %v, want ErrInvalidRequest", agent, err)
+			}
+			if text := err.Error(); strings.Contains(text, "TOK-") || !strings.Contains(text, "[redacted]") {
+				t.Errorf("whois %s error text = %q, want the token redacted", agent, text)
+			}
+		}
+	})
+
+	t.Run("resource URI", func(t *testing.T) {
+		t.Parallel()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req JSONRPCRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode request: %v", err)
+				return
+			}
+			params, _ := req.Params.(map[string]interface{})
+			uri, _ := params["uri"].(string)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{
+				Code:    0,
+				Message: fmt.Sprintf("Error reading resource from template %q", uri),
+			}})
+		}))
+		defer server.Close()
+		c := NewClient(WithBaseURL(server.URL + "/"))
+
+		for _, token := range []string{"TOK-CALLER-GREEN", "TOK+with/escapes="} {
+			_, err := c.GetMessage(WithAgentToken(context.Background(), "GreenCastle", token), "/p", "GreenCastle", 3)
+			if err == nil {
+				t.Fatalf("GetMessage with token %q: want an error", token)
+			}
+			text := err.Error()
+			if strings.Contains(text, token) || strings.Contains(text, url.QueryEscape(token)) || !strings.Contains(text, "agent_token=[redacted]") {
+				t.Errorf("GetMessage error text = %q, want agent_token redacted", text)
+			}
+		}
+	})
+}
+
 // TestReservePaths_ReplayedGrants: neither server names the holder, the
 // project or a creation time in a grant, since every grant goes to the agent
 // the call named. The holder is filled in from the call; the project and

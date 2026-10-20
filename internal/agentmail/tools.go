@@ -14,12 +14,14 @@ import (
 	"time"
 )
 
-// attachTokenFromField adds a cached token to an MCP tool arg map.
-// Different Agent Mail tools use different token parameter names:
-// send_message/reply_message use sender_token, most agent-scoped read
-// and reservation tools use registration_token, and handshake macros
-// use requester_registration_token / target_registration_token.
-func (c *Client) attachTokenFromField(args map[string]interface{}, tokenField, agentField string) {
+// attachTokenFromField adds the token of the agent named by args[agentField]
+// to an MCP tool arg map: the one WithAgentToken put in ctx for that agent,
+// else the cached one. Different Agent Mail tools use different token
+// parameter names: send_message/reply_message use sender_token, most
+// agent-scoped read and reservation tools use registration_token, and
+// handshake macros use requester_registration_token /
+// target_registration_token.
+func (c *Client) attachTokenFromField(ctx context.Context, args map[string]interface{}, tokenField, agentField string) {
 	if c == nil || args == nil {
 		return
 	}
@@ -37,17 +39,17 @@ func (c *Client) attachTokenFromField(args map[string]interface{}, tokenField, a
 	if agentName == "" {
 		return
 	}
-	if token := c.RegistrationToken(projectKey, agentName); token != "" {
+	if token := c.agentTokenFor(ctx, projectKey, agentName); token != "" {
 		args[tokenField] = token
 	}
 }
 
-func (c *Client) attachRegistrationToken(args map[string]interface{}) {
-	c.attachTokenFromField(args, "registration_token", "agent_name")
+func (c *Client) attachRegistrationToken(ctx context.Context, args map[string]interface{}) {
+	c.attachTokenFromField(ctx, args, "registration_token", "agent_name")
 }
 
-func (c *Client) attachSenderToken(args map[string]interface{}) {
-	c.attachTokenFromField(args, "sender_token", "sender_name")
+func (c *Client) attachSenderToken(ctx context.Context, args map[string]interface{}) {
+	c.attachTokenFromField(ctx, args, "sender_token", "sender_name")
 }
 
 // EnsureProject ensures a project exists for the given path.
@@ -119,7 +121,7 @@ func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (
 	// the server can authenticate us as the existing identity instead of
 	// rejecting the call. New registrations leave it empty and the
 	// server returns a fresh token in the response.
-	c.attachTokenFromField(args, "registration_token", "name")
+	c.attachTokenFromField(ctx, args, "registration_token", "name")
 
 	result, err := c.callToolWithBusyRetry(ctx, "register_agent", args, 3*time.Second, 3)
 	if err != nil {
@@ -130,7 +132,7 @@ func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (
 	if err := json.Unmarshal(result, &agent); err != nil {
 		return nil, NewAPIError("register_agent", 0, err)
 	}
-	c.rememberRegistrationToken(opts.ProjectKey, &agent)
+	c.rememberRegistrationToken(ctx, opts.ProjectKey, &agent)
 
 	return &agent, nil
 }
@@ -158,7 +160,7 @@ func (c *Client) CreateAgentIdentity(ctx context.Context, opts RegisterAgentOpti
 	if err := json.Unmarshal(result, &agent); err != nil {
 		return nil, NewAPIError("create_agent_identity", 0, err)
 	}
-	c.rememberRegistrationToken(opts.ProjectKey, &agent)
+	c.rememberRegistrationToken(ctx, opts.ProjectKey, &agent)
 
 	return &agent, nil
 }
@@ -173,7 +175,7 @@ func (c *Client) Whois(ctx context.Context, projectKey, agentName string, includ
 
 	// The Python server refuses whois without the looked-up agent's
 	// registration token; the Rust server ignores it.
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "whois", args)
 	if err != nil {
 		return nil, err
@@ -215,7 +217,7 @@ func (c *Client) SendMessage(ctx context.Context, opts SendMessageOptions) (*Sen
 		args["convert_images"] = *opts.ConvertImages
 	}
 
-	c.attachSenderToken(args)
+	c.attachSenderToken(ctx, args)
 	result, err := c.callTool(ctx, "send_message", args)
 	if err != nil {
 		return nil, err
@@ -250,7 +252,7 @@ func (c *Client) ReplyMessage(ctx context.Context, opts ReplyMessageOptions) (*M
 		args["subject_prefix"] = opts.SubjectPrefix
 	}
 
-	c.attachSenderToken(args)
+	c.attachSenderToken(ctx, args)
 	result, err := c.callTool(ctx, "reply_message", args)
 	if err != nil {
 		return nil, err
@@ -286,7 +288,7 @@ func (c *Client) FetchInbox(ctx context.Context, opts FetchInboxOptions) ([]Inbo
 		args["mark_read"] = false
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "fetch_inbox", args)
 	if err != nil && opts.Peek && rejectsArgument(err, "mark_read") {
 		// The Python server's fetch_inbox has no mark_read parameter and
@@ -338,7 +340,7 @@ func (c *Client) MarkMessageRead(ctx context.Context, projectKey, agentName stri
 		"message_id":  messageID,
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "mark_message_read", args)
 	if err != nil {
 		return nil, err
@@ -360,7 +362,7 @@ func (c *Client) AcknowledgeMessage(ctx context.Context, projectKey, agentName s
 		"message_id":  messageID,
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "acknowledge_message", args)
 	if err != nil {
 		return nil, err
@@ -410,7 +412,7 @@ func (c *Client) RequestContact(ctx context.Context, opts RequestContactOptions)
 		args["ttl_seconds"] = opts.TTLSeconds
 	}
 
-	c.attachTokenFromField(args, "registration_token", "from_agent")
+	c.attachTokenFromField(ctx, args, "registration_token", "from_agent")
 	result, err := c.callTool(ctx, "request_contact", args)
 	if err != nil {
 		return nil, err
@@ -436,7 +438,7 @@ func (c *Client) RespondContact(ctx context.Context, opts RespondContactOptions)
 		args["ttl_seconds"] = opts.TTLSeconds
 	}
 
-	c.attachTokenFromField(args, "registration_token", "to_agent")
+	c.attachTokenFromField(ctx, args, "registration_token", "to_agent")
 	result, err := c.callTool(ctx, "respond_contact", args)
 	if err != nil {
 		return nil, err
@@ -462,7 +464,7 @@ func (c *Client) ListContacts(ctx context.Context, projectKey, agentName string)
 		"agent_name":  agentName,
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "list_contacts", args)
 	if err != nil {
 		return nil, err
@@ -494,8 +496,11 @@ func (c *Client) SearchMessages(ctx context.Context, opts SearchOptions) ([]Sear
 	if opts.Limit > 0 {
 		args["limit"] = opts.Limit
 	}
+	if opts.AgentName != "" {
+		args["agent_name"] = opts.AgentName
+	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callToolWithTimeout(ctx, "search_messages", args, LongTimeout)
 	if err != nil {
 		return nil, err
@@ -535,7 +540,11 @@ func (c *Client) SummarizeThread(ctx context.Context, opts SummarizeThreadOption
 	if opts.LLMModel != "" {
 		args["llm_model"] = opts.LLMModel
 	}
+	if opts.AgentName != "" {
+		args["agent_name"] = opts.AgentName
+	}
 
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callToolWithTimeout(ctx, "summarize_thread", args, LongTimeout)
 	if err != nil {
 		return nil, err
@@ -587,7 +596,7 @@ func (c *Client) ReservePaths(ctx context.Context, opts FileReservationOptions) 
 		args["reason"] = opts.Reason
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "file_reservation_paths", args)
 	if err != nil {
 		return nil, err
@@ -628,7 +637,7 @@ func (c *Client) ReleaseReservations(ctx context.Context, projectKey, agentName 
 		args["file_reservation_ids"] = ids
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "release_file_reservations", args)
 	if err != nil {
 		return nil, err
@@ -656,7 +665,7 @@ func (c *Client) RenewReservations(ctx context.Context, opts RenewReservationsOp
 		args["paths"] = opts.Paths
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "renew_file_reservations", args)
 	if err != nil {
 		return nil, err
@@ -694,7 +703,7 @@ func (c *Client) ListReservations(ctx context.Context, projectKey, agentName str
 			args["all_agents"] = true
 		}
 
-		c.attachRegistrationToken(args)
+		c.attachRegistrationToken(ctx, args)
 		toolResult, toolErr := c.callTool(ctx, "list_file_reservations", args)
 		if toolErr != nil {
 			fallbackResult, fallbackErr := c.callTool(ctx, "list_reservations", args)
@@ -800,7 +809,7 @@ func (c *Client) StartSession(ctx context.Context, projectKey, program, model, t
 		args["task_description"] = taskDescription
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "macro_start_session", args)
 	if err != nil {
 		return nil, err
@@ -852,7 +861,7 @@ func (c *Client) PrepareThread(ctx context.Context, opts PrepareThreadOptions) (
 		args["register_if_missing"] = *opts.RegisterIfMissing
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "macro_prepare_thread", args)
 	if err != nil {
 		return nil, err
@@ -906,8 +915,8 @@ func (c *Client) ContactHandshake(ctx context.Context, opts ContactHandshakeOpti
 	args["auto_accept"] = opts.AutoAccept
 	args["register_if_missing"] = true // Always try to register
 
-	c.attachTokenFromField(args, "requester_registration_token", "agent_name")
-	c.attachTokenFromField(args, "target_registration_token", "to_agent")
+	c.attachTokenFromField(ctx, args, "requester_registration_token", "agent_name")
+	c.attachTokenFromField(ctx, args, "target_registration_token", "to_agent")
 	result, err := c.callTool(ctx, "macro_contact_handshake", args)
 	if err != nil {
 		return nil, err
@@ -1174,16 +1183,17 @@ func (c *Client) UninstallPrecommitGuard(ctx context.Context, repoPath string) e
 // (neither has a get_message tool). The Rust server needs only the project.
 // The Python server also needs the reading agent and its registration token,
 // and returns the message only to its sender or a recipient, so agentName
-// names the reader and its cached token goes along when the client has one;
-// the Rust server ignores both. Reading the resource does not mark the
-// message read on either server.
+// names the reader and its token (from WithAgentToken, else cached) goes
+// along when there is one; the Rust server ignores both. Reading the resource
+// does not mark the message read on either server.
 func (c *Client) GetMessage(ctx context.Context, projectKey, agentName string, messageID int) (*Message, error) {
 	query := url.Values{}
 	query.Set("project", projectKey)
 	query.Set("format", "json")
+	var token string
 	if agentName != "" {
 		query.Set("agent", agentName)
-		if token := c.RegistrationToken(projectKey, agentName); token != "" {
+		if token = c.agentTokenFor(ctx, projectKey, agentName); token != "" {
 			query.Set("agent_token", token)
 		}
 	}
@@ -1191,7 +1201,8 @@ func (c *Client) GetMessage(ctx context.Context, projectKey, agentName string, m
 
 	result, err := c.ReadResource(ctx, uri)
 	if err != nil {
-		return nil, err
+		// The Python server's refusal can quote the URI, agent_token included.
+		return nil, redactToken(redactToken(err, token), url.QueryEscape(token))
 	}
 
 	var resource struct {
@@ -1222,7 +1233,7 @@ func (c *Client) SetContactPolicy(ctx context.Context, projectKey, agentName, po
 		"policy":      policy,
 	}
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "set_contact_policy", args)
 	if err != nil {
 		return nil, err
@@ -1453,7 +1464,7 @@ func (c *Client) ForceReleaseReservation(ctx context.Context, opts ForceReleaseO
 	}
 	args["notify_previous"] = opts.NotifyPrevious
 
-	c.attachRegistrationToken(args)
+	c.attachRegistrationToken(ctx, args)
 	result, err := c.callTool(ctx, "force_release_file_reservation", args)
 	if err != nil {
 		return nil, err

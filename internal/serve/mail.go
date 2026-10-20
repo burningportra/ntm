@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -465,6 +466,32 @@ func (s *Server) getMailClient() (*agentmail.Client, error) {
 	return client, nil
 }
 
+// AgentMailTokenHeader carries the Agent Mail registration token of the agent
+// a mail or reservation request acts as: the one its agent_name, sender_name,
+// from_agent (contact request), to_agent (contact response) or {name} (agent
+// lookup) names. The Python Agent Mail server refuses agent-scoped calls
+// without that agent's token; the Rust server ignores it. A header keeps the
+// token out of URLs, which access logs and browser history record.
+const AgentMailTokenHeader = "X-Agent-Mail-Token"
+
+// actAs returns ctx for the Agent Mail calls a request makes as agentName. A
+// token the caller sent in AgentMailTokenHeader rides only in the returned
+// context, so it authenticates this request's calls and is never stored in
+// the shared client, where another request could use it. Without one, the
+// calls fall back to the tokens ntm saved for the agents it spawned, reloaded
+// from the session registries first so agents spawned after serve started
+// count too.
+func (s *Server) actAs(ctx context.Context, r *http.Request, client *agentmail.Client, agentName string) context.Context {
+	if agentName == "" {
+		return ctx
+	}
+	if token := strings.TrimSpace(r.Header.Get(AgentMailTokenHeader)); token != "" {
+		return agentmail.WithAgentToken(ctx, agentName, token)
+	}
+	agentmail.HydrateClientTokensForProject(client, s.projectDirSnapshot())
+	return ctx
+}
+
 func (s *Server) publishMailEvent(agentName, eventType string, payload map[string]interface{}) {
 	if s.wsHub == nil {
 		return
@@ -640,6 +667,12 @@ func (s *Server) handleCreateMailAgent(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	// Registering a name that exists proves the identity with its token, and
+	// the reply hands that token back. Only a token the caller sent may do
+	// that: the registry fallback would give any mail:write caller the token
+	// of an agent ntm spawned. The token the reply carries is the caller's, so
+	// the shared client does not cache it either.
+	ctx = agentmail.WithAgentToken(ctx, req.Name, strings.TrimSpace(r.Header.Get(AgentMailTokenHeader)))
 
 	agent, err := client.RegisterAgent(ctx, agentmail.RegisterAgentOptions{
 		ProjectKey:      s.projectDirSnapshot(),
@@ -682,6 +715,7 @@ func (s *Server) handleGetMailAgent(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	ctx = s.actAs(ctx, r, client, agentName)
 
 	agent, err := client.Whois(ctx, s.projectDirSnapshot(), agentName, true)
 	if err != nil {
@@ -761,7 +795,7 @@ func (s *Server) handleMailInbox(w http.ResponseWriter, r *http.Request) {
 		opts.IncludeBodies = parsed
 	}
 
-	messages, err := client.FetchInbox(ctx, opts)
+	messages, err := client.FetchInbox(s.actAs(ctx, r, client, agentName), opts)
 	if err != nil {
 		writeAgentMailAgentActionError(w, reqID, err, "mail inbox retrieval is not supported by the configured Agent Mail server")
 		return
@@ -803,6 +837,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	ctx = s.actAs(ctx, r, client, req.SenderName)
 
 	result, err := client.SendMessage(ctx, agentmail.SendMessageOptions{
 		ProjectKey:  s.projectDirSnapshot(),
@@ -829,8 +864,8 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 // handleGetMessage handles GET /api/v1/mail/messages/{id}. The optional
 // agent_name query parameter names the reader: the Python Agent Mail server
-// returns a message only to its sender or a recipient, and the Rust server
-// ignores it. Reading a message does not mark it read.
+// authenticates it and returns a message only to its sender or a recipient,
+// and the Rust server ignores it. Reading a message does not mark it read.
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	idStr := chi.URLParam(r, "id")
@@ -857,7 +892,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	message, err := client.GetMessage(ctx, s.projectDirSnapshot(), agentName, messageID)
+	message, err := client.GetMessage(s.actAs(ctx, r, client, agentName), s.projectDirSnapshot(), agentName, messageID)
 	if err != nil {
 		writeAgentMailHandlerError(w, reqID, err, ErrCodeMessageNotFound, func(err error) bool {
 			return errors.Is(err, agentmail.ErrMessageNotFound) || agentmail.IsNotFound(err)
@@ -906,6 +941,7 @@ func (s *Server) handleReplyMessage(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	ctx = s.actAs(ctx, r, client, req.SenderName)
 
 	message, err := client.ReplyMessage(ctx, agentmail.ReplyMessageOptions{
 		ProjectKey:    s.projectDirSnapshot(),
@@ -962,7 +998,7 @@ func (s *Server) handleMarkMessageRead(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	readResult, err := client.MarkMessageRead(ctx, s.projectDirSnapshot(), agentName, messageID)
+	readResult, err := client.MarkMessageRead(s.actAs(ctx, r, client, agentName), s.projectDirSnapshot(), agentName, messageID)
 	if err != nil {
 		writeAgentMailMessageActionError(w, reqID, err, "marking messages as read is not supported by the configured Agent Mail server")
 		return
@@ -1022,7 +1058,7 @@ func (s *Server) handleAckMessage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	ackResult, err := client.AcknowledgeMessage(ctx, s.projectDirSnapshot(), agentName, messageID)
+	ackResult, err := client.AcknowledgeMessage(s.actAs(ctx, r, client, agentName), s.projectDirSnapshot(), agentName, messageID)
 	if err != nil {
 		writeAgentMailMessageActionError(w, reqID, err, "message acknowledgements are not supported by the configured Agent Mail server")
 		return
@@ -1089,10 +1125,14 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 
-	results, err := client.SearchMessages(ctx, agentmail.SearchOptions{
+	// The optional agent_name names the searcher, which the Python server
+	// requires and authenticates; the Rust server ignores it.
+	agentName := r.URL.Query().Get("agent_name")
+	results, err := client.SearchMessages(s.actAs(ctx, r, client, agentName), agentmail.SearchOptions{
 		ProjectKey: s.projectDirSnapshot(),
 		Query:      query,
 		Limit:      limit,
+		AgentName:  agentName,
 	})
 	if err != nil {
 		writeAgentMailError(w, reqID, err, "message search is not supported by the configured Agent Mail server")
@@ -1151,11 +1191,15 @@ func (s *Server) handleThreadSummary(w http.ResponseWriter, r *http.Request) {
 		llmMode = &parsed
 	}
 
-	result, err := client.SummarizeThread(ctx, agentmail.SummarizeThreadOptions{
+	// The optional agent_name names the agent asking, which the Python server
+	// requires and authenticates; the Rust server ignores it.
+	agentName := r.URL.Query().Get("agent_name")
+	result, err := client.SummarizeThread(s.actAs(ctx, r, client, agentName), agentmail.SummarizeThreadOptions{
 		ProjectKey:      s.projectDirSnapshot(),
 		ThreadID:        threadID,
 		IncludeExamples: includeExamples,
 		LLMMode:         llmMode,
+		AgentName:       agentName,
 	})
 	if err != nil {
 		writeAgentMailHandlerError(w, reqID, err, ErrCodeThreadNotFound, agentmail.IsNotFound, "thread summaries are not supported by the configured Agent Mail server", "")
@@ -1204,7 +1248,7 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	contacts, err := client.ListContacts(ctx, s.projectDirSnapshot(), agentName)
+	contacts, err := client.ListContacts(s.actAs(ctx, r, client, agentName), s.projectDirSnapshot(), agentName)
 	if err != nil {
 		writeAgentMailAgentActionError(w, reqID, err, "listing contacts is not supported by the configured Agent Mail server")
 		return
@@ -1245,7 +1289,7 @@ func (s *Server) handleRequestContact(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	result, err := client.RequestContact(ctx, agentmail.RequestContactOptions{
+	result, err := client.RequestContact(s.actAs(ctx, r, client, req.FromAgent), agentmail.RequestContactOptions{
 		ProjectKey: s.projectDirSnapshot(),
 		FromAgent:  req.FromAgent,
 		ToAgent:    req.ToAgent,
@@ -1299,7 +1343,7 @@ func (s *Server) handleRespondContact(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	result, err := client.RespondContact(ctx, agentmail.RespondContactOptions{
+	result, err := client.RespondContact(s.actAs(ctx, r, client, req.ToAgent), agentmail.RespondContactOptions{
 		ProjectKey: s.projectDirSnapshot(),
 		ToAgent:    req.ToAgent,
 		FromAgent:  req.FromAgent,
@@ -1360,7 +1404,7 @@ func (s *Server) handleSetContactPolicy(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	result, err := client.SetContactPolicy(ctx, s.projectDirSnapshot(), req.AgentName, req.Policy)
+	result, err := client.SetContactPolicy(s.actAs(ctx, r, client, req.AgentName), s.projectDirSnapshot(), req.AgentName, req.Policy)
 	if err != nil {
 		writeAgentMailAgentActionError(w, reqID, err, "setting contact policy is not supported by the configured Agent Mail server")
 		return
@@ -1452,7 +1496,7 @@ func (s *Server) handleReservePaths(w http.ResponseWriter, r *http.Request) {
 		ttl = 3600 // Default 1 hour
 	}
 
-	result, err := client.ReservePaths(ctx, agentmail.FileReservationOptions{
+	result, err := client.ReservePaths(s.actAs(ctx, r, client, req.AgentName), agentmail.FileReservationOptions{
 		ProjectKey: s.projectDirSnapshot(),
 		AgentName:  req.AgentName,
 		Paths:      req.Paths,
@@ -1531,7 +1575,7 @@ func (s *Server) handleReleaseReservations(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	releaseResult, err := client.ReleaseReservations(ctx, s.projectDirSnapshot(), req.AgentName, req.Paths, req.IDs)
+	releaseResult, err := client.ReleaseReservations(s.actAs(ctx, r, client, req.AgentName), s.projectDirSnapshot(), req.AgentName, req.Paths, req.IDs)
 	if err != nil {
 		writeAgentMailError(w, reqID, err, "releasing reservations is not supported by the configured Agent Mail server")
 		return
@@ -1677,7 +1721,7 @@ func (s *Server) handleReleaseReservationByID(w http.ResponseWriter, r *http.Req
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	releaseResult, err := client.ReleaseReservations(ctx, s.projectDirSnapshot(), agentName, nil, []int{reservationID})
+	releaseResult, err := client.ReleaseReservations(s.actAs(ctx, r, client, agentName), s.projectDirSnapshot(), agentName, nil, []int{reservationID})
 	if err != nil {
 		writeAgentMailError(w, reqID, err, "releasing reservations is not supported by the configured Agent Mail server")
 		return
@@ -1749,7 +1793,7 @@ func (s *Server) handleRenewReservation(w http.ResponseWriter, r *http.Request) 
 		extendSeconds = 1800 // Default 30 minutes
 	}
 
-	result, err := client.RenewReservationsWithOptions(ctx, agentmail.RenewReservationsOptions{
+	result, err := client.RenewReservationsWithOptions(s.actAs(ctx, r, client, req.AgentName), agentmail.RenewReservationsOptions{
 		ProjectKey:     s.projectDirSnapshot(),
 		AgentName:      req.AgentName,
 		ExtendSeconds:  extendSeconds,
@@ -1817,7 +1861,7 @@ func (s *Server) handleForceReleaseReservation(w http.ResponseWriter, r *http.Re
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	result, err := client.ForceReleaseReservation(ctx, agentmail.ForceReleaseOptions{
+	result, err := client.ForceReleaseReservation(s.actAs(ctx, r, client, req.AgentName), agentmail.ForceReleaseOptions{
 		ProjectKey:     s.projectDirSnapshot(),
 		AgentName:      req.AgentName,
 		ReservationID:  reservationID,

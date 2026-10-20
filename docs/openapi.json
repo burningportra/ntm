@@ -4476,7 +4476,16 @@
             "name": "agent_name",
             "in": "query",
             "required": false,
-            "description": "The reading agent. The Python Agent Mail server returns a message only to its sender or a recipient and authenticates that agent with its registration token, which serve sends only when its mail client has one cached; the Rust server ignores both.",
+            "description": "The reading agent, whose token goes in X-Agent-Mail-Token. The Python Agent Mail server authenticates it and returns a message only to its sender or a recipient; the Rust server ignores both.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Agent-Mail-Token",
+            "in": "header",
+            "required": false,
+            "description": "Registration token of the agent the request acts as. serve sends it to Agent Mail for this request only and never stores it. Without it serve sends the token ntm saved for that agent when it spawned it, if there is one. The Python Agent Mail server refuses an agent-scoped call without the agent's token; the Rust server ignores it.",
             "schema": {
               "type": "string"
             }
@@ -4544,7 +4553,7 @@
             }
           },
           "401": {
-            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or the reader: the Python server refuses a request without agent_name, or an agent_name serve holds no registration token for.",
+            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or the reader: the Python server refuses a request without agent_name, with a wrong X-Agent-Mail-Token, or without one for an agent ntm saved no token for.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4786,6 +4795,15 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "name": "X-Agent-Mail-Token",
+            "in": "header",
+            "required": false,
+            "description": "Registration token of the agent the request acts as. serve sends it to Agent Mail for this request only and never stores it. Without it serve sends the token ntm saved for that agent when it spawned it, if there is one. The Python Agent Mail server refuses an agent-scoped call without the agent's token; the Rust server ignores it.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4836,7 +4854,7 @@
             }
           },
           "401": {
-            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or agent_name: the Python server refuses an agent_name serve holds no registration token for.",
+            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or agent_name: the Python server refuses a wrong X-Agent-Mail-Token, or a request without one for an agent ntm saved no token for.",
             "content": {
               "application/json": {
                 "schema": {

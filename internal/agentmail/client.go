@@ -129,12 +129,88 @@ func (c *Client) RegistrationToken(projectKey, agentName string) string {
 	return c.registrationTokens[tokenKey(projectKey, agentName)]
 }
 
+// agentTokenKey is the context key WithAgentToken stores a caller's token
+// under.
+type agentTokenKey struct{}
+
+// agentToken is a token a caller supplied for the agent its calls act as.
+type agentToken struct {
+	agentName string
+	token     string
+}
+
+// WithAgentToken returns a copy of ctx for calls a caller makes with the token
+// it holds for agentName. Calls acting as agentName send token as that agent's
+// token (registration_token, sender_token, or agent_token on
+// resource://message) in place of any token the client has cached for it; an
+// empty token sends none, so the cached one is not used either. Calls acting
+// as any other agent still send cached tokens. No call made with the returned
+// context caches a token Agent Mail hands back (register_agent's), since that
+// token is the caller's too.
+//
+// The token lives only in the returned context and is never stored in the
+// client, so a client shared by many callers for its whole life (ntm serve
+// keeps one) cannot send one caller's token on another caller's call.
+// PeekInboxes, whose reads its callers share, ignores it.
+func WithAgentToken(ctx context.Context, agentName, token string) context.Context {
+	return context.WithValue(ctx, agentTokenKey{}, agentToken{agentName: agentName, token: token})
+}
+
+// agentTokenFor returns the token to send for agentName on a call made with
+// ctx: the one WithAgentToken supplied for that agent, else the one cached for
+// (projectKey, agentName), else "".
+func (c *Client) agentTokenFor(ctx context.Context, projectKey, agentName string) string {
+	if supplied, ok := ctx.Value(agentTokenKey{}).(agentToken); ok && supplied.agentName == agentName {
+		return supplied.token
+	}
+	return c.RegistrationToken(projectKey, agentName)
+}
+
+// tokenArgs are the tool arguments that carry an agent's token.
+var tokenArgs = []string{"registration_token", "sender_token", "requester_registration_token", "target_registration_token"}
+
+// redactedError is an error whose text has a token the call sent replaced,
+// for refusals that echo the request: the Python server's pydantic reports
+// quote a rejected argument's value, and its resource errors quote the URI,
+// agent_token included. errors.Is and errors.As still see the wrapped error.
+type redactedError struct {
+	err   error
+	token string
+}
+
+func (e *redactedError) Error() string {
+	return strings.ReplaceAll(e.err.Error(), e.token, "[redacted]")
+}
+
+func (e *redactedError) Unwrap() error { return e.err }
+
+// redactToken returns err with token removed from its text.
+func redactToken(err error, token string) error {
+	if err == nil || token == "" || !strings.Contains(err.Error(), token) {
+		return err
+	}
+	return &redactedError{err: err, token: token}
+}
+
+// redactTokenArgs returns err with every token in args removed from its text.
+func redactTokenArgs(err error, args map[string]interface{}) error {
+	for _, name := range tokenArgs {
+		if token, _ := args[name].(string); token != "" {
+			err = redactToken(err, token)
+		}
+	}
+	return err
+}
+
 // rememberRegistrationToken caches the token returned by an identity
 // creation / registration call so subsequent identity-scoped MCP calls
 // for the same agent can succeed without the caller threading the
-// token through.
-func (c *Client) rememberRegistrationToken(projectKey string, agent *Agent) {
+// token through. A call made with WithAgentToken caches nothing.
+func (c *Client) rememberRegistrationToken(ctx context.Context, projectKey string, agent *Agent) {
 	if c == nil || agent == nil || agent.RegistrationToken == "" || agent.Name == "" {
+		return
+	}
+	if _, supplied := ctx.Value(agentTokenKey{}).(agentToken); supplied {
 		return
 	}
 	c.SetRegistrationToken(projectKey, agent.Name, agent.RegistrationToken)
@@ -550,13 +626,13 @@ func (c *Client) callTool(ctx context.Context, toolName string, args map[string]
 		Arguments: args,
 	})
 	if err != nil {
-		return nil, err
+		return nil, redactTokenArgs(err, args)
 	}
 
 	// Extract actual content from MCP envelope
 	content, err := extractMCPContent(result)
 	if err != nil {
-		return nil, NewAPIError(toolName, 0, err)
+		return nil, redactTokenArgs(NewAPIError(toolName, 0, err), args)
 	}
 
 	return content, nil
@@ -807,7 +883,9 @@ func (c *Client) readInboxPeek(ctx context.Context, read *inboxPeekRead, opts Fe
 		return
 	}
 	defer func() { <-c.inboxPeekSlots }()
-	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultTimeout)
+	// The read answers every caller waiting on it, so it sends only the
+	// client's cached tokens, never one a caller supplied.
+	fetchCtx, cancel := context.WithTimeout(context.WithValue(context.WithoutCancel(ctx), agentTokenKey{}, nil), DefaultTimeout)
 	defer cancel()
 	read.started = true
 	read.peek.Messages, read.peek.Err = c.FetchInbox(fetchCtx, opts)
