@@ -88,7 +88,7 @@ type diagnoseDependencies struct {
 	sessionExists func(context.Context, string) (bool, error)
 	listPanes     func(context.Context, string) ([]tmux.Pane, error)
 	restartPane   diagnoseRestartPaneFunc
-	sendKeys      func(context.Context, string, string, bool) error
+	sendKeyName   func(context.Context, string, string) error
 }
 
 func defaultDiagnoseDependencies() diagnoseDependencies {
@@ -96,7 +96,7 @@ func defaultDiagnoseDependencies() diagnoseDependencies {
 		sessionExists: tmux.SessionExistsContext,
 		listPanes:     tmux.GetPanesContext,
 		restartPane:   GetRestartPaneContext,
-		sendKeys:      tmux.SendKeysContext,
+		sendKeyName:   tmux.SendKeyNameContext,
 	}
 }
 
@@ -111,8 +111,8 @@ func (deps diagnoseDependencies) withDefaults() diagnoseDependencies {
 	if deps.restartPane == nil {
 		deps.restartPane = defaults.restartPane
 	}
-	if deps.sendKeys == nil {
-		deps.sendKeys = defaults.sendKeys
+	if deps.sendKeyName == nil {
+		deps.sendKeyName = defaults.sendKeyName
 	}
 	return deps
 }
@@ -494,9 +494,9 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 	// hold a pane 1, and an index-keyed map silently kept only the last one — so
 	// --fix respawned a pane in the wrong window.
 	fixMultiWindow := tmux.PanesSpanMultipleWindows(fixPanes)
-	paneIDByTarget := map[string]string{}
+	paneByTarget := map[string]tmux.Pane{}
 	for _, p := range fixPanes {
-		paneIDByTarget[paneTargetKey(p, fixMultiWindow)] = p.ID
+		paneByTarget[paneTargetKey(p, fixMultiWindow)] = p
 	}
 	if err := validateDiagnoseFixTargets(diag, fixPanes); err != nil {
 		fixReport.RobotResponse = NewErrorResponse(err, ErrCodeNotImplemented, agent.GrokPhaseOneCapabilityHint)
@@ -521,7 +521,7 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 			Action: rec.Action,
 		}
 
-		paneTarget, paneFound := paneIDByTarget[diagnoseRecommendationKey(rec)]
+		pane, paneFound := paneByTarget[diagnoseRecommendationKey(rec)]
 		if !paneFound {
 			attempt.Success = false
 			attempt.Message = fmt.Sprintf("Pane %s not found in session %q", diagnoseRecommendationLabel(rec), opts.Session)
@@ -533,7 +533,7 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 		switch rec.Action {
 		case "restart":
 			var restartErr error
-			attempt.Success, attempt.Message, restartErr = executeDiagnoseRestart(ctx, opts.Session, paneTarget, deps.restartPane)
+			attempt.Success, attempt.Message, restartErr = executeDiagnoseRestart(ctx, opts.Session, pane.ID, deps.restartPane)
 			if attempt.Success {
 				fixedCount++
 			} else {
@@ -544,15 +544,17 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 			}
 
 		case "interrupt":
-			// Send Ctrl+C to interrupt via the pane ID.
-			interruptErr := deps.sendKeys(ctx, paneTarget, "C-c", false)
+			// Press the interrupt key (Escape for Muse Code, Ctrl+C otherwise)
+			// via the pane ID, as a key name rather than literal text.
+			key := interruptKeyForAgent(interruptPaneTMUXAgentType(pane))
+			interruptErr := deps.sendKeyName(ctx, pane.ID, key.tmuxKey)
 			if interruptErr != nil {
 				attempt.Success = false
 				attempt.Message = fmt.Sprintf("Failed to interrupt: %v", interruptErr)
 				failedCount++
 			} else {
 				attempt.Success = true
-				attempt.Message = "Interrupt sent (Ctrl+C)"
+				attempt.Message = fmt.Sprintf("Interrupt sent (%s)", key.label)
 				fixedCount++
 			}
 			if cancelErr := diagnoseCancellationError(ctx, interruptErr); cancelErr != nil {

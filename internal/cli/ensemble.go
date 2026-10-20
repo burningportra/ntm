@@ -395,17 +395,9 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 	stoppedCount := 0
 	var stopErrors []error
 
-	// Graceful shutdown: send Ctrl+C to each pane
+	// Graceful shutdown: interrupt each pane
 	if !opts.Force && len(panes) > 0 {
-		for _, pane := range panes {
-			// Send Ctrl+C (interrupt signal)
-			if err := tmux.SendKeys(pane.ID, "C-c", false); err != nil {
-				slog.Default().Warn("failed to send interrupt to pane",
-					"pane", pane.ID,
-					"error", err,
-				)
-			}
-		}
+		interruptEnsemblePanes(panes, tmux.SendKeyName)
 
 		// Wait for graceful shutdown
 		time.Sleep(5 * time.Second)
@@ -460,6 +452,21 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 		return renderEnsembleStopFailureOutput(w, result, format, opts.Quiet, errors.Join(stopErrors...))
 	}
 	return renderEnsembleStopOutput(w, result, format, opts.Quiet)
+}
+
+// interruptEnsemblePanes presses each pane's interrupt key (Escape for Muse
+// Code, Ctrl+C otherwise) through sendKeyName, which must send tmux key names:
+// tmux.SendKeys sends literal text and would type the characters "C-c". A
+// failed send is logged and the rest of the panes still get interrupted.
+func interruptEnsemblePanes(panes []tmux.Pane, sendKeyName func(target, keyName string) error) {
+	for _, pane := range panes {
+		if err := sendKeyName(pane.ID, interruptKeyForPane(pane)); err != nil {
+			slog.Default().Warn("failed to send interrupt to pane",
+				"pane", pane.ID,
+				"error", err,
+			)
+		}
+	}
 }
 
 func renderEnsembleStopOutput(w io.Writer, payload ensembleStopOutput, format string, quiet bool) error {

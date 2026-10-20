@@ -3,10 +3,12 @@ package robot
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // TestEnvelope_EnsembleModes verifies envelope compliance for --robot-ensemble-modes.
@@ -275,6 +277,64 @@ func TestGetEnsembleStopCaptureFailureLeavesSessionRunning(t *testing.T) {
 	}
 	if saved.Status != ensemble.EnsembleActive {
 		t.Fatalf("saved status = %q, want active", saved.Status)
+	}
+}
+
+// TestGetEnsembleStopPressesInterruptKeys checks that a graceful stop presses
+// each pane's interrupt key before killing the session. It used to call
+// tmux.SendKeys, which sends literal text, so every pane got the characters
+// "C-c" typed into it instead of Ctrl+C. Muse Code panes get Escape, including
+// one known only by its pane title.
+func TestGetEnsembleStopPressesInterruptKeys(t *testing.T) {
+	t.Setenv("NTM_CONFIG", "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ensemble.CloseDefaultStateStore()
+	t.Cleanup(ensemble.CloseDefaultStateStore)
+
+	state := &ensemble.EnsembleSession{
+		SessionName:       "interrupt-keys-ensemble-stop",
+		Question:          "Stop gracefully",
+		Status:            ensemble.EnsembleActive,
+		SynthesisStrategy: ensemble.StrategyConsensus,
+		CreatedAt:         time.Now().UTC(),
+	}
+	if err := ensemble.SaveSession("", state); err != nil {
+		t.Fatalf("SaveSession error: %v", err)
+	}
+
+	var events []string
+	deps := defaultEnsembleStopDependencies()
+	deps.SessionExists = func(string) bool { return true }
+	deps.CaptureAll = func(*ensemble.EnsembleSession) ([]ensemble.CapturedOutput, error) { return nil, nil }
+	deps.GetPanes = func(string) ([]tmux.Pane, error) {
+		return []tmux.Pane{
+			{ID: "%0", Index: 0, Type: tmux.AgentUser},
+			{ID: "%1", Index: 1, Type: tmux.AgentClaude},
+			{ID: "%2", Index: 2, Type: tmux.AgentMuse},
+			{ID: "%3", Index: 3, Title: state.SessionName + "__muse_3"},
+		}, nil
+	}
+	deps.SendKeyName = func(target, keyName string) error {
+		events = append(events, target+"="+keyName)
+		return nil
+	}
+	deps.Sleep = func(time.Duration) { events = append(events, "sleep") }
+	deps.KillSession = func(string) error {
+		events = append(events, "kill")
+		return nil
+	}
+
+	output, err := getEnsembleStop(state.SessionName, EnsembleStopOptions{}, deps)
+	if err != nil {
+		t.Fatalf("getEnsembleStop error: %v", err)
+	}
+	if !output.Success {
+		t.Fatalf("expected success, got error=%q code=%q", output.Error, output.ErrorCode)
+	}
+	want := "%0=C-c %1=C-c %2=Escape %3=Escape sleep kill"
+	if got := strings.Join(events, " "); got != want {
+		t.Fatalf("stop sequence = %q, want %q", got, want)
 	}
 }
 

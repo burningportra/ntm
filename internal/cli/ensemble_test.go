@@ -3,11 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func TestBuildEnsembleAssignmentsCounts(t *testing.T) {
@@ -478,5 +480,32 @@ func TestParseSelectionIndices(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestInterruptEnsemblePanesPressesInterruptKeys checks that ensemble stop
+// presses each pane's interrupt key through the key-name API. It used to call
+// tmux.SendKeys, which sends literal text, so every pane got the characters
+// "C-c" typed into it and nothing was interrupted before the session was
+// killed. Muse Code panes get Escape. A failed send must not stop the rest.
+func TestInterruptEnsemblePanesPressesInterruptKeys(t *testing.T) {
+	panes := []tmux.Pane{
+		{ID: "%0", Index: 0, Type: tmux.AgentUser},
+		{ID: "%1", Index: 1, Type: tmux.AgentClaude},
+		{ID: "%2", Index: 2, Type: tmux.AgentMuse},
+		{ID: "%3", Index: 3, Type: tmux.AgentCodex},
+	}
+	var sent []string
+	interruptEnsemblePanes(panes, func(target, keyName string) error {
+		sent = append(sent, target+"="+keyName)
+		if target == "%1" {
+			return errors.New("pane is gone")
+		}
+		return nil
+	})
+
+	want := []string{"%0=C-c", "%1=C-c", "%2=Escape", "%3=C-c"}
+	if strings.Join(sent, " ") != strings.Join(want, " ") {
+		t.Fatalf("sent %v, want %v", sent, want)
 	}
 }

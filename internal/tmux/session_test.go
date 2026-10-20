@@ -1126,6 +1126,29 @@ func TestSendInterrupt(t *testing.T) {
 	}
 }
 
+func TestInterruptKey(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		agent AgentType
+		want  string
+	}{
+		{AgentMuse, "Escape"},
+		{AgentType("muse-code"), "Escape"},
+		{AgentType(" MUSE "), "Escape"},
+		{AgentClaude, "C-c"},
+		{AgentCodex, "C-c"},
+		{AgentUser, "C-c"},
+		{AgentType(""), "C-c"},
+		{AgentType("unknown-tui"), "C-c"},
+	}
+	for _, tc := range cases {
+		if got := InterruptKey(tc.agent); got != tc.want {
+			t.Errorf("InterruptKey(%q) = %q, want %q", tc.agent, got, tc.want)
+		}
+	}
+}
+
 func TestSendKeysMultiByteChunking(t *testing.T) {
 	skipIfNoTmux(t)
 

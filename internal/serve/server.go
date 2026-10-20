@@ -91,6 +91,7 @@ type Server struct {
 	waitAgents      func(context.Context, robot.WaitOptions) (*robot.WaitResponse, int)
 	resolvePane     func(context.Context, string, int) (tmux.Pane, error)
 	sendPaneKeys    func(string, string, bool) error
+	sendPaneKeyName func(string, string) error
 	// policyWriteFile is optional test-only fault injection for policy updates.
 	// Production servers leave it nil and use os.WriteFile directly.
 	policyWriteFile func(string, []byte, os.FileMode) error
@@ -3490,20 +3491,25 @@ func (s *Server) handlePaneInterruptV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
+	pane, ok := s.resolvePaneForRequest(w, r, sessionID, paneIdx, reqID)
 	if !ok {
 		return
 	}
 
-	// Send Ctrl+c to interrupt
-	if err := tmux.SendKeys(paneTarget, "C-c", false); err != nil {
+	// Press the interrupt key (Ctrl+C, or Escape for Muse Code) as a key
+	// name. tmux.SendKeys sends literal text, so it would type "C-c".
+	sendKeyName := tmux.SendKeyName
+	if s.sendPaneKeyName != nil {
+		sendKeyName = s.sendPaneKeyName
+	}
+	if err := sendKeyName(pane.ID, tmux.InterruptKey(pane.Type)); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
 		return
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"interrupted": true,
-		"pane":        paneTarget,
+		"pane":        pane.ID,
 	}, reqID)
 }
 

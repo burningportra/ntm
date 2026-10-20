@@ -2605,6 +2605,18 @@ func SendInterrupt(target string) error {
 	return DefaultClient.SendInterrupt(target)
 }
 
+// InterruptKey returns the tmux key name, for SendKeyName, that stops a
+// running turn in a pane of agentType. Muse Code gets Escape: its Ctrl+C only
+// clears the composer draft while the turn keeps running, and on an idle
+// composer it arms quit, so a second Ctrl+C exits Muse. Every other pane,
+// shells and unknown types included, gets Ctrl+C.
+func InterruptKey(agentType AgentType) string {
+	if agentType.Canonical() == AgentMuse {
+		return "Escape"
+	}
+	return "C-c"
+}
+
 // SendEOF sends Ctrl+D (EOF) to a pane
 func (c *Client) SendEOF(target string) error {
 	return c.RunSilent("send-keys", "-t", target, "C-d")

@@ -990,6 +990,84 @@ func TestHandlePaneInputV1_GrokReturnsNotImplementedBeforeSendKeys(t *testing.T)
 	}
 }
 
+// TestHandlePaneInterruptV1PressesInterruptKey checks that the pane interrupt
+// presses a key instead of typing text. It used to call tmux.SendKeys, which
+// sends literal text, so the pane got the three characters "C-c" while its
+// process kept running. Muse Code panes get Escape, since their Ctrl+C only
+// clears the draft and on an idle composer arms quit.
+func TestHandlePaneInterruptV1PressesInterruptKey(t *testing.T) {
+	cases := []struct {
+		paneType tmux.AgentType
+		wantKey  string
+	}{
+		{tmux.AgentClaude, "C-c"},
+		{tmux.AgentUser, "C-c"},
+		{tmux.AgentMuse, "Escape"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.paneType), func(t *testing.T) {
+			srv, _ := setupTestServer(t)
+			srv.resolvePane = func(_ context.Context, session string, paneIdx int) (tmux.Pane, error) {
+				if session != "proj" || paneIdx != 1 {
+					t.Fatalf("resolve pane called with session=%q pane=%d", session, paneIdx)
+				}
+				return tmux.Pane{ID: "%9", Index: paneIdx, Type: tc.paneType}, nil
+			}
+			srv.sendPaneKeys = func(target, text string, _ bool) error {
+				t.Fatalf("interrupt typed literal text %q into %s", text, target)
+				return nil
+			}
+			var gotTarget, gotKey string
+			srv.sendPaneKeyName = func(target, keyName string) error {
+				gotTarget, gotKey = target, keyName
+				return nil
+			}
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/proj/panes/1/interrupt", nil)
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("sessionId", "proj")
+			rctx.URLParams.Add("paneIdx", "1")
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+			srv.handlePaneInterruptV1(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+			}
+			if gotTarget != "%9" || gotKey != tc.wantKey {
+				t.Fatalf("sent key %q to %q, want %q to %%9", gotKey, gotTarget, tc.wantKey)
+			}
+		})
+	}
+}
+
+func TestHandlePaneInterruptV1ReportsSendFailure(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.resolvePane = func(_ context.Context, _ string, paneIdx int) (tmux.Pane, error) {
+		return tmux.Pane{ID: "%9", Index: paneIdx, Type: tmux.AgentClaude}, nil
+	}
+	srv.sendPaneKeyName = func(string, string) error {
+		return errors.New("tmux send-keys failed")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/proj/panes/1/interrupt", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("sessionId", "proj")
+	rctx.URLParams.Add("paneIdx", "1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	srv.handlePaneInterruptV1(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "tmux send-keys failed") {
+		t.Fatalf("body = %s, want the send error", rec.Body.String())
+	}
+}
+
 func TestHandleAgentSendV1PropagatesRobotNotImplemented(t *testing.T) {
 	srv, _ := setupTestServer(t)
 	calls := 0

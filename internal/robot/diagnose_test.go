@@ -425,7 +425,7 @@ func TestExecuteDiagnoseFixStopsOnWrappedRestartCancellation(t *testing.T) {
 			}
 			return nil, fmt.Errorf("restart callback: %w", context.Canceled)
 		},
-		sendKeys: func(context.Context, string, string, bool) error {
+		sendKeyName: func(context.Context, string, string) error {
 			interruptCalls++
 			return nil
 		},
@@ -455,10 +455,10 @@ func TestExecuteDiagnoseFixStopsOnInterruptCancellation(t *testing.T) {
 			restartCalls++
 			return &RestartPaneOutput{RobotResponse: NewRobotResponse(true)}, nil
 		},
-		sendKeys: func(gotCtx context.Context, target, keys string, enter bool) error {
+		sendKeyName: func(gotCtx context.Context, target, keyName string) error {
 			interruptCalls++
-			if gotCtx != ctx || target != "%1" || keys != "C-c" || enter {
-				t.Fatalf("interrupt callback context/args = %p %q %q %v", gotCtx, target, keys, enter)
+			if gotCtx != ctx || target != "%1" || keyName != "C-c" {
+				t.Fatalf("interrupt callback context/args = %p %q %q", gotCtx, target, keyName)
 			}
 			return fmt.Errorf("interrupt transport: %w", context.DeadlineExceeded)
 		},
@@ -467,6 +467,41 @@ func TestExecuteDiagnoseFixStopsOnInterruptCancellation(t *testing.T) {
 		interruptCalls != 1 || restartCalls != 0 || len(output.FixAttempts) != 1 ||
 		output.FixAttempts[0].Action != "interrupt" || output.FixAttempts[0].Success {
 		t.Fatalf("interrupt cancellation output=%+v err=%v interrupt_calls=%d restart_calls=%d", output, returnedErr, interruptCalls, restartCalls)
+	}
+}
+
+// TestExecuteDiagnoseFixInterruptPressesKeyPerAgent checks that the interrupt
+// fix presses a key rather than typing text. It used to send "C-c" through
+// tmux.SendKeysContext, which sends literal text, so the pane got the three
+// characters typed into it. Muse Code panes get Escape, since their Ctrl+C
+// only clears the draft and on an idle composer arms quit.
+func TestExecuteDiagnoseFixInterruptPressesKeyPerAgent(t *testing.T) {
+	var sent []string
+	output, returnedErr := captureDiagnoseFixOutput(t, t.Context(), DiagnoseOutput{Recommendations: []DiagnoseRecommendation{
+		{Pane: 1, Action: "interrupt", AutoFixable: true},
+		{Pane: 2, Action: "interrupt", AutoFixable: true},
+	}}, diagnoseDependencies{
+		listPanes: func(context.Context, string) ([]tmux.Pane, error) {
+			return []tmux.Pane{
+				{ID: "%1", Index: 1, Type: tmux.AgentClaude},
+				{ID: "%2", Index: 2, Type: tmux.AgentMuse},
+			}, nil
+		},
+		sendKeyName: func(_ context.Context, target, keyName string) error {
+			sent = append(sent, target+"="+keyName)
+			return nil
+		},
+	})
+	if returnedErr != nil || !output.Success {
+		t.Fatalf("interrupt fix output=%+v err=%v", output, returnedErr)
+	}
+	if got, want := strings.Join(sent, " "), "%1=C-c %2=Escape"; got != want {
+		t.Fatalf("sent %q, want %q", got, want)
+	}
+	if len(output.FixAttempts) != 2 ||
+		output.FixAttempts[0].Message != "Interrupt sent (Ctrl+C)" ||
+		output.FixAttempts[1].Message != "Interrupt sent (Escape)" {
+		t.Fatalf("fix attempts = %+v, want Ctrl+C then Escape", output.FixAttempts)
 	}
 }
 
@@ -540,7 +575,7 @@ func TestExecuteDiagnoseFixClassifiesDiscoveryCancellation(t *testing.T) {
 			restartCalls++
 			return nil, nil
 		},
-		sendKeys: func(context.Context, string, string, bool) error {
+		sendKeyName: func(context.Context, string, string) error {
 			interruptCalls++
 			return nil
 		},

@@ -41,7 +41,7 @@ type ensembleStopDependencies struct {
 	SessionExists func(string) bool
 	CaptureAll    func(*ensemble.EnsembleSession) ([]ensemble.CapturedOutput, error)
 	GetPanes      func(string) ([]tmux.Pane, error)
-	SendKeys      func(string, string, bool) error
+	SendKeyName   func(string, string) error
 	KillSession   func(string) error
 	Sleep         func(time.Duration)
 }
@@ -53,7 +53,7 @@ func defaultEnsembleStopDependencies() ensembleStopDependencies {
 			return ensemble.NewOutputCapture(tmux.DefaultClient).CaptureAll(state)
 		},
 		GetPanes:    tmux.GetPanes,
-		SendKeys:    tmux.SendKeys,
+		SendKeyName: tmux.SendKeyName,
 		KillSession: tmux.KillSession,
 		Sleep:       time.Sleep,
 	}
@@ -191,10 +191,11 @@ func getEnsembleStop(session string, opts EnsembleStopOptions, deps ensembleStop
 	panes, _ := deps.GetPanes(session)
 	stoppedCount := len(panes)
 
-	// Graceful shutdown: send Ctrl+C to each pane
+	// Graceful shutdown: press each pane's interrupt key (Escape for Muse
+	// Code, Ctrl+C otherwise) as a tmux key name, not literal text.
 	if !opts.Force && len(panes) > 0 {
 		for _, pane := range panes {
-			_ = deps.SendKeys(pane.ID, "C-c", false)
+			_ = deps.SendKeyName(pane.ID, interruptKeyForAgent(interruptPaneTMUXAgentType(pane)).tmuxKey)
 		}
 		deps.Sleep(5 * time.Second)
 	}
