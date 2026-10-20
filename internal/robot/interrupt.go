@@ -681,30 +681,6 @@ func clearRestoredMuseDrafts(
 	return kept, failed
 }
 
-type interruptMessageTarget struct {
-	Pane      string
-	Target    string
-	AgentType tmux.AgentType
-}
-
-func sendInterruptMessages(
-	targets []interruptMessageTarget,
-	message string,
-	send func(target, keys string, enter bool, enterDelay time.Duration, agentType tmux.AgentType) error,
-) []InterruptError {
-	var errors []InterruptError
-	for _, target := range targets {
-		enterDelay := tmux.EnterDelayForAgent(target.AgentType)
-		if err := send(target.Target, message, true, enterDelay, target.AgentType); err != nil {
-			errors = append(errors, InterruptError{
-				Pane:   target.Pane,
-				Reason: fmt.Sprintf("failed to send message: %v", err),
-			})
-		}
-	}
-	return errors
-}
-
 // getLastMeaningfulOutput extracts the last meaningful output lines up to maxLen chars
 func getLastMeaningfulOutput(lines []string, maxLen int, agentType string) string {
 	// Guard against invalid maxLen values that would cause slice panic

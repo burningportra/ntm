@@ -444,24 +444,3 @@ func TestClearMuseDraftFallsBackToCtrlC(t *testing.T) {
 		})
 	}
 }
-
-func TestSendInterruptMessagesUsesMuseEnterDelay(t *testing.T) {
-	var delays []time.Duration
-	errs := sendInterruptMessages(
-		[]interruptMessageTarget{
-			{Pane: "1", Target: "%1", AgentType: tmux.AgentMuse},
-			{Pane: "2", Target: "%2", AgentType: tmux.AgentClaude},
-		},
-		"continue",
-		func(_, _ string, _ bool, enterDelay time.Duration, _ tmux.AgentType) error {
-			delays = append(delays, enterDelay)
-			return nil
-		},
-	)
-	if len(errs) != 0 {
-		t.Fatalf("errors = %+v", errs)
-	}
-	if len(delays) != 2 || delays[0] != tmux.MuseEnterDelay || delays[1] != tmux.DefaultEnterDelay {
-		t.Fatalf("enter delays = %v, want [%s %s]", delays, tmux.MuseEnterDelay, tmux.DefaultEnterDelay)
-	}
-}
