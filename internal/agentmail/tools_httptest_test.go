@@ -1777,6 +1777,33 @@ func TestWithAgentToken_SendsTheCallersTokenWithoutCachingIt(t *testing.T) {
 	}
 }
 
+// TestAgentScopedCallsWithANilContextReturnAnError: callers such as the
+// reservation manager's tests pass a nil context, which makes the request
+// fail; looking up a supplied token must not panic first (bd-6m68a).
+func TestAgentScopedCallsWithANilContextReturnAnError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"release_file_reservations": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			return ReleaseReservationsResult{Released: 1}, nil
+		},
+	}))
+	defer server.Close()
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	c.SetRegistrationToken("/p", "GreenCastle", "TOK-GREEN")
+	var nilCtx context.Context
+
+	if _, err := c.ReleaseReservations(nilCtx, "/p", "GreenCastle", nil, []int{1}); err == nil {
+		t.Error("ReleaseReservations with a nil context: err = nil, want the request's error")
+	}
+	if _, err := c.Whois(nilCtx, "/p", "GreenCastle", false); err == nil {
+		t.Error("Whois with a nil context: err = nil, want the request's error")
+	}
+	if _, err := c.GetMessage(nilCtx, "/p", "GreenCastle", 1); err == nil {
+		t.Error("GetMessage with a nil context: err = nil, want the request's error")
+	}
+}
+
 // TestRegisterAgent_WithAgentTokenCachesNothing: the token register_agent
 // hands back on a caller's call is the caller's, so the client keeps it only
 // for its own calls.

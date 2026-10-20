@@ -156,11 +156,21 @@ func WithAgentToken(ctx context.Context, agentName, token string) context.Contex
 	return context.WithValue(ctx, agentTokenKey{}, agentToken{agentName: agentName, token: token})
 }
 
+// suppliedAgentToken returns the token WithAgentToken put in ctx, if any. A
+// nil ctx carries none; the call made with it then fails on its own.
+func suppliedAgentToken(ctx context.Context) (agentToken, bool) {
+	if ctx == nil {
+		return agentToken{}, false
+	}
+	supplied, ok := ctx.Value(agentTokenKey{}).(agentToken)
+	return supplied, ok
+}
+
 // agentTokenFor returns the token to send for agentName on a call made with
 // ctx: the one WithAgentToken supplied for that agent, else the one cached for
 // (projectKey, agentName), else "".
 func (c *Client) agentTokenFor(ctx context.Context, projectKey, agentName string) string {
-	if supplied, ok := ctx.Value(agentTokenKey{}).(agentToken); ok && supplied.agentName == agentName {
+	if supplied, ok := suppliedAgentToken(ctx); ok && supplied.agentName == agentName {
 		return supplied.token
 	}
 	return c.RegistrationToken(projectKey, agentName)
@@ -210,7 +220,7 @@ func (c *Client) rememberRegistrationToken(ctx context.Context, projectKey strin
 	if c == nil || agent == nil || agent.RegistrationToken == "" || agent.Name == "" {
 		return
 	}
-	if _, supplied := ctx.Value(agentTokenKey{}).(agentToken); supplied {
+	if _, supplied := suppliedAgentToken(ctx); supplied {
 		return
 	}
 	c.SetRegistrationToken(projectKey, agent.Name, agent.RegistrationToken)
