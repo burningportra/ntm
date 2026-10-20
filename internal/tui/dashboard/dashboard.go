@@ -3710,11 +3710,7 @@ func (m *Model) cycleFocus(dir int) {
 func (m *Model) updateStats() {
 	counts := make(map[tmux.AgentType]int)
 	for _, p := range m.panes {
-		agentType := p.Type.Canonical()
-		if !agentType.IsValid() {
-			agentType = tmux.AgentUser
-		}
-		counts[agentType]++
+		counts[dashboardAgentType(p.Type)]++
 	}
 	m.agentCounts = counts
 }
@@ -3974,7 +3970,8 @@ func (m Model) renderPaneGrid() string {
 		ps, hasPaneStatus := m.paneStatus[paneStatusKey(p)]
 
 		// Determine card colors based on agent type
-		iconColor, agentIcon := paneTypePresentation(p.Type, t, ic)
+		iconColor := agentTypeColor(p.Type, t)
+		agentIcon := agentTypeGlyph(p.Type, ic)
 		borderColor := iconColor
 
 		// Selection highlight
@@ -5702,28 +5699,6 @@ func dashboardPaneIdentityForProject(p tmux.Pane, projectDir string) (string, *p
 }
 
 // renderPaneDetail renders detailed info for the selected pane
-// paneTypePresentation returns the accent color and icon that the pane cards
-// and the pane detail type badge use for a pane's agent type. Types without
-// their own presentation fall back to the user pane's green and icon.
-func paneTypePresentation(agentType tmux.AgentType, t theme.Theme, ic icons.IconSet) (lipgloss.Color, string) {
-	switch agentType.Canonical() {
-	case tmux.AgentClaude:
-		return t.Claude, ic.Claude
-	case tmux.AgentCodex:
-		return t.Codex, ic.Codex
-	case tmux.AgentGemini:
-		return t.Gemini, ic.Gemini
-	case tmux.AgentGrok:
-		return t.Pink, ic.Robot
-	case tmux.AgentAntigravity:
-		return t.Lavender, ic.Gemini
-	case tmux.AgentMuse:
-		return t.Sky, ic.AgentIcon(string(tmux.AgentMuse))
-	default:
-		return t.Green, ic.User
-	}
-}
-
 func (m Model) renderPaneDetail(width int) string {
 	t := m.theme
 	ic := m.icons
@@ -5756,13 +5731,12 @@ func (m Model) renderPaneDetail(width int) string {
 	valueStyle := lipgloss.NewStyle().Foreground(t.Text)
 
 	// Type badge
-	typeColor, typeIcon := paneTypePresentation(p.Type, t, ic)
 	typeBadge := lipgloss.NewStyle().
-		Background(typeColor).
+		Background(agentTypeColor(p.Type, t)).
 		Foreground(t.Base).
 		Bold(true).
 		Padding(0, 1).
-		Render(typeIcon + " " + p.Type.ProfileName())
+		Render(agentTypeGlyph(p.Type, ic) + " " + p.Type.ProfileName())
 	lines = append(lines, labelStyle.Render("Agent Type:")+typeBadge)
 	if panePersona != nil {
 		personaBadge := lipgloss.NewStyle().

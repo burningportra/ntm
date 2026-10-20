@@ -17,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/tokens"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
 	"github.com/Dicklesworthstone/ntm/internal/tui/components"
+	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/layout"
 	"github.com/Dicklesworthstone/ntm/internal/tui/styles"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -360,7 +361,7 @@ func BuildPaneTableRows(
 			ContextHistory: append([]float64(nil), ps.ContextHistory...), // [tui-upgrade: bd-3btd6]
 			Model:          ps.ContextModel,
 			IsCompacted:    ps.LastCompaction != nil,
-			BorderColor:    AgentBorderColor(string(pane.Type), t),
+			BorderColor:    agentTypeColor(pane.Type, t),
 		}
 
 		// Populate health classification from process_triage
@@ -603,14 +604,20 @@ func BuildPaneTableRow(pane tmux.Pane, ps PaneStatus, beads []bv.BeadPreview, fi
 	return row
 }
 
+// paneRowTypeWidth is the width of the pane table's type column, enough for
+// the longest label agentTypeGlyph shows in place of the robot glyph (KIMI,
+// MUSE), so titles line up whatever mix of types the rows hold.
+const paneRowTypeWidth = 4
+
 // RenderPaneRow renders a single pane as a table row with progressive columns
-func RenderPaneRow(row PaneTableRow, dims LayoutDimensions, t theme.Theme) string {
+func RenderPaneRow(row PaneTableRow, dims LayoutDimensions, t theme.Theme, ic icons.IconSet) string {
 	var parts []string
+	agentType := tmux.AgentType(row.Type)
 
 	// Per-agent colored border indicator (pulses when working)
 	borderColor := row.BorderColor
 	if borderColor == "" {
-		borderColor = AgentBorderColor(row.Type, t)
+		borderColor = agentTypeColor(agentType, t)
 	}
 	if row.Status == "working" && row.Tick > 0 {
 		borderColor = styles.Pulse(string(borderColor), row.Tick)
@@ -634,15 +641,15 @@ func RenderPaneRow(row PaneTableRow, dims LayoutDimensions, t theme.Theme) strin
 	}
 	parts = append(parts, idxStyle.Render(fmt.Sprintf("%2s", address)))
 
-	typeColor, typeIcon := agentRowTypePresentation(row.Type, t)
+	typeColor := agentTypeColor(agentType, t)
 
 	// Apply pulse animation when agent is actively working
 	if row.Status == "working" && row.Tick > 0 {
 		typeColor = styles.Pulse(string(typeColor), row.Tick)
 	}
 
-	typeStyle := lipgloss.NewStyle().Foreground(typeColor).Bold(true)
-	parts = append(parts, typeStyle.Render(typeIcon))
+	typeStyle := lipgloss.NewStyle().Foreground(typeColor).Bold(true).Width(paneRowTypeWidth)
+	parts = append(parts, typeStyle.Render(agentTypeGlyph(agentType, ic)))
 
 	// Status indicator (always shown except mobile)
 	if dims.ShowStatusCol {
@@ -704,7 +711,7 @@ func RenderPaneRow(row PaneTableRow, dims LayoutDimensions, t theme.Theme) strin
 	}
 
 	// Title (flexible width)
-	titleWidth := dims.CardWidth - 16 // Base width minus fixed columns
+	titleWidth := dims.CardWidth - 15 - paneRowTypeWidth // Base width minus fixed columns
 	if dims.ShowContextCol {
 		titleWidth -= 12 // Context bar width
 	}
@@ -826,25 +833,6 @@ func RenderPaneRow(row PaneTableRow, dims LayoutDimensions, t theme.Theme) strin
 	return firstLine
 }
 
-func agentRowTypePresentation(agentType string, t theme.Theme) (lipgloss.Color, string) {
-	switch tmux.AgentType(agentType).Canonical() {
-	case tmux.AgentClaude:
-		return t.Claude, "󰗣"
-	case tmux.AgentCodex:
-		return t.Codex, "󰘦"
-	case tmux.AgentGemini:
-		return t.Gemini, "󰇮"
-	case tmux.AgentGrok:
-		return t.Pink, "󰚩"
-	case tmux.AgentAntigravity:
-		return t.Lavender, "󰇮"
-	case tmux.AgentMuse:
-		return t.Sky, "󰚩"
-	default:
-		return t.Green, "󰄛"
-	}
-}
-
 // RenderPaneDetail renders the detail panel for a selected pane
 // tick is used for shimmer animation on high context bars
 func RenderPaneDetail(pane tmux.Pane, ps PaneStatus, dims LayoutDimensions, t theme.Theme, tick int) string {
@@ -872,9 +860,8 @@ func RenderPaneDetail(pane tmux.Pane, ps PaneStatus, dims LayoutDimensions, t th
 
 	// Type
 	canonicalType := pane.Type.Canonical()
-	typeColor, _ := agentRowTypePresentation(string(canonicalType), t)
 	typeBadge := lipgloss.NewStyle().
-		Background(typeColor).
+		Background(agentTypeColor(canonicalType, t)).
 		Foreground(t.Base).
 		Bold(true).
 		Padding(0, 1).
@@ -1076,13 +1063,13 @@ func RenderTableHeader(dims LayoutDimensions, t theme.Theme) string {
 	parts = append(parts, " ") // Border indicator placeholder (matches row's "▌")
 	parts = append(parts, " ") // Selection column
 	parts = append(parts, headerStyle.Width(2).Render("#"))
-	parts = append(parts, headerStyle.Width(1).Render("T")) // Width(1) to match row's icon
+	parts = append(parts, headerStyle.Width(paneRowTypeWidth).Render("T"))
 
 	if dims.ShowStatusCol {
 		parts = append(parts, headerStyle.Width(1).Render("S"))
 	}
 
-	titleWidth := dims.CardWidth - 16
+	titleWidth := dims.CardWidth - 15 - paneRowTypeWidth
 	if dims.ShowContextCol {
 		titleWidth -= 12
 	}
@@ -1226,43 +1213,43 @@ func WorkingSpinnerFrame(tick int) string {
 	return workingSpinnerFrames[tick%len(workingSpinnerFrames)]
 }
 
-// AgentBorderColor returns the theme color for a given agent type.
-// Each agent type has a unique color: Claude=purple/Mauve, Codex=blue, Gemini=yellow, Grok=pink, Muse=sky, User=green.
-func AgentBorderColor(agentType string, t theme.Theme) lipgloss.Color {
-	switch tmux.AgentType(agentType).Canonical() {
-	case tmux.AgentClaude:
-		return t.Claude
-	case tmux.AgentCodex:
-		return t.Codex
-	case tmux.AgentGemini:
-		return t.Gemini
-	case tmux.AgentGrok:
-		return t.Pink
-	case tmux.AgentAntigravity:
-		return t.Lavender
-	case tmux.AgentMuse:
-		return t.Sky
-	case tmux.AgentCursor:
-		return t.Claude
-	case tmux.AgentWindsurf:
-		return t.Codex
-	case tmux.AgentAider:
-		return t.Gemini
-	case tmux.AgentOllama:
-		// Fallback to a distinct color if missing from theme,
-		// but typically we'd use t.Text if we don't have a specific color
-		return t.Text
-	case tmux.AgentUser:
-		return t.User
-	default:
-		return t.Text
+// dashboardAgentType returns agentType's canonical form, with types ntm
+// doesn't know as user panes, which is how the dashboard counts and draws them.
+func dashboardAgentType(agentType tmux.AgentType) tmux.AgentType {
+	canonical := agentType.Canonical()
+	if !canonical.IsValid() {
+		return tmux.AgentUser
 	}
+	return canonical
+}
+
+// agentTypeColor returns the color that marks a pane's agent type on the
+// dashboard's pane cards, rows, borders and type badges: the semantic
+// palette's agent color, the one the header, ticker and status bar count
+// badges use.
+func agentTypeColor(agentType tmux.AgentType, t theme.Theme) lipgloss.Color {
+	return t.Semantic().AgentColor(string(dashboardAgentType(agentType)))
+}
+
+// agentTypeGlyph returns what the dashboard shows to mark a pane's agent
+// type: the type's icon, or its count badge label when the icon set has only
+// the generic robot glyph for it, so Pi, Kimi, Muse, Grok and Opencode panes
+// stay distinguishable without color.
+func agentTypeGlyph(agentType tmux.AgentType, ic icons.IconSet) string {
+	agentType = dashboardAgentType(agentType)
+	if agentType == tmux.AgentUser {
+		return ic.User
+	}
+	if icon := ic.AgentIcon(string(agentType)); icon != ic.Robot {
+		return icon
+	}
+	return components.AgentCountLabel(agentType)
 }
 
 // AgentBorderStyle returns a lipgloss border style for an agent.
 // When isActive is true and tick > 0, the border pulses to indicate active processing.
 func AgentBorderStyle(agentType string, isActive bool, tick int, t theme.Theme) lipgloss.Style {
-	baseColor := AgentBorderColor(agentType, t)
+	baseColor := agentTypeColor(tmux.AgentType(agentType), t)
 
 	var borderColor lipgloss.Color
 	if isActive && tick > 0 {
@@ -1281,7 +1268,7 @@ func AgentBorderStyle(agentType string, isActive bool, tick int, t theme.Theme) 
 // AgentPanelStyles returns list and detail panel styles with agent-specific border colors.
 // The selected/focused panel uses the agent's color; unfocused uses a neutral color.
 func AgentPanelStyles(agentType string, focused FocusedPanel, isActive bool, tick int, t theme.Theme) (listStyle, detailStyle lipgloss.Style) {
-	agentColor := AgentBorderColor(agentType, t)
+	agentColor := agentTypeColor(tmux.AgentType(agentType), t)
 	unfocusedBorder := t.Surface1
 
 	// Apply pulse effect if agent is active

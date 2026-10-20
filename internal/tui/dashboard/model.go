@@ -610,7 +610,7 @@ func New(session, projectDir string) Model {
 		fetchingSession: true,
 	}
 
-	m.paneDelegate = newPaneDelegate(t, CalculateLayout(40, 1))
+	m.paneDelegate = newPaneDelegate(t, ic, CalculateLayout(40, 1))
 	m.paneTable = components.NewPaneTable(t)
 	m.paneList = list.New(nil, m.paneDelegate, 40, 8)
 	m.paneList.DisableQuitKeybindings()

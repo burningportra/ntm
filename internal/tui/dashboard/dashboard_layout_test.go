@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
@@ -30,7 +31,9 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
 	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard/panels"
+	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/layout"
+	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 	"github.com/Dicklesworthstone/ntm/internal/watcher"
 	"github.com/Dicklesworthstone/ntm/internal/workflow"
 )
@@ -435,7 +438,7 @@ func TestPaneRowSelectionStyling_NoWrapAcrossWidths(t *testing.T) {
 				ContextPct:   m.paneStatus[paneStatusKey(m.panes[0])].ContextPercent,
 				ModelVariant: m.panes[0].Variant,
 			}
-			rendered := RenderPaneRow(row, dims, m.theme)
+			rendered := RenderPaneRow(row, dims, m.theme, m.icons)
 			clean := status.StripANSI(rendered)
 
 			// Row should be rendered and not empty
@@ -3382,98 +3385,147 @@ func TestRenderHistoryPanel(t *testing.T) {
 	}
 }
 
-func TestAgentBorderColor(t *testing.T) {
+// detectedIconSets are the icon sets icons.Detect hands the dashboard.
+var detectedIconSets = map[string]icons.IconSet{
+	"nerd":    icons.NerdFonts.WithFallback(icons.Unicode).WithFallback(icons.ASCII),
+	"unicode": icons.Unicode.WithFallback(icons.ASCII),
+	"ascii":   icons.ASCII,
+}
 
-	m := newTestModel(120)
-
-	types := []string{
-		string(tmux.AgentClaude),
-		string(tmux.AgentCodex),
-		string(tmux.AgentGemini),
-		string(tmux.AgentGrok),
-		string(tmux.AgentUser),
-		"unknown",
+// Every agent type ntm can launch takes its semantic palette color, and its
+// icon or, where the icon set has only the generic robot glyph for it, its
+// count badge label. None falls back to the user pane's glyph, and panes of
+// no known type look like user panes, the way they count.
+func TestAgentTypePresentationCoversEveryAgentType(t *testing.T) {
+	nerd := detectedIconSets["nerd"]
+	wantNerdGlyphs := map[tmux.AgentType]string{
+		tmux.AgentClaude:      nerd.Claude,
+		tmux.AgentCodex:       nerd.Codex,
+		tmux.AgentGemini:      nerd.Gemini,
+		tmux.AgentPi:          "PI",
+		tmux.AgentKimi:        "KIMI",
+		tmux.AgentMuse:        "MUSE",
+		tmux.AgentAntigravity: nerd.Gemini,
+		tmux.AgentGrok:        "GRK",
+		tmux.AgentCursor:      nerd.Cursor,
+		tmux.AgentWindsurf:    nerd.Windsurf,
+		tmux.AgentAider:       "AID",
+		tmux.AgentOpencode:    "OC",
+		tmux.AgentOllama:      "OLL",
+		tmux.AgentUser:        nerd.User,
 	}
-
-	if got := AgentBorderColor(string(tmux.AgentGrok), m.theme); got != m.theme.Pink {
-		t.Errorf("AgentBorderColor(%q) = %q, want Grok pink %q", tmux.AgentGrok, got, m.theme.Pink)
-	}
-
-	for _, agentType := range types {
-		result := AgentBorderColor(agentType, m.theme)
-		if result == "" {
-			t.Errorf("AgentBorderColor(%s) returned empty string", agentType)
+	for _, agentType := range append(agent.AgentTypes(), tmux.AgentUser) {
+		want, ok := wantNerdGlyphs[agentType]
+		if !ok {
+			t.Errorf("no expected Nerd Font glyph for agent type %q", agentType)
+			continue
+		}
+		if got := agentTypeGlyph(agentType, nerd); got != want {
+			t.Errorf("agentTypeGlyph(%q, NerdFonts) = %q, want %q", agentType, got, want)
 		}
 	}
 
-	aliasPairs := [][2]string{
-		{"claude-code", string(tmux.AgentClaude)},
-		{"claude_code", string(tmux.AgentClaude)},
-		{"openai-codex", string(tmux.AgentCodex)},
-		{"google-gemini", string(tmux.AgentGemini)},
-		{"grok-build", string(tmux.AgentGrok)},
-		{"ws", string(tmux.AgentWindsurf)},
+	th := theme.CatppuccinMocha
+	palette := th.Semantic()
+	for name, ic := range detectedIconSets {
+		for _, agentType := range agent.AgentTypes() {
+			if got, want := agentTypeColor(agentType, th), palette.AgentColor(string(agentType)); got != want {
+				t.Errorf("agentTypeColor(%q) = %q, want palette color %q", agentType, got, want)
+			}
+			glyph := agentTypeGlyph(agentType, ic)
+			if glyph != ic.AgentIcon(string(agentType)) && glyph != components.AgentCountLabel(agentType) {
+				t.Errorf("%s: agentTypeGlyph(%q) = %q, want its icon or its label %q", name, agentType, glyph, components.AgentCountLabel(agentType))
+			}
+			if glyph == "" || glyph == ic.Robot || glyph == ic.User {
+				t.Errorf("%s: agentTypeGlyph(%q) = %q, want a glyph of its own, not the robot %q or user %q glyph", name, agentType, glyph, ic.Robot, ic.User)
+			}
+		}
+		for _, agentType := range []tmux.AgentType{tmux.AgentUser, tmux.AgentUnknown, "", "bash"} {
+			if got := agentTypeColor(agentType, th); got != palette.AgentUser {
+				t.Errorf("agentTypeColor(%q) = %q, want user color %q", agentType, got, palette.AgentUser)
+			}
+			if got := agentTypeGlyph(agentType, ic); got != ic.User {
+				t.Errorf("%s: agentTypeGlyph(%q) = %q, want user glyph %q", name, agentType, got, ic.User)
+			}
+		}
 	}
+}
 
+func TestAgentTypePresentationCanonicalizesAliases(t *testing.T) {
+	th := theme.CatppuccinMocha
+	ic := detectedIconSets["nerd"]
+	aliasPairs := [][2]tmux.AgentType{
+		{"claude-code", tmux.AgentClaude},
+		{"claude_code", tmux.AgentClaude},
+		{"openai-codex", tmux.AgentCodex},
+		{"google-gemini", tmux.AgentGemini},
+		{"grok-build", tmux.AgentGrok},
+		{"muse-code", tmux.AgentMuse},
+		{"moonshot", tmux.AgentKimi},
+		{"opencode", tmux.AgentOpencode},
+		{"ws", tmux.AgentWindsurf},
+	}
 	for _, pair := range aliasPairs {
-		got := AgentBorderColor(pair[0], m.theme)
-		want := AgentBorderColor(pair[1], m.theme)
-		if got != want {
-			t.Errorf("AgentBorderColor(%q) = %q, want same color as %q (%q)", pair[0], got, pair[1], want)
+		if got, want := agentTypeColor(pair[0], th), agentTypeColor(pair[1], th); got != want {
+			t.Errorf("agentTypeColor(%q) = %q, want %q's %q", pair[0], got, pair[1], want)
+		}
+		if got, want := agentTypeGlyph(pair[0], ic), agentTypeGlyph(pair[1], ic); got != want {
+			t.Errorf("agentTypeGlyph(%q) = %q, want %q's %q", pair[0], got, pair[1], want)
 		}
 	}
 }
 
-func TestAgentRowTypePresentation_CanonicalizesAliases(t *testing.T) {
+// Pi, Kimi, Opencode, Cursor, Windsurf, Aider and Ollama panes used to fall
+// back to the user pane's green and icon on the pane cards, rows and detail
+// badge, and the row borders gave Cursor, Windsurf and Aider the Claude, Codex
+// and Gemini colors. A pane card, table row, row border and detail badge of
+// every type now show that type's palette color and glyph.
+func TestPaneCardsRowsAndBordersUseAgentTypePresentation(t *testing.T) {
+	prevProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(prevProfile) })
 
-	m := newTestModel(120)
-	aliasPairs := [][2]string{
-		{"claude-code", string(tmux.AgentClaude)},
-		{"claude_code", string(tmux.AgentClaude)},
-		{"openai-codex", string(tmux.AgentCodex)},
-		{"google-gemini", string(tmux.AgentGemini)},
-		{"grok-build", string(tmux.AgentGrok)},
-	}
+	th := theme.CatppuccinMocha
+	ic := detectedIconSets["nerd"]
+	palette := th.Semantic()
+	dims := CalculateLayout(160, 30)
+	for _, agentType := range append(agent.AgentTypes(), tmux.AgentUser) {
+		m := newTestModel(120)
+		lipgloss.SetColorProfile(termenv.TrueColor)
+		m.theme, m.icons = th, ic
+		m.panes = []tmux.Pane{{ID: "%1", Index: 1, Title: "proj__pane_1", Type: agentType}}
+		m.paneStatus = map[string]PaneStatus{}
+		m.cursor = 0
 
-	for _, pair := range aliasPairs {
-		gotColor, gotIcon := agentRowTypePresentation(pair[0], m.theme)
-		wantColor, wantIcon := agentRowTypePresentation(pair[1], m.theme)
-		if gotColor != wantColor || gotIcon != wantIcon {
-			t.Errorf("agentRowTypePresentation(%q) = (%q, %q), want same presentation as %q (%q, %q)",
-				pair[0], gotColor, gotIcon, pair[1], wantColor, wantIcon)
+		wantColor := palette.AgentColor(string(agentType))
+		glyph := agentTypeGlyph(agentType, ic)
+		styledGlyph := lipgloss.NewStyle().Foreground(wantColor).Bold(true).Render(glyph)
+		label := glyph + " " + agentType.ProfileName()
+
+		card := m.renderPaneGrid()
+		if !strings.Contains(card, styledGlyph) {
+			t.Errorf("%s card does not show %q in %q: %q", agentType, glyph, wantColor, card)
 		}
-	}
-}
-
-func TestAgentRowTypePresentation_Grok(t *testing.T) {
-	m := newTestModel(120)
-
-	gotColor, gotIcon := agentRowTypePresentation(string(tmux.AgentGrok), m.theme)
-	if gotColor != m.theme.Pink {
-		t.Errorf("agentRowTypePresentation(%q) color = %q, want %q", tmux.AgentGrok, gotColor, m.theme.Pink)
-	}
-	if gotIcon != "󰚩" {
-		t.Errorf("agentRowTypePresentation(%q) icon = %q, want robot glyph", tmux.AgentGrok, gotIcon)
-	}
-}
-
-// Muse Code panes get the sky accent and robot icon that `ntm status` and the
-// agent badges use, instead of the generic fallback (user green in the pane
-// cards, detail badge and rows, plain text in the border).
-func TestMusePanePresentationUsesSky(t *testing.T) {
-	m := newTestModel(120)
-
-	for _, agentType := range []string{string(tmux.AgentMuse), "muse-code"} {
-		if got := AgentBorderColor(agentType, m.theme); got != m.theme.Sky {
-			t.Errorf("AgentBorderColor(%q) = %q, want sky %q", agentType, got, m.theme.Sky)
+		plainCard := status.StripANSI(card)
+		if !strings.Contains(plainCard, label) {
+			t.Errorf("%s card = %q, want header %q", agentType, plainCard, label)
 		}
-		gotColor, gotIcon := agentRowTypePresentation(agentType, m.theme)
-		if gotColor != m.theme.Sky || gotIcon != "󰚩" {
-			t.Errorf("agentRowTypePresentation(%q) = (%q, %q), want (%q, robot glyph)", agentType, gotColor, gotIcon, m.theme.Sky)
+		if userHeader := "• " + ic.User + " "; agentType != tmux.AgentUser && strings.Contains(plainCard, userHeader) {
+			t.Errorf("%s card header shows the user glyph %q: %q", agentType, ic.User, plainCard)
 		}
-		gotColor, gotIcon = paneTypePresentation(tmux.AgentType(agentType), m.theme, m.icons)
-		if wantIcon := m.icons.AgentIcon(string(tmux.AgentMuse)); gotColor != m.theme.Sky || gotIcon != wantIcon {
-			t.Errorf("paneTypePresentation(%q) = (%q, %q), want (%q, %q)", agentType, gotColor, gotIcon, m.theme.Sky, wantIcon)
+
+		rows := BuildPaneTableRows(m.panes, nil, m.paneStatus, nil, nil, nil, 0, th)
+		if rows[0].BorderColor != wantColor {
+			t.Errorf("%s row border = %q, want %q", agentType, rows[0].BorderColor, wantColor)
+		}
+		if row := RenderPaneRow(rows[0], dims, th, ic); !strings.Contains(row, styledGlyph) {
+			t.Errorf("%s row does not show %q in %q: %q", agentType, glyph, wantColor, row)
+		}
+		if item := toPaneItems(m.panes, m.paneStatus, nil, th)[0].(paneItem); item.row.BorderColor != wantColor {
+			t.Errorf("%s list row border = %q, want %q", agentType, item.row.BorderColor, wantColor)
+		}
+
+		if detail := status.StripANSI(m.renderPaneDetail(60)); !strings.Contains(detail, label) {
+			t.Errorf("%s detail = %q, want type badge %q", agentType, detail, label)
 		}
 	}
 }
@@ -4196,7 +4248,7 @@ func TestPaneItemInterface(t *testing.T) {
 func TestPaneDelegateRender(t *testing.T) {
 	m := newTestModel(120)
 	dims := CalculateLayout(100, 1)
-	d := newPaneDelegate(m.theme, dims)
+	d := newPaneDelegate(m.theme, m.icons, dims)
 	d.SetTick(5) // Set animation tick
 
 	items := []list.Item{
@@ -4235,7 +4287,7 @@ func TestPaneDelegateRender(t *testing.T) {
 func TestPaneListRefreshPreservesSelection(t *testing.T) {
 	m := newTestModel(120)
 	dims := CalculateLayout(100, 1)
-	d := newPaneDelegate(m.theme, dims)
+	d := newPaneDelegate(m.theme, m.icons, dims)
 
 	// Initial items
 	items := []list.Item{
@@ -4286,7 +4338,7 @@ func TestPaneListRefreshPreservesSelection(t *testing.T) {
 func TestPaneListEmptyState(t *testing.T) {
 	m := newTestModel(120)
 	dims := CalculateLayout(100, 1)
-	d := newPaneDelegate(m.theme, dims)
+	d := newPaneDelegate(m.theme, m.icons, dims)
 
 	// Empty list
 	l := list.New(nil, d, 100, 20)
@@ -4308,7 +4360,7 @@ func TestPaneListEmptyState(t *testing.T) {
 func TestPaneListFilterKey(t *testing.T) {
 	m := newTestModel(120)
 	dims := CalculateLayout(100, 1)
-	d := newPaneDelegate(m.theme, dims)
+	d := newPaneDelegate(m.theme, m.icons, dims)
 
 	items := []list.Item{
 		paneItem{row: PaneTableRow{Title: "proj__cc_1", Type: "cc"}},
@@ -4557,7 +4609,7 @@ func TestToPaneItems(t *testing.T) {
 func BenchmarkPaneListView(b *testing.B) {
 	m := newTestModel(120)
 	dims := CalculateLayout(100, 1)
-	d := newPaneDelegate(m.theme, dims)
+	d := newPaneDelegate(m.theme, m.icons, dims)
 
 	items := make([]list.Item, 20)
 	for i := range items {

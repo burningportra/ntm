@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
 
@@ -44,15 +45,17 @@ func (p paneItem) FilterValue() string {
 // It preserves the existing visual design from RenderPaneRow.
 type paneDelegate struct {
 	theme    theme.Theme
+	icons    icons.IconSet
 	dims     LayoutDimensions
 	tick     int
 	selected int // Currently selected index for highlight
 }
 
-// newPaneDelegate creates a delegate with the given theme and layout.
-func newPaneDelegate(t theme.Theme, dims LayoutDimensions) paneDelegate {
+// newPaneDelegate creates a delegate with the given theme, icons and layout.
+func newPaneDelegate(t theme.Theme, ic icons.IconSet, dims LayoutDimensions) paneDelegate {
 	return paneDelegate{
 		theme: t,
+		icons: ic,
 		dims:  dims,
 	}
 }
@@ -90,7 +93,7 @@ func (d paneDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	row.Tick = d.tick
 
 	// Use existing RenderPaneRow for visual consistency
-	rendered := RenderPaneRow(row, d.dims, d.theme)
+	rendered := RenderPaneRow(row, d.dims, d.theme, d.icons)
 	fmt.Fprint(w, rendered)
 }
 
@@ -114,7 +117,7 @@ func toPaneItems(panes []tmux.Pane, statuses map[string]PaneStatus, beads []bv.B
 		row.WindowIndex = pane.WindowIndex
 		row.PaneID = pane.ID
 		row.Address = pane.Ref().Canonical(multiWindow)
-		row.BorderColor = AgentBorderColor(string(pane.Type), t)
+		row.BorderColor = agentTypeColor(pane.Type, t)
 		items[i] = paneItem{pane: pane, row: row}
 	}
 	return items

@@ -9,6 +9,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
+	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/styles"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -496,8 +497,7 @@ func TestRenderPaneDetail(t *testing.T) {
 		if strings.Contains(got, "grok-build") {
 			t.Fatalf("expected Grok alias to be canonicalized in detail output, got %q", got)
 		}
-		color, _ := agentRowTypePresentation(string(pane.Type), th)
-		if color != th.Pink {
+		if color := agentTypeColor(pane.Type, th); color != th.Pink {
 			t.Fatalf("Grok pane detail color = %q, want pink %q", color, th.Pink)
 		}
 	})
@@ -746,7 +746,7 @@ func TestRenderPaneRow_ContextHistoryTriggersWideSecondLine(t *testing.T) {
 	}
 	dims := CalculateLayout(160, 30)
 
-	rendered := status.StripANSI(RenderPaneRow(row, dims, th))
+	rendered := status.StripANSI(RenderPaneRow(row, dims, th, icons.Current()))
 	if !strings.Contains(rendered, "\n") {
 		t.Fatalf("expected wide row with context history to render a second line, got %q", rendered)
 	}

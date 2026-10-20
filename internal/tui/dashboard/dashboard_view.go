@@ -13,7 +13,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard/panels"
-	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/layout"
 	"github.com/Dicklesworthstone/ntm/internal/tui/styles"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -419,20 +418,6 @@ func (m Model) renderFooterSection() string {
 	return b.String()
 }
 
-// statsBarAgentGlyph returns what the header stats bar shows before an agent
-// type's pane count: the type's icon, or its short label when the icon set has
-// only the generic robot glyph for it, so Pi, Kimi, Muse, Grok and Opencode
-// badges stay distinguishable without color.
-func statsBarAgentGlyph(c components.AgentCount, ic icons.IconSet) string {
-	if c.Type == tmux.AgentUser {
-		return ic.User
-	}
-	if icon := ic.AgentIcon(string(c.Type)); icon != ic.Robot {
-		return icon
-	}
-	return c.Label
-}
-
 func (m Model) renderStatsBar() string {
 	t := m.theme
 	ic := m.icons
@@ -486,14 +471,13 @@ func (m Model) renderStatsBar() string {
 		Render(fmt.Sprintf("%s %d panes", ic.Pane, len(m.panes)))
 	parts = append(parts, totalBadge)
 
-	palette := t.Semantic()
 	for _, c := range components.AgentCountsInOrder(m.agentCounts) {
 		parts = append(parts, lipgloss.NewStyle().
-			Background(palette.AgentColor(string(c.Type))).
+			Background(agentTypeColor(c.Type, t)).
 			Foreground(t.Base).
 			Bold(true).
 			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", statsBarAgentGlyph(c, ic), c.Count)))
+			Render(fmt.Sprintf("%s %d", agentTypeGlyph(c.Type, ic), c.Count)))
 	}
 	if scanBadge := m.renderScanBadge(); scanBadge != "" {
 		parts = append(parts, scanBadge)
