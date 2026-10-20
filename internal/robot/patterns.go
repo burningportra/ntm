@@ -126,12 +126,15 @@ func defaultPatterns() []Pattern {
 		{Name: "gemini_prompt", RegexStr: `(?i)gemini\s*>?\s*$`, Agent: "gemini", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Gemini prompt"},
 		{Name: "gemini_triple_arrow", RegexStr: `>>>\s*$`, Agent: "gemini", State: StateWaiting, Category: CategoryIdle, Priority: 90, Description: "Gemini triple arrow prompt"},
 
-		// Pi patterns
-		{Name: "pi_prompt", RegexStr: `(?im)^\s*pi>\s*$`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Pi prompt"},
-		{Name: "pi_version", RegexStr: `(?im)^\s*pi\s+v[0-9]+(?:\.[0-9]+)*\b`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Pi version banner"},
-		{Name: "pi_path_status", RegexStr: `(?m)^\s*(?:/|~)[^\n]*\([^\)\n]+\)\s*$`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 98, Description: "Pi path/status line"},
-		{Name: "pi_model_status", RegexStr: `(?m)^\s*(?:[$↑][^\n]*(?:\(auto\)|\bCodex:|\bgpt-|\bclaude-|\bgemini-))`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 98, Description: "Pi model/status line"},
-		{Name: "pi_banner", RegexStr: `(?im)^\s*pi\s+-\s+ai\s+coding\s+assistant\b`, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Pi coding assistant banner"},
+		// Pi patterns. Pi keeps its banner and footer (cwd, usage and model
+		// lines) on screen for the whole turn, so neither is an idle signal:
+		// an idle Pi shows an empty editor box, and a busy one shows its
+		// status indicator in the editor's top rule or just above the editor,
+		// which pi_working must outrank the empty box for. These keep the
+		// library's verdicts in line with agent.PiIdlePromptShowing and
+		// agent.PiActivelyWorking.
+		{Name: "pi_editor", RegexStr: agent.PiEmptyEditorPattern, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Pi empty editor box"},
+		{Name: "pi_working", RegexStr: agent.PiWorkingLinePattern, Agent: "pi", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "Pi status indicator (e.g. ── ⠋ Working ───)"},
 
 		// Kimi patterns
 		{Name: "kimi_prompt", RegexStr: `(?im)^\s*kimi>\s*$`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Kimi prompt"},
@@ -204,6 +207,9 @@ func defaultPatterns() []Pattern {
 		// ==================
 		// Spinners (braille pattern characters)
 		{Name: "braille_spinner", RegexStr: `[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]`, Agent: "*", State: StateThinking, Category: CategoryThinking, Priority: 80, Description: "Braille spinner"},
+		// dots_spinner reads only the end of the capture, which tmux trims
+		// to the last non-empty line. Agents whose last line is always a
+		// footer skip it (drawsFooterLast).
 		{Name: "dots_spinner", RegexStr: `\.{3,}$`, Agent: "*", State: StateThinking, Category: CategoryThinking, Priority: 70, Description: "Dots spinner"},
 
 		// Text indicators
@@ -282,6 +288,9 @@ func (lib *PatternLibrary) Match(content string, agentType string) []PatternMatc
 		if p.Agent == "*" && isGenericShellIdlePattern(p.Name) && isKnownAgentPatternType(agentType) {
 			continue
 		}
+		if p.Agent == "*" && p.Name == "dots_spinner" && drawsFooterLast(agentType) {
+			continue
+		}
 
 		if p.Regex != nil && p.Regex.MatchString(content) {
 			matches = append(matches, PatternMatch{
@@ -328,6 +337,9 @@ func (lib *PatternLibrary) MatchByCategory(content string, agentType string, cat
 		// Keep shell fallback prompts out of known-agent panes; they indicate an
 		// exited agent rather than an idle agent prompt.
 		if p.Agent == "*" && isGenericShellIdlePattern(p.Name) && isKnownAgentPatternType(agentType) {
+			continue
+		}
+		if p.Agent == "*" && p.Name == "dots_spinner" && drawsFooterLast(agentType) {
 			continue
 		}
 
@@ -474,6 +486,22 @@ func HasIdlePattern(content string, agentType string) bool {
 func isGenericShellIdlePattern(name string) bool {
 	switch name {
 	case "shell_dollar", "shell_percent", "shell_hash":
+		return true
+	default:
+		return false
+	}
+}
+
+// drawsFooterLast reports whether an agent's TUI always ends its screen with
+// a footer or status line below the prompt, as live captures show for Claude
+// Code (permissions line), Codex (model and cwd line), Muse (status bar) and
+// Pi (cwd, usage and extension status lines). The last line of such a
+// capture is never a spinner, so a trailing "..." there is a footer cut short
+// at the pane edge (Pi cuts footers with "...") and their own working
+// patterns decide instead of dots_spinner.
+func drawsFooterLast(agentType string) bool {
+	switch normalizeAgentType(agentType) {
+	case "claude", "codex", "muse", "pi":
 		return true
 	default:
 		return false

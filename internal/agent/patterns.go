@@ -314,7 +314,10 @@ var (
 	agyHeaderPattern = regexp.MustCompile(`(?i)antigravity`)
 )
 
-// Pi (pi) patterns.
+// Pi (pi) patterns. A pane known to run Pi is read with PiActivelyWorking and
+// PiIdlePromptShowing, which follow the screen Pi 1.3.0 draws; the substring
+// working and idle lists below only score unknown panes and feed
+// GetPatternSet.
 var (
 	piRateLimitPatterns = []string{
 		"rate limit",
@@ -352,7 +355,144 @@ var (
 	}
 
 	piHeaderPattern = regexp.MustCompile(`(?im)(^\s*pi\s+-\s+ai\s+coding\s+assistant\b|\bpi\b.*\b(coding\s+assistant|terminal\s+coding\s+harness)\b|\[pi(?:[-_][[:alnum:]-]+)?\])`)
+
+	// piWorkingLineRe matches one of Pi's status indicator lines
+	// (PiWorkingLinePattern).
+	piWorkingLineRe = regexp.MustCompile(PiWorkingLinePattern)
+
+	// piBottomRuleRe matches the editor's bottom rule: a plain rule, or one
+	// carrying the "↓ 3 more" label when the editor holds more text than it
+	// shows.
+	piBottomRuleRe = regexp.MustCompile(`^─+(?: ↓ \d+ more ─*)?[ \t]*$`)
+
+	// piPlainRuleRe matches a rule with no label. The editor's top rule is
+	// plain unless the status indicator sits in it or text scrolled above.
+	piPlainRuleRe = regexp.MustCompile(`^─+[ \t]*$`)
 )
+
+// Pi's screen, measured against pi 1.3.0 in tmux in its default fullscreen
+// TUI mode. The bottom of every Pi screen is the input editor, a box between
+// two rules drawn from column 0, followed by the footer: the cwd line, the
+// usage and model line and, when extensions publish any, a line of extension
+// statuses. Pi cuts each footer line at the pane edge with "...", so in a
+// narrow pane an idle screen ends in "..." ("0.3%/...", "🐴 ponytail...").
+//
+// While a turn runs Pi shows a status indicator: a braille spinner frame and
+// "Working", or "Retrying (1/3) in 5s...", "Compacting context...",
+// "Auto-compacting..." or "Summarizing branch...". Pi's own editor draws it in
+// its top rule ("── ⠋ Working ─────"). An editor installed by an extension
+// that does not embed it, such as pi-prompt-suggester's ghost editor, leaves
+// it on a line of its own above the box (" ⠧ Working"). Pi clears the
+// indicator when the turn ends, so the top rule is plain again.
+const (
+	// PiWorkingLinePattern matches a Pi status indicator line: the editor's
+	// top rule with the indicator in it ("── ⠋ Working ───", where "↑ 3
+	// more" is the scroll label of an idle editor instead), or the
+	// indicator on its own line, led by a braille spinner frame.
+	PiWorkingLinePattern = `(?m)^(?:──[ ][^\s─↑↓][^\n]*[ ]─+|[ \t]*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏][ \t]+\S[^\n]*)[ \t]*$`
+
+	// PiEmptyEditorPattern matches Pi's editor with nothing in it: two plain
+	// rules with only blank lines between them.
+	PiEmptyEditorPattern = `(?m)^─+[ \t]*\n(?:[ \t\x{00a0}]*\n)*─+[ \t]*$`
+)
+
+// piFooterScanLines bounds how many non-blank lines up from the bottom
+// piEditorBox looks for the editor's bottom rule: the three footer lines, up
+// to ten lines of extension widgets below the editor, and an open
+// autocomplete list.
+const piFooterScanLines = 16
+
+// piEditorMaxLines bounds the lines between the editor's rules. Pi shows at
+// most 30% of the pane's rows of editor text, five at least.
+const piEditorMaxLines = 40
+
+// piStatusLinesAboveEditor bounds how far above the editor's top rule
+// piStatusShowing looks for an indicator on a line of its own. Between the
+// indicator and the editor Pi draws a blank line, or up to ten lines of
+// extension widgets.
+const piStatusLinesAboveEditor = 12
+
+// piLiveTailLines is the window PiActivelyWorking searches when no editor is
+// drawn, as while a selector or dialog replaces it.
+const piLiveTailLines = 10
+
+// PiActivelyWorking reports whether a Pi pane shows a live turn: the status
+// indicator is drawn in the editor's top rule or just above the editor.
+// Footer lines are never read, so a footer Pi cut short with "..." in a narrow
+// pane is not mistaken for a spinner.
+func PiActivelyWorking(output string) bool {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	top, _, ok := piEditorBox(lines)
+	if !ok {
+		return piWorkingLineRe.MatchString(util.GetLastNLines(strings.Join(lines, "\n"), piLiveTailLines))
+	}
+	return piStatusShowing(lines, top)
+}
+
+// PiIdlePromptShowing reports whether a Pi pane is waiting for input with an
+// empty editor and no live turn. An editor holding a draft returns false, so
+// a pane is never offered new work on top of unsent text.
+// status.DetectIdleFromOutput and the agent parser's detectIdle both call it.
+func PiIdlePromptShowing(output string) bool {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	top, bottom, ok := piEditorBox(lines)
+	if !ok || piStatusShowing(lines, top) || !piPlainRuleRe.MatchString(lines[top]) {
+		return false
+	}
+	for _, line := range lines[top+1 : bottom] {
+		if strings.TrimSpace(line) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// PiEditorShowing reports whether a Pi pane is waiting for input: its editor
+// is drawn with no live turn, whether or not it holds a draft.
+func PiEditorShowing(output string) bool {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	top, _, ok := piEditorBox(lines)
+	return ok && !piStatusShowing(lines, top)
+}
+
+// piEditorBox returns the line indexes of the top and bottom rules of the
+// editor at the bottom of a Pi screen. ok is false when no editor is drawn.
+// Rules in the transcript (markdown, tool output) are indented and never sit
+// directly above the footer, so the bottom-most rule drawn from column 0
+// near the bottom is the editor's.
+func piEditorBox(lines []string) (top, bottom int, ok bool) {
+	seen := 0
+	for i := len(lines) - 1; i >= 0 && seen < piFooterScanLines; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		seen++
+		if !piBottomRuleRe.MatchString(lines[i]) {
+			continue
+		}
+		for j := i - 1; j >= 0 && i-j <= piEditorMaxLines+1; j-- {
+			if strings.HasPrefix(lines[j], "─") {
+				return j, i, true
+			}
+		}
+		return -1, -1, false
+	}
+	return -1, -1, false
+}
+
+// piStatusShowing reports whether Pi's status indicator is drawn in the
+// editor's top rule (lines[top]) or on its own line just above the editor.
+func piStatusShowing(lines []string, top int) bool {
+	if piWorkingLineRe.MatchString(lines[top]) {
+		return true
+	}
+	for i := top - 1; i >= 0 && top-i <= piStatusLinesAboveEditor; i-- {
+		if piWorkingLineRe.MatchString(lines[i]) {
+			return true
+		}
+	}
+	return false
+}
 
 // Kimi (kimi) patterns.
 var (

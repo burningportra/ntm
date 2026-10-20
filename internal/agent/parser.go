@@ -355,7 +355,10 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiWorkingPatterns)
 	case AgentTypePi:
-		return matchAny(recentOutput, piWorkingPatterns)
+		// Pi's status indicator is its only in-flight marker. Words such as
+		// "running" or the "Thinking..." label of a collapsed thinking block
+		// stay in the transcript after a turn ends.
+		return PiActivelyWorking(output)
 	case AgentTypeKimi:
 		return matchAny(recentOutput, kimiWorkingPatterns)
 	case AgentTypeMuse:
@@ -430,7 +433,9 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		// or lack of working indicators
 		return matchAnyRegex(lastLines, gmiIdlePatterns)
 	case AgentTypePi:
-		return matchAnyRegex(lastLines, piIdlePatterns)
+		// Pi's footer runs below the editor, so the editor is anchored from
+		// the bottom of the whole capture rather than read from lastLines.
+		return PiIdlePromptShowing(output)
 	case AgentTypeKimi:
 		return matchAnyRegex(lastLines, kimiIdlePatterns)
 	case AgentTypeMuse:
@@ -565,7 +570,7 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return collectMatches(recentOutput, gmiWorkingPatterns)
 	case AgentTypePi:
-		return collectMatches(recentOutput, piWorkingPatterns)
+		return []string{"pi_status_indicator"}
 	case AgentTypeKimi:
 		return collectMatches(recentOutput, kimiWorkingPatterns)
 	case AgentTypeMuse:

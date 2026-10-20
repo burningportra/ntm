@@ -508,3 +508,94 @@ func TestMuseIdleAgreesWithUnifiedDetector(t *testing.T) {
 		})
 	}
 }
+
+// Pi 1.3.0 screen bottoms captured from `pi --offline` panes in tmux,
+// trimmed the way tmux.Client returns captures. Pi was never sent a prompt;
+// the working screens carry the indicator Pi's own editor draws in its top
+// rule, and piWorkingAboveEditorCapture is a live capture of a busy Pi whose
+// extension-installed editor shows the indicator above the box.
+var (
+	piRule40 = strings.Repeat("─", 40)
+
+	// After a turn in 40 columns: Pi cut the usage line to "0.3%/...".
+	piIdleNarrowCapture = " tests pass. I'm running nothing else;\n" +
+		" tell me what to change next...\n\n" +
+		piRule40 + "\n\n" + piRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.3%/..."
+
+	// 32 columns with extensions loaded: their status line is cut short.
+	piIdleExtensionStatusCapture = " Ponytail loaded: full\n\n" +
+		strings.Repeat("─", 32) + "\n\n" + strings.Repeat("─", 32) + "\n" +
+		"/private/tmp/claude-501/-Volu...\n" +
+		"0.0%/1.0M (auto)  google/gemini-\n" +
+		"🧠 work · ready ○ 🐴 ponytail..."
+
+	piDraftCapture = strings.Replace(piIdleNarrowCapture, piRule40+"\n\n"+piRule40,
+		piRule40+"\nrename main.go to app.go and update\n"+piRule40, 1)
+
+	piWorkingNarrowCapture = strings.Replace(piIdleNarrowCapture, piRule40+"\n\n",
+		"── ⠋ Working "+strings.Repeat("─", 27)+"\n\n", 1)
+
+	piWorkingAboveEditorCapture = " Elapsed 1m 2s\n ⠧ Working\n" +
+		strings.Repeat("─", 140) + "\n" + strings.Repeat("─", 140) + "\n" +
+		"/Volumes/1tb/Projects/ManchesterSquare (main)\n" +
+		"↑166k ↓20k R2.4M CH99.7% $0.181 8.8%/1.0M (auto)            (vercel-ai-gateway) deepseek/d\n" +
+		"🧠 114-manchester · ready ● 🐴 ponytail: ⚡ FULL"
+)
+
+// TestPiIdleAgreesWithUnifiedDetector pins the Pi idle readers to one rule
+// (bd-7bzre): DetectIdleFromOutput, the unified detector's state plus
+// dispatch confidence, and the agent parser. Pi draws no prompt glyph, so
+// before Pi had its own branch an idle Pi read idle only when an extension
+// status happened to say "ready", and never as an idle prompt.
+func TestPiIdleAgreesWithUnifiedDetector(t *testing.T) {
+	t.Parallel()
+
+	d := NewDetector()
+	observedAt := time.Date(2026, 10, 19, 21, 0, 0, 0, time.UTC)
+	parser := agent.NewParser()
+
+	tests := []struct {
+		name      string
+		output    string
+		wantState AgentState
+		wantIdle  bool
+	}{
+		{"usage line cut short", piIdleNarrowCapture, StateIdle, true},
+		{"extension status cut short", piIdleExtensionStatusCapture, StateIdle, true},
+		{"draft", piDraftCapture, StateIdle, false},
+		{"indicator in the top rule", piWorkingNarrowCapture, StateWorking, false},
+		{"indicator above the editor", piWorkingAboveEditorCapture, StateWorking, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, activity := range []time.Time{observedAt, observedAt.Add(-time.Hour)} {
+				state, _ := d.determineStateAt(tt.output, "pi", activity, observedAt)
+				if state != tt.wantState {
+					t.Errorf("determineStateAt() = %v, want %v", state, tt.wantState)
+				}
+				confidence := observationConfidence(AgentStatus{AgentType: "pi", State: state}, tt.output)
+				dispatchable := state == StateIdle && ObservationConfidenceIsActionable(confidence)
+				if dispatchable != tt.wantIdle {
+					t.Errorf("unified dispatchable = %v (state %v, confidence %.2f), want %v", dispatchable, state, confidence, tt.wantIdle)
+				}
+			}
+			for _, agentType := range []string{"pi", "pi-coding-agent"} {
+				if got := DetectIdleFromOutput(tt.output, agentType); got != tt.wantIdle {
+					t.Errorf("DetectIdleFromOutput(%s) = %v, want %v", agentType, got, tt.wantIdle)
+				}
+			}
+			parsed, err := parser.ParseWithHint(tt.output, agent.AgentTypePi)
+			if err != nil {
+				t.Fatalf("ParseWithHint error: %v", err)
+			}
+			if parsed.IsIdle != tt.wantIdle {
+				t.Errorf("parser IsIdle = %v, want %v", parsed.IsIdle, tt.wantIdle)
+			}
+			if parsed.IsWorking != (tt.wantState == StateWorking) {
+				t.Errorf("parser IsWorking = %v, want %v", parsed.IsWorking, tt.wantState == StateWorking)
+			}
+		})
+	}
+}

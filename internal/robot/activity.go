@@ -880,6 +880,12 @@ func IsLiveBusy(scrollback string, agentType string) bool {
 	if normalizeAgentType(agentType) == "muse" {
 		return agent.MuseActivelyWorking(scrollback)
 	}
+	// Pi panes defer to the Pi recognizer: it reads the status indicator in
+	// or above the editor and never the footer below it, which Pi cuts short
+	// with "..." in a narrow pane and dots_spinner would read as a spinner.
+	if normalizeAgentType(agentType) == "pi" {
+		return agent.PiActivelyWorking(scrollback)
+	}
 
 	live := lastNLines(scrollback, liveThinkingWindowLines)
 	if live == "" {

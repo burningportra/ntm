@@ -233,6 +233,14 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 		return agent.MuseIdlePromptShowing(output)
 	}
 
+	// Pi has no prompt glyph: its empty editor box above the footer is the
+	// idle prompt, and the footer lines below it end in arbitrary text, cut
+	// short with "..." in a narrow pane. The shared recognizer is
+	// authoritative, as for Muse.
+	if agentType == string(agent.AgentTypePi) {
+		return agent.PiIdlePromptShowing(output)
+	}
+
 	// Strip ANSI first for cleaner processing
 	clean := StripANSI(output)
 

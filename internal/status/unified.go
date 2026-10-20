@@ -173,6 +173,20 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 		}
 	}
 
+	// Pi is read the same way: its status indicator, in the editor's top
+	// rule or just above the editor, is the only live-turn marker, and an
+	// editor with no indicator is waiting for input. An editor holding a
+	// draft is idle here but not an idle prompt, so observationConfidence
+	// keeps it from being dispatched to.
+	if agentType == string(agent.AgentTypePi) {
+		if agent.PiActivelyWorking(output) {
+			return StateWorking, ErrorNone
+		}
+		if agent.PiEditorShowing(output) {
+			return StateIdle, ErrorNone
+		}
+	}
+
 	// Check if at prompt (idle) - prioritize this when velocity is low
 	isAtPrompt := DetectIdleFromOutput(output, agentType)
 	if isAtPrompt && isLowVelocity {

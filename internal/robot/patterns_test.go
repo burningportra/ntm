@@ -1379,3 +1379,203 @@ const (
 		museTestRule + "\n" +
 		"  echo · /private/tmp/claude-501/claude-port · YOLO"
 )
+
+// Pi 1.3.0 screens: the bottoms of tmux captures from panes running
+// `pi --offline`, trimmed the way tmux.Client returns them. No prompt was
+// sent, so the idle screens after a turn come from a synthetic session, and
+// piTestWorkingNarrowScreen puts the status indicator into the editor's top
+// rule the way Pi's CustomEditor renders it at 40 columns.
+// piTestWorkingAboveEditorScreen is a live capture of a busy Pi whose
+// extension-installed editor draws the indicator above the box.
+var (
+	piTestRule40 = strings.Repeat("─", 40)
+
+	// 40 columns after a turn. Pi cut the usage line to "0.3%/...", and the
+	// collapsed thinking block and the reply hold "Thinking..." and "running ".
+	piTestIdleNarrowScreen = " list the go files and run the tests\n\n\n" +
+		" Thinking...\n\n\n" +
+		" $ ls *.go && go test ./...\n\n" +
+		" main.go\n" +
+		" ok     example   0.012s\n\n\n" +
+		" There is one Go file, main.go, and the\n" +
+		" tests pass. I'm running nothing else;\n" +
+		" tell me what to change next...\n\n" +
+		piTestRule40 + "\n\n" + piTestRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.3%/..."
+
+	// The same session in 160 columns (cwd shortened): nothing is cut.
+	piTestIdleWideScreen = " There is one Go file, main.go, and the tests pass. I'm running nothing else; tell me what to change next...\n" +
+		strings.Repeat("\n", 15) +
+		strings.Repeat("─", 160) + "\n\n" + strings.Repeat("─", 160) + "\n" +
+		"/private/tmp/claude-501/scratchpad/bd-7bzre/gitwork (main)\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.3%/1.0M (auto)" + strings.Repeat(" ", 64) +
+		"(vercel-ai-gateway) google/gemini-4-argon • high"
+
+	// A fresh 32-column pane with the operator's extensions loaded. Their
+	// status line is last and Pi cut it to "ponytail...".
+	piTestIdleExtensionStatusScreen = " Ponytail loaded: full\n\n" +
+		strings.Repeat("─", 32) + "\n\n" + strings.Repeat("─", 32) + "\n" +
+		"/private/tmp/claude-501/-Volu...\n" +
+		"0.0%/1.0M (auto)  google/gemini-\n" +
+		"🧠 work · ready ○ 🐴 ponytail..."
+
+	// Text typed into the editor after the turn and not sent.
+	piTestDraftScreen = " tell me what to change next...\n\n" +
+		piTestRule40 + "\n" +
+		"rename main.go to app.go and update\n" +
+		"the imports in every package that uses\n" +
+		"it\n" +
+		piTestRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.3%/..."
+
+	piTestWorkingNarrowScreen = strings.Replace(piTestIdleNarrowScreen, piTestRule40+"\n\n"+piTestRule40,
+		"── ⠋ Working "+strings.Repeat("─", 27)+"\n\n"+piTestRule40, 1)
+
+	piTestWorkingAboveEditorScreen = " Elapsed 1m 2s\n ⠧ Working\n" +
+		strings.Repeat("─", 140) + "\n" + strings.Repeat("─", 140) + "\n" +
+		"/Volumes/1tb/Projects/ManchesterSquare (main)\n" +
+		"↑166k ↓20k R2.4M CH99.7% $0.181 8.8%/1.0M (auto)            (vercel-ai-gateway) deepseek/d\n" +
+		"🧠 114-manchester · ready ● 🐴 ponytail: ⚡ FULL"
+)
+
+// TestPiPatterns_EditorIdleUnlessStatusShowing is the bd-7bzre regression in
+// the pattern library. Pi's footer runs below its editor and Pi cuts it short
+// with "..." in a narrow pane, which dots_spinner read as a spinner, so an
+// idle Pi pane read as working. An idle Pi shows an empty editor box; a busy
+// one shows its status indicator in or just above the editor.
+func TestPiPatterns_EditorIdleUnlessStatusShowing(t *testing.T) {
+	lib := NewPatternLibrary()
+
+	for name, screen := range map[string]string{
+		"usage line cut short, 40 columns":       piTestIdleNarrowScreen,
+		"extension status cut short, 32 columns": piTestIdleExtensionStatusScreen,
+		"160 columns":                            piTestIdleWideScreen,
+	} {
+		if !lib.HasIdlePrompt(screen, "pi") {
+			t.Errorf("idle Pi screen (%s) has no idle pattern match", name)
+		}
+		if lib.HasThinkingIndicator(screen, "pi") {
+			t.Errorf("idle Pi screen (%s) matched a thinking pattern: %v", name, lib.MatchByCategory(screen, "pi", CategoryThinking))
+		}
+		if IsLiveBusy(screen, "pi") {
+			t.Errorf("IsLiveBusy(idle Pi screen, %s) = true, want false", name)
+		}
+	}
+
+	for name, screen := range map[string]string{
+		"indicator in the top rule":  piTestWorkingNarrowScreen,
+		"indicator above the editor": piTestWorkingAboveEditorScreen,
+	} {
+		if !IsLiveBusy(screen, "pi") {
+			t.Errorf("IsLiveBusy(working Pi screen, %s) = false, want true", name)
+		}
+		if got := lib.MatchFirst(screen, "pi"); got == nil || got.Pattern != "pi_working" {
+			t.Errorf("MatchFirst(working Pi screen, %s) = %+v, want pi_working ahead of the editor", name, got)
+		}
+	}
+}
+
+func TestPiPatterns_ClassifierStates(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		screen string
+		want   AgentState
+	}{
+		{name: "idle, usage line cut short", screen: piTestIdleNarrowScreen, want: StateWaiting},
+		{name: "idle, extension status cut short", screen: piTestIdleExtensionStatusScreen, want: StateWaiting},
+		{name: "idle, 160 columns", screen: piTestIdleWideScreen, want: StateWaiting},
+		{name: "working, indicator in the top rule", screen: piTestWorkingNarrowScreen, want: StateThinking},
+		{name: "working, indicator above the editor", screen: piTestWorkingAboveEditorScreen, want: StateThinking},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := NewStateClassifier("%1", &ClassifierConfig{AgentType: "pi", HysteresisDuration: 0})
+			if _, err := sc.ClassifyWithOutput(tc.screen); err != nil {
+				t.Fatalf("baseline: %v", err)
+			}
+			activity, err := sc.ClassifyWithOutput(tc.screen)
+			if err != nil {
+				t.Fatalf("ClassifyWithOutput: %v", err)
+			}
+			if activity.State != tc.want {
+				t.Fatalf("State = %q, want %q (patterns %v)", activity.State, tc.want, activity.DetectedPatterns)
+			}
+		})
+	}
+}
+
+// TestPiPatterns_AgreeWithPiIdlePromptShowing pins the robot verdicts for Pi
+// panes to agent.PiIdlePromptShowing, which the parser and status detectors
+// use. The old pi_path_status and pi_model_status idle patterns matched the
+// footer, which Pi draws for the whole turn, so a busy pane and a pane
+// holding a draft both read idle.
+func TestPiPatterns_AgreeWithPiIdlePromptShowing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		screen string
+		idle   bool
+	}{
+		{name: "idle, usage line cut short", screen: piTestIdleNarrowScreen, idle: true},
+		{name: "idle, extension status cut short", screen: piTestIdleExtensionStatusScreen, idle: true},
+		{name: "idle, 160 columns", screen: piTestIdleWideScreen, idle: true},
+		{name: "draft", screen: piTestDraftScreen},
+		{name: "working, indicator in the top rule", screen: piTestWorkingNarrowScreen},
+		{name: "working, indicator above the editor", screen: piTestWorkingAboveEditorScreen},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agent.PiIdlePromptShowing(tc.screen); got != tc.idle {
+				t.Fatalf("fixture: agent.PiIdlePromptShowing = %v, want %v", got, tc.idle)
+			}
+			wantState := "active"
+			if tc.idle {
+				wantState = "idle"
+			}
+			if got := determineState(tc.screen, "pi"); got != wantState {
+				t.Errorf("determineState = %q, want %q", got, wantState)
+			}
+			// A busy pane keeps its empty editor box below the indicator,
+			// so pi_editor may match there; pi_working outranks it.
+			if !strings.Contains(tc.name, "working") {
+				if got := HasIdlePattern(tc.screen, "pi"); got != tc.idle {
+					t.Errorf("HasIdlePattern = %v, want %v", got, tc.idle)
+				}
+			}
+		})
+	}
+}
+
+// TestDotsSpinnerSkipsAgentsThatDrawAFooterLast covers the wildcard behind
+// bd-7bzre. tmux trims a capture to its last non-empty line, so dots_spinner
+// only ever reads the last line. Claude, Codex, Muse and Pi always draw a
+// footer there, so a trailing "..." in their panes is a footer cut short and
+// their own patterns decide. Agents whose output can end on a "..." progress
+// line keep the wildcard.
+func TestDotsSpinnerSkipsAgentsThatDrawAFooterLast(t *testing.T) {
+	lib := NewPatternLibrary()
+	hasDots := func(content, agentType string) bool {
+		for _, m := range lib.Match(content, agentType) {
+			if m.Pattern == "dots_spinner" {
+				return true
+			}
+		}
+		for _, m := range lib.MatchByCategory(content, agentType, CategoryThinking) {
+			if m.Pattern == "dots_spinner" {
+				return true
+			}
+		}
+		return false
+	}
+
+	const cutFooter = "────────────────────────────────────────\n/private/tmp/claude-501/-Volumes-1tb-..."
+	for _, agentType := range []string{"claude", "cc", "codex", "cod", "muse", "pi"} {
+		if hasDots(cutFooter, agentType) {
+			t.Errorf("dots_spinner matched a cut-off footer for %q", agentType)
+		}
+	}
+	for _, agentType := range []string{"", "aider", "gemini", "ollama"} {
+		if !hasDots("Generating response...", agentType) {
+			t.Errorf("dots_spinner did not match a trailing progress line for %q", agentType)
+		}
+	}
+}

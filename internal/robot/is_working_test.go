@@ -551,6 +551,82 @@ func TestIsLiveBusy_Claude_DefersToOrderingAwareClassifier(t *testing.T) {
 	}
 }
 
+// TestClassifyPaneWork_PiPanes is the bd-7bzre regression at the verdict
+// --robot-is-working, --robot-smart-restart and the state surfaces share. An
+// idle Pi pane whose footer Pi cut short with "..." read DO_NOT_INTERRUPT
+// (live_window_thinking), so smart restart skipped it without --force.
+func TestClassifyPaneWork_PiPanes(t *testing.T) {
+	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
+	parser := agent.NewParser()
+	tests := []struct {
+		name      string
+		output    string
+		want      agent.Recommendation
+		wantState state.AgentState
+	}{
+		{name: "idle, usage line cut short", output: piTestIdleNarrowScreen, want: agent.RecommendSafeToRestart, wantState: state.AgentStateIdle},
+		{name: "idle, extension status cut short", output: piTestIdleExtensionStatusScreen, want: agent.RecommendSafeToRestart, wantState: state.AgentStateIdle},
+		{name: "idle, 160 columns", output: piTestIdleWideScreen, want: agent.RecommendSafeToRestart, wantState: state.AgentStateIdle},
+		{name: "working, indicator in the top rule", output: piTestWorkingNarrowScreen, want: agent.RecommendDoNotInterrupt, wantState: state.AgentStateBusy},
+		{name: "working, indicator above the editor", output: piTestWorkingAboveEditorScreen, want: agent.RecommendDoNotInterrupt, wantState: state.AgentStateBusy},
+		// Pi is waiting for input, but restarting would drop the draft.
+		{name: "draft", output: piTestDraftScreen, want: agent.RecommendUnknown, wantState: state.AgentStateUnknown},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pane := tmux.Pane{ID: fmt.Sprintf("%%%d", i+1), Index: i + 1, Title: fmt.Sprintf("proj__pi_%d", i+1), Type: tmux.AgentPi}
+			work := classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, tt.output, "")
+			if work.Recommendation != string(tt.want) {
+				t.Fatalf("recommendation = %q, want %q (work=%+v)", work.Recommendation, tt.want, work)
+			}
+			if wantIdle := tt.want == agent.RecommendSafeToRestart; work.IsIdle != wantIdle || work.SafeToDispatch != wantIdle {
+				t.Errorf("is_idle = %v, safe_to_dispatch = %v, want both %v", work.IsIdle, work.SafeToDispatch, wantIdle)
+			}
+			if got := runtimeAgentState(paneAgentType(pane), work); got != tt.wantState {
+				t.Errorf("runtimeAgentState = %q, want %q", got, tt.wantState)
+			}
+		})
+	}
+}
+
+// TestClassifyPaneWork_GenuineSpinnersStillBusy covers the other side of
+// bd-7bzre: dots_spinner no longer reads the last line of Claude and Codex
+// panes, which is always their footer, so a live turn there must read busy
+// through each agent's own spinner and interrupt hint, also when a narrow
+// pane cuts the working line short.
+func TestClassifyPaneWork_GenuineSpinnersStillBusy(t *testing.T) {
+	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
+	parser := agent.NewParser()
+	codexWorking := "› fix the flaky retry test\n\n" +
+		"• Working (12s • esc to interrupt)\n\n" +
+		"› Summarize recent commits\n\n" +
+		"  gpt-5.5 medium · ~/proj · 100% context left"
+	codexNarrow := "› fix the flaky retry test\n\n" +
+		"• Working (12s • esc to i…\n\n" +
+		"› Summarize recent commi…\n\n" +
+		"  gpt-5.5 medium · ~/proj…"
+	tests := []struct {
+		name   string
+		pane   tmux.Pane
+		output string
+	}{
+		{name: "claude spinner", pane: tmux.Pane{ID: "%1", Index: 1, Title: "proj__cc_1", Type: tmux.AgentClaude}, output: claudeTestWorkingScreen},
+		{name: "codex working line", pane: tmux.Pane{ID: "%2", Index: 2, Title: "proj__cod_1", Type: tmux.AgentCodex}, output: codexWorking},
+		{name: "codex working line cut short", pane: tmux.Pane{ID: "%3", Index: 3, Title: "proj__cod_2", Type: tmux.AgentCodex}, output: codexNarrow},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !IsLiveBusy(tt.output, paneAgentType(tt.pane)) {
+				t.Errorf("IsLiveBusy = false, want true")
+			}
+			work := classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: tt.pane, LastActivity: time.Now()}, tt.output, "")
+			if work.Recommendation != string(agent.RecommendDoNotInterrupt) || !work.IsWorking {
+				t.Fatalf("recommendation = %q, is_working = %v, want DO_NOT_INTERRUPT and working (work=%+v)", work.Recommendation, work.IsWorking, work)
+			}
+		})
+	}
+}
+
 func TestApplyLiveBusyOverrideRecommendationPrecedence(t *testing.T) {
 	activeSpinner := "Error: prior command failed\n" +
 		"✻ Germinating… (ctrl+c to interrupt · 5m 56s)\n" +

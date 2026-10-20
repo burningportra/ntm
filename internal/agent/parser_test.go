@@ -347,11 +347,7 @@ func TestParser_OtherAgentScreensNeverMuse(t *testing.T) {
 			"› Ask Codex to do anything\n\n" +
 			"  GPT-5.6-Sol max · ~/Github/hoyehh-shop · Review unpaid account moderation · Main [default]\n" +
 			"  ? for shortcuts                                                    ⚠ 5 warnings · f2 to view",
-		"pi working": " Elapsed 1m 2s\n ⠧ Working\n" +
-			strings.Repeat("─", 140) + "\n" + strings.Repeat("─", 140) + "\n" +
-			"/Volumes/1tb/Projects/ManchesterSquare (main)\n" +
-			"↑166k ↓20k R2.4M CH99.7% $0.181 8.8%/1.0M (auto)            (vercel-ai-gateway) deepseek/d\n" +
-			"🧠 114-manchester · ready ● 🐴 ponytail: ⚡ FULL",
+		"pi working": piWorkingAboveEditorScreen,
 		// Claude quoting Muse in tool output: `muse --version`, a capture
 		// whose second line is the bare banner, and a capture ending in the
 		// status bar. Tool output continues at a five-space indent.
@@ -693,6 +689,236 @@ func TestMuseActivelyWorking_DraftAndNarrowPane(t *testing.T) {
 	finished := strings.Replace(museLongDraftWorkingScreen, "◆ Thinking (1s · esc to interrupt)", "◆ echo: start a turn", 1)
 	if MuseActivelyWorking(finished) {
 		t.Error("long draft after the turn: MuseActivelyWorking = true, want false")
+	}
+}
+
+// Pi 1.3.0 screens: the bottoms of tmux 3.7b captures, trimmed the way
+// tmux.Client returns them, from panes running `pi --offline`. No prompt was
+// sent, so no live turn was captured. The finished turn comes from a
+// synthetic session loaded with --session, and the working screens put Pi's
+// status indicator into the editor's top rule exactly as Pi's own
+// CustomEditor renders it (run under node from Pi's dist at 40 and 160
+// columns). piWorkingAboveEditorScreen is a live capture of a busy Pi on the
+// review host, whose extension-installed editor does not embed the indicator.
+var (
+	piRule40  = strings.Repeat("─", 40)
+	piRule160 = strings.Repeat("─", 160)
+
+	// 40 columns with --no-extensions, after a turn. The usage line is last
+	// and Pi cut it to "0.3%/...". The collapsed thinking block and the reply
+	// hold "Thinking..." and "running ".
+	piIdleNarrowScreen = " list the go files and run the tests\n\n\n" +
+		" Thinking...\n\n\n" +
+		" $ ls *.go && go test ./...\n\n" +
+		" main.go\n" +
+		" ok     example   0.012s\n\n\n" +
+		" There is one Go file, main.go, and the\n" +
+		" tests pass. I'm running nothing else;\n" +
+		" tell me what to change next...\n\n" +
+		piRule40 + "\n\n" + piRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.3%/..."
+
+	// The same session in 160 columns (cwd shortened): nothing is cut.
+	piIdleWideScreen = " There is one Go file, main.go, and the tests pass. I'm running nothing else; tell me what to change next...\n" +
+		strings.Repeat("\n", 15) +
+		piRule160 + "\n\n" + piRule160 + "\n" +
+		"/private/tmp/claude-501/scratchpad/bd-7bzre/gitwork (main)\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.3%/1.0M (auto)" + strings.Repeat(" ", 64) +
+		"(vercel-ai-gateway) google/gemini-4-argon • high"
+
+	// A fresh 32-column pane with the operator's extensions loaded. Their
+	// status line is last and Pi cut it to "ponytail...".
+	piIdleExtensionStatusScreen = " Ponytail loaded: full\n\n" +
+		strings.Repeat("─", 32) + "\n\n" + strings.Repeat("─", 32) + "\n" +
+		"/private/tmp/claude-501/-Volu...\n" +
+		"0.0%/1.0M (auto)  google/gemini-\n" +
+		"🧠 work · ready ○ 🐴 ponytail..."
+
+	// A fresh 40-column pane with --no-extensions.
+	piIdleFreshScreen = " Pi can explain its own features and\n" +
+		" look up its docs. Ask it how to use or\n" +
+		" extend Pi.\n" + strings.Repeat("\n", 7) +
+		piRule40 + "\n\n" + piRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"0.0%/1.0M (auto)  google/gemini-4-argon"
+
+	// Text typed into the editor after the turn and not sent.
+	piDraftScreen = " tell me what to change next...\n\n" +
+		piRule40 + "\n" +
+		"rename main.go to app.go and update\n" +
+		"the imports in every package that uses\n" +
+		"it\n" +
+		piRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.3%/..."
+
+	piWorkingNarrowScreen = strings.Replace(piIdleNarrowScreen, piRule40+"\n\n"+piRule40,
+		"── ⠋ Working "+strings.Repeat("─", 27)+"\n\n"+piRule40, 1)
+	piWorkingWideScreen = strings.Replace(piIdleWideScreen, piRule160+"\n\n"+piRule160,
+		"── ⠋ Working "+strings.Repeat("─", 147)+"\n\n"+piRule160, 1)
+
+	piWorkingAboveEditorScreen = " Elapsed 1m 2s\n ⠧ Working\n" +
+		strings.Repeat("─", 140) + "\n" + strings.Repeat("─", 140) + "\n" +
+		"/Volumes/1tb/Projects/ManchesterSquare (main)\n" +
+		"↑166k ↓20k R2.4M CH99.7% $0.181 8.8%/1.0M (auto)            (vercel-ai-gateway) deepseek/d\n" +
+		"🧠 114-manchester · ready ● 🐴 ponytail: ⚡ FULL"
+
+	// Pi's other status indicators in a 40-column top rule, as rendered.
+	piStatusRules40 = []string{
+		"── ⠋ Retrying (1/3) in 5s... (escape ───",
+		"── ⠋ Compacting context... (escape to ──",
+		"── ⠋ Auto-compacting... (escape to ─────",
+		"── ⠋ Summarizing branch... (escape to ──",
+	}
+)
+
+// TestPiActivelyWorking is the bd-7bzre regression: an idle Pi pane whose
+// footer Pi cut short with "..." read as working, because the wildcard
+// dots_spinner pattern matched the last line. Pi's status indicator, in the
+// editor's top rule or just above the editor, is the only live-turn marker.
+func TestPiActivelyWorking(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "indicator in the top rule, 40 columns", output: piWorkingNarrowScreen, want: true},
+		{name: "indicator in the top rule, 160 columns", output: piWorkingWideScreen, want: true},
+		{name: "indicator above an editor that does not embed it", output: piWorkingAboveEditorScreen, want: true},
+		{
+			name:   "indicator above the editor, extension status cut short",
+			output: strings.Replace(piIdleExtensionStatusScreen, " Ponytail loaded: full", " ⠧ Working", 1),
+			want:   true,
+		},
+		{
+			name:   "indicator with a scroll label in the top rule",
+			output: strings.Replace(piDraftScreen, piRule40+"\nrename", "── ⠋ Working ── ↑ 3 more "+strings.Repeat("─", 15)+"\nrename", 1),
+			want:   true,
+		},
+		{
+			name:   "ansi colored top rule",
+			output: strings.Replace(piIdleNarrowScreen, piRule40+"\n\n", "\x1b[38;5;240m── \x1b[38;5;75m⠙\x1b[0m \x1b[2mWorking\x1b[0m\x1b[38;5;240m "+strings.Repeat("─", 27)+"\x1b[0m\n\n", 1),
+			want:   true,
+		},
+		{name: "no editor drawn, indicator in the tail", output: " ⠧ Working\n\n/repo (main)\n0.0%/1.0M (auto)  model", want: true},
+		{name: "idle, usage line cut short", output: piIdleNarrowScreen},
+		{name: "idle, extension status cut short", output: piIdleExtensionStatusScreen},
+		{name: "idle, 160 columns", output: piIdleWideScreen},
+		{name: "idle, fresh", output: piIdleFreshScreen},
+		{name: "draft", output: piDraftScreen},
+		{
+			name:   "draft scrolled in the editor",
+			output: strings.Replace(piDraftScreen, piRule40+"\nrename", strings.Repeat("─", 15)+" ↑ 3 more "+strings.Repeat("─", 15)+"\nrename", 1),
+		},
+		{
+			name:   "spinner in tool output far above the editor",
+			output: " ⠋ installing deps\n" + strings.Repeat(" more tool output\n", piStatusLinesAboveEditor) + piIdleFreshScreen,
+		},
+		{name: "empty output", output: ""},
+	}
+	for _, rule := range piStatusRules40 {
+		tests = append(tests, struct {
+			name   string
+			output string
+			want   bool
+		}{name: rule, output: strings.Replace(piIdleNarrowScreen, piRule40+"\n\n", rule+"\n\n", 1), want: true})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := PiActivelyWorking(tt.output); got != tt.want {
+				t.Errorf("PiActivelyWorking() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPiIdlePromptShowing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		output     string
+		wantIdle   bool
+		wantEditor bool
+	}{
+		{name: "idle, usage line cut short", output: piIdleNarrowScreen, wantIdle: true, wantEditor: true},
+		{name: "idle, extension status cut short", output: piIdleExtensionStatusScreen, wantIdle: true, wantEditor: true},
+		{name: "idle, 160 columns", output: piIdleWideScreen, wantIdle: true, wantEditor: true},
+		{name: "idle, fresh", output: piIdleFreshScreen, wantIdle: true, wantEditor: true},
+		// An editor with no line between its rules, as in the live capture.
+		{name: "idle, rules adjacent", output: strings.Replace(piWorkingAboveEditorScreen, " ⠧ Working", " ✓ done", 1), wantIdle: true, wantEditor: true},
+		// Unsent text is not an idle prompt, but Pi is waiting for input.
+		{name: "draft", output: piDraftScreen, wantEditor: true},
+		{name: "working, 40 columns", output: piWorkingNarrowScreen},
+		{name: "working, 160 columns", output: piWorkingWideScreen},
+		{name: "working above the editor", output: piWorkingAboveEditorScreen},
+		{name: "no editor drawn", output: "/repo (main)\n0.0%/1.0M (auto)  model"},
+		{name: "empty output", output: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := PiIdlePromptShowing(tt.output); got != tt.wantIdle {
+				t.Errorf("PiIdlePromptShowing() = %v, want %v", got, tt.wantIdle)
+			}
+			if got := PiEditorShowing(tt.output); got != tt.wantEditor {
+				t.Errorf("PiEditorShowing() = %v, want %v", got, tt.wantEditor)
+			}
+		})
+	}
+}
+
+// TestParser_Parse_PiStates pins the parser to the Pi recognizers. Before
+// bd-7bzre it read Pi with substring guesses: an idle pane after a turn read
+// as working ("running ", the "Thinking..." label) and never as idle, since
+// Pi 1.3.0 draws no ">" prompt.
+func TestParser_Parse_PiStates(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	tests := []struct {
+		name        string
+		output      string
+		wantWorking bool
+		wantIdle    bool
+	}{
+		{name: "idle, usage line cut short", output: piIdleNarrowScreen, wantIdle: true},
+		{name: "idle, extension status cut short", output: piIdleExtensionStatusScreen, wantIdle: true},
+		{name: "idle, 160 columns", output: piIdleWideScreen, wantIdle: true},
+		{name: "idle, fresh", output: piIdleFreshScreen, wantIdle: true},
+		{name: "draft", output: piDraftScreen},
+		{name: "working, 40 columns", output: piWorkingNarrowScreen, wantWorking: true},
+		{name: "working, 160 columns", output: piWorkingWideScreen, wantWorking: true},
+		{name: "working above the editor", output: piWorkingAboveEditorScreen, wantWorking: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, hint := range []AgentType{AgentTypePi, AgentType("pi-coding-agent")} {
+				state, err := p.ParseWithHint(tt.output, hint)
+				if err != nil {
+					t.Fatalf("ParseWithHint(%q) error: %v", hint, err)
+				}
+				if state.Type != AgentTypePi {
+					t.Errorf("hint %q: Type = %v, want %v", hint, state.Type, AgentTypePi)
+				}
+				if state.IsWorking != tt.wantWorking || state.IsIdle != tt.wantIdle {
+					t.Errorf("hint %q: IsWorking = %v, IsIdle = %v, want %v, %v (indicators %v)",
+						hint, state.IsWorking, state.IsIdle, tt.wantWorking, tt.wantIdle, state.WorkIndicators)
+				}
+				if state.IsRateLimited || state.IsInError {
+					t.Errorf("hint %q: IsRateLimited = %v, IsInError = %v, want both false", hint, state.IsRateLimited, state.IsInError)
+				}
+				if shared := PiIdlePromptShowing(tt.output); state.IsIdle != shared {
+					t.Errorf("hint %q: IsIdle = %v but PiIdlePromptShowing = %v", hint, state.IsIdle, shared)
+				}
+			}
+		})
 	}
 }
 
