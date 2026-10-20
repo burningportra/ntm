@@ -107,19 +107,24 @@ func (h *ErrorHandler) action(kind ErrorType) ErrorAction {
 	}
 }
 
-// TimeoutMonitor invokes its handler once when the named stage remains current at expiry.
+// TimeoutMonitor invokes its handler once when the named stage remains current
+// at expiry. Start and Stop may be called from different goroutines.
 type TimeoutMonitor struct {
 	timeout time.Duration
 	handler *ErrorHandler
 	current func() string
-	cancel  context.CancelFunc
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
 }
 
 func NewTimeoutMonitor(timeout time.Duration, handler *ErrorHandler, current func() string) *TimeoutMonitor {
 	return &TimeoutMonitor{timeout: timeout, handler: handler, current: current}
 }
 func (m *TimeoutMonitor) Start(ctx context.Context, stage string) {
-	m.Stop()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stopLocked()
 	if m.timeout <= 0 || m.handler == nil || m.current == nil {
 		return
 	}
@@ -139,6 +144,12 @@ func (m *TimeoutMonitor) Start(ctx context.Context, stage string) {
 	}()
 }
 func (m *TimeoutMonitor) Stop() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stopLocked()
+}
+
+func (m *TimeoutMonitor) stopLocked() {
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
