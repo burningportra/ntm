@@ -1219,6 +1219,182 @@ func TestGetMessage_NotFound(t *testing.T) {
 	}
 }
 
+// TestServerRefusalsClassify replays refusals both servers sent live and checks
+// each comes back as the sentinel error serve maps to an HTTP status. The Rust
+// server (am 0.3.36) sends a tool error's type and message as JSON in the
+// result text and a resource error's type in the JSON-RPC error data. The
+// Python server (mcp_agent_mail 0.3.4) sends only text: "Error calling tool
+// 'X': <message>" for a tool, JSON-RPC code 0 for a resource. Large data
+// fields are trimmed, and the Python project path is shortened to /p.
+func TestServerRefusalsClassify(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		resource bool // resources/read rather than tools/call
+		body     string
+		want     error
+		wantText string
+	}{
+		{
+			name:     "rust force-release of an active reservation",
+			body:     `{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"error\":{\"type\":\"RESERVATION_ACTIVE\",\"message\":\"Reservation still shows recent activity; refusing forced release.\",\"recoverable\":true,\"data\":{\"file_reservation_id\":14598,\"stale_reasons\":[\"agent_recently_active\",\"no_recent_mail_activity>900s\",\"path_pattern_unmatched\"]}}}"}],"isError":true},"id":7}`,
+			want:     ErrReservationConflict,
+			wantText: "RESERVATION_ACTIVE: Reservation still shows recent activity; refusing forced release.",
+		},
+		{
+			name:     "python force-release of an active reservation",
+			body:     `{"jsonrpc":"2.0","id":38,"result":{"content":[{"type":"text","text":"Error calling tool 'force_release_file_reservation': Reservation still shows recent activity; refusing forced release."}],"isError":true}}`,
+			want:     ErrReservationConflict,
+			wantText: ": Reservation still shows recent activity; refusing forced release.",
+		},
+		{
+			name:     "rust force-release of a missing id",
+			body:     `{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"error\":{\"type\":\"NOT_FOUND\",\"message\":\"File reservation id=999999999 not found for project '/Volumes/1tb/Projects/ntm'.\",\"recoverable\":true,\"data\":{\"file_reservation_id\":999999999}}}"}],"isError":true},"id":5}`,
+			want:     ErrNotFound,
+			wantText: "NOT_FOUND: File reservation id=999999999 not found",
+		},
+		{
+			name:     "rust whois of a missing agent",
+			body:     `{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"error\":{\"type\":\"AGENT_NOT_FOUND\",\"message\":\"Agent 'NoSuchAgentZzq' not found in project 'volumes-1tb-projects-ntm'\",\"recoverable\":true,\"data\":{\"agent_name\":\"NoSuchAgentZzq\",\"project\":\"volumes-1tb-projects-ntm\"}}}"}],"isError":true},"id":1}`,
+			want:     ErrAgentNotRegistered,
+			wantText: "AGENT_NOT_FOUND: Agent 'NoSuchAgentZzq' not found",
+		},
+		{
+			name:     "rust whois in a missing project",
+			body:     `{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"error\":{\"type\":\"NOT_FOUND\",\"message\":\"Project '/nonexistent/bd-m0gm2-probe' not found. Did you mean: 'volumes-1tb-projects-pi', 'volumes-1tb-projects-ntm'? Use ensure_project to create a new project, or check spelling.\",\"recoverable\":true,\"data\":{\"identifier\":\"/nonexistent/bd-m0gm2-probe\"}}}"}],"isError":true},"id":2}`,
+			want:     ErrNotFound,
+			wantText: "NOT_FOUND: Project '/nonexistent/bd-m0gm2-probe' not found.",
+		},
+		{
+			name:     "rust send with a wrong sender_token",
+			body:     `{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"error\":{\"type\":\"SENDER_TOKEN_MISMATCH\",\"message\":\"sender_token does not match the registered token for agent 'RoseRiver'. Only the agent's owner (the session that called register_agent) can send messages as this agent. Use the registration_token returned by register_agent.\",\"recoverable\":false,\"data\":{\"sender_name\":\"RoseRiver\",\"hint\":\"Use the registration_token returned by register_agent as sender_token\"}}}"}],"isError":true},"id":9}`,
+			want:     ErrUnauthorized,
+			wantText: "SENDER_TOKEN_MISMATCH: sender_token does not match the registered token for agent 'RoseRiver'.",
+		},
+		{
+			name:     "rust retire with a wrong registration_token",
+			body:     `{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"error\":{\"type\":\"AUTHENTICATION_REQUIRED\",\"message\":\"retire_agent was refused: the supplied registration_token does not match agent 'RoseRiver'. Present the token returned when 'RoseRiver' was registered (the ` + "`registration_token`" + ` field of the register_agent / create_agent_identity / macro_start_session response).\",\"recoverable\":true,\"data\":{\"agent_name\":\"RoseRiver\",\"token_param\":\"registration_token\",\"reason\":\"token_mismatch\"}}}"}],"isError":true},"id":10}`,
+			want:     ErrUnauthorized,
+			wantText: "AUTHENTICATION_REQUIRED: retire_agent was refused",
+		},
+		{
+			name:     "python whois without a token",
+			body:     `{"jsonrpc":"2.0","id":14,"result":{"content":[{"type":"text","text":"Error calling tool 'whois': whois requires registration_token for agent 'GreenCastle', unless this MCP session has already authenticated as that agent."}],"isError":true}}`,
+			want:     ErrUnauthorized,
+			wantText: ": whois requires registration_token for agent 'GreenCastle'",
+		},
+		{
+			name:     "python reply without a sender_token",
+			body:     `{"jsonrpc":"2.0","id":19,"result":{"content":[{"type":"text","text":"Error calling tool 'reply_message': reply_message requires sender_token for agent 'GreenCastle', unless this MCP session has already authenticated as that agent."}],"isError":true}}`,
+			want:     ErrUnauthorized,
+			wantText: ": reply_message requires sender_token for agent 'GreenCastle'",
+		},
+		{
+			name:     "python search without an agent",
+			body:     `{"jsonrpc":"2.0","id":20,"result":{"content":[{"type":"text","text":"Error calling tool 'search_messages': search_messages requires an authenticated agent for project '/p'. Provide agent_name plus registration_token (or agent_token for resources), or authenticate in this session first."}],"isError":true}}`,
+			want:     ErrUnauthorized,
+			wantText: ": search_messages requires an authenticated agent for project '/p'.",
+		},
+		{
+			name:     "python fetch_inbox given mark_read",
+			body:     `{"jsonrpc":"2.0","id":16,"result":{"content":[{"type":"text","text":"1 validation error for call[fetch_inbox]\nmark_read\n  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=False, input_type=bool]\n    For further information visit https://errors.pydantic.dev/2.12/v/unexpected_keyword_argument"}],"isError":true}}`,
+			want:     ErrInvalidRequest,
+			wantText: "1 validation error for call[fetch_inbox]",
+		},
+		{
+			name:     "python message resource without an agent",
+			resource: true,
+			body:     `{"jsonrpc":"2.0","id":8,"error":{"code":0,"message":"Error reading resource from template 'resource://message/3?project=%2Fp&format=json': resource://message/{message_id} requires an authenticated agent for project '/p'. Provide agent_name plus registration_token (or agent_token for resources), or authenticate in this session first."}}`,
+			want:     ErrUnauthorized,
+			wantText: "requires an authenticated agent for project '/p'.",
+		},
+		{
+			name:     "python message resource without a token",
+			resource: true,
+			body:     `{"jsonrpc":"2.0","id":9,"error":{"code":0,"message":"Error reading resource from template 'resource://message/3?project=%2Fp&format=json&agent=GreenCastle': resource://message/{message_id} requires agent_token for agent 'GreenCastle', unless this MCP session has already authenticated as that agent."}}`,
+			want:     ErrUnauthorized,
+			wantText: "requires agent_token for agent 'GreenCastle'",
+		},
+		{
+			name:     "python message resource with a wrong token",
+			resource: true,
+			body:     `{"jsonrpc":"2.0","id":13,"error":{"code":0,"message":"Error reading resource from template 'resource://message/3?project=%2Fp&format=json&agent=GreenCastle&agent_token=ILoW67Kh4O_-WDlBmI64wrplclNDoDPaza9KxjEf4eA': Invalid agent_token for agent 'GreenCastle'."}}`,
+			want:     ErrUnauthorized,
+			wantText: "Invalid agent_token for agent 'GreenCastle'.",
+		},
+		{
+			name:     "python message resource for a non-participant",
+			resource: true,
+			body:     `{"jsonrpc":"2.0","id":12,"error":{"code":0,"message":"Error reading resource from template 'resource://message/3?project=%2Fp&format=json&agent=RedStone&agent_token=TWtYrUBgdJWO-kD0Uu0VWqQt7k0jVSyRp3tt2hxyDKU': Message '3' not found or not visible to agent 'RedStone' in project '/p'."}}`,
+			want:     ErrNotFound,
+			wantText: "Message '3' not found or not visible to agent 'RedStone'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			c := NewClient(WithBaseURL(server.URL + "/"))
+			var err error
+			if tt.resource {
+				_, err = c.ReadResource(context.Background(), "resource://message/3")
+			} else {
+				_, err = c.callTool(context.Background(), "replayed_tool", map[string]interface{}{})
+			}
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("error = %v, want %v", err, tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.wantText)
+			}
+			// The Python resource wrapping repeats the request URI, agent_token
+			// included, which serve would hand to its caller.
+			for _, wrapping := range []string{`{"error"`, "Error calling tool", "Error reading resource", "agent_token="} {
+				if strings.Contains(err.Error(), wrapping) {
+					t.Errorf("error = %q, want the server's message without its wrapping %q", err.Error(), wrapping)
+				}
+			}
+		})
+	}
+}
+
+// TestServerRefusalsLeftUnclassified pins that a refusal naming none of the
+// classified conditions stays a plain tool error, so serve keeps answering 500
+// for what is a server fault. The CONFLICT reply is built from the Rust
+// server's identity.rs (agent name namespace exhausted), which shares its type
+// with a lost force-release race but is not a reservation conflict.
+func TestServerRefusalsLeftUnclassified(t *testing.T) {
+	t.Parallel()
+
+	sentinels := []error{
+		ErrReservationConflict, ErrUnauthorized, ErrNotFound, ErrAgentNotRegistered, ErrMessageNotFound,
+		ErrContactBlocked, ErrInvalidRequest, ErrTransientBusy, ErrTimeout, ErrNotImplemented,
+	}
+	for _, text := range []string{
+		`{"error":{"type":"CONFLICT","message":"Could not auto-generate an unused agent name after 512 draws; this project's adjective+noun namespace is heavily used.","recoverable":true}}`,
+		`{"error":{"type":"DATABASE_ERROR","message":"Database error: disk I/O error","recoverable":false}}`,
+		`Agent name already in use`,
+	} {
+		err := classifyToolErrorText(text)
+		for _, sentinel := range sentinels {
+			if errors.Is(err, sentinel) {
+				t.Errorf("classifyToolErrorText(%q) = %v, want no sentinel, matched %v", text, err, sentinel)
+			}
+		}
+		if !strings.HasPrefix(err.Error(), "tool error: ") {
+			t.Errorf("classifyToolErrorText(%q) = %q, want a plain tool error", text, err.Error())
+		}
+	}
+}
+
 func TestSetContactPolicy(t *testing.T) {
 	t.Parallel()
 

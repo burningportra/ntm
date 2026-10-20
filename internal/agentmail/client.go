@@ -509,15 +509,8 @@ func extractMCPContent(result json.RawMessage) (json.RawMessage, error) {
 
 	// Check for tool-level error
 	if envelope.IsError {
-		// Extract error message from content if available
 		if len(envelope.Content) > 0 && envelope.Content[0].Text != "" {
-			errMsg := envelope.Content[0].Text
-			msgLower := strings.ToLower(errMsg)
-			// Detect transient busy errors so callers can retry
-			if strings.Contains(msgLower, "busy") || strings.Contains(msgLower, "temporarily unavailable") {
-				return nil, fmt.Errorf("%w: %s", ErrTransientBusy, errMsg)
-			}
-			return nil, fmt.Errorf("tool error: %s", errMsg)
+			return nil, classifyToolErrorText(envelope.Content[0].Text)
 		}
 		return nil, fmt.Errorf("tool returned error")
 	}
@@ -620,7 +613,7 @@ func (c *Client) rpc(ctx context.Context, operation, method string, params inter
 
 	// Check HTTP status
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, NewAPIError(operation, resp.StatusCode, ErrUnauthorized)
+		return nil, NewAPIError(operation, resp.StatusCode, fmt.Errorf("%w: invalid or missing bearer token", ErrUnauthorized))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, NewAPIError(operation, resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))

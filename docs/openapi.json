@@ -4544,7 +4544,7 @@
             }
           },
           "401": {
-            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail rejected serve's.",
+            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or the reader: the Python server refuses a request without agent_name, or an agent_name serve holds no registration token for.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4564,7 +4564,7 @@
             }
           },
           "404": {
-            "description": "MESSAGE_NOT_FOUND: Agent Mail has no such message in this project.",
+            "description": "MESSAGE_NOT_FOUND when Agent Mail has no such message in this project (or, on the Python server, the reader is neither its sender nor a recipient), AGENT_NOT_FOUND when agent_name is not registered.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4574,7 +4574,7 @@
             }
           },
           "500": {
-            "description": "INTERNAL_ERROR: serve could not build its mail client, or any other Agent Mail failure, including the Python server refusing a reader it cannot authenticate.",
+            "description": "INTERNAL_ERROR: serve could not build its mail client, or Agent Mail failed in a way that is none of the above.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4836,7 +4836,7 @@
             }
           },
           "401": {
-            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail rejected serve's.",
+            "description": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail refused serve's bearer token or agent_name: the Python server refuses an agent_name serve holds no registration token for.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4866,7 +4866,7 @@
             }
           },
           "409": {
-            "description": "CONFLICT: Agent Mail reported a reservation conflict, or released nothing without saying the reservation was already released (details carries notified, previous_holder and path_pattern).",
+            "description": "CONFLICT: Agent Mail refused because the reservation still shows recent activity (both servers) or was renewed or released while it decided (Rust server), or it released nothing without saying the reservation was already released (details carries notified, previous_holder and path_pattern).",
             "content": {
               "application/json": {
                 "schema": {
@@ -4876,7 +4876,7 @@
             }
           },
           "500": {
-            "description": "INTERNAL_ERROR: serve could not build its mail client or got no result, or any other Agent Mail failure, including the tool error both servers return when the reservation still looks active and the Python server refusing an agent_name it cannot authenticate.",
+            "description": "INTERNAL_ERROR: serve could not build its mail client or got no result, or Agent Mail failed in a way that is none of the above.",
             "content": {
               "application/json": {
                 "schema": {

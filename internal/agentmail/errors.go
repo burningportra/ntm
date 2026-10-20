@@ -1,8 +1,10 @@
 package agentmail
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -11,8 +13,11 @@ var (
 	// ErrServerUnavailable is returned when the Agent Mail server is not reachable.
 	ErrServerUnavailable = errors.New("agent mail server unavailable")
 
-	// ErrUnauthorized is returned when the bearer token is invalid or missing.
-	ErrUnauthorized = errors.New("unauthorized: invalid or missing bearer token")
+	// ErrUnauthorized is returned when Agent Mail refuses the caller's
+	// credentials: an invalid or missing bearer token (HTTP 401), or a
+	// missing or wrong registration, sender or agent token for the agent a
+	// call acts as.
+	ErrUnauthorized = errors.New("unauthorized")
 
 	// ErrNotFound is returned when a requested resource doesn't exist.
 	ErrNotFound = errors.New("resource not found")
@@ -139,29 +144,146 @@ func IsTransientBusy(err error) bool {
 	return errors.Is(err, ErrTransientBusy)
 }
 
+// authRefusalText matches the Python server's authentication refusals, which
+// carry no error type on the wire: "<action> requires registration_token for
+// agent 'X', ...", "... requires agent_token ...", "... requires a project
+// registration token ...", "Invalid registration_token for agent 'X'." and
+// "Invalid agent_token for agent 'X'." (lowercased).
+var authRefusalText = regexp.MustCompile(`\b(requires|invalid) (a project )?[a-z_]*(registration_token|sender_token|agent_token|registration token)\b`)
+
+// agentNotFoundText matches "Agent 'X' not found ..." (lowercased), which both
+// servers send for an agent name the project does not have.
+var agentNotFoundText = regexp.MustCompile(`\bagent '[^']*' not found\b`)
+
+// classifyServerError returns the sentinel error an Agent Mail refusal stands
+// for, or nil when it is none of them. It is the one place both servers'
+// refusals are classified, for tool errors and JSON-RPC errors alike.
+//
+// errType is the error type the server named, if any. The Rust server names
+// one for every tool error ({"error": {"type", "message", ...}} as the result
+// text) and in the data of its JSON-RPC errors. The Python server sends only
+// the message, so an empty or unknown type falls back to the message text.
+func classifyServerError(errType, message string) error {
+	msg := strings.ToLower(message)
+	switch errType {
+	case "AGENT_NOT_FOUND":
+		return ErrAgentNotRegistered
+	case "RESERVATION_ACTIVE":
+		return ErrReservationConflict
+	case "CONFLICT":
+		// Also sent when the agent name namespace is exhausted, which is no
+		// reservation conflict.
+		if strings.Contains(msg, "reservation") {
+			return ErrReservationConflict
+		}
+		return nil
+	case "CONTACT_BLOCKED", "CONTACT_REQUIRED":
+		return ErrContactBlocked
+	case "AUTHENTICATION_REQUIRED", "SENDER_TOKEN_REQUIRED", "SENDER_TOKEN_MISMATCH":
+		return ErrUnauthorized
+	case "INVALID_ARGUMENT", "MISSING_FIELD", "TYPE_ERROR":
+		return ErrInvalidRequest
+	case "RESOURCE_BUSY", "DATABASE_POOL_EXHAUSTED":
+		return ErrTransientBusy
+	}
+	if errType == "NOT_FOUND" || strings.HasSuffix(errType, "_NOT_FOUND") {
+		if strings.Contains(msg, "message not found") {
+			return ErrMessageNotFound
+		}
+		return ErrNotFound
+	}
+	if strings.HasPrefix(errType, "INVALID_") || strings.HasPrefix(errType, "EMPTY_") {
+		return ErrInvalidRequest
+	}
+
+	switch {
+	case authRefusalText.MatchString(msg) || strings.Contains(msg, "requires an authenticated agent") || strings.Contains(msg, "cannot be authenticated"):
+		return ErrUnauthorized
+	case strings.Contains(msg, "agent not registered") || agentNotFoundText.MatchString(msg):
+		return ErrAgentNotRegistered
+	case strings.Contains(msg, "message not found"):
+		return ErrMessageNotFound
+	case strings.Contains(msg, "contact_blocked") || (strings.Contains(msg, "contact") && strings.Contains(msg, "blocked")) ||
+		strings.Contains(msg, "not accepting messages") || strings.Contains(msg, "contact approval required"):
+		return ErrContactBlocked
+	case strings.Contains(msg, "still shows recent activity") || (strings.Contains(msg, "conflict") && strings.Contains(msg, "reservation")):
+		return ErrReservationConflict
+	case strings.Contains(msg, "not found") && !strings.Contains(msg, "method not found"):
+		return ErrNotFound
+	case strings.Contains(msg, "busy") || strings.Contains(msg, "temporarily unavailable") || strings.Contains(msg, "overloaded"):
+		return ErrTransientBusy
+	case strings.Contains(msg, "timed out") || strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded"):
+		return ErrTimeout
+	case strings.Contains(msg, "validation error for call["):
+		// pydantic rejecting the arguments before the Python tool runs.
+		return ErrInvalidRequest
+	}
+	return nil
+}
+
+// stripPythonErrorPrefix drops the wrapping the Python server's MCP framework
+// puts before a refusal: "Error calling tool '<name>': " on a tool error and
+// "Error reading resource from template '<uri>': " on a resource error. The
+// URI repeats the request's query, agent_token included, so the prefix must
+// not reach an error message serve hands its callers.
+func stripPythonErrorPrefix(text string) string {
+	for _, prefix := range []string{"Error calling tool '", "Error reading resource from template '"} {
+		if rest, ok := strings.CutPrefix(text, prefix); ok {
+			if _, msg, found := strings.Cut(rest, "': "); found {
+				return msg
+			}
+		}
+	}
+	return text
+}
+
+// classifyToolErrorText turns the text of a tool result with isError set into
+// an error. The Rust server's text is {"error": {"type", "message", ...}}; the
+// Python server's is "Error calling tool '<name>': <message>", or a pydantic
+// validation report. The error wraps the sentinel the refusal classifies as,
+// and is a plain "tool error" when it classifies as none.
+func classifyToolErrorText(text string) error {
+	var payload struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	errType, message := "", stripPythonErrorPrefix(text)
+	if err := json.Unmarshal([]byte(text), &payload); err == nil && payload.Error.Message != "" {
+		errType, message = payload.Error.Type, payload.Error.Message
+	}
+
+	described := message
+	if errType != "" {
+		described = errType + ": " + message
+	}
+	if kind := classifyServerError(errType, message); kind != nil {
+		return fmt.Errorf("%w: %s", kind, described)
+	}
+	return fmt.Errorf("tool error: %s", described)
+}
+
+// jsonRPCErrorType returns the error type the Rust server puts in a JSON-RPC
+// error's data ({"error": {"type": ...}}), or "" when there is none.
+func jsonRPCErrorType(data interface{}) string {
+	fields, _ := data.(map[string]interface{})
+	inner, _ := fields["error"].(map[string]interface{})
+	errType, _ := inner["type"].(string)
+	return errType
+}
+
 // mapJSONRPCError converts JSON-RPC error codes to Go errors.
 func mapJSONRPCError(rpcErr *JSONRPCError) error {
 	if rpcErr == nil {
 		return nil
 	}
 
-	// Map application-specific errors by message content (heuristic)
-	msg := strings.ToLower(rpcErr.Message)
-	switch {
-	case strings.Contains(msg, "agent not registered"):
-		return fmt.Errorf("%w: %s", ErrAgentNotRegistered, rpcErr.Message)
-	case strings.Contains(msg, "message not found"):
-		return fmt.Errorf("%w: %s", ErrMessageNotFound, rpcErr.Message)
-	case strings.Contains(msg, "contact_blocked") || (strings.Contains(msg, "contact") && strings.Contains(msg, "blocked")):
-		return fmt.Errorf("%w: %s", ErrContactBlocked, rpcErr.Message)
-	case strings.Contains(msg, "conflict") && strings.Contains(msg, "reservation"):
-		return fmt.Errorf("%w: %s", ErrReservationConflict, rpcErr.Message)
-	case strings.Contains(msg, "not found") && !strings.Contains(msg, "method not found"):
-		return fmt.Errorf("%w: %s", ErrNotFound, rpcErr.Message)
-	case strings.Contains(msg, "busy") || strings.Contains(msg, "temporarily unavailable") || strings.Contains(msg, "overloaded"):
-		return fmt.Errorf("%w: %s", ErrTransientBusy, rpcErr.Message)
-	case strings.Contains(msg, "timed out") || strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded"):
-		return fmt.Errorf("%w: %s", ErrTimeout, rpcErr.Message)
+	if message := stripPythonErrorPrefix(rpcErr.Message); message != rpcErr.Message {
+		rpcErr = &JSONRPCError{Code: rpcErr.Code, Message: message, Data: rpcErr.Data}
+	}
+	if kind := classifyServerError(jsonRPCErrorType(rpcErr.Data), rpcErr.Message); kind != nil {
+		return fmt.Errorf("%w: %s", kind, rpcErr.Message)
 	}
 
 	// Map common JSON-RPC error codes

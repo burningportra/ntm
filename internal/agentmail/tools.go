@@ -1046,7 +1046,7 @@ func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessa
 
 	// Check HTTP status
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, NewAPIError("overseer_send", resp.StatusCode, ErrUnauthorized)
+		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("%w: invalid or missing bearer token", ErrUnauthorized))
 	}
 	if resp.StatusCode == http.StatusBadRequest {
 		// Try to extract error message from response
