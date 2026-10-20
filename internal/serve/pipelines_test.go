@@ -1,11 +1,15 @@
 package serve
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/config"
 )
 
 // Workflow paths must be confined to the project directory. pipeline.ParseFile
@@ -97,10 +101,20 @@ func mustEval(t *testing.T, path string) string {
 // HTTP server — continuously, because only successful probes were cached and every
 // mail request therefore re-probed.
 func TestGetMailClientDoesNotBlockReadersDuringProbe(t *testing.T) {
-	srv := &Server{projectDir: t.TempDir()}
+	// A slow, failing stand-in server keeps the probe running for a while
+	// and sends it down the unavailable path.
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer slow.Close()
+	t.Setenv("AGENT_MAIL_URL", "")
+	srv := &Server{
+		projectDir: t.TempDir(),
+		agentMail:  config.AgentMailConfig{Enabled: true, URL: slow.URL + "/"},
+	}
 
-	// Agent Mail is not reachable in tests, so the probe takes the unavailable
-	// path. While it runs, a reader must still be able to acquire s.mu.
+	// While the probe runs, a reader must still be able to acquire s.mu.
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
@@ -117,7 +131,7 @@ func TestGetMailClientDoesNotBlockReadersDuringProbe(t *testing.T) {
 		t.Fatalf("getMailClient: %v", err)
 	}
 	if client != nil {
-		t.Skip("Agent Mail is reachable in this environment; the unavailable path is not exercised")
+		t.Fatal("getMailClient returned a client for an unavailable server")
 	}
 
 	select {

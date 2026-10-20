@@ -40,6 +40,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/policy"
@@ -99,7 +100,8 @@ type Server struct {
 	// Production servers leave it nil and use os.MkdirAll directly.
 	policyMkdirAll func(string, os.FileMode) error
 
-	// Agent Mail client (lazy-init)
+	// Agent Mail client (lazy-init from agentMail)
+	agentMail  config.AgentMailConfig
 	mailClient *agentmail.Client
 	// mailUnavailableUntil caches a negative availability verdict so an
 	// unreachable Agent Mail server does not make every mail request pay the
@@ -204,6 +206,10 @@ type Config struct {
 	// retention goroutine, and callers construct many servers in tests. Ownership
 	// stays with the caller, which is responsible for closing it.
 	AuditStore *AuditStore
+	// AgentMail holds the [agent_mail] settings the mail endpoints build their
+	// client from. The zero value has Enabled false, so a server constructed
+	// without them never contacts an Agent Mail server.
+	AgentMail config.AgentMailConfig
 }
 
 const (
@@ -952,6 +958,7 @@ func New(cfg Config) *Server {
 		stateStore:         cfg.StateStore,
 		auth:               cfg.Auth,
 		auditStore:         cfg.AuditStore,
+		agentMail:          cfg.AgentMail,
 		sseClients:         make(map[chan events.BusEvent]struct{}),
 		corsAllowedOrigins: cfg.AllowedOrigins,
 		jwksCache:          newJWKSCache(cfg.Auth.OIDC.CacheTTL),

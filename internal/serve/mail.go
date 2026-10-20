@@ -456,11 +456,11 @@ func (s *Server) getMailClient() (*agentmail.Client, error) {
 		return nil, nil // Known unavailable; do not re-probe yet.
 	}
 
-	// Create client with project key derived from working directory, and probe
-	// without holding the server lock.
-	client := agentmail.NewClient(
-		agentmail.WithProjectKey(projectDir),
-	)
+	// Build the client for the project directory from the server's
+	// [agent_mail] settings, and probe without holding the server lock. With
+	// enabled = false the client refuses every call, so the probe reports
+	// unavailable without contacting the server.
+	client := s.agentMail.NewClient(projectDir)
 	available := client.IsAvailable()
 
 	s.mu.Lock()

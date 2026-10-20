@@ -154,6 +154,11 @@ func runServe(opts serveOptions) error {
 		}()
 	}
 
+	agentMailCfg := config.Default().AgentMail
+	if cfg != nil {
+		agentMailCfg = cfg.AgentMail
+	}
+
 	serverCfg := serve.Config{
 		Host:           opts.Host,
 		Port:           opts.Port,
@@ -163,6 +168,7 @@ func runServe(opts serveOptions) error {
 		StateStore:     stateStore,
 		AllowedOrigins: opts.CORSAllowOrigins,
 		AuditStore:     auditStore,
+		AgentMail:      agentMailCfg,
 		Auth: serve.AuthConfig{
 			Mode:   mode,
 			APIKey: opts.APIKey,

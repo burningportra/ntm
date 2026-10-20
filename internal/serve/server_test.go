@@ -31,6 +31,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/pipeline"
@@ -47,6 +48,20 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+// unreachableAgentMailURL is a closed local port. TestMain points
+// AGENT_MAIL_URL at it so any Agent Mail client a test builds without its own
+// mock (robot status, a bare Server's getMailClient) fails closed instead of
+// reaching the developer's real server on 127.0.0.1:8765.
+const unreachableAgentMailURL = "http://127.0.0.1:1/"
+
+func TestMain(m *testing.M) {
+	if err := os.Setenv("AGENT_MAIL_URL", unreachableAgentMailURL); err != nil {
+		fmt.Fprintf(os.Stderr, "point serve tests at a closed Agent Mail port: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
 }
 
 func skipServeRealToolsInShort(t *testing.T, tools ...string) {
@@ -1131,7 +1146,6 @@ func TestHandleMailInbox_InvalidSinceTS(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
-	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL("http://127.0.0.1:8765/"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/inbox?agent_name=BlueLake&since_ts=not-a-timestamp", nil)
@@ -1147,7 +1161,6 @@ func TestHandleMailInbox_InvalidLimit(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
-	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL("http://127.0.0.1:8765/"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/inbox?agent_name=BlueLake&limit=zero", nil)
@@ -1163,7 +1176,6 @@ func TestHandleMailInbox_InvalidUrgentOnly(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
-	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL("http://127.0.0.1:8765/"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/inbox?agent_name=BlueLake&urgent_only=maybe", nil)
@@ -1179,7 +1191,6 @@ func TestHandleMailInbox_InvalidIncludeBodies(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
-	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL("http://127.0.0.1:8765/"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/inbox?agent_name=BlueLake&include_bodies=maybe", nil)
@@ -1195,7 +1206,6 @@ func TestHandleSearchMessages_InvalidLimit(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
-	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL("http://127.0.0.1:8765/"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/search?q=test&limit=bogus", nil)
@@ -1211,7 +1221,6 @@ func TestHandleThreadSummary_InvalidLLMMode(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
-	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL("http://127.0.0.1:8765/"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/threads/TKT-123/summary?llm_mode=definitely", nil)
@@ -1230,7 +1239,6 @@ func TestHandleThreadSummary_InvalidIncludeExamples(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
-	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL("http://127.0.0.1:8765/"))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/threads/TKT-123/summary?include_examples=maybe", nil)
@@ -1565,6 +1573,58 @@ func TestHandleMailHealth_PingDecidesAvailability(t *testing.T) {
 	}
 	if errText, _ := body["error"].(string); !strings.Contains(errText, "health_check") {
 		t.Fatalf("error = %q, want the health_check failure", errText)
+	}
+}
+
+// TestGetMailClientUsesAgentMailConfig locks bd-46tqx: the mail endpoints
+// build their client from the [agent_mail] settings serve was started with, so
+// its url and token reach the server when AGENT_MAIL_URL is unset, and
+// enabled = false (the zero value) reports Agent Mail unavailable without
+// contacting any server.
+func TestGetMailClientUsesAgentMailConfig(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		auths []string
+	)
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer mock.Close()
+	t.Setenv("AGENT_MAIL_URL", "")
+	t.Setenv("AGENT_MAIL_TOKEN", "")
+	requests := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), auths...)
+	}
+
+	enabled := New(Config{AgentMail: config.AgentMailConfig{Enabled: true, URL: mock.URL + "/", Token: "cfg-token"}})
+	t.Cleanup(enabled.Stop)
+	enabled.projectDir = t.TempDir()
+	client, err := enabled.getMailClient()
+	if err != nil || client == nil {
+		t.Fatalf("getMailClient() = %v, %v; want a client for the configured server", client, err)
+	}
+	if got := client.BaseURL(); got != mock.URL+"/" {
+		t.Fatalf("BaseURL = %q, want the configured %q", got, mock.URL+"/")
+	}
+	if got := requests(); len(got) == 0 || got[0] != "Bearer cfg-token" {
+		t.Fatalf("Authorization headers = %q, want the configured token on the probe", got)
+	}
+
+	before := len(requests())
+	disabled := New(Config{AgentMail: config.AgentMailConfig{URL: mock.URL + "/"}})
+	t.Cleanup(disabled.Stop)
+	disabled.projectDir = t.TempDir()
+	if client, err := disabled.getMailClient(); err != nil || client != nil {
+		t.Fatalf("getMailClient() = %v, %v; want unavailable when [agent_mail] enabled = false", client, err)
+	}
+	if got := requests(); len(got) != before {
+		t.Fatalf("Agent Mail requests = %d, want %d: a disabled server must not contact Agent Mail", len(got), before)
 	}
 }
 
