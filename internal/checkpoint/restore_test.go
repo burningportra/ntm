@@ -488,6 +488,9 @@ func TestRestorer_RestoreFromCheckpoint_SkipsLegacyLayoutForMultiWindowSession(t
 
 	workDir := t.TempDir()
 	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
+	// The sleep stand-ins never draw a ready screen, so the restore waits out
+	// its ready deadline; a short one keeps the test fast.
+	r.agentReadyTimeout = time.Second
 	sessionName := "cplegacy-layout-" + time.Now().Format("150405000000")
 
 	cp := &Checkpoint{
@@ -686,15 +689,26 @@ func TestRestorer_InjectContextWaitsForAgentReadiness(t *testing.T) {
 	if result.ContextInjected {
 		t.Error("ContextInjected = true although the Codex pane never became ready")
 	}
+	// Relaunch reports the Codex agent started but not ready, and injection
+	// reports its context not injected.
 	var notReady []string
 	for _, warning := range result.Warnings {
 		if strings.Contains(warning, "not ready") {
 			notReady = append(notReady, warning)
 		}
 	}
-	wantWarning := sessionName + "__cod_1): agent not ready within 4s; context not injected"
-	if len(notReady) != 1 || !strings.HasSuffix(notReady[0], wantWarning) {
-		t.Errorf("not-ready warnings = %q, want one ending %q (all warnings: %q)", notReady, wantWarning, result.Warnings)
+	wantWarnings := []string{
+		sessionName + `__cod_1): agent "cat" started but not ready within 4s`,
+		sessionName + "__cod_1): agent not ready within 4s; context not injected",
+	}
+	if len(notReady) != len(wantWarnings) {
+		t.Errorf("not-ready warnings = %q, want %d ending %q (all warnings: %q)", notReady, len(wantWarnings), wantWarnings, result.Warnings)
+	} else {
+		for i, want := range wantWarnings {
+			if !strings.HasSuffix(notReady[i], want) {
+				t.Errorf("not-ready warning %d = %q, want it ending %q", i, notReady[i], want)
+			}
+		}
 	}
 
 	want := restoreTestPastedContext("muse scrollback")
@@ -704,6 +718,112 @@ func TestRestorer_InjectContextWaitsForAgentReadiness(t *testing.T) {
 	time.Sleep(time.Second)
 	if data, _ := os.ReadFile(received["cod"]); len(data) != 0 {
 		t.Errorf("codex pane that never became ready got input %q", data)
+	}
+}
+
+// TestRestorer_RelaunchWaitsForSlowLaunchers restores three agent panes whose
+// launchers behave like real ones: two stay in their shell for 3 s and 10 s
+// (an update check, a version-manager shim) before exec'ing an agent that
+// draws its idle screen, and one exits with an error at once. Each slow agent
+// must be launched once and not reported; the old restore gave a pane 2 s to
+// show its command, then killed the launcher and launched it again, three
+// times, and reported it failed. The failing launcher must be launched three
+// times and reported, and its pane kept, dead, so the failure stays visible;
+// the old restore lost the pane when the launcher exited and never retried.
+func TestRestorer_RelaunchWaitsForSlowLaunchers(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	workDir := t.TempDir()
+	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
+	r.agentReadyTimeout = 20 * time.Second
+	sessionName := "cpslow-" + time.Now().Format("150405000000")
+
+	cp := &Checkpoint{
+		ID:          "slow-launcher-checkpoint",
+		SessionName: sessionName,
+		WorkingDir:  workDir,
+		CreatedAt:   time.Now(),
+	}
+	launchers := []struct {
+		agentType string
+		// then runs after the launcher records its launch; %[1]q is the agent.
+		then string
+	}{
+		{agentType: "cc", then: "sleep 3\nexec %[1]q\n"},
+		{agentType: "muse", then: "sleep 10\nexec %[1]q\n"},
+		{agentType: "cod", then: "echo 'launcher: update check failed' >&2\nexit 1\n"},
+	}
+	launchLogs := map[string]string{}
+	for window, l := range launchers {
+		dir := filepath.Join(workDir, l.agentType)
+		if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		agentPath := writeRestoreInputRecorder(t, dir, filepath.Join(dir, "received.txt"), restoreTestReadyScreens[l.agentType], "")
+		launchLogs[l.agentType] = filepath.Join(dir, "launches")
+		launcher := filepath.Join(dir, "bin", "launch")
+		script := fmt.Sprintf("#!/bin/sh\necho launched >> %q\n", launchLogs[l.agentType]) + fmt.Sprintf(l.then, agentPath)
+		if err := os.WriteFile(launcher, []byte(script), 0o755); err != nil {
+			t.Fatalf("write launcher: %v", err)
+		}
+		cp.Session.Panes = append(cp.Session.Panes, PaneState{
+			WindowIndex: window,
+			ID:          fmt.Sprintf("%%%d", window),
+			Title:       fmt.Sprintf("%s__%s_1", sessionName, l.agentType),
+			AgentType:   l.agentType,
+			Command:     launcher,
+		})
+		cp.Session.WindowLayouts = append(cp.Session.WindowLayouts, WindowLayoutState{WindowIndex: window, Layout: "tiled"})
+	}
+
+	t.Cleanup(func() {
+		if tmux.SessionExists(sessionName) {
+			_ = tmux.KillSession(sessionName)
+		}
+	})
+
+	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	if err != nil {
+		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+	}
+
+	var agentWarnings []string
+	for _, warning := range result.Warnings {
+		if strings.HasPrefix(warning, "agent restoration incomplete") {
+			agentWarnings = append(agentWarnings, warning)
+		}
+	}
+	wantWarning := sessionName + "__cod_1): agent failed to start in 3 attempts; the last exited with status 1"
+	if len(agentWarnings) != 1 || !strings.HasSuffix(agentWarnings[0], wantWarning) {
+		t.Errorf("agent warnings = %q, want one ending %q", agentWarnings, wantWarning)
+	}
+
+	for agentType, want := range map[string]int{"cc": 1, "muse": 1, "cod": 3} {
+		data, _ := os.ReadFile(launchLogs[agentType])
+		if got := strings.Count(string(data), "launched\n"); got != want {
+			t.Errorf("%s launcher ran %d times, want %d", agentType, got, want)
+		}
+	}
+
+	panes, err := tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanes failed: %v", err)
+	}
+	byTitle := map[string]tmux.Pane{}
+	for _, pane := range panes {
+		byTitle[pane.Title] = pane
+	}
+	for _, agentType := range []string{"cc", "muse"} {
+		if pane, ok := byTitle[sessionName+"__"+agentType+"_1"]; !ok || pane.Command != "cat" {
+			t.Errorf("%s pane = %+v (found %v), want it running its agent (cat)", agentType, pane, ok)
+		}
+	}
+	failed, ok := byTitle[sessionName+"__cod_1"]
+	if !ok {
+		t.Fatalf("failed launcher's pane is gone; panes: %+v", panes)
+	}
+	if dead, err := tmux.DefaultClient.Run("display-message", "-p", "-t", failed.ID, "#{pane_dead}"); err != nil || dead != "1" {
+		t.Errorf("failed launcher's pane_dead = %q (err %v), want 1", dead, err)
 	}
 }
 
@@ -765,40 +885,193 @@ func TestWaitForRestoredAgentReady(t *testing.T) {
 	const museScreen = "Muse Code 1.4.11\n\n❯\n  muse-wonder-1.0 · /repo · YOLO"
 	tests := []struct {
 		name string
-		// screens are the captures in order; the last one repeats.
+		// screens are the observed outputs in order; the last one repeats.
 		screens  []string
 		command  string
+		dead     bool
+		gone     bool
 		deadline time.Duration
-		want     bool
-		// minCaptures is how many captures a ready result must take.
-		minCaptures int
+		// want is the returned error's text; empty for a ready agent.
+		want string
+		// minObservations and maxObservations bound how many observations
+		// the wait takes; zero is unbounded.
+		minObservations, maxObservations int
 	}{
-		{name: "ready once the TUI draws", screens: []string{"", "", museScreen}, command: "muse-bin-1.4.11", deadline: 2 * time.Second, want: true, minCaptures: 3},
-		{name: "never draws", screens: []string{""}, command: "cat", deadline: 50 * time.Millisecond, want: false},
-		{name: "shell prompt under a shell", screens: []string{"% "}, command: "zsh", deadline: 50 * time.Millisecond, want: false},
-		{name: "ready text while the launcher shell still runs", screens: []string{"Update ready"}, command: "bash", deadline: 50 * time.Millisecond, want: false},
-		{name: "dead pane", screens: []string{museScreen}, command: "", deadline: 50 * time.Millisecond, want: false},
-		{name: "checked once after the deadline", screens: []string{museScreen}, command: "muse-bin-1.4.11", deadline: -time.Second, want: true, minCaptures: 1},
+		{name: "ready once the TUI draws", screens: []string{"", "", museScreen}, command: "muse-bin-1.4.11", deadline: 2 * time.Second, minObservations: 3},
+		{name: "never draws", screens: []string{""}, command: "cat", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
+		{name: "shell prompt under a shell", screens: []string{"% "}, command: "zsh", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
+		{name: "ready text while the launcher shell still runs", screens: []string{"Update ready"}, command: "bash", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
+		{name: "dead pane keeps its agent's screen and name, and stops the wait", screens: []string{museScreen}, command: "muse-bin-1.4.11", dead: true, deadline: 5 * time.Second, want: "agent exited", maxObservations: 1},
+		{name: "closed pane stops the wait", screens: []string{""}, gone: true, deadline: 5 * time.Second, want: "pane closed", maxObservations: 1},
+		{name: "checked once after the deadline", screens: []string{museScreen}, command: "muse-bin-1.4.11", deadline: -time.Second, minObservations: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			captures := 0
-			capture := func(paneID string, lines int) (string, error) {
-				if paneID != "%7" || lines != 50 {
-					t.Errorf("capture(%q, %d), want capture(%%7, 50)", paneID, lines)
+			observations := 0
+			observe := func(paneID string) (restoredPaneState, error) {
+				if paneID != "%7" {
+					t.Errorf("observe(%q), want observe(%%7)", paneID)
 				}
-				screen := tc.screens[min(captures, len(tc.screens)-1)]
-				captures++
-				return screen, nil
+				screen := tc.screens[min(observations, len(tc.screens)-1)]
+				observations++
+				return restoredPaneState{gone: tc.gone, dead: tc.dead, command: tc.command, output: screen}, nil
 			}
-			command := func(string) (string, error) { return tc.command, nil }
 
-			got := waitForRestoredAgentReady("%7", time.Now().Add(tc.deadline), time.Millisecond, capture, command)
-			if got != tc.want {
-				t.Fatalf("waitForRestoredAgentReady() = %v, want %v", got, tc.want)
+			err := waitForRestoredAgentReady("%7", time.Now().Add(tc.deadline), max(tc.deadline, 0), time.Millisecond, observe)
+			got := ""
+			if err != nil {
+				got = err.Error()
 			}
-			if tc.want && captures < tc.minCaptures {
-				t.Fatalf("ready after %d captures, want at least %d", captures, tc.minCaptures)
+			if got != tc.want {
+				t.Fatalf("waitForRestoredAgentReady() = %q, want %q", got, tc.want)
+			}
+			if observations < tc.minObservations || (tc.maxObservations > 0 && observations > tc.maxObservations) {
+				t.Fatalf("took %d observations, want between %d and %d", observations, tc.minObservations, tc.maxObservations)
+			}
+		})
+	}
+}
+
+// TestRelaunchRestoredPanes drives one pane's relaunch through scripted
+// observations: per launch, what the pane shows on each poll.
+func TestRelaunchRestoredPanes(t *testing.T) {
+	const museScreen = "Muse Code 1.4.11\n\n❯\n  muse-wonder-1.0 · /repo · YOLO"
+	var (
+		inShell  = restoredPaneState{command: "bash"}
+		wrapper  = restoredPaneState{command: "env"}
+		started  = restoredPaneState{command: "muse-bin-1.4.11"}
+		up       = restoredPaneState{command: "muse-bin-1.4.11", output: museScreen}
+		exited   = restoredPaneState{dead: true, exitStatus: "1", command: "bash"}
+		killed   = restoredPaneState{dead: true, command: "muse-bin-1.4.11"}
+		gone     = restoredPaneState{gone: true}
+		promptUp = restoredPaneState{command: "bash", output: "% "}
+	)
+	tests := []struct {
+		name string
+		// launches lists, per launch, the pane's observations in order; the
+		// last one repeats.
+		launches   [][]restoredPaneState
+		respawnErr error
+		deadline   time.Duration
+		// wantLaunches is how many times the agent must be launched.
+		wantLaunches int
+		// wantErr is the launch's outcome; empty for an agent that came up.
+		wantErr string
+	}{
+		{
+			name:         "launcher stays in its shell for many polls, then the agent comes up",
+			launches:     [][]restoredPaneState{{inShell, inShell, inShell, inShell, inShell, inShell, started, started, up}},
+			deadline:     5 * time.Second,
+			wantLaunches: 1,
+		},
+		{
+			name:         "launcher still in its shell at the deadline is left running",
+			launches:     [][]restoredPaneState{{inShell}},
+			deadline:     50 * time.Millisecond,
+			wantLaunches: 1,
+			wantErr:      "agent not started within 50ms; its launcher (bash) is still running",
+		},
+		{
+			name:         "shell prompt is not an agent coming up",
+			launches:     [][]restoredPaneState{{promptUp}},
+			deadline:     50 * time.Millisecond,
+			wantLaunches: 1,
+			wantErr:      "agent not started within 50ms; its launcher (bash) is still running",
+		},
+		{
+			name:         "agent started but not ready at the deadline is left running",
+			launches:     [][]restoredPaneState{{started}},
+			deadline:     50 * time.Millisecond,
+			wantLaunches: 1,
+			wantErr:      `agent "muse-bin-1.4.11" started but not ready within 50ms`,
+		},
+		{
+			name:         "launcher exits, the second launch comes up",
+			launches:     [][]restoredPaneState{{inShell, exited}, {inShell, up}},
+			deadline:     5 * time.Second,
+			wantLaunches: 2,
+		},
+		{
+			name:         "launcher exits on every launch",
+			launches:     [][]restoredPaneState{{exited}},
+			deadline:     5 * time.Second,
+			wantLaunches: 3,
+			wantErr:      "agent failed to start in 3 attempts; the last exited with status 1",
+		},
+		{
+			name:         "agent killed by a signal on every launch",
+			launches:     [][]restoredPaneState{{started, killed}},
+			deadline:     5 * time.Second,
+			wantLaunches: 3,
+			wantErr:      "agent failed to start in 3 attempts; the last exited",
+		},
+		{
+			name:         "agent back in a shell after it started is launched again",
+			launches:     [][]restoredPaneState{{started, started, inShell}, {up}},
+			deadline:     5 * time.Second,
+			wantLaunches: 2,
+		},
+		{
+			name:         "agent back in a shell after it started on every launch",
+			launches:     [][]restoredPaneState{{started, started, inShell}},
+			deadline:     5 * time.Second,
+			wantLaunches: 3,
+			wantErr:      "agent failed to start in 3 attempts; the last returned to a shell (bash) after its agent started",
+		},
+		{
+			name:         "wrapper seen once before the launcher's shell is not an agent that started",
+			launches:     [][]restoredPaneState{{wrapper, inShell, inShell, up}},
+			deadline:     5 * time.Second,
+			wantLaunches: 1,
+		},
+		{
+			name:         "pane closed",
+			launches:     [][]restoredPaneState{{inShell, gone}},
+			deadline:     5 * time.Second,
+			wantLaunches: 1,
+			wantErr:      "pane closed while its agent was starting",
+		},
+		{
+			name:         "respawn fails",
+			launches:     [][]restoredPaneState{{up}},
+			respawnErr:   errors.New("can't find pane: %3"),
+			deadline:     5 * time.Second,
+			wantLaunches: 1,
+			wantErr:      "launching agent: can't find pane: %3",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			launches, polls := 0, 0
+			ops := restoredPaneOps{
+				respawn: func(paneID, command string) error {
+					if paneID != "%3" || command != "muse --yolo" {
+						t.Errorf("respawn(%q, %q), want respawn(%%3, muse --yolo)", paneID, command)
+					}
+					launches++
+					polls = 0
+					return tc.respawnErr
+				},
+				observe: func(paneID string) (restoredPaneState, error) {
+					script := tc.launches[min(launches, len(tc.launches))-1]
+					state := script[min(polls, len(script)-1)]
+					polls++
+					return state, nil
+				},
+			}
+			launch := &restoredLaunch{paneID: "%3", command: "muse --yolo"}
+
+			relaunchRestoredPanes([]*restoredLaunch{launch}, time.Now().Add(tc.deadline), tc.deadline, time.Millisecond, ops)
+
+			if launches != tc.wantLaunches || launch.attempts != tc.wantLaunches {
+				t.Errorf("launched %d times (attempts %d), want %d", launches, launch.attempts, tc.wantLaunches)
+			}
+			gotErr := ""
+			if launch.err != nil {
+				gotErr = launch.err.Error()
+			}
+			if gotErr != tc.wantErr {
+				t.Errorf("outcome = %q, want %q", gotErr, tc.wantErr)
 			}
 		})
 	}
@@ -1447,105 +1720,6 @@ func TestRestorableAgentCommand(t *testing.T) {
 	}
 }
 
-func TestExpectedPaneCommand(t *testing.T) {
-	tests := []struct {
-		name    string
-		command string
-		want    string
-	}{
-		{
-			name:    "plain command",
-			command: "claude --print",
-			want:    "claude",
-		},
-		{
-			name:    "custom wrapper path",
-			command: "/usr/local/bin/custom-claude-wrapper --fast",
-			want:    "custom-claude-wrapper",
-		},
-		{
-			name:    "leading env assignment",
-			command: `NODE_OPTIONS="--max-old-space-size=32768" claude --dangerously-skip-permissions`,
-			want:    "claude",
-		},
-		{
-			name:    "command substitution in env assignment",
-			command: `CODEX_SYSTEM_PROMPT="$(cat /tmp/system prompt.txt)" codex --search`,
-			want:    "codex",
-		},
-		{
-			name:    "env prefix with assignments",
-			command: "env FOO=bar codex --search",
-			want:    "codex",
-		},
-		{
-			name:    "env prefix with options",
-			command: "env -i FOO=bar codex --search",
-			want:    "codex",
-		},
-		{
-			name:    "absolute env wrapper path",
-			command: "/usr/bin/env FOO=bar codex --search",
-			want:    "codex",
-		},
-		{
-			name:    "exec prefix",
-			command: "exec codex --search",
-			want:    "codex",
-		},
-		{
-			name:    "env and exec prefixes",
-			command: "env FOO=bar exec codex --search",
-			want:    "codex",
-		},
-		{
-			name:    "muse restore command",
-			command: "muse --yolo",
-			want:    "muse",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := expectedPaneCommand(tt.command); got != tt.want {
-				t.Fatalf("expectedPaneCommand(%q) = %q, want %q", tt.command, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPaneCommandMatches(t *testing.T) {
-	tests := []struct {
-		name     string
-		current  string
-		expected string
-		want     bool
-	}{
-		{name: "exact match", current: "codex", expected: "codex", want: true},
-		{name: "different command", current: "zsh", expected: "codex", want: false},
-		{name: "muse launcher exec'd its truncated versioned binary", current: "muse-bin-1.4.11", expected: "muse", want: true},
-		{name: "muse launcher exec'd its full versioned binary", current: "muse-bin-1.4.11-R6667.1", expected: "muse", want: true},
-		{name: "muse launcher still running before exec", current: "muse", expected: "muse", want: true},
-		{name: "muse not started yet", current: "zsh", expected: "muse", want: false},
-		{name: "muse binary does not satisfy another agent", current: "muse-bin-1.4.11", expected: "claude", want: false},
-		{name: "unrelated muse-prefixed command", current: "museum", expected: "muse", want: false},
-		{name: "pi runs under its node runtime", current: "node", expected: "pi", want: true},
-		{name: "pi launcher script still running before exec", current: "sh", expected: "pi", want: false},
-		{name: "kimi runs under its node runtime", current: "node", expected: "kimi", want: true},
-		{name: "legacy kimi runs under python", current: "python3.13", expected: "kimi", want: true},
-		{name: "kimi native binary", current: "kimi", expected: "kimi", want: true},
-		{name: "pi not started yet", current: "zsh", expected: "pi", want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := paneCommandMatches(tt.current, tt.expected); got != tt.want {
-				t.Fatalf("paneCommandMatches(%q, %q) = %v, want %v", tt.current, tt.expected, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestSortedCheckpointPanes(t *testing.T) {
 	panes := []PaneState{
 		{WindowIndex: 2, Index: 0, Title: "w2p0"},
@@ -1592,6 +1766,9 @@ func TestRestorer_RestoreFromCheckpoint_RelaunchesCommandsAcrossWindows(t *testi
 
 	workDir := t.TempDir()
 	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
+	// The sleep stand-ins never draw a ready screen, so the restore waits out
+	// its ready deadline; a short one keeps the test fast.
+	r.agentReadyTimeout = time.Second
 	sessionName := "cprestore-" + time.Now().Format("150405000000")
 
 	cp := &Checkpoint{
@@ -1705,6 +1882,9 @@ func TestRestorer_RestoreFromCheckpoint_PreservesSparseWindowIndexes(t *testing.
 
 	workDir := t.TempDir()
 	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
+	// The sleep stand-ins never draw a ready screen, so the restore waits out
+	// its ready deadline; a short one keeps the test fast.
+	r.agentReadyTimeout = time.Second
 	sessionName := "cprestore-sparse-" + time.Now().Format("150405000000")
 
 	cp := &Checkpoint{

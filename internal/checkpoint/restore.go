@@ -28,12 +28,15 @@ var (
 var errWorkingDirNotDirectory = errors.New("not a directory")
 
 const (
-	// restoreAgentReadyTimeout bounds context injection's wait, shared by all
-	// panes, for the relaunched agents to come up. It matches robot spawn's
-	// default ready wait.
+	// restoreAgentReadyTimeout bounds the restore's wait for the relaunched
+	// agents to come up, shared by all panes and by relaunch and context
+	// injection. It matches robot spawn's default ready wait.
 	restoreAgentReadyTimeout = 30 * time.Second
 	// restoreAgentReadyPollInterval is restart-pane's readiness poll period.
 	restoreAgentReadyPollInterval = 400 * time.Millisecond
+	// restoreLaunchAttempts is how many times restore launches an agent whose
+	// launch fails outright.
+	restoreLaunchAttempts = 3
 )
 
 // RestoreOptions configures how a checkpoint is restored.
@@ -204,14 +207,18 @@ func (r *Restorer) RestoreFromCheckpoint(cp *Checkpoint, opts RestoreOptions) (*
 	}
 	result.PanesRestored = panesCreated
 
-	if err := r.restoreAgents(cp, restoreDir); err != nil {
+	// Relaunch and context injection wait on one deadline, so an agent that
+	// is slow to come up costs the restore its wait once.
+	readyTimeout := r.readyTimeout()
+	readyDeadline := time.Now().Add(readyTimeout)
+	for _, err := range r.restoreAgents(cp, restoreDir, readyDeadline, readyTimeout) {
 		result.Warnings = append(result.Warnings,
 			fmt.Sprintf("agent restoration incomplete: %v", err))
 	}
 
 	// Inject context if requested
 	if opts.InjectContext {
-		failures := r.injectContext(cp, opts.ScrollbackLines)
+		failures := r.injectContext(cp, opts.ScrollbackLines, readyDeadline, readyTimeout)
 		for _, err := range failures {
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("context injection failed: %v", err))
@@ -341,16 +348,27 @@ func (r *Restorer) restoreLayout(cp *Checkpoint, workDir string) (int, error) {
 	return panesCreated, nil
 }
 
-func (r *Restorer) restoreAgents(cp *Checkpoint, workDir string) error {
+// readyTimeout is how long the restore waits for its relaunched agents.
+func (r *Restorer) readyTimeout() time.Duration {
+	if r.agentReadyTimeout > 0 {
+		return r.agentReadyTimeout
+	}
+	return restoreAgentReadyTimeout
+}
+
+// restoreAgents relaunches the agent in each agent pane and waits, until
+// deadline, for every agent to be up (see relaunchRestoredPanes). It returns
+// one error per agent pane whose agent is not up.
+func (r *Restorer) restoreAgents(cp *Checkpoint, workDir string, deadline time.Time, timeout time.Duration) []error {
 	panes, err := tmux.GetPanes(cp.SessionName)
 	if err != nil {
-		return fmt.Errorf("getting panes: %w", err)
+		return []error{fmt.Errorf("getting panes: %w", err)}
 	}
 
 	sortedStates := sortedCheckpointPanes(cp.Session.Panes)
 	sortedPanes := sortedTmuxPanes(panes)
-	attempted := 0
-	launched := 0
+	var failures []error
+	var launches []*restoredLaunch
 
 	for i, paneState := range sortedStates {
 		if i >= len(sortedPanes) {
@@ -362,249 +380,262 @@ func (r *Restorer) restoreAgents(cp *Checkpoint, workDir string) error {
 			continue
 		}
 
-		attempted++
-		if err := relaunchRestoredPane(sortedPanes[i].ID, workDir, agentCmd); err != nil {
-			slog.Warn("checkpoint restore: failed to relaunch pane command",
-				"session", cp.SessionName,
-				"pane_index", paneState.Index,
-				"window_index", paneState.WindowIndex,
-				"agent_type", paneState.AgentType,
-				"command", agentCmd,
-				"error", err)
+		paneID := sortedPanes[i].ID
+		safeCommand, err := tmux.SanitizePaneCommand(agentCmd)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", restoredPaneLabel(paneID, paneState.Title), err))
 			continue
 		}
-		launched++
+		// remain-on-exit keeps the pane when its launcher exits, so the
+		// restore sees the exit and can launch the agent again. Without it
+		// tmux closes the pane, and the session along with its last pane.
+		_ = tmux.DefaultClient.RunSilent("set-option", "-p", "-t", paneID, "remain-on-exit", "on")
+		launches = append(launches, &restoredLaunch{pane: paneState, paneID: paneID, command: safeCommand})
 	}
 
-	if attempted > 0 && launched == 0 {
-		return fmt.Errorf("all %d agent launch attempts failed", attempted)
+	// Respawn each pane directly into its command instead of typing into a
+	// shell prompt, which loses input typed while the pane initializes.
+	relaunchRestoredPanes(launches, deadline, timeout, restoreAgentReadyPollInterval, restoredPaneOps{
+		respawn: func(paneID, command string) error {
+			return tmux.DefaultClient.RunSilent("respawn-pane", "-k", "-c", workDir, "-t", paneID, command)
+		},
+		observe: observeRestoredPane,
+	})
+
+	for _, l := range launches {
+		// A dead pane keeps remain-on-exit, so it stays in the layout showing
+		// tmux's "Pane is dead" line with the exit status; the others close
+		// when their agent exits, as before.
+		if !l.last.dead {
+			_ = tmux.DefaultClient.RunSilent("set-option", "-p", "-u", "-t", l.paneID, "remain-on-exit")
+		}
+		if l.err == nil {
+			continue
+		}
+		slog.Warn("checkpoint restore: relaunched agent is not up",
+			"session", cp.SessionName,
+			"pane_id", l.paneID,
+			"pane_index", l.pane.Index,
+			"window_index", l.pane.WindowIndex,
+			"agent_type", l.pane.AgentType,
+			"command", l.command,
+			"attempts", l.attempts,
+			"error", l.err)
+		failures = append(failures, fmt.Errorf("%s: %w", restoredPaneLabel(l.paneID, l.pane.Title), l.err))
 	}
-	if launched != attempted {
-		return fmt.Errorf("launched %d of %d agent panes", launched, attempted)
-	}
-	return nil
+	return failures
 }
 
-func relaunchRestoredPane(paneID, workDir, agentCmd string) error {
-	safeCommand, err := tmux.SanitizePaneCommand(agentCmd)
-	if err != nil {
-		return err
+// restoredPaneLabel names a restored pane in warnings: its tmux ID and, when
+// the checkpoint has one, its title.
+func restoredPaneLabel(paneID, title string) string {
+	if title == "" {
+		return "pane " + paneID
 	}
-
-	expected := expectedPaneCommand(agentCmd)
-	if expected == "" {
-		return fmt.Errorf("determine expected pane command for %q", agentCmd)
-	}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-
-		// Respawn the pane directly into the target command instead of typing into
-		// a shell prompt. This avoids lost-input races while panes are still initializing.
-		if err := tmux.DefaultClient.RunSilent("respawn-pane", "-k", "-c", workDir, "-t", paneID, safeCommand); err != nil {
-			lastErr = err
-			continue
-		}
-		if err := waitForPaneCommand(paneID, expected, 2*time.Second); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-	}
-
-	if lastErr != nil {
-		return lastErr
-	}
-	return fmt.Errorf("pane %s did not start %q", paneID, expected)
+	return "pane " + paneID + " (" + title + ")"
 }
 
-func waitForPaneCommand(paneID, expected string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		current, err := currentPaneCommand(paneID)
-		if err == nil && paneCommandMatches(current, expected) {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("pane %s current command = %q, want %q", paneID, current, expected)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+// restoredPaneOps are the tmux operations a relaunch takes, swapped out in
+// tests.
+type restoredPaneOps struct {
+	// respawn kills the pane's process and starts command in its place.
+	respawn func(paneID, command string) error
+	// observe looks at the pane once.
+	observe func(paneID string) (restoredPaneState, error)
 }
 
-// paneCommandMatches reports whether tmux's pane_current_command shows the
-// launched command. The `muse` launcher execs a versioned muse-bin-* binary,
-// so a pane started with `muse` reports that binary rather than `muse`. An
-// agent that is a script reports its runtime instead: tmux on macOS shows
-// `node` for a running `pi`.
-func paneCommandMatches(current, expected string) bool {
-	if current == expected {
-		return true
-	}
-	if expected == "muse" && looksLikeMuseBinary(current) {
-		return true
-	}
-	return looksLikeAgentRuntime(current)
+// restoredLaunch is one agent pane's relaunch.
+type restoredLaunch struct {
+	pane     PaneState
+	paneID   string
+	command  string
+	attempts int
+	// started is set once the pane has shown the same non-shell process on
+	// two polls in a row since its last launch. One sighting does not count:
+	// a launcher run through a wrapper shows the wrapper for an instant (a
+	// `#!/usr/bin/env bash` script is env until env execs bash).
+	started     bool
+	lastCommand string
+	// last is the latest observation and observeErr the latest observation's
+	// error.
+	last       restoredPaneState
+	observeErr error
+	// err says why the agent is not up once the relaunch is over; nil when
+	// it is up.
+	err error
 }
 
-func currentPaneCommand(paneID string) (string, error) {
-	output, err := tmux.DefaultClient.Run("display-message", "-p", "-t", paneID, "#{pane_current_command}")
-	if err != nil {
-		return "", fmt.Errorf("getting pane current command: %w", err)
+// relaunchRestoredPanes launches each pane's agent and polls the panes
+// together until every agent is up, has failed outright, or deadline passes.
+// An agent is up when restoredPaneState.ready holds, the same check context
+// injection waits on. A pane is launched again, up to restoreLaunchAttempts
+// launches, only after a definite failure: the pane died (its launcher or
+// agent exited), or it is back in a shell after its agent had started. A
+// launcher still in its shell is never killed however long it takes (a
+// wrapper script, an update check, an nvm or asdf shim), and neither is an
+// agent that started but is not ready: a pane in either state at the deadline
+// is reported as such and left running. Each launch's err records the outcome.
+func relaunchRestoredPanes(launches []*restoredLaunch, deadline time.Time, timeout, pollInterval time.Duration, ops restoredPaneOps) {
+	pending := make([]*restoredLaunch, 0, len(launches))
+	for _, l := range launches {
+		if l.launch(ops) {
+			pending = append(pending, l)
+		}
 	}
-	return strings.TrimSpace(output), nil
-}
-
-func expectedPaneCommand(agentCmd string) string {
-	rest := strings.TrimSpace(agentCmd)
-	inEnvPrefix := false
-	for rest != "" {
-		token, remaining := nextShellToken(rest)
-		if token == "" {
-			return ""
-		}
-		rest = strings.TrimSpace(remaining)
-		baseToken := strings.ToLower(filepath.Base(trimMatchingQuotes(token)))
-		if baseToken == "env" {
-			inEnvPrefix = true
-			continue
-		}
-		if baseToken == "exec" {
-			continue
-		}
-		if inEnvPrefix && strings.HasPrefix(token, "-") {
-			continue
-		}
-		if isShellEnvAssignment(token) {
-			continue
-		}
-		return baseToken
-	}
-	return ""
-}
-
-func nextShellToken(command string) (string, string) {
-	const (
-		singleQuote = byte(39)
-		doubleQuote = byte(34)
-		backtick    = byte(96)
-		backslash   = byte(92)
-	)
-
-	start := 0
-	for start < len(command) && isShellWhitespace(command[start]) {
-		start++
-	}
-	command = command[start:]
-	if command == "" {
-		return "", ""
-	}
-
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	escaped := false
-	commandSubstDepth := 0
-
-	for i := 0; i < len(command); i++ {
-		ch := command[i]
-
-		if escaped {
-			escaped = false
-			continue
-		}
-
-		if ch == backslash && !inSingle {
-			escaped = true
-			continue
-		}
-
-		if inSingle {
-			if ch == singleQuote {
-				inSingle = false
-			}
-			continue
-		}
-
-		if inDouble {
-			if ch == doubleQuote {
-				inDouble = false
-				continue
-			}
-		} else if inBacktick {
-			if ch == backtick {
-				inBacktick = false
-			}
-			continue
-		} else {
-			switch ch {
-			case singleQuote:
-				inSingle = true
-				continue
-			case doubleQuote:
-				inDouble = true
-				continue
-			case backtick:
-				inBacktick = true
-				continue
+	for len(pending) > 0 {
+		open := pending[:0]
+		for _, l := range pending {
+			if !l.poll(ops) {
+				open = append(open, l)
 			}
 		}
-
-		if !inSingle && !inBacktick && ch == '$' && i+1 < len(command) && command[i+1] == '(' {
-			commandSubstDepth++
-			i++
-			continue
+		pending = open
+		if len(pending) == 0 {
+			return
 		}
-		if commandSubstDepth > 0 && !inSingle && !inBacktick && ch == ')' {
-			commandSubstDepth--
-			continue
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			for _, l := range pending {
+				l.err = l.notUpError(timeout)
+			}
+			return
 		}
-
-		if commandSubstDepth == 0 && !inDouble && !inBacktick && isShellWhitespace(ch) {
-			return command[:i], command[i:]
-		}
+		time.Sleep(min(pollInterval, remaining))
 	}
-
-	return command, ""
 }
 
-func isShellWhitespace(ch byte) bool {
-	return ch == ' ' || ch == byte(9) || ch == byte(10) || ch == byte(13)
-}
-
-func isShellEnvAssignment(token string) bool {
-	idx := strings.IndexByte(token, '=')
-	if idx <= 0 {
+// launch starts the pane's agent command and reports whether it did.
+func (l *restoredLaunch) launch(ops restoredPaneOps) bool {
+	l.attempts++
+	l.started, l.lastCommand, l.last = false, "", restoredPaneState{}
+	if err := ops.respawn(l.paneID, l.command); err != nil {
+		l.err = fmt.Errorf("launching agent: %w", err)
 		return false
-	}
-	name := token[:idx]
-	for i := 0; i < len(name); i++ {
-		ch := name[i]
-		if i == 0 {
-			if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') && ch != '_' {
-				return false
-			}
-			continue
-		}
-		if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '_' {
-			return false
-		}
 	}
 	return true
 }
 
-func trimMatchingQuotes(token string) string {
-	if len(token) >= 2 {
-		if (token[0] == byte(39) && token[len(token)-1] == byte(39)) || (token[0] == byte(34) && token[len(token)-1] == byte(34)) {
-			return token[1 : len(token)-1]
+// poll observes the pane once and reports whether its relaunch is over: the
+// agent is up, or its launch failed outright with no attempts left. A launch
+// that failed outright with attempts left is launched again.
+func (l *restoredLaunch) poll(ops restoredPaneOps) bool {
+	state, err := ops.observe(l.paneID)
+	l.observeErr = err
+	if err != nil {
+		return false
+	}
+	l.last = state
+	switch {
+	case state.gone:
+		l.err = errors.New("pane closed while its agent was starting")
+		return true
+	case state.ready():
+		return true
+	case state.dead || (l.started && tmux.PaneCommandIsShell(state.command)):
+		if l.attempts < restoreLaunchAttempts {
+			return !l.launch(ops)
+		}
+		l.err = fmt.Errorf("agent failed to start in %d attempts; the last %s", l.attempts, state.failure())
+		return true
+	case state.agentRunning():
+		l.started = l.started || state.command == l.lastCommand
+		l.lastCommand = state.command
+	default:
+		l.lastCommand = ""
+	}
+	return false
+}
+
+// notUpError says why an agent whose relaunch is still open at the deadline
+// is not up.
+func (l *restoredLaunch) notUpError(timeout time.Duration) error {
+	switch {
+	case l.observeErr != nil:
+		return fmt.Errorf("agent not ready within %s: %w", timeout, l.observeErr)
+	case l.last.agentRunning():
+		return fmt.Errorf("agent %q started but not ready within %s", l.last.command, timeout)
+	case l.last.command != "":
+		return fmt.Errorf("agent not started within %s; its launcher (%s) is still running", timeout, l.last.command)
+	default:
+		return fmt.Errorf("agent not started within %s; its launcher is still running", timeout)
+	}
+}
+
+// restoredPaneState is one look at a relaunched pane.
+type restoredPaneState struct {
+	// gone is set when tmux no longer has the pane.
+	gone bool
+	// dead is set when the pane's process exited and remain-on-exit kept the
+	// pane; exitStatus is the process's exit status.
+	dead       bool
+	exitStatus string
+	// command is the pane's foreground process, which for a dead pane is the
+	// one that exited.
+	command string
+	// output is the pane's last 50 lines, captured only while a non-shell
+	// process runs in it.
+	output string
+}
+
+// agentRunning reports whether a non-shell process, the agent or a launcher
+// that is not a shell script, runs in the pane.
+func (s restoredPaneState) agentRunning() bool {
+	return !s.gone && !s.dead && s.command != "" && !tmux.PaneCommandIsShell(s.command)
+}
+
+// ready reports whether the pane's agent is up: its output passes
+// agent.IsReadyOutput, the check robot spawn and restart-pane wait on, while
+// a non-shell process runs in the pane. A shell prompt passes the text check
+// too, so the process corroborates it as spawn's and restart-pane's process
+// checks do.
+func (s restoredPaneState) ready() bool {
+	return s.agentRunning() && agent.IsReadyOutput(s.output)
+}
+
+// failure describes a launch that failed outright.
+func (s restoredPaneState) failure() string {
+	switch {
+	case s.dead && s.exitStatus != "":
+		return "exited with status " + s.exitStatus
+	case s.dead:
+		return "exited"
+	default:
+		return fmt.Sprintf("returned to a shell (%s) after its agent started", s.command)
+	}
+}
+
+// observeRestoredPane looks at a relaunched pane through tmux.
+func observeRestoredPane(paneID string) (restoredPaneState, error) {
+	sep := tmux.FieldSeparator
+	output, err := tmux.DefaultClient.Run("display-message", "-p", "-t", paneID,
+		"#{pane_id}"+sep+"#{pane_dead}"+sep+"#{pane_dead_status}"+sep+"#{pane_current_command}")
+	if err != nil {
+		switch tmux.ClassifyCommandError(err).Kind {
+		case tmux.CommandErrorPaneNotFound, tmux.CommandErrorSessionNotFound:
+			return restoredPaneState{gone: true}, nil
+		}
+		return restoredPaneState{}, fmt.Errorf("reading pane state: %w", err)
+	}
+	fields := strings.Split(strings.TrimSpace(output), sep)
+	if len(fields) != 4 {
+		return restoredPaneState{}, fmt.Errorf("reading pane state: unexpected output %q", output)
+	}
+	// Newer tmux prints empty fields, not an error, for a pane it no longer
+	// has.
+	if fields[0] == "" {
+		return restoredPaneState{gone: true}, nil
+	}
+	state := restoredPaneState{
+		dead:       fields[1] == "1",
+		exitStatus: fields[2],
+		command:    strings.TrimSpace(fields[3]),
+	}
+	if state.agentRunning() {
+		if state.output, err = tmux.CapturePaneOutput(paneID, 50); err != nil {
+			return restoredPaneState{}, fmt.Errorf("capturing pane: %w", err)
 		}
 	}
-	return token
+	return state, nil
 }
 
 func moveInitialWindow(sessionName string, targetWindowIndex int) error {
@@ -686,19 +717,14 @@ func (r *Restorer) applyWindowLayouts(sessionName string, windowLayouts []Window
 // agent-aware submit, the protocol ntm send uses, once the agent is ready. A
 // paste sent while the agent is still starting lands in its launcher's shell
 // or a startup screen, or is discarded when the TUI takes over the terminal,
-// so a pane whose agent is not ready by the deadline the panes share gets
-// nothing. It returns one error per pane that did not get its context.
-func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) []error {
+// so a pane whose agent is not ready by readyDeadline, which relaunch waited
+// on too, gets nothing. It returns one error per pane that did not get its
+// context.
+func (r *Restorer) injectContext(cp *Checkpoint, maxLines int, readyDeadline time.Time, readyTimeout time.Duration) []error {
 	panes, err := tmux.GetPanes(cp.SessionName)
 	if err != nil {
 		return []error{fmt.Errorf("getting panes: %w", err)}
 	}
-
-	readyTimeout := restoreAgentReadyTimeout
-	if r.agentReadyTimeout > 0 {
-		readyTimeout = r.agentReadyTimeout
-	}
-	readyDeadline := time.Now().Add(readyTimeout)
 
 	var failures []error
 	for i, paneState := range cp.Session.Panes {
@@ -716,10 +742,7 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) []error {
 		if !ok {
 			continue
 		}
-		label := "pane " + targetPane.ID
-		if paneState.Title != "" {
-			label += " (" + paneState.Title + ")"
-		}
+		label := restoredPaneLabel(targetPane.ID, paneState.Title)
 
 		// Load scrollback content
 		content, err := r.loadPaneScrollbackForPane(cp.SessionName, cp.ID, paneState)
@@ -733,8 +756,8 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) []error {
 			content = truncateToLines(content, maxLines)
 		}
 
-		if !waitForRestoredAgentReady(targetPane.ID, readyDeadline, restoreAgentReadyPollInterval, tmux.CapturePaneOutput, currentPaneCommand) {
-			failures = append(failures, fmt.Errorf("%s: agent not ready within %s; context not injected", label, readyTimeout))
+		if err := waitForRestoredAgentReady(targetPane.ID, readyDeadline, readyTimeout, restoreAgentReadyPollInterval, observeRestoredPane); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w; context not injected", label, err))
 			continue
 		}
 
@@ -747,28 +770,34 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) []error {
 	return failures
 }
 
-// waitForRestoredAgentReady polls a relaunched pane until its output passes
-// agent.IsReadyOutput, the check robot spawn and restart-pane wait on, while
-// its foreground process is not a shell. A shell prompt passes the text check
-// too, so the process corroborates it as spawn's and restart-pane's process
-// checks do. The pane is checked at least once, so a ready pane still gets its
-// context after another pane used up the deadline.
+// waitForRestoredAgentReady polls a relaunched pane until its agent is up
+// (restoredPaneState.ready, the check relaunch waits on) or deadline, timeout
+// after the restore's relaunch began, passes. It returns nil once the agent
+// is up, and otherwise why it is not. A dead or closed pane cannot come up,
+// so it stops there at once. The pane is checked at least once, so a ready
+// pane still gets its context after another pane used up the deadline.
 func waitForRestoredAgentReady(
 	paneID string,
 	deadline time.Time,
+	timeout time.Duration,
 	pollInterval time.Duration,
-	capture func(string, int) (string, error),
-	currentCommand func(string) (string, error),
-) bool {
+	observe func(string) (restoredPaneState, error),
+) error {
 	for {
-		if output, err := capture(paneID, 50); err == nil && agent.IsReadyOutput(output) {
-			if command, err := currentCommand(paneID); err == nil && command != "" && !tmux.PaneCommandIsShell(command) {
-				return true
-			}
+		state, err := observe(paneID)
+		switch {
+		case err != nil:
+			// A failed look is retried until the deadline.
+		case state.ready():
+			return nil
+		case state.gone:
+			return errors.New("pane closed")
+		case state.dead:
+			return errors.New("agent " + state.failure())
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return false
+			return fmt.Errorf("agent not ready within %s", timeout)
 		}
 		time.Sleep(min(pollInterval, remaining))
 	}
