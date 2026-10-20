@@ -703,7 +703,8 @@ type GenerateHandoffOptions struct {
 	// BVClient is an optional pre-configured BV client
 	BVClient *bv.BVClient
 
-	// AgentMailClient is an optional pre-configured Agent Mail client
+	// AgentMailClient is the Agent Mail client for enrichment, built by the
+	// caller from its [agent_mail] config; nil leaves the handoff unenriched.
 	AgentMailClient *agentmail.Client
 
 	// CASSClient is an optional pre-configured CASS client
@@ -957,14 +958,12 @@ func (g *Generator) enrichWithAgentMail(ctx context.Context, h *Handoff, opts Ge
 		return err
 	}
 
-	// Use provided client or create default
+	// The caller builds the client from its [agent_mail] config; without one
+	// the handoff is left unenriched.
 	client := opts.AgentMailClient
 	if client == nil {
-		projectKey := opts.ProjectKey
-		if projectKey == "" {
-			projectKey = g.projectDir
-		}
-		client = agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+		g.logger.Debug("No Agent Mail client, skipping enrichment")
+		return nil
 	}
 
 	// Check if Agent Mail is available

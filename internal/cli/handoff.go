@@ -256,6 +256,11 @@ func runHandoffCreate(cmd *cobra.Command, sessionName, goal, now, fromFile strin
 			TransferTTLSeconds:   transferTTLSeconds,
 			TransferGraceSeconds: 2,
 		}
+		// Agent Mail enrichment is automatic integration, so [agent_mail]
+		// enabled = false leaves the handoff without it.
+		if cfg == nil || cfg.AgentMail.Enabled {
+			opts.AgentMailClient = newAgentMailClient(projectDir)
+		}
 		h, err = generator.GenerateHandoff(ctx, opts)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("auto-generation failed: %w", ctxErr)

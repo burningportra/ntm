@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 )
 
 // MailSendStep describes a first-class MCP Agent Mail send operation.
@@ -79,7 +80,16 @@ func (c *agentMailClientCache) get(projectKey string) *agentmail.Client {
 		return client
 	}
 
-	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+	// The merged config for the project supplies the server url and token.
+	// Mail steps are explicit actions, like ntm mail commands, so they run
+	// even when [agent_mail] enabled is false.
+	cfg, err := config.LoadMerged(projectKey, config.DefaultPath())
+	if err != nil {
+		cfg = config.Default()
+	}
+	settings := cfg.AgentMail
+	settings.Enabled = true
+	client := settings.NewClient(projectKey)
 	c.byProject[projectKey] = client
 	return client
 }

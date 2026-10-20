@@ -9,8 +9,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/scanner"
 	"github.com/Dicklesworthstone/ntm/internal/startup"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
@@ -142,6 +146,81 @@ func TestNewAgentMailClientUsesConfig(t *testing.T) {
 	t.Setenv("AGENT_MAIL_URL", "http://127.0.0.1:1/env/")
 	if got := newAgentMailClient("").BaseURL(); got != "http://127.0.0.1:1/env/" {
 		t.Fatalf("BaseURL = %q, want AGENT_MAIL_URL to override the config", got)
+	}
+}
+
+// recordAgentMailCalls starts a stand-in Agent Mail server that answers every
+// JSON-RPC call with an empty result and records "method" or "tools/call
+// <tool>" for each request it receives.
+func recordAgentMailCalls(t *testing.T) (*httptest.Server, func() []string) {
+	t.Helper()
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		call, _ := req["method"].(string)
+		if params, ok := req["params"].(map[string]any); ok {
+			if name, ok := params["name"].(string); ok {
+				call += " " + name
+			}
+		}
+		mu.Lock()
+		calls = append(calls, call)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req["id"], "result": map[string]any{}})
+	}))
+	t.Cleanup(server.Close)
+	return server, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), calls...)
+	}
+}
+
+// TestExplicitAgentMailCommandsUseConfiguredServer locks bd-46tqx: scan
+// notifications and the guards commands build their client through
+// newAgentMailClient, so they reach the [agent_mail] url (even with
+// enabled = false, like every explicit command) instead of the env-only
+// default server.
+func TestExplicitAgentMailCommandsUseConfiguredServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	server, calls := recordAgentMailCalls(t)
+	t.Setenv("AGENT_MAIL_URL", "")
+
+	oldCfg, oldJSON := cfg, jsonOutput
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: false, URL: server.URL + "/"}}
+	jsonOutput = true
+	t.Cleanup(func() { cfg, jsonOutput = oldCfg, oldJSON })
+
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+
+	result := &scanner.ScanResult{
+		Totals:   scanner.ScanTotals{Warning: 1},
+		Findings: []scanner.Finding{{File: "main.go", Severity: scanner.SeverityWarning, Message: "warning"}},
+	}
+	if err := notifyScanResults(t.Context(), result, repo); err != nil {
+		t.Fatalf("notifyScanResults: %v", err)
+	}
+	if got := calls(); !slices.Contains(got, "tools/call register_agent") {
+		t.Fatalf("scan notify calls = %v, want register_agent on the configured server", got)
+	}
+
+	t.Chdir(repo)
+	before := len(calls())
+	if err := runGuardsStatus(newGuardsStatusCmd(), nil); err != nil {
+		t.Fatalf("runGuardsStatus: %v", err)
+	}
+	if got := calls()[before:]; !slices.Contains(got, "ping") {
+		t.Fatalf("guards status calls = %v, want a ping on the configured server", got)
 	}
 }
 

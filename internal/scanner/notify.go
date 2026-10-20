@@ -14,12 +14,12 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 )
 
-// NotifyScanResults sends scan results to relevant agents via Agent Mail.
-func NotifyScanResults(ctx context.Context, result *ScanResult, projectKey string) error {
-	if result == nil {
+// NotifyScanResults sends scan results to relevant agents through client,
+// which the caller builds from its [agent_mail] config.
+func NotifyScanResults(ctx context.Context, client *agentmail.Client, result *ScanResult, projectKey string) error {
+	if result == nil || client == nil {
 		return nil
 	}
-	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
 	if !client.IsAvailable() {
 		return nil
 	}

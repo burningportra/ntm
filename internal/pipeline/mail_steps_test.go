@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -878,5 +880,33 @@ func TestStep_HasMailStep_FalseWhenAbsent(t *testing.T) {
 	}
 	if (*Step)(nil).hasMailStep() {
 		t.Errorf("hasMailStep() on nil receiver returned true")
+	}
+}
+
+// TestMailClientUsesAgentMailConfig locks bd-46tqx: mail steps build their
+// client from the merged [agent_mail] config, so its url applies when
+// AGENT_MAIL_URL is unset, and, being explicit actions, they still reach the
+// server when enabled = false.
+func TestMailClientUsesAgentMailConfig(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer server.Close()
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	configTOML := "[agent_mail]\nenabled = false\nurl = \"" + server.URL + "/\"\n"
+	if err := os.WriteFile(configPath, []byte(configTOML), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("NTM_CONFIG", configPath)
+	t.Setenv("AGENT_MAIL_URL", "")
+
+	client := NewExecutor(DefaultExecutorConfig("mailcfg")).mailClient(t.TempDir())
+	if got := client.BaseURL(); got != server.URL+"/" {
+		t.Fatalf("BaseURL = %q, want the configured %q", got, server.URL+"/")
+	}
+	if !client.IsAvailableContext(t.Context()) {
+		t.Fatalf("mail step client unavailable with enabled = false: %v", client.LastAvailabilityError())
 	}
 }

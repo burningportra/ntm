@@ -31,7 +31,9 @@ var (
 	}
 	createBeadsFromScan = scanner.CreateBeadsFromFindings
 	updateBeadsFromScan = scanner.UpdateBeadsFromFindings
-	notifyScanResults   = scanner.NotifyScanResults
+	notifyScanResults   = func(ctx context.Context, result *scanner.ScanResult, projectKey string) error {
+		return scanner.NotifyScanResults(ctx, newAgentMailClient(projectKey), result, projectKey)
+	}
 )
 
 func newScanCmd() *cobra.Command {

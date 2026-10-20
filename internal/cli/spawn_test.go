@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2113,5 +2114,56 @@ func TestWizardLaunchAgentSpecs_RecipeAndTemplateSelectionsDeferCounts(t *testin
 	}
 	if wizardDeferredSelection(SpawnWizardResult{CCCount: 1}) {
 		t.Fatal("wizardDeferredSelection(manual) = true, want false")
+	}
+}
+
+// TestSpawnAgentMailRegistrationPrefersEnvOverConfig locks bd-46tqx: spawn
+// registration builds its client through config.AgentMailConfig.NewClient, so
+// AGENT_MAIL_URL wins over [agent_mail] url as it does for every other caller.
+func TestSpawnAgentMailRegistrationPrefersEnvOverConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	server, calls := recordAgentMailCalls(t)
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	oldCfg := cfg
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: true, URL: "http://127.0.0.1:1/"}}
+	t.Cleanup(func() { cfg = oldCfg })
+
+	status := registerSpawnedAgents(t.Context(), t.TempDir(), "envwins", nil)
+	if status == nil || !status.Available || !status.ProjectRegistered {
+		t.Fatalf("status = %+v, want available and registered through AGENT_MAIL_URL", status)
+	}
+	if got := calls(); !slices.Contains(got, "tools/call ensure_project") {
+		t.Fatalf("AGENT_MAIL_URL server calls = %v, want ensure_project", got)
+	}
+}
+
+// TestSpawnAgentMailSilentWhenDisabled locks bd-46tqx: session registration,
+// pane registration and recovery context are automatic integration, so with
+// [agent_mail] enabled = false spawn never contacts the server.
+func TestSpawnAgentMailSilentWhenDisabled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	server, calls := recordAgentMailCalls(t)
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	oldCfg := cfg
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: false}}
+	t.Cleanup(func() { cfg = oldCfg })
+
+	dir := t.TempDir()
+	registerSessionAgent(t.Context(), "disabled", dir)
+	if status := registerSpawnedAgents(t.Context(), dir, "disabled", []spawnedAgentInfo{{paneIndex: 1, paneID: "%1", paneTitle: "disabled__cc_1", agentType: "cc"}}); status != nil {
+		t.Fatalf("registerSpawnedAgents status = %+v, want nil when disabled", status)
+	}
+	msgs, reservations, transfer, err := loadRecoveryMessages(t.Context(), "disabled", dir)
+	if err != nil || msgs != nil || reservations != nil || transfer != nil {
+		t.Fatalf("loadRecoveryMessages = %v, %v, %v, %v; want nothing when disabled", msgs, reservations, transfer, err)
+	}
+	if got := calls(); len(got) != 0 {
+		t.Fatalf("Agent Mail calls = %v, want none when [agent_mail] enabled = false", got)
 	}
 }

@@ -4219,16 +4219,12 @@ func registerSessionAgent(parentCtx context.Context, sessionName, workingDir str
 		}
 		return
 	}
-	var opts []agentmail.Option
-	if cfg != nil {
-		if cfg.AgentMail.URL != "" {
-			opts = append(opts, agentmail.WithBaseURL(cfg.AgentMail.URL))
-		}
-		if cfg.AgentMail.Token != "" {
-			opts = append(opts, agentmail.WithToken(cfg.AgentMail.Token))
-		}
+	// Registration is automatic integration, so it stays silent when
+	// [agent_mail] enabled is false.
+	if cfg != nil && !cfg.AgentMail.Enabled {
+		return
 	}
-	client := agentmail.NewClient(opts...)
+	client := newAgentMailClient(workingDir)
 	ctx, cancel := context.WithTimeout(parentCtx, 15*time.Second)
 	defer cancel()
 
@@ -4267,16 +4263,7 @@ func registerSpawnedAgents(parentCtx context.Context, workingDir, sessionName st
 		return nil
 	}
 
-	var opts []agentmail.Option
-	if cfg != nil {
-		if cfg.AgentMail.URL != "" {
-			opts = append(opts, agentmail.WithBaseURL(cfg.AgentMail.URL))
-		}
-		if cfg.AgentMail.Token != "" {
-			opts = append(opts, agentmail.WithToken(cfg.AgentMail.Token))
-		}
-	}
-	client := agentmail.NewClient(opts...)
+	client := newAgentMailClient(workingDir)
 
 	// Check availability first (uses cached result)
 	if !client.IsAvailable() {
@@ -4862,6 +4849,11 @@ func loadRecoveryMessages(ctx context.Context, sessionName, workingDir string) (
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err
+	}
+	// Recovery context is automatic integration, so it stays silent when
+	// [agent_mail] enabled is false.
+	if cfg != nil && !cfg.AgentMail.Enabled {
+		return nil, nil, nil, nil
 	}
 	client := newAgentMailClient(workingDir)
 

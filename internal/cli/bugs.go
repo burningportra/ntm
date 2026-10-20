@@ -311,7 +311,7 @@ Examples:
 
 			// Send notifications
 			ctx := context.Background()
-			if err := scanner.NotifyScanResults(ctx, result, projectKey); err != nil {
+			if err := notifyScanResults(ctx, result, projectKey); err != nil {
 				if jsonOutput {
 					return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
 						"success":   false,

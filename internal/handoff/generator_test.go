@@ -1273,6 +1273,35 @@ func TestEnrichWithAgentMailPreservesMidflightCancellation(t *testing.T) {
 	}
 }
 
+// TestEnrichWithAgentMailWithoutClientContactsNoServer locks bd-46tqx: the
+// generator no longer builds its own env-only client, so a caller that passes
+// no client (no [agent_mail] config to build one from) gets an unenriched
+// handoff and no Agent Mail traffic.
+func TestEnrichWithAgentMailWithoutClientContactsNoServer(t *testing.T) {
+	requests := make(chan string, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Method + " " + r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	h := New("test-session")
+	err := NewGenerator(t.TempDir()).enrichWithAgentMail(t.Context(), h, GenerateHandoffOptions{
+		AgentName:  "BlackSeal",
+		ProjectKey: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("enrichWithAgentMail error = %v, want nil", err)
+	}
+	select {
+	case got := <-requests:
+		t.Fatalf("Agent Mail request %q, want none without a client", got)
+	default:
+	}
+}
+
 func TestGetInProgressBeadsNoBeads(t *testing.T) {
 	tmpDir := t.TempDir()
 	g := NewGenerator(tmpDir)

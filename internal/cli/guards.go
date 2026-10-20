@@ -12,7 +12,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 
-	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 )
 
@@ -130,7 +129,7 @@ func runGuardsInstall(projectKey string, force bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	client := agentmail.NewClient()
+	client := newAgentMailClient(projectKey)
 	err = client.InstallPrecommitGuard(ctx, projectKey, repoPath)
 	if err == nil {
 		if IsJSONOutput() {
@@ -290,7 +289,7 @@ func runGuardsUninstall(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	client := agentmail.NewClient()
+	client := newAgentMailClient(repoPath)
 	err = client.UninstallPrecommitGuard(ctx, repoPath)
 	if err == nil {
 		if IsJSONOutput() {
@@ -382,7 +381,7 @@ func runGuardsStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check MCP availability using the IsAvailable() method
-	client := agentmail.NewClient()
+	client := newAgentMailClient(repoPath)
 	mcpAvailable := client.IsAvailable()
 
 	// Check hook status

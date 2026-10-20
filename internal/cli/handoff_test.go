@@ -534,6 +534,50 @@ func TestRunHandoffCreateAutoPreservesCommandCancellation(t *testing.T) {
 	}
 }
 
+// TestRunHandoffCreateAutoAgentMailFollowsConfig locks bd-46tqx: auto
+// handoffs enrich from the Agent Mail server that [agent_mail] names, and
+// enabled = false leaves the handoff unenriched without contacting any server.
+func TestRunHandoffCreateAutoAgentMailFollowsConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+
+	for _, tc := range []struct {
+		name      string
+		enabled   bool
+		wantCalls bool
+	}{
+		{name: "enabled", enabled: true, wantCalls: true},
+		{name: "disabled", enabled: false, wantCalls: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, calls := recordAgentMailCalls(t)
+			if tc.enabled {
+				t.Setenv("AGENT_MAIL_URL", "")
+			} else {
+				t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+			}
+			cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: tc.enabled, URL: server.URL + "/"}}
+			t.Chdir(t.TempDir())
+
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			cmd.SetOut(io.Discard)
+			// An empty project gives the generated handoff no goal, so
+			// validation rejects it, but only after enrichment has run.
+			err := runHandoffCreate(cmd, "amcfg", "", "", "", true, "", false, "", "yaml", false)
+			if err != nil && !strings.Contains(err.Error(), "validation failed") {
+				t.Fatalf("runHandoffCreate(auto) error: %v", err)
+			}
+			if got := calls(); (len(got) > 0) != tc.wantCalls {
+				t.Fatalf("Agent Mail calls = %v, want calls=%v", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
 func TestRunHandoffHelpersRequireLiveCommandContext(t *testing.T) {
 	t.Chdir(t.TempDir())
 	outputPath := filepath.Join(t.TempDir(), "must-not-exist.yaml")
