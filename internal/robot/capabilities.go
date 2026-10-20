@@ -1011,7 +1011,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "exit-cli",
 			Flag:        "--robot-exit-cli",
 			Category:    "control",
-			Description: "Gracefully exit agent CLIs (encapsulated double Ctrl+C choreography) without destroying panes; verifies via the pane's foreground command.",
+			Description: "Gracefully exit agent CLIs (encapsulated double Ctrl+C choreography; Escape then three Ctrl+Cs for Muse Code panes) without destroying panes; verifies via the pane's foreground command.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-exit-cli", Type: "string", Required: true, Description: "Session name"},
 				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated N, W.P, or %N pane selectors (default: all agent panes)"},

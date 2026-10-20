@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -242,9 +243,15 @@ func waitForBareShell(ctx context.Context, session, paneID string, timeout time.
 }
 
 // sendExitChoreography sends the graceful double Ctrl+C with the per-CLI
-// timing window encapsulated.
-func sendExitChoreography(ctx context.Context, paneID string) error {
-	if err := tmux.DefaultClient.SendInterrupt(paneID); err != nil {
+// timing window encapsulated. Muse panes get exitMuse's sequence instead: on
+// a working Muse the first Ctrl+C interrupts the turn and puts the prompt back
+// as a draft, and the second only clears that draft, so a double Ctrl+C left
+// Muse running until the second attempt.
+func sendExitChoreography(ctx context.Context, pane tmux.Pane) error {
+	if restartCanonicalAgentType(restartPaneAgentType(pane)) == agent.AgentTypeMuse {
+		return sendMuseExitKeys(ctx, pane.ID)
+	}
+	if err := tmux.DefaultClient.SendInterrupt(pane.ID); err != nil {
 		return err
 	}
 	select {
@@ -252,7 +259,7 @@ func sendExitChoreography(ctx context.Context, paneID string) error {
 		return ctx.Err()
 	case <-time.After(lifecycleDoubleTapGap):
 	}
-	return tmux.DefaultClient.SendInterrupt(paneID)
+	return tmux.DefaultClient.SendInterrupt(pane.ID)
 }
 
 // relaunchAgentCLI sends the configured launch command into the pane's shell
@@ -322,7 +329,7 @@ func GetExitCLI(ctx context.Context, opts LifecycleOptions) (*ExitCLIOutput, err
 		} else {
 			exited := false
 			for attempt := 0; attempt < 2 && !exited; attempt++ {
-				if err := sendExitChoreography(ctx, pane.ID); err != nil {
+				if err := sendExitChoreography(ctx, pane); err != nil {
 					result.Detail = joinLifecycleDetail(result.Detail, fmt.Sprintf("exit keystrokes failed: %v", err))
 					break
 				}

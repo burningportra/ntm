@@ -113,29 +113,35 @@ func exitGemini(ctx context.Context, session string, win, pane int, seq *Restart
 // submitted as part of a prompt; Ctrl+D does nothing.
 func exitMuse(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
 	seq.ExitMethod = "escape_then_triple_ctrl_c"
+	return sendMuseExitKeys(ctx, formatTargetWin(session, win, pane))
+}
 
-	if err := sendEscape(ctx, session, win, pane); err != nil {
+// sendMuseExitKeys sends the exitMuse key sequence to a tmux target. Smart
+// restart addresses the pane by session, window and index; --robot-exit-cli
+// addresses it by pane ID.
+func sendMuseExitKeys(ctx context.Context, target string) error {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "Escape"); err != nil {
 		return wrapError("escape failed", err)
 	}
 	if err := waitForExitSequenceDelay(ctx, 100*time.Millisecond); err != nil {
 		return err
 	}
 
-	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "C-c"); err != nil {
 		return wrapError("first ctrl-c failed", err)
 	}
 	if err := waitForExitSequenceDelay(ctx, 100*time.Millisecond); err != nil {
 		return err
 	}
 
-	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "C-c"); err != nil {
 		return wrapError("second ctrl-c failed", err)
 	}
 	if err := waitForExitSequenceDelay(ctx, 500*time.Millisecond); err != nil {
 		return err
 	}
 
-	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "C-c"); err != nil {
 		return wrapError("third ctrl-c failed", err)
 	}
 

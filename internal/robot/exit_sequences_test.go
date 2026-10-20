@@ -119,6 +119,50 @@ func TestExitAgentMuseSendsVerifiedSequence(t *testing.T) {
 	}
 }
 
+// TestSendExitChoreographyUsesMuseExitSequence covers --robot-exit-cli. A
+// plain double Ctrl+C on a working Muse pane interrupts the turn and then
+// clears the restored draft, so Muse only quit on the second attempt, about
+// 15 s later. Muse panes get the exitMuse keys, addressed by pane ID; other
+// agents keep the double Ctrl+C.
+func TestSendExitChoreographyUsesMuseExitSequence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pane tmux.Pane
+		want []string
+	}{
+		{
+			name: "muse pane type",
+			pane: tmux.Pane{ID: "%7", Type: tmux.AgentMuse, Title: "proj__muse_1"},
+			want: []string{"send-keys -t %7 Escape", "send-keys -t %7 C-c", "send-keys -t %7 C-c", "send-keys -t %7 C-c"},
+		},
+		{
+			name: "muse title with model variant",
+			pane: tmux.Pane{ID: "%8", Title: "proj__muse_2_wonder-full@xhigh"},
+			want: []string{"send-keys -t %8 Escape", "send-keys -t %8 C-c", "send-keys -t %8 C-c", "send-keys -t %8 C-c"},
+		},
+		{
+			name: "claude keeps the double ctrl-c",
+			pane: tmux.Pane{ID: "%9", Type: tmux.AgentClaude, Title: "proj__cc_1"},
+			want: []string{"send-keys -t %9 C-c", "send-keys -t %9 C-c"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := useTimedTmuxBinary(t)
+			if err := sendExitChoreography(t.Context(), tc.pane); err != nil {
+				t.Fatalf("sendExitChoreography() error = %v", err)
+			}
+			got := drainTmuxCalls(calls)
+			gotArgs := make([]string, len(got))
+			for i, call := range got {
+				gotArgs[i] = call.args
+			}
+			if !slices.Equal(gotArgs, tc.want) {
+				t.Fatalf("sendExitChoreography() tmux calls = %q, want %q", gotArgs, tc.want)
+			}
+		})
+	}
+}
+
 func TestExitAgentMuseStopsAtFirstFailedKey(t *testing.T) {
 	useFailingTmuxBinary(t)
 	seq := &RestartSequence{}
