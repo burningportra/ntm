@@ -1502,6 +1502,13 @@ func runProjectionRefresh() {
 // pending refresh first.
 func currentProjectionStore() *state.Store {
 	runProjectionRefresh()
+	return loadedProjectionStore()
+}
+
+// loadedProjectionStore returns the projection store without running the
+// pending refresh, for state the refresh does not write and that is also
+// read from inside the refresh itself.
+func loadedProjectionStore() *state.Store {
 	projectionStoreMu.RLock()
 	defer projectionStoreMu.RUnlock()
 	return projectionStore

@@ -7083,6 +7083,37 @@ func TestProjectionRefreshConcurrentReadersWaitForIt(t *testing.T) {
 	}
 }
 
+// The refresh captures every pane through enrichAgentStatus, which advances
+// the durable output sequence. That nested store read used to wait on the
+// refresh it ran inside, so --robot-status hung forever whenever a live
+// session had agent panes.
+func TestProjectionRefreshEnrichingAgentsDoesNotWaitOnItself(t *testing.T) {
+	clearPaneStates()
+	store := newTestAttentionStore(t)
+	prev := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(prev) })
+
+	agent := &Agent{PID: os.Getpid(), Pane: "%1", Type: "claude"}
+	SetProjectionRefresh(func() {
+		enrichAgentStatus(agent, "sess", "", "working on it\n")
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = currentProjectionStore()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("projection read deadlocked on the refresh's own agent enrichment")
+	}
+	if agent.OutputSequence == nil {
+		t.Fatal("enrichment inside the refresh did not advance the durable output sequence")
+	}
+}
+
 func TestSetProjectionStoreDropsPendingRefresh(t *testing.T) {
 	store := newTestAttentionStore(t)
 	prev := currentProjectionStore()

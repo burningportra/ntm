@@ -687,9 +687,10 @@ func outputSeqContentHash(rawContent string) string {
 // observeOutputSequence hashes the normalized tail of raw pane content, then
 // advances the durable output sequence for the pane's scope. Errors and a
 // missing store both degrade to nil: the signal is additive and must never
-// break the surface that carries it.
+// break the surface that carries it. The projection refresh captures panes
+// through this path, so it must not wait on that refresh.
 func observeOutputSequence(sessionName, paneID, rawContent string, observedAt time.Time) *OutputSequenceInfo {
-	store := currentProjectionStore()
+	store := loadedProjectionStore()
 	if store == nil {
 		return nil
 	}
