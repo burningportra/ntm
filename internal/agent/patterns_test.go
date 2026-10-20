@@ -820,6 +820,63 @@ func TestAllPatternsCompile(t *testing.T) {
 	}
 }
 
+func TestIsReadyOutput(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		// Claude indicators
+		{"claude_prompt_lowercase", "claude>", true},
+		{"claude_prompt_spaced", "claude > ", true},
+		{"claude_code_version", "Claude Code v1.2.3", true},
+		{"claude_welcome", "Welcome back!", true},
+		{"claude_bypass_permissions", "Bypass permissions: enabled", true},
+		{"claude_try_example", "Try \"help me with X\"", true},
+
+		// Codex indicators
+		{"codex_prompt", "codex>", true},
+		{"codex_context_left", "42% context left · ? for shortcuts", true},
+		{"codex_chevron_prompt", "› Write tests for @filename", true},
+		{"codex_ready", "Ready for input", true},
+
+		// Gemini indicators
+		{"gemini_prompt", "gemini>", true},
+		{"gemini_help", "How can I help you today?", true},
+
+		// Muse indicators: the last line is the status bar, not a prompt.
+		{"muse_idle_screen", museIdleScreen, true},
+		{"muse_status_bar_only", "◆ echo: done\n\n❯ draft\n" + museCaptureRule + "\n  muse-wonder-1.0 · /path/to/repo · YOLO", true},
+		{"muse_command_echo_only", "% muse --yolo --model 'muse-wonder-1.0'", false},
+
+		// Generic shell prompts
+		{"shell_dollar", "$ ", true},
+		{"shell_percent", "% ", true},
+		{"shell_arrow", "❯ ", true},
+		{"shell_simple", "> ", true},
+		{"python_repl", ">>> ", true},
+
+		// "ready" must match as a word: as a bare substring it also hit
+		// "already".
+		{"ready_word", "agent ready for input\n", true},
+		{"already_up_to_date", "Already up to date.\n", false},
+
+		// Not ready states
+		{"loading", "Loading...", false},
+		{"empty", "", false},
+		{"garbage", "xyzabc123", false},
+		{"partial_prompt", "claud", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsReadyOutput(tc.output); got != tc.want {
+				t.Errorf("IsReadyOutput(%q) = %v, want %v", tc.output, got, tc.want)
+			}
+		})
+	}
+}
+
 // Helper functions for creating pointers
 func floatPtr(v float64) *float64 {
 	return &v

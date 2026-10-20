@@ -586,19 +586,7 @@ func TestRestorer_InjectContextSubmitsToAgentPanesOnly(t *testing.T) {
 			t.Fatalf("mkdir: %v", err)
 		}
 		received[agentType] = filepath.Join(dir, "received.txt")
-		idleScreen := `────────\n❯\n────────\n`
-		if agentType == "cod" {
-			idleScreen = `›\n`
-		}
-		// The recorder is named cat so the restore's wait for the relaunched
-		// command sees it once the script execs cat. stty -echo keeps the
-		// input off the screen, where the Claude and Codex submission checks
-		// would read it as a stranded composer.
-		recorder := filepath.Join(dir, "bin", "cat")
-		script := fmt.Sprintf("#!/bin/sh\nstty -echo\nprintf '\\033[?2004h%s'\nexec /bin/cat -uv > %q\n", idleScreen, received[agentType])
-		if err := os.WriteFile(recorder, []byte(script), 0o755); err != nil {
-			t.Fatalf("write recorder: %v", err)
-		}
+		recorder := writeRestoreInputRecorder(t, dir, received[agentType], restoreTestReadyScreens[agentType], "")
 		addPane(window, agentType, recorder, agentType+" line one\n"+agentType+" line two")
 	}
 	addPane(len(agentTypes), "user", "", "touch "+marker)
@@ -618,19 +606,8 @@ func TestRestorer_InjectContextSubmitsToAgentPanesOnly(t *testing.T) {
 	}
 
 	for _, agentType := range agentTypes {
-		// The tty turns the paste's CRs and each Enter into newlines.
-		want := "^[[200~# Context from checkpoint (just now ago)\n\n" +
-			agentType + " line one\n" + agentType + " line two^[[201~\n\n"
-		var got string
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			data, _ := os.ReadFile(received[agentType])
-			if got = string(data); got == want {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if got != want {
+		want := restoreTestPastedContext(agentType+" line one", agentType+" line two")
+		if got := waitForRestoreInput(received[agentType], want, 5*time.Second); got != want {
 			t.Errorf("%s pane input = %q, want %q", agentType, got, want)
 		}
 	}
@@ -640,6 +617,190 @@ func TestRestorer_InjectContextSubmitsToAgentPanesOnly(t *testing.T) {
 		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("user pane ran its pasted scrollback as a shell command (stat err = %v)", err)
 		}
+	}
+}
+
+// TestRestorer_InjectContextWaitsForAgentReadiness restores two agents whose
+// processes start at once but whose TUIs differ: the Muse pane draws its idle
+// screen and turns on bracketed paste two seconds later, as a real TUI takes a
+// moment after its process starts, and the Codex pane never draws anything.
+// The Muse pane must get its context only once it is up, so the paste arrives
+// bracketed; the old restore submitted right after relaunch, while the TUI was
+// still starting, and the paste arrived bare. The Codex pane must get nothing
+// and be reported.
+func TestRestorer_InjectContextWaitsForAgentReadiness(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	workDir := t.TempDir()
+	storage := NewStorageWithDir(t.TempDir())
+	r := NewRestorerWithStorage(storage)
+	r.agentReadyTimeout = 4 * time.Second
+	sessionName := "cpready-" + time.Now().Format("150405000000")
+	const checkpointID = "inject-ready-checkpoint"
+
+	cp := &Checkpoint{
+		ID:          checkpointID,
+		SessionName: sessionName,
+		WorkingDir:  workDir,
+		CreatedAt:   time.Now(),
+	}
+	received := map[string]string{}
+	for window, agentType := range []string{"muse", "cod"} {
+		dir := filepath.Join(workDir, agentType)
+		if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		received[agentType] = filepath.Join(dir, "received.txt")
+		screen, delay := "", ""
+		if agentType == "muse" {
+			screen, delay = restoreTestReadyScreens["muse"], "2"
+		}
+		recorder := writeRestoreInputRecorder(t, dir, received[agentType], screen, delay)
+
+		paneID := fmt.Sprintf("%%%d", window)
+		rel, err := storage.SaveScrollback(sessionName, checkpointID, paneID, agentType+" scrollback")
+		if err != nil {
+			t.Fatalf("SaveScrollback(%s): %v", agentType, err)
+		}
+		cp.Session.Panes = append(cp.Session.Panes, PaneState{
+			WindowIndex:    window,
+			ID:             paneID,
+			Title:          fmt.Sprintf("%s__%s_1", sessionName, agentType),
+			AgentType:      agentType,
+			Command:        recorder,
+			ScrollbackFile: rel,
+		})
+		cp.Session.WindowLayouts = append(cp.Session.WindowLayouts, WindowLayoutState{WindowIndex: window, Layout: "tiled"})
+	}
+
+	t.Cleanup(func() {
+		if tmux.SessionExists(sessionName) {
+			_ = tmux.KillSession(sessionName)
+		}
+	})
+
+	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{InjectContext: true})
+	if err != nil {
+		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+	}
+	if result.ContextInjected {
+		t.Error("ContextInjected = true although the Codex pane never became ready")
+	}
+	var notReady []string
+	for _, warning := range result.Warnings {
+		if strings.Contains(warning, "not ready") {
+			notReady = append(notReady, warning)
+		}
+	}
+	wantWarning := sessionName + "__cod_1): agent not ready within 4s; context not injected"
+	if len(notReady) != 1 || !strings.HasSuffix(notReady[0], wantWarning) {
+		t.Errorf("not-ready warnings = %q, want one ending %q (all warnings: %q)", notReady, wantWarning, result.Warnings)
+	}
+
+	want := restoreTestPastedContext("muse scrollback")
+	if got := waitForRestoreInput(received["muse"], want, 5*time.Second); got != want {
+		t.Errorf("muse pane input = %q, want %q", got, want)
+	}
+	time.Sleep(time.Second)
+	if data, _ := os.ReadFile(received["cod"]); len(data) != 0 {
+		t.Errorf("codex pane that never became ready got input %q", data)
+	}
+}
+
+// restoreTestReadyScreens are idle screens that agent.IsReadyOutput accepts,
+// as printf format strings.
+var restoreTestReadyScreens = map[string]string{
+	"cc":   `────────\n❯\n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n`,
+	"cod":  `›\n`,
+	"muse": `Muse Code 1.4.11\n\n────────\n❯\n────────\n  muse-wonder-1.0 · /repo · YOLO\n`,
+}
+
+// writeRestoreInputRecorder writes a stand-in agent into dir/bin that records
+// its raw input in received. It draws screen and turns on bracketed paste
+// after delay seconds (at once when delay is empty, never when screen is
+// empty) while the recording starts at once, as an agent process starts
+// before its TUI is up. The recorder is named cat so the restore's wait for
+// the relaunched command sees it once the script execs cat. stty -echo keeps
+// the input off the screen, where the Claude and Codex submission checks
+// would read it as a stranded composer.
+func writeRestoreInputRecorder(t *testing.T, dir, received, screen, delay string) string {
+	t.Helper()
+	draw := ""
+	switch {
+	case screen != "" && delay == "":
+		draw = fmt.Sprintf("printf '\\033[?2004h%s'\n", screen)
+	case screen != "":
+		draw = fmt.Sprintf("(sleep %s; printf '\\033[?2004h%s') &\n", delay, screen)
+	}
+	recorder := filepath.Join(dir, "bin", "cat")
+	script := fmt.Sprintf("#!/bin/sh\nstty -echo\n%sexec /bin/cat -uv > %q\n", draw, received)
+	if err := os.WriteFile(recorder, []byte(script), 0o755); err != nil {
+		t.Fatalf("write recorder: %v", err)
+	}
+	return recorder
+}
+
+// restoreTestPastedContext is what a recorder receives for a restored pane's
+// context message: one bracketed paste and the shared protocol's two Enters.
+// The tty turns the paste's CRs and each Enter into newlines.
+func restoreTestPastedContext(scrollback ...string) string {
+	return "^[[200~# Context from checkpoint (just now ago)\n\n" +
+		strings.Join(scrollback, "\n") + "^[[201~\n\n"
+}
+
+// waitForRestoreInput polls a recorder's input file until it holds want or
+// timeout passes, and returns what it last read.
+func waitForRestoreInput(path, want string, timeout time.Duration) string {
+	var got string
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		data, _ := os.ReadFile(path)
+		if got = string(data); got == want {
+			break
+		}
+	}
+	return got
+}
+
+func TestWaitForRestoredAgentReady(t *testing.T) {
+	const museScreen = "Muse Code 1.4.11\n\n❯\n  muse-wonder-1.0 · /repo · YOLO"
+	tests := []struct {
+		name string
+		// screens are the captures in order; the last one repeats.
+		screens  []string
+		command  string
+		deadline time.Duration
+		want     bool
+		// minCaptures is how many captures a ready result must take.
+		minCaptures int
+	}{
+		{name: "ready once the TUI draws", screens: []string{"", "", museScreen}, command: "muse-bin-1.4.11", deadline: 2 * time.Second, want: true, minCaptures: 3},
+		{name: "never draws", screens: []string{""}, command: "cat", deadline: 50 * time.Millisecond, want: false},
+		{name: "shell prompt under a shell", screens: []string{"% "}, command: "zsh", deadline: 50 * time.Millisecond, want: false},
+		{name: "ready text while the launcher shell still runs", screens: []string{"Update ready"}, command: "bash", deadline: 50 * time.Millisecond, want: false},
+		{name: "dead pane", screens: []string{museScreen}, command: "", deadline: 50 * time.Millisecond, want: false},
+		{name: "checked once after the deadline", screens: []string{museScreen}, command: "muse-bin-1.4.11", deadline: -time.Second, want: true, minCaptures: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			captures := 0
+			capture := func(paneID string, lines int) (string, error) {
+				if paneID != "%7" || lines != 50 {
+					t.Errorf("capture(%q, %d), want capture(%%7, 50)", paneID, lines)
+				}
+				screen := tc.screens[min(captures, len(tc.screens)-1)]
+				captures++
+				return screen, nil
+			}
+			command := func(string) (string, error) { return tc.command, nil }
+
+			got := waitForRestoredAgentReady("%7", time.Now().Add(tc.deadline), time.Millisecond, capture, command)
+			if got != tc.want {
+				t.Fatalf("waitForRestoredAgentReady() = %v, want %v", got, tc.want)
+			}
+			if tc.want && captures < tc.minCaptures {
+				t.Fatalf("ready after %d captures, want at least %d", captures, tc.minCaptures)
+			}
+		})
 	}
 }
 

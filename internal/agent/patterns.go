@@ -1378,3 +1378,74 @@ func GetPatternSet(agentType AgentType) *PatternSet {
 		return &PatternSet{} // Empty pattern set for unknown types
 	}
 }
+
+// readyWordRe matches "ready" as a whole word. A bare substring check also hit
+// "already", so lines like "Already up to date." read as an agent coming up.
+var readyWordRe = regexp.MustCompile(`\bready\b`)
+
+// readyPromptPatterns are the prompts IsReadyOutput accepts, anchored to the
+// end of a line or of the output.
+var readyPromptPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?m)^\$\s*$`), // Empty Shell prompt
+	regexp.MustCompile(`(?m)^%\s*$`),  // Empty Zsh prompt
+	regexp.MustCompile(`❯\s*$`),       // Modern prompts (U+276F)
+	regexp.MustCompile(`›\s*$`),       // Codex prompt (U+203A) empty
+	regexp.MustCompile(`(?m)^›`),      // Codex prompt with hint text
+	regexp.MustCompile(`>\s*$`),       // Simple prompt at end of output
+	regexp.MustCompile(`(?m)^>\s*$`),  // Simple prompt on its own line
+}
+
+// IsReadyOutput reports whether a freshly launched agent's pane output shows
+// its TUI up and taking input. Robot spawn, restart-pane and checkpoint
+// restore wait on it before sending an agent work. The shell prompts it
+// accepts also match a pane whose agent never started, so callers corroborate
+// it with the pane's process.
+func IsReadyOutput(output string) bool {
+	lower := strings.ToLower(output)
+
+	// Common ready indicators (case-insensitive)
+	lowerPatterns := []string{
+		"claude>",
+		"claude >",
+		"codex>",
+		"openai codex",
+		"context left",
+		"gemini>",
+		">>>", // Python REPL
+		"waiting for input",
+		"how can i help",
+		// Claude Code TUI indicators
+		"claude code v",      // Version banner
+		"welcome back",       // Greeting
+		"bypass permissions", // Status line
+		"try \"",             // Example prompt
+	}
+
+	for _, pattern := range lowerPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+
+	// Muse Code's last line is its status bar, not a prompt, so the prompt
+	// patterns below never match it; its banner or status bar means the TUI
+	// is up and taking input.
+	if IsMuseOutput(output) {
+		return true
+	}
+
+	// "ready" needs a word boundary: as a bare substring it also matched
+	// "already", so ordinary output such as "Already up to date." counted as an
+	// agent coming up.
+	if readyWordRe.MatchString(lower) {
+		return true
+	}
+
+	for _, p := range readyPromptPatterns {
+		if p.MatchString(output) {
+			return true
+		}
+	}
+
+	return false
+}

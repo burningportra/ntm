@@ -27,6 +27,15 @@ var (
 
 var errWorkingDirNotDirectory = errors.New("not a directory")
 
+const (
+	// restoreAgentReadyTimeout bounds context injection's wait, shared by all
+	// panes, for the relaunched agents to come up. It matches robot spawn's
+	// default ready wait.
+	restoreAgentReadyTimeout = 30 * time.Second
+	// restoreAgentReadyPollInterval is restart-pane's readiness poll period.
+	restoreAgentReadyPollInterval = 400 * time.Millisecond
+)
+
 // RestoreOptions configures how a checkpoint is restored.
 type RestoreOptions struct {
 	// Force kills any existing session with the same name
@@ -67,6 +76,8 @@ type RestoreResult struct {
 // Restorer handles checkpoint restoration.
 type Restorer struct {
 	storage *Storage
+	// agentReadyTimeout overrides restoreAgentReadyTimeout when positive.
+	agentReadyTimeout time.Duration
 }
 
 // NewRestorer creates a new Restorer with default storage.
@@ -200,12 +211,12 @@ func (r *Restorer) RestoreFromCheckpoint(cp *Checkpoint, opts RestoreOptions) (*
 
 	// Inject context if requested
 	if opts.InjectContext {
-		if err := r.injectContext(cp, opts.ScrollbackLines); err != nil {
+		failures := r.injectContext(cp, opts.ScrollbackLines)
+		for _, err := range failures {
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("context injection failed: %v", err))
-		} else {
-			result.ContextInjected = true
 		}
+		result.ContextInjected = len(failures) == 0
 	}
 
 	if err := r.restoreActivePane(cp); err != nil {
@@ -671,15 +682,25 @@ func (r *Restorer) applyWindowLayouts(sessionName string, windowLayouts []Window
 	return nil
 }
 
-// injectContext sends scrollback content to restored agents, submitting each
-// message through dispatch's agent-aware submit, the protocol ntm send uses.
-func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
+// injectContext submits each relaunched agent's scrollback through dispatch's
+// agent-aware submit, the protocol ntm send uses, once the agent is ready. A
+// paste sent while the agent is still starting lands in its launcher's shell
+// or a startup screen, or is discarded when the TUI takes over the terminal,
+// so a pane whose agent is not ready by the deadline the panes share gets
+// nothing. It returns one error per pane that did not get its context.
+func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) []error {
 	panes, err := tmux.GetPanes(cp.SessionName)
 	if err != nil {
-		return fmt.Errorf("getting panes: %w", err)
+		return []error{fmt.Errorf("getting panes: %w", err)}
 	}
 
-	var lastErr error
+	readyTimeout := restoreAgentReadyTimeout
+	if r.agentReadyTimeout > 0 {
+		readyTimeout = r.agentReadyTimeout
+	}
+	readyDeadline := time.Now().Add(readyTimeout)
+
+	var failures []error
 	for i, paneState := range cp.Session.Panes {
 		if paneState.ScrollbackFile == "" {
 			continue
@@ -695,11 +716,15 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
 		if !ok {
 			continue
 		}
+		label := "pane " + targetPane.ID
+		if paneState.Title != "" {
+			label += " (" + paneState.Title + ")"
+		}
 
 		// Load scrollback content
 		content, err := r.loadPaneScrollbackForPane(cp.SessionName, cp.ID, paneState)
 		if err != nil {
-			lastErr = err
+			failures = append(failures, fmt.Errorf("%s: %w", label, err))
 			continue
 		}
 
@@ -708,13 +733,45 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
 			content = truncateToLines(content, maxLines)
 		}
 
+		if !waitForRestoredAgentReady(targetPane.ID, readyDeadline, restoreAgentReadyPollInterval, tmux.CapturePaneOutput, currentPaneCommand) {
+			failures = append(failures, fmt.Errorf("%s: agent not ready within %s; context not injected", label, readyTimeout))
+			continue
+		}
+
 		contextMsg := formatContextInjection(content, cp.CreatedAt)
 		if err := (dispatch.TMUXDeliverer{}).SubmitPrompt(context.Background(), targetPane.ID, tmux.AgentType(paneState.AgentType), contextMsg); err != nil {
-			lastErr = err
+			failures = append(failures, fmt.Errorf("%s: %w", label, err))
 		}
 	}
 
-	return lastErr
+	return failures
+}
+
+// waitForRestoredAgentReady polls a relaunched pane until its output passes
+// agent.IsReadyOutput, the check robot spawn and restart-pane wait on, while
+// its foreground process is not a shell. A shell prompt passes the text check
+// too, so the process corroborates it as spawn's and restart-pane's process
+// checks do. The pane is checked at least once, so a ready pane still gets its
+// context after another pane used up the deadline.
+func waitForRestoredAgentReady(
+	paneID string,
+	deadline time.Time,
+	pollInterval time.Duration,
+	capture func(string, int) (string, error),
+	currentCommand func(string) (string, error),
+) bool {
+	for {
+		if output, err := capture(paneID, 50); err == nil && agent.IsReadyOutput(output) {
+			if command, err := currentCommand(paneID); err == nil && command != "" && !tmux.PaneCommandIsShell(command) {
+				return true
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		time.Sleep(min(pollInterval, remaining))
+	}
 }
 
 func (r *Restorer) loadPaneScrollback(sessionName, checkpointID, paneID string) (string, error) {

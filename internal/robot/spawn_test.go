@@ -727,63 +727,6 @@ func TestAgentTypeShort(t *testing.T) {
 // Unit tests, E2E scripts, schema stability, deterministic ordering
 // =============================================================================
 
-// TestIsAgentReady_Patterns validates agent ready detection patterns
-func TestIsAgentReady_Patterns(t *testing.T) {
-
-	tests := []struct {
-		name      string
-		output    string
-		agentType string
-		expected  bool
-	}{
-		// Claude indicators
-		{"claude_prompt_lowercase", "claude>", "claude", true},
-		{"claude_prompt_spaced", "claude > ", "claude", true},
-		{"claude_code_version", "Claude Code v1.2.3", "claude", true},
-		{"claude_welcome", "Welcome back!", "claude", true},
-		{"claude_bypass_permissions", "Bypass permissions: enabled", "claude", true},
-		{"claude_try_example", "Try \"help me with X\"", "claude", true},
-
-		// Codex indicators
-		{"codex_prompt", "codex>", "codex", true},
-		{"codex_context_left", "42% context left · ? for shortcuts", "codex", true},
-		{"codex_chevron_prompt", "› Write tests for @filename", "codex", true},
-		{"codex_ready", "Ready for input", "codex", true},
-
-		// Gemini indicators
-		{"gemini_prompt", "gemini>", "gemini", true},
-		{"gemini_help", "How can I help you today?", "gemini", true},
-
-		// Muse indicators: the last line is the status bar, not a prompt.
-		{"muse_idle_screen", museTestIdleScreen, "muse", true},
-		{"muse_status_bar_only", "◆ echo: done\n\n❯ draft\n" + museTestRule + "\n" + museTestStatusBar, "muse", true},
-		{"muse_command_echo_only", "% muse --yolo --model 'muse-wonder-1.0'", "muse", false},
-
-		// Generic shell prompts
-		{"shell_dollar", "$ ", "claude", true},
-		{"shell_percent", "% ", "claude", true},
-		{"shell_arrow", "❯ ", "claude", true},
-		{"shell_simple", "> ", "claude", true},
-		{"python_repl", ">>> ", "codex", true},
-
-		// Not ready states
-		{"loading", "Loading...", "claude", false},
-		{"empty", "", "claude", false},
-		{"garbage", "xyzabc123", "claude", false},
-		{"partial_prompt", "claud", "claude", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := isAgentReady(tc.output, tc.agentType)
-			if got != tc.expected {
-				t.Errorf("[E2E-SPAWN] isAgentReady(%q, %q) = %v, want %v",
-					tc.output, tc.agentType, got, tc.expected)
-			}
-		})
-	}
-}
-
 // TestGetAgentCommands validates command resolution with/without config
 func TestGetAgentCommands(t *testing.T) {
 
@@ -3137,16 +3080,6 @@ func TestWaitForAgentsReadyRequiresLiveProcess(t *testing.T) {
 	}
 	if !output.Agents[0].Ready {
 		t.Fatal("an unavailable PID must not block readiness")
-	}
-}
-
-// "ready" must match as a word: as a bare substring it also hit "already".
-func TestIsAgentReadyDoesNotMatchAlready(t *testing.T) {
-	if isAgentReady("Already up to date.\n", "claude") {
-		t.Fatal(`"Already up to date." must not count as an agent being ready`)
-	}
-	if !isAgentReady("agent ready for input\n", "claude") {
-		t.Fatal(`a genuine "ready" line should still match`)
 	}
 }
 
