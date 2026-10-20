@@ -7420,3 +7420,36 @@ func TestWorkRowsAreScopedByProject(t *testing.T) {
 		}
 	}
 }
+
+// A refresh peeked every inbox twice, once for the tmux projection and once
+// for the coordination section, and the snapshot after it peeked them all a
+// third time (bd-gm0d7). Each inbox is now read once for all three.
+func TestSnapshotMailReusesTheRefreshInboxPeeks(t *testing.T) {
+	names := make([]string, 12)
+	for i := range names {
+		names[i] = fmt.Sprintf("Agent%02d", i)
+	}
+	server, peeked := newSlowInboxMailServer(t, names, 20*time.Millisecond)
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+	installFakeWorkTools(t, fakeBRBlockedScript)
+	oldStore := currentProjectionStore()
+	t.Cleanup(func() { SetProjectionStore(oldStore) })
+
+	projectDir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := RefreshNormalizedProjection(ctx, newTestAttentionStore(t), projectDir, "", 10*time.Second); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if got := peeked.Load(); got != int64(len(names)) {
+		t.Fatalf("the refresh peeked %d inboxes for %d agents, want one read each", got, len(names))
+	}
+
+	summary, _, _ := fetchAgentMailData(projectDir)
+	if got := peeked.Load(); got != int64(len(names)) {
+		t.Fatalf("after the snapshot read, %d inboxes were peeked for %d agents, want the refresh's reads reused", got, len(names))
+	}
+	if summary == nil || summary.AgentsNotRead != 0 || summary.TotalUnread != len(names) {
+		t.Fatalf("snapshot mail = %+v, want every agent's one unread message", summary)
+	}
+}

@@ -79,6 +79,11 @@ type Client struct {
 	// every caller sharing this client shares InboxPeekConcurrency.
 	inboxPeekSlotsOnce sync.Once
 	inboxPeekSlots     chan struct{}
+
+	// inboxPeeks holds the latest PeekInboxes read of each inbox, by its
+	// fetch options, so callers share a read in flight or a recent one.
+	inboxPeeksMu sync.Mutex
+	inboxPeeks   map[FetchInboxOptions]*inboxPeekRead
 }
 
 // availabilityErrBox wraps an error for atomic.Value storage (atomic.Value
@@ -690,12 +695,33 @@ type InboxPeek struct {
 	Err error
 }
 
+// InboxPeekReuse is how long PeekInboxes answers from a successful read of an
+// inbox instead of reading it again.
+const InboxPeekReuse = 30 * time.Second
+
+// inboxPeekRead is one PeekInboxes read of one inbox. Its other fields are
+// set before done closes; started says the fetch was sent.
+type inboxPeekRead struct {
+	done    chan struct{}
+	started bool
+	peek    InboxPeek
+	readAt  time.Time
+}
+
 // PeekInboxes reads each named agent's inbox without marking anything read,
 // at most InboxPeekConcurrency at a time across every caller sharing this
 // client. Observers peek so they never consume other agents' mail
 // (bd-ntu8w). opts supplies every field but AgentName and Peek. The result
 // holds an entry for every name, so a caller can tell an inbox it could not
 // read from an empty one.
+//
+// Callers sharing this client share reads: an inbox another caller is
+// reading with the same options is waited on, and one read successfully in
+// the last InboxPeekReuse is answered without reading it again, so a
+// projection refresh and the snapshot after it read each inbox once
+// (bd-gm0d7). A caller that waits gets that read's result, failure included.
+// A read that has started finishes after its caller's ctx ends, so a refresh
+// that stops waiting at its budget leaves its last reads for the snapshot.
 func (c *Client) PeekInboxes(ctx context.Context, opts FetchInboxOptions, agentNames []string) map[string]InboxPeek {
 	c.inboxPeekSlotsOnce.Do(func() {
 		c.inboxPeekSlots = make(chan struct{}, InboxPeekConcurrency)
@@ -704,20 +730,31 @@ func (c *Client) PeekInboxes(ctx context.Context, opts FetchInboxOptions, agentN
 	peeks := make([]InboxPeek, len(agentNames))
 	var wg sync.WaitGroup
 	for i, name := range agentNames {
+		agentOpts := opts
+		agentOpts.AgentName = name
+		agentOpts.Peek = true
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			select {
-			case c.inboxPeekSlots <- struct{}{}:
-			case <-ctx.Done():
-				peeks[i].Err = ctx.Err()
-				return
+			for {
+				read, owned := c.claimInboxPeek(agentOpts)
+				if owned {
+					go c.readInboxPeek(ctx, read, agentOpts)
+				}
+				select {
+				case <-read.done:
+				case <-ctx.Done():
+					peeks[i].Err = ctx.Err()
+					return
+				}
+				// A read whose owner's context ended before it started says
+				// nothing about the inbox, so a caller still waiting reads it.
+				if read.started || ctx.Err() != nil {
+					// Each caller gets its own slice of the shared read's messages.
+					peeks[i] = InboxPeek{Messages: append([]InboxMessage(nil), read.peek.Messages...), Err: read.peek.Err}
+					return
+				}
 			}
-			defer func() { <-c.inboxPeekSlots }()
-			agentOpts := opts
-			agentOpts.AgentName = name
-			agentOpts.Peek = true
-			peeks[i].Messages, peeks[i].Err = c.FetchInbox(ctx, agentOpts)
 		}()
 	}
 	wg.Wait()
@@ -727,6 +764,54 @@ func (c *Client) PeekInboxes(ctx context.Context, opts FetchInboxOptions, agentN
 		byAgent[name] = peeks[i]
 	}
 	return byAgent
+}
+
+// claimInboxPeek returns the read that answers opts: one in flight or a recent
+// success to wait on, or a new read the caller owns and must finish. Reads
+// since a timestamp are never shared, since each caller's timestamp differs.
+func (c *Client) claimInboxPeek(opts FetchInboxOptions) (*inboxPeekRead, bool) {
+	read := &inboxPeekRead{done: make(chan struct{})}
+	if opts.SinceTS != nil {
+		return read, true
+	}
+	c.inboxPeeksMu.Lock()
+	defer c.inboxPeeksMu.Unlock()
+	if prior, ok := c.inboxPeeks[opts]; ok {
+		select {
+		case <-prior.done:
+			if prior.peek.Err == nil && time.Since(prior.readAt) < InboxPeekReuse {
+				return prior, false
+			}
+		default:
+			return prior, false
+		}
+	}
+	if c.inboxPeeks == nil {
+		c.inboxPeeks = make(map[FetchInboxOptions]*inboxPeekRead)
+	}
+	c.inboxPeeks[opts] = read
+	return read, true
+}
+
+// readInboxPeek reads one inbox into read once a PeekInboxes slot is free,
+// unless ctx ends first. A read that has started runs to completion even when
+// ctx ends, bounded by DefaultTimeout: the server does the work either way, and
+// the result is then there for the next caller instead of wasted (bd-gm0d7).
+func (c *Client) readInboxPeek(ctx context.Context, read *inboxPeekRead, opts FetchInboxOptions) {
+	defer close(read.done)
+	select {
+	case c.inboxPeekSlots <- struct{}{}:
+	case <-ctx.Done():
+		read.peek.Err = ctx.Err()
+		read.readAt = time.Now()
+		return
+	}
+	defer func() { <-c.inboxPeekSlots }()
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultTimeout)
+	defer cancel()
+	read.started = true
+	read.peek.Messages, read.peek.Err = c.FetchInbox(fetchCtx, opts)
+	read.readAt = time.Now()
 }
 
 // httpBaseURL returns the HTTP REST API base URL derived from the MCP base URL.

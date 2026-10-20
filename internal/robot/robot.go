@@ -1536,6 +1536,12 @@ var (
 	projectionStoreMu sync.RWMutex
 	projectionStore   *state.Store
 	projectionRefresh func()
+	// projectionMailProject and projectionMailClient are the project the
+	// latest refresh read and the Agent Mail client it read through. Mail
+	// readers after it in this process use that client, so the inboxes it
+	// just peeked are not read again (bd-gm0d7).
+	projectionMailProject string
+	projectionMailClient  *agentmail.Client
 )
 
 const (
@@ -1552,6 +1558,22 @@ func SetProjectionStore(store *state.Store) {
 	defer projectionStoreMu.Unlock()
 	projectionStore = store
 	projectionRefresh = nil
+	projectionMailProject = ""
+	projectionMailClient = nil
+}
+
+// agentMailClientFor returns the client a mail reader for projectKey uses:
+// the latest refresh's when that refresh read the same project, so its recent
+// inbox peeks are reused, otherwise a new one.
+func agentMailClientFor(projectKey string) *agentmail.Client {
+	projectionStoreMu.RLock()
+	client := projectionMailClient
+	sameProject := projectionMailProject == projectKey
+	projectionStoreMu.RUnlock()
+	if client != nil && sameProject {
+		return client
+	}
+	return newAgentMailClient(projectKey)
 }
 
 // SetProjectionRefresh registers the work that brings the projection store up
@@ -4558,7 +4580,7 @@ func splitLines(s string) []string {
 // fetchAgentMailData retrieves Agent Mail state for the project.
 // Returns the summary, raw agent list, and per-agent stats map.
 func fetchAgentMailData(projectKey string) (*SnapshotAgentMail, []agentmail.Agent, map[string]SnapshotAgentMailStats) {
-	return fetchAgentMailDataContext(context.Background(), newAgentMailClient(projectKey), projectKey)
+	return fetchAgentMailDataContext(context.Background(), agentMailClientFor(projectKey), projectKey)
 }
 
 // fetchAgentMailDataContext reads Agent Mail state through client. It peeks
@@ -4610,10 +4632,12 @@ func fetchAgentMailDataContext(parent context.Context, client *agentmail.Client,
 	statsMap := make(map[string]SnapshotAgentMailStats)
 
 	// Read one at a time, a few dozen inboxes on a busy server never fit the
-	// budget and most agents went missing (bd-o4u96).
+	// budget and most agents went missing (bd-o4u96). The options match the
+	// coordination adapter's, so a refresh peeks each inbox once for both.
 	peeks := client.PeekInboxes(ctx, agentmail.FetchInboxOptions{
-		ProjectKey: projectKey,
-		Limit:      25,
+		ProjectKey:    projectKey,
+		Limit:         25,
+		IncludeBodies: true,
 	}, mailAgentNames(agents))
 	threadSet := make(map[string]struct{})
 	for name, peek := range peeks {
@@ -7785,9 +7809,14 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 		defer cancelSources()
 	}
 
-	// One Agent Mail client serves the whole refresh, so its availability
-	// probe runs once rather than once per consumer.
+	// One Agent Mail client serves the whole refresh and the mail readers
+	// after it, so its availability probe runs once and each inbox is peeked
+	// once rather than once per consumer.
 	mailClient := newAgentMailClient(resolvedProjectDir)
+	projectionStoreMu.Lock()
+	projectionMailProject = resolvedProjectDir
+	projectionMailClient = mailClient
+	projectionStoreMu.Unlock()
 	adapterConfig := adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir)
 	adapterConfig.AgentMailClient = mailClient
 	aggregator := adapters.NewSignalAggregator(0)

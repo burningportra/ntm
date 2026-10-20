@@ -1502,6 +1502,66 @@ func TestPeekInboxesSharesOneBoundAcrossCallers(t *testing.T) {
 	}
 }
 
+// bd-gm0d7: a projection refresh's two readers and the snapshot after it each
+// peeked every inbox, so one process read each inbox three times. Callers
+// sharing a client now share a read in flight and reuse a recent success.
+func TestPeekInboxesReadsEachInboxOnceForEveryCaller(t *testing.T) {
+	t.Parallel()
+
+	server := newPeekInboxServer(t, 40*time.Millisecond)
+	defer server.Close()
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	opts := FetchInboxOptions{ProjectKey: "/test/project", Limit: 25}
+	healthy := peekAgentNames("Agent", InboxPeekConcurrency)
+	names := append([]string{"Broken"}, healthy...)
+	reads := func() map[string]int {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		counts := map[string]int{}
+		for _, args := range server.calls {
+			name, _ := args["agent_name"].(string)
+			counts[name]++
+		}
+		return counts
+	}
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.PeekInboxes(context.Background(), opts, names)
+		}()
+	}
+	wg.Wait()
+	later := c.PeekInboxes(context.Background(), opts, names)
+
+	counts := reads()
+	for _, name := range healthy {
+		if counts[name] != 1 {
+			t.Fatalf("%s was read %d times by three callers, want once", name, counts[name])
+		}
+		if peek := later[name]; peek.Err != nil || len(peek.Messages) != 1 {
+			t.Fatalf("reused %s = %+v, want its one message", name, peek)
+		}
+	}
+	if counts["Broken"] != 2 || later["Broken"].Err == nil {
+		t.Fatalf("Broken was read %d times and last returned %+v; want the failed read shared once in flight, then read again", counts["Broken"], later["Broken"])
+	}
+
+	c.PeekInboxes(context.Background(), FetchInboxOptions{ProjectKey: "/test/project", Limit: 50}, healthy[:1])
+	c.inboxPeeksMu.Lock()
+	for _, read := range c.inboxPeeks {
+		read.readAt = read.readAt.Add(-InboxPeekReuse)
+	}
+	c.inboxPeeksMu.Unlock()
+	c.PeekInboxes(context.Background(), opts, healthy[1:2])
+	counts = reads()
+	if counts[healthy[0]] != 2 || counts[healthy[1]] != 2 {
+		t.Fatalf("reads = %v; want a read with other options and a read older than %v each to read again", counts, InboxPeekReuse)
+	}
+}
+
 // bd-o4u96, bd-7x7t7: an inbox that could not be read must stay visible to
 // the caller instead of reading as an empty one.
 func TestPeekInboxesReportsEveryInboxItCouldNotRead(t *testing.T) {
