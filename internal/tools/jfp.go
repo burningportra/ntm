@@ -4,12 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
 	"time"
 )
+
+// ErrJFPCommandMoved is returned for jfp commands that upstream retired with a
+// "deprecated_command" error; skill management (install/installed/update)
+// moved to jsm.
+var ErrJFPCommandMoved = errors.New("jfp command moved")
 
 // JFPAdapter provides integration with the JeffreysPrompts CLI (jfp)
 type JFPAdapter struct {
@@ -137,20 +143,6 @@ func (a *JFPAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 	}, nil
 }
 
-// HasCapability checks if jfp has a specific capability
-func (a *JFPAdapter) HasCapability(ctx context.Context, cap Capability) bool {
-	caps, err := a.Capabilities(ctx)
-	if err != nil {
-		return false
-	}
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
-}
-
 // Info returns complete jfp tool information
 func (a *JFPAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
@@ -193,11 +185,6 @@ func (a *JFPAdapter) Status(ctx context.Context) (json.RawMessage, error) {
 	return a.runCommand(ctx, "status", "--json")
 }
 
-// Installed returns list of installed Claude Code skills
-func (a *JFPAdapter) Installed(ctx context.Context) (json.RawMessage, error) {
-	return a.runCommand(ctx, "installed", "--json")
-}
-
 // Categories returns all categories with counts
 func (a *JFPAdapter) Categories(ctx context.Context) (json.RawMessage, error) {
 	return a.runCommand(ctx, "categories", "--json")
@@ -218,17 +205,6 @@ func (a *JFPAdapter) Bundle(ctx context.Context, id string) (json.RawMessage, er
 	return a.runCommand(ctx, "bundle", id, "--json")
 }
 
-// Install installs one or more prompts by ID.
-func (a *JFPAdapter) Install(ctx context.Context, ids []string, projectDir string) (json.RawMessage, error) {
-	args := []string{"install"}
-	if projectDir != "" {
-		args = append(args, "--project", projectDir)
-	}
-	args = append(args, ids...)
-	args = append(args, "--json")
-	return a.runCommand(ctx, args...)
-}
-
 // Export exports one or more prompts by ID.
 func (a *JFPAdapter) Export(ctx context.Context, ids []string, format string) (json.RawMessage, error) {
 	args := []string{"export"}
@@ -240,9 +216,9 @@ func (a *JFPAdapter) Export(ctx context.Context, ids []string, format string) (j
 	return a.runCommand(ctx, args...)
 }
 
-// Update refreshes the local prompt registry/cache.
-func (a *JFPAdapter) Update(ctx context.Context) (json.RawMessage, error) {
-	return a.runCommand(ctx, "update", "--json")
+// Refresh refreshes the local prompt registry cache from the remote registry.
+func (a *JFPAdapter) Refresh(ctx context.Context) (json.RawMessage, error) {
+	return a.runCommand(ctx, "refresh", "--json")
 }
 
 // runCommand executes a jfp command and returns raw JSON
@@ -280,6 +256,18 @@ func (a *JFPAdapter) runCommand(ctx context.Context, args ...string) (json.RawMe
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, ErrTimeout
+		}
+		// jfp reports failures as {"error":true,"code":...,"message":...} on stdout.
+		var failure struct {
+			Error   bool   `json:"error"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(bytes.TrimSpace(output), &failure) == nil && failure.Error && failure.Message != "" {
+			if failure.Code == "deprecated_command" {
+				return nil, fmt.Errorf("%w: %s", ErrJFPCommandMoved, failure.Message)
+			}
+			return nil, fmt.Errorf("jfp %s failed: %s (%s)", strings.Join(args, " "), failure.Message, failure.Code)
 		}
 		return nil, fmt.Errorf("jfp %s failed: %w: %s", strings.Join(args, " "), err, stderr.String())
 	}

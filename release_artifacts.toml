@@ -1,0 +1,61 @@
+# release_artifacts.toml — WS0-G4 release-artifact lockstep manifest
+# (bd-ws0-guards-klz98.5). Consumed by scripts/release_preflight.sh, which runs
+# as the `release-preflight` CI job (dry-run on every push) AND as STEP 0 of
+# the DSR release checklist in AGENTS.md.
+#
+# One [artifact.<name>] block per deliverable. Fields:
+#   kind          binary | installer | web-embed | vsix | docker-image | ...
+#   dir           deliverable directory (required for deferred entries; the
+#                 pre-flight fails if the dir vanishes — stale entry — or if a
+#                 buildable deliverable dir exists with NO entry — the F1/F2
+#                 "finished but never shipped" class, structurally impossible)
+#   version_probe bash snippet run from the repo root with EXPECTED_VERSION
+#                 and PREFLIGHT_TMP exported; its stdout's LAST line must equal
+#                 EXPECTED_VERSION exactly
+#   deferred      open bead ID: deliverable exists but is not shipped yet; the
+#                 owning bead must replace this with a version_probe in the PR
+#                 that ships it. version_probe and deferred are mutually
+#                 exclusive; every entry needs exactly one of them.
+
+schema = "1"
+
+[artifact.ntm-binary]
+kind = "binary"
+# Replicates the .goreleaser.yaml build (internal/cli.Version stamp AND the
+# ensemble_experimental tag) with go build, asserts the built artifact
+# exposes a REAL `ensemble spawn` (the --dry-run flag exists only in the
+# tagged build; the untagged stub registers no spawn flags — F3,
+# bd-ws5-ship-or-cut-jv0rc.3), then asserts the stamped version.
+version_probe = 'go build -trimpath -tags ensemble_experimental -ldflags "-s -w -X github.com/Dicklesworthstone/ntm/internal/cli.Version=${EXPECTED_VERSION}" -o "${PREFLIGHT_TMP}/ntm" ./cmd/ntm && "${PREFLIGHT_TMP}/ntm" ensemble spawn --help | grep -q -- "--dry-run" && "${PREFLIGHT_TMP}/ntm" version --short'
+
+[artifact.install-sh]
+kind = "installer"
+# install.sh is version-agnostic (it resolves GitHub release assets at run
+# time), so the probe asserts the naming/repo contract it depends on is intact
+# and then reports the expected version itself.
+version_probe = 'bash -n install.sh && grep -q "REPO_OWNER=\"Dicklesworthstone\"" install.sh && grep -q "BIN_NAME=\"ntm\"" install.sh && grep -q -- "--version=" install.sh && echo "${EXPECTED_VERSION}"'
+
+[artifact.web]
+kind = "web-embed"
+dir = "web"
+# Shipped by F1b (bd-ws5-ship-or-cut-jv0rc.1.2): the static export is
+# go:embed-ed from internal/webui/dist and served by `ntm web` / `ntm serve
+# --web`. The probe asserts (1) the embed directive is live, (2) the embedded
+# export is present, and (3) BOTH the source package.json version and the
+# baked data-ntm-version stamp in the embedded index.html equal the tag —
+# version skew between UI and binary is exactly how the dashboard froze at
+# v1.16.0. A stale embed (version bump without scripts/build_web.sh) fails
+# here and in the internal/webui lockstep test.
+version_probe = 'grep -q "go:embed all:dist" internal/webui/webui.go && test -f internal/webui/dist/index.html && grep -q "\"version\": \"${EXPECTED_VERSION}\"" web/package.json && grep -q "data-ntm-version=\"${EXPECTED_VERSION}\"" internal/webui/dist/index.html && echo "${EXPECTED_VERSION}"'
+
+[artifact.vscode-extension]
+kind = "vsix"
+dir = "vscode"
+# Shipped by F2 (bd-ws5-ship-or-cut-jv0rc.2): the DSR release attaches
+# vscode/dist/ntm-vscode-<version>.vsix (marketplace publishing stays deferred
+# per the Q1 ledger entry on the bead). The probe builds the vsix for real —
+# npm ci + tsc + `vsce package` via scripts/build_vsix.sh — and reports the
+# version baked into the packaged extension manifest, so a version bump
+# without the vscode/package.json lockstep bump, or any compile rot, fails
+# here (and in the ci.yml vscode-extension job on every push).
+version_probe = 'bash scripts/build_vsix.sh'

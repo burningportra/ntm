@@ -3,6 +3,7 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,12 +12,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	approvalpkg "github.com/Dicklesworthstone/ntm/internal/approval"
 	"github.com/Dicklesworthstone/ntm/internal/policy"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
 // registerSafetyRoutes registers all safety and policy related routes.
@@ -61,7 +63,13 @@ type SafetyStatusResponse struct {
 	WrapperPath         string `json:"wrapper_path,omitempty"`
 	GitWrapperInstalled bool   `json:"git_wrapper_installed"`
 	RmWrapperInstalled  bool   `json:"rm_wrapper_installed"`
-	HookInstalled       bool   `json:"hook_installed"`
+	// HookInstalled is true only when the hook script exists and Claude
+	// Code's settings register it; Claude never runs unregistered scripts.
+	HookInstalled     bool   `json:"hook_installed"`
+	HookScriptPresent bool   `json:"hook_script_present"`
+	HookRegistered    bool   `json:"hook_registered"`
+	HookSettingsPath  string `json:"hook_settings_path,omitempty"`
+	HookSettingsError string `json:"hook_settings_error,omitempty"`
 }
 
 func (s *Server) handleSafetyStatusV1(w http.ResponseWriter, r *http.Request) {
@@ -83,9 +91,11 @@ func (s *Server) handleSafetyStatusV1(w http.ResponseWriter, r *http.Request) {
 	gitWrapperInstalled := safetyFileExists(gitWrapper)
 	rmWrapperInstalled := safetyFileExists(rmWrapper)
 
-	// Check if Claude Code hook is installed
-	hookPath := filepath.Join(home, ".claude", "hooks", "PreToolUse", "ntm-safety.sh")
-	hookInstalled := safetyFileExists(hookPath)
+	hookPath := policy.ClaudeHookScriptPath(home)
+	settingsPath := policy.ClaudeUserSettingsPath(home)
+	hookScriptPresent := safetyFileExists(hookPath)
+	hookRegistered, registeredErr := policy.ClaudeHookRegistered(settingsPath, hookPath)
+	hookInstalled := hookScriptPresent && hookRegistered
 
 	// Load policy
 	p, err := policy.LoadOrDefault()
@@ -118,6 +128,12 @@ func (s *Server) handleSafetyStatusV1(w http.ResponseWriter, r *http.Request) {
 		GitWrapperInstalled: gitWrapperInstalled,
 		RmWrapperInstalled:  rmWrapperInstalled,
 		HookInstalled:       hookInstalled,
+		HookScriptPresent:   hookScriptPresent,
+		HookRegistered:      hookRegistered,
+		HookSettingsPath:    settingsPath,
+	}
+	if registeredErr != nil {
+		resp.HookSettingsError = registeredErr.Error()
 	}
 
 	data, err := toJSONMap(resp)
@@ -258,6 +274,7 @@ type SafetyInstallResponse struct {
 	GitWrapper string `json:"git_wrapper"`
 	RmWrapper  string `json:"rm_wrapper"`
 	Hook       string `json:"hook"`
+	Settings   string `json:"settings"`
 	Policy     string `json:"policy"`
 }
 
@@ -293,29 +310,34 @@ func (s *Server) handleSafetyInstallV1(w http.ResponseWriter, r *http.Request) {
 
 	// Install git wrapper
 	gitWrapper := filepath.Join(binDir, "git")
-	if err := installWrapperFile(gitWrapper, gitWrapperScript, req.Force); err != nil {
+	if err := installWrapperFile(gitWrapper, policy.GitWrapperScript, req.Force); err != nil {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
 		return
 	}
 
 	// Install rm wrapper
 	rmWrapper := filepath.Join(binDir, "rm")
-	if err := installWrapperFile(rmWrapper, rmWrapperScript, req.Force); err != nil {
+	if err := installWrapperFile(rmWrapper, policy.RmWrapperScript, req.Force); err != nil {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
 		return
 	}
 
-	// Install Claude Code hook
-	hookDir := filepath.Join(home, ".claude", "hooks", "PreToolUse")
-	if err := os.MkdirAll(hookDir, 0755); err != nil {
+	// Install the Claude Code hook script and register it in Claude's
+	// settings: Claude Code runs only hooks a settings file lists.
+	hookPath := policy.ClaudeHookScriptPath(home)
+	if err := os.MkdirAll(filepath.Dir(hookPath), 0755); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"failed to create hook directory", nil, reqID)
 		return
 	}
-
-	hookPath := filepath.Join(hookDir, "ntm-safety.sh")
-	if err := installWrapperFile(hookPath, claudeHookScript, req.Force); err != nil {
+	if err := installWrapperFile(hookPath, policy.ClaudeHookScript, req.Force); err != nil {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
+		return
+	}
+	settingsPath := policy.ClaudeUserSettingsPath(home)
+	if _, err := policy.RegisterClaudeHook(settingsPath, hookPath); err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			fmt.Sprintf("failed to register Claude Code hook: %v", err), nil, reqID)
 		return
 	}
 
@@ -333,6 +355,7 @@ func (s *Server) handleSafetyInstallV1(w http.ResponseWriter, r *http.Request) {
 		GitWrapper: gitWrapper,
 		RmWrapper:  rmWrapper,
 		Hook:       hookPath,
+		Settings:   settingsPath,
 		Policy:     policyPath,
 	}
 
@@ -377,8 +400,17 @@ func (s *Server) handleSafetyUninstallV1(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Remove hook
-	hookPath := filepath.Join(home, ".claude", "hooks", "PreToolUse", "ntm-safety.sh")
+	// Unregister the hook before removing its script, so Claude Code is never
+	// left pointing at a missing file.
+	hookPath := policy.ClaudeHookScriptPath(home)
+	settingsPath := policy.ClaudeUserSettingsPath(home)
+	if changed, err := policy.UnregisterClaudeHook(settingsPath, hookPath); err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			fmt.Sprintf("failed to unregister Claude Code hook: %v", err), nil, reqID)
+		return
+	} else if changed {
+		removed = append(removed, settingsPath+" (hooks.PreToolUse entry)")
+	}
 	if safetyFileExists(hookPath) {
 		if err := os.Remove(hookPath); err != nil {
 			writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -935,7 +967,9 @@ func (s *Server) handlePolicyAutomationUpdateV1(w http.ResponseWriter, r *http.R
 	writeSuccessResponse(w, http.StatusOK, data, reqID)
 }
 
-// Approval represents a pending approval request.
+// Approval is the REST/WS representation of a durable approval record. It is
+// a view over internal/state.Approval (field names kept for API stability:
+// "requestor" maps to state's RequestedBy, "slb_required" to RequiresSLB).
 type Approval struct {
 	ID          string    `json:"id"`
 	Action      string    `json:"action"`       // The action requiring approval
@@ -943,54 +977,108 @@ type Approval struct {
 	Requestor   string    `json:"requestor"`    // Who requested the action
 	Reason      string    `json:"reason"`       // Why approval is needed
 	SLBRequired bool      `json:"slb_required"` // Whether SLB two-person approval is needed
-	Status      string    `json:"status"`       // pending, approved, denied, expired
+	Status      string    `json:"status"`       // pending, approved, denied, expired, consumed
 	CreatedAt   time.Time `json:"created_at"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	ApprovedBy  string    `json:"approved_by,omitempty"`
 	ApprovedAt  time.Time `json:"approved_at,omitempty"`
 }
 
-// In-memory approval store (in production, this would be persisted)
-var (
-	approvals     = make(map[string]*Approval)
-	approvalsLock sync.RWMutex
-	approvalIDSeq int64
-)
+// approvalFromState converts a durable approval record to its REST shape.
+func approvalFromState(a *state.Approval) Approval {
+	out := Approval{
+		ID:          a.ID,
+		Action:      a.Action,
+		Resource:    a.Resource,
+		Requestor:   a.RequestedBy,
+		Reason:      a.Reason,
+		SLBRequired: a.RequiresSLB,
+		Status:      string(a.Status),
+		CreatedAt:   a.CreatedAt,
+		ExpiresAt:   a.ExpiresAt,
+		ApprovedBy:  a.ApprovedBy,
+	}
+	if a.ApprovedAt != nil {
+		out.ApprovedAt = *a.ApprovedAt
+	}
+	return out
+}
 
-// approvalRetention is how long a terminal (approved/denied/expired) approval
-// stays queryable after it stopped being actionable.
+// approvalEngine returns the durable approval engine backed by the server's
+// state store — the SAME store `ntm approve` and the force-release gate use,
+// so approvals created over HTTP are visible to the CLI workflow and vice
+// versa (bd-d2uxt, closing the disconnect noted in bd-2y2on).
 //
-// The TTL cap on an approval request bounds its ExpiresAt, not its residency:
-// nothing ever deleted from the approvals map, so every POST /approvals added a
-// permanent entry for the life of the server. Both list handlers iterate the
-// whole map on every call — and the primary one does so under a WRITE lock, so
-// latency and lock hold time degraded linearly and forever under a swarm that
-// requests approvals in a loop.
-const approvalRetention = 24 * time.Hour
+// Returns nil when the server was constructed without a state store; approval
+// endpoints then fail closed with 503 rather than falling back to
+// process-local memory.
+func (s *Server) approvalEngine() *approvalpkg.Engine {
+	s.approvalEngOnce.Do(func() {
+		if s.stateStore == nil {
+			return
+		}
+		cfg := approvalpkg.DefaultConfig()
+		// The HTTP surface must not shell out to the external `slb` binary
+		// from a request handler (blocking, non-hermetic). The internal
+		// two-person rule is still enforced: RequiresSLB is recorded on the
+		// durable record and Engine.Approve rejects self-approval.
+		cfg.EnableSLB = false
+		s.approvalEng = approvalpkg.New(s.stateStore, nil, s.eventBus, cfg)
+	})
+	return s.approvalEng
+}
 
-// reapApprovalsLocked drops terminal approvals past the retention window and
-// marks newly expired ones. Callers must hold approvalsLock for writing.
+// requireApprovalEngine fetches the engine or writes a 503 and returns nil.
+func (s *Server) requireApprovalEngine(w http.ResponseWriter, reqID string) *approvalpkg.Engine {
+	eng := s.approvalEngine()
+	if eng == nil {
+		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeServiceUnavail,
+			"approval store unavailable: server started without a state store", nil, reqID)
+	}
+	return eng
+}
+
+// approvalIdentity resolves the acting principal recorded on approval
+// records created or decided over HTTP.
 //
-// Sweeping on mutation and on list keeps the store bounded in proportion to
-// activity — which is exactly when it needs bounding — without a background
-// goroutine whose lifetime would have to be tied to the server's.
-func reapApprovalsLocked(now time.Time) {
-	for id, a := range approvals {
-		if a.Status == "pending" && now.After(a.ExpiresAt) {
-			a.Status = "expired"
-		}
-		if a.Status == "pending" {
-			continue
-		}
-		// Terminal. Retire it once it has been terminal long enough to have
-		// been observed by anything that cared.
-		terminalSince := a.ExpiresAt
-		if !a.ApprovedAt.IsZero() && a.ApprovedAt.After(terminalSince) {
-			terminalSince = a.ApprovedAt
-		}
-		if now.Sub(terminalSince) > approvalRetention {
-			delete(approvals, id)
-		}
+// Identity mapping (documented for bd-d2uxt): the authenticated principal
+// from the RBAC context is authoritative — for OIDC/mTLS that is the token's
+// sub/user_id/email claim. In local mode there are no claims and the
+// middleware records "anonymous"; direct callers may have no RBAC context at
+// all. In both of those cases we fall back to the CLI's NTM_USER || USER
+// precedent (see internal/cli/approve.go getCurrentApprover) so serve-side
+// decisions land in the same identity space as `ntm approve` on this host.
+// Like the CLI trail, the fallback is asserted, not authenticated.
+func approvalIdentity(r *http.Request) string {
+	if rc := RoleFromContext(r.Context()); rc != nil && rc.UserID != "" && rc.UserID != "anonymous" {
+		return rc.UserID
+	}
+	if user := os.Getenv("NTM_USER"); user != "" {
+		return user
+	}
+	if user := os.Getenv("USER"); user != "" {
+		return user
+	}
+	return "unknown"
+}
+
+// writeApprovalActionError maps engine failures onto the HTTP statuses the
+// approval API has always used: unknown ID → 404, two-person-rule violation →
+// 403, already-decided/expired/raced → 409, anything else → 500.
+func writeApprovalActionError(w http.ResponseWriter, err error, reqID string) {
+	switch {
+	case errors.Is(err, approvalpkg.ErrNotFound):
+		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, err.Error(), nil, reqID)
+	case errors.Is(err, approvalpkg.ErrSLBSelfApproval):
+		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
+			"SLB two-person approval required: approver cannot be the requestor", nil, reqID)
+	case errors.Is(err, approvalpkg.ErrExpired),
+		errors.Is(err, approvalpkg.ErrNotPending),
+		errors.Is(err, approvalpkg.ErrConcurrentDecision):
+		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
+	default:
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"approval operation failed", nil, reqID)
 	}
 }
 
@@ -1003,26 +1091,31 @@ type ApprovalsListResponse struct {
 func (s *Server) handleApprovalsListV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 
+	eng := s.requireApprovalEngine(w, reqID)
+	if eng == nil {
+		return
+	}
+
 	// Filter by status
 	status := r.URL.Query().Get("status")
 
-	approvalsLock.Lock()
-	defer approvalsLock.Unlock()
+	// History returns every durable record newest-first and lazily transitions
+	// pending rows past their deadline to expired, so the listing reflects
+	// reality without a serve-side sweep.
+	records, err := eng.History(r.Context())
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to list approvals", nil, reqID)
+		return
+	}
 
 	var result []Approval
-	now := time.Now()
-
-	// Marks newly expired approvals and retires long-terminal ones, so the map
-	// this loop walks stays bounded.
-	reapApprovalsLocked(now)
-
-	for _, a := range approvals {
-		// Filter by status
+	for i := range records {
+		a := approvalFromState(&records[i])
 		if status != "" && a.Status != status {
 			continue
 		}
-
-		result = append(result, *a)
+		result = append(result, a)
 	}
 
 	// Return newest approvals first so the dashboard selection is stable.
@@ -1059,18 +1152,25 @@ func (s *Server) handleApprovalsHistoryV1(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// History is a terminal-state view, so it must perform the same expiry
-	// transition as the list and get endpoints before filtering. Otherwise a
-	// request that expires while callers only use /history remains pending in
-	// memory and is omitted from the only endpoint meant to show its outcome.
-	approvalsLock.Lock()
-	defer approvalsLock.Unlock()
-	reapApprovalsLocked(time.Now())
+	eng := s.requireApprovalEngine(w, reqID)
+	if eng == nil {
+		return
+	}
+
+	// History is a terminal-state view. Engine.History performs the same lazy
+	// expiry transition as the list and get endpoints, so a request that
+	// expires while callers only use /history still shows its outcome here.
+	records, err := eng.History(r.Context())
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to list approval history", nil, reqID)
+		return
+	}
 
 	var result []Approval
-	for _, a := range approvals {
-		if a.Status != "pending" {
-			result = append(result, *a)
+	for i := range records {
+		if records[i].Status != state.ApprovalPending {
+			result = append(result, approvalFromState(&records[i]))
 		}
 	}
 
@@ -1109,24 +1209,26 @@ func (s *Server) handleApprovalGetV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	approvalsLock.Lock()
-	approval, ok := approvals[id]
-	if !ok {
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
-			fmt.Sprintf("approval '%s' not found", id), nil, reqID)
+	eng := s.requireApprovalEngine(w, reqID)
+	if eng == nil {
 		return
 	}
 
-	// Check if expired (safe to modify since we hold the write lock)
-	if approval.Status == "pending" && time.Now().After(approval.ExpiresAt) {
-		approval.Status = "expired"
+	// Check lazily transitions a pending record past its deadline to expired
+	// (durably) before returning it.
+	record, err := eng.Check(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, approvalpkg.ErrNotFound) {
+			writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
+				fmt.Sprintf("approval '%s' not found", id), nil, reqID)
+			return
+		}
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to load approval", nil, reqID)
+		return
 	}
-	// Copy the approval data while holding the lock
-	approvalCopy := *approval
-	approvalsLock.Unlock()
 
-	data, err := toJSONMap(approvalCopy)
+	data, err := toJSONMap(approvalFromState(record))
 	if err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"failed to serialize response", nil, reqID)
@@ -1153,58 +1255,24 @@ func (s *Server) handleApprovalApproveV1(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Get approver identity from RBAC context
-	rc := RoleFromContext(r.Context())
-	approver := "unknown"
-	if rc != nil {
-		approver = rc.UserID
-	}
-
-	approvalsLock.Lock()
-	approval, ok := approvals[id]
-	if !ok {
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
-			fmt.Sprintf("approval '%s' not found", id), nil, reqID)
+	eng := s.requireApprovalEngine(w, reqID)
+	if eng == nil {
 		return
 	}
 
-	// Terminal state is checked BEFORE expiry. ExpiresAt is never cleared on
-	// resolution, so an approved or denied record stays past its TTL forever;
-	// checking expiry first meant a retry or double-click hours later rewrote
-	// Status to "expired" while leaving ApprovedBy set. The audit trail then
-	// claimed a dangerous action had never been approved, though it had been
-	// approved and performed.
-	if approval.Status != "pending" {
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict,
-			fmt.Sprintf("approval is not pending (status: %s)", approval.Status), nil, reqID)
+	approver := approvalIdentity(r)
+
+	// The engine enforces the guarded pending->approved transition (terminal
+	// state checked before expiry so a late retry cannot rewrite a resolved
+	// record), expiry, and the SLB two-person rule against the durable record.
+	if err := eng.Approve(r.Context(), id, approver); err != nil {
+		writeApprovalActionError(w, err, reqID)
 		return
 	}
-
-	if time.Now().After(approval.ExpiresAt) {
-		approval.Status = "expired"
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict,
-			"approval has expired", nil, reqID)
-		return
-	}
-
-	// Check SLB requirement (approver can't be the requestor)
-	if approval.SLBRequired && approver == approval.Requestor {
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
-			"SLB two-person approval required: approver cannot be the requestor", nil, reqID)
-		return
-	}
-
-	approval.Status = "approved"
-	approval.ApprovedBy = approver
-	approval.ApprovedAt = time.Now()
-	approvalCopy := *approval
-	approvalsLock.Unlock()
 
 	log.Printf("Approval %s approved by %s", id, approver)
+	// WS push sourced from the durable transition: published only after
+	// Engine.Approve has committed pending->approved to state.db.
 	s.publishApprovalEvent("approval.resolved", map[string]interface{}{
 		"approval_id": id,
 		"decision":    "approved",
@@ -1212,8 +1280,8 @@ func (s *Server) handleApprovalApproveV1(w http.ResponseWriter, r *http.Request)
 	})
 
 	resp := ApprovalDecisionResponse{
-		ID:       approvalCopy.ID,
-		Status:   approvalCopy.Status,
+		ID:       id,
+		Status:   string(state.ApprovalApproved),
 		Decision: "approved",
 	}
 
@@ -1237,50 +1305,34 @@ func (s *Server) handleApprovalDenyV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get denier identity from RBAC context
-	rc := RoleFromContext(r.Context())
-	denier := "unknown"
-	if rc != nil {
-		denier = rc.UserID
-	}
-
-	approvalsLock.Lock()
-	approval, ok := approvals[id]
-	if !ok {
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
-			fmt.Sprintf("approval '%s' not found", id), nil, reqID)
+	eng := s.requireApprovalEngine(w, reqID)
+	if eng == nil {
 		return
 	}
 
-	// Terminal state is checked BEFORE expiry. ExpiresAt is never cleared on
-	// resolution, so an approved or denied record stays past its TTL forever;
-	// checking expiry first meant a retry or double-click hours later rewrote
-	// Status to "expired" while leaving ApprovedBy set. The audit trail then
-	// claimed a dangerous action had never been approved, though it had been
-	// approved and performed.
-	if approval.Status != "pending" {
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict,
-			fmt.Sprintf("approval is not pending (status: %s)", approval.Status), nil, reqID)
-		return
+	denier := approvalIdentity(r)
+
+	// Optional body: {"reason": "..."} — recorded as the durable denial
+	// reason. Absent or malformed bodies are tolerated for compatibility with
+	// the historical bodyless deny.
+	var denyReq struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&denyReq)
 	}
 
-	if time.Now().After(approval.ExpiresAt) {
-		approval.Status = "expired"
-		approvalsLock.Unlock()
-		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict,
-			"approval has expired", nil, reqID)
+	// The engine enforces the guarded pending->denied transition (terminal
+	// state checked before expiry so a late retry cannot rewrite a resolved
+	// record) against the durable record.
+	if err := eng.Deny(r.Context(), id, denier, denyReq.Reason); err != nil {
+		writeApprovalActionError(w, err, reqID)
 		return
 	}
-
-	approval.Status = "denied"
-	approval.ApprovedBy = denier
-	approval.ApprovedAt = time.Now()
-	approvalCopy := *approval
-	approvalsLock.Unlock()
 
 	log.Printf("Approval %s denied by %s", id, denier)
+	// WS push sourced from the durable transition: published only after
+	// Engine.Deny has committed pending->denied to state.db.
 	s.publishApprovalEvent("approval.resolved", map[string]interface{}{
 		"approval_id": id,
 		"decision":    "denied",
@@ -1288,8 +1340,8 @@ func (s *Server) handleApprovalDenyV1(w http.ResponseWriter, r *http.Request) {
 	})
 
 	resp := ApprovalDecisionResponse{
-		ID:       approvalCopy.ID,
-		Status:   approvalCopy.Status,
+		ID:       id,
+		Status:   string(state.ApprovalDenied),
 		Decision: "denied",
 	}
 
@@ -1335,12 +1387,12 @@ func (s *Server) handleApprovalRequestV1(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Get requestor identity from RBAC context
-	rc := RoleFromContext(r.Context())
-	requestor := "unknown"
-	if rc != nil {
-		requestor = rc.UserID
+	eng := s.requireApprovalEngine(w, reqID)
+	if eng == nil {
+		return
 	}
+
+	requestor := approvalIdentity(r)
 
 	// Check if this action requires SLB approval
 	p, policyErr := policy.LoadOrDefault()
@@ -1351,7 +1403,8 @@ func (s *Server) handleApprovalRequestV1(w http.ResponseWriter, r *http.Request)
 	}
 	slbRequired := p.NeedsSLBApproval(req.Action)
 
-	// Default TTL (capped at 24 hours to prevent unbounded memory growth)
+	// Default TTL 1 hour, capped at 24 hours (matching the engine's default
+	// expiry ceiling for HTTP-created requests).
 	ttl := 3600
 	if req.TTLSeconds > 0 {
 		ttl = req.TTLSeconds
@@ -1360,38 +1413,27 @@ func (s *Server) handleApprovalRequestV1(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	approvalsLock.Lock()
-	// Bound the store on the write path too: a client that only ever creates
-	// approvals and never lists them would otherwise grow it without limit.
-	reapApprovalsLocked(time.Now())
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-%d", approvalIDSeq)
-
-	approval := &Approval{
-		ID:          id,
+	record, err := eng.Request(r.Context(), approvalpkg.RequestParams{
 		Action:      req.Action,
 		Resource:    req.Resource,
-		Requestor:   requestor,
 		Reason:      req.Reason,
-		SLBRequired: slbRequired,
-		Status:      "pending",
-		CreatedAt:   time.Now(),
-		ExpiresAt:   time.Now().Add(time.Duration(ttl) * time.Second),
+		RequestedBy: requestor,
+		RequiresSLB: slbRequired,
+		ExpiresIn:   time.Duration(ttl) * time.Second,
+	})
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to create approval request", nil, reqID)
+		return
 	}
-	approvals[id] = approval
-	// Snapshot under the lock. Approval IDs are sequential ("apr-<N>"), so a
-	// client holding apr-7 can POST /approvals/apr-8/approve in a loop while
-	// this request is creating apr-8 — the approver writes Status/ApprovedBy
-	// on the very record this handler is about to read. Reading the shared
-	// pointer after unlocking was both a data race and a correctness bug: the
-	// approval.requested event and the 201 body could carry status "approved"
-	// for a request that had only just been created.
-	snapshot := *approval
-	approvalsLock.Unlock()
+	snapshot := approvalFromState(record)
 
-	log.Printf("Approval request %s created by %s for action '%s'", id, requestor, req.Action)
+	log.Printf("Approval request %s created by %s for action '%s'", snapshot.ID, requestor, req.Action)
+	// WS push sourced from the durable insert: published only after
+	// Engine.Request has persisted the record to state.db. The record is now
+	// visible to `ntm approve list` as well.
 	s.publishApprovalEvent("approval.requested", map[string]interface{}{
-		"approval_id":  id,
+		"approval_id":  snapshot.ID,
 		"action":       snapshot.Action,
 		"resource":     snapshot.Resource,
 		"requestor":    snapshot.Requestor,
@@ -1403,7 +1445,7 @@ func (s *Server) handleApprovalRequestV1(w http.ResponseWriter, r *http.Request)
 	})
 
 	resp := ApprovalRequestResponse{
-		ID:          id,
+		ID:          snapshot.ID,
 		Status:      snapshot.Status,
 		ExpiresAt:   snapshot.ExpiresAt,
 		SLBRequired: slbRequired,
@@ -1597,149 +1639,3 @@ func safetyEscapeYAMLDoubleQuote(s string) string {
 	s = strings.ReplaceAll(s, "\t", "\\t")
 	return s
 }
-
-// Wrapper scripts (same as CLI)
-
-const gitWrapperScript = `#!/bin/bash
-# NTM Safety Wrapper for git
-# Intercepts destructive git commands
-
-REAL_GIT=$(which -a git | grep -v "$HOME/.ntm/bin" | head -1)
-if [ -z "$REAL_GIT" ]; then
-    REAL_GIT="/usr/bin/git"
-fi
-
-# Check command against policy (include "git" in the command string)
-check_result=$(ntm safety check "git $*" --json 2>&1)
-exit_code=$?
-
-# ntm safety check exits 0 for allow/approve, 1 for block
-if [ $exit_code -eq 1 ]; then
-    # Command was blocked
-    reason=$(echo "$check_result" | jq -r '.reason // "Policy violation"' 2>/dev/null)
-    echo "NTM Safety: Command blocked" >&2
-    echo "  Reason: $reason" >&2
-    echo "  Command: git $*" >&2
-
-    # Log the blocked command (use jq for proper JSON escaping)
-    mkdir -p "$HOME/.ntm/logs"
-    if command -v jq >/dev/null 2>&1; then
-        jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --arg cmd "git $*" \
-              --arg reason "${reason:-Policy violation}" \
-              '{timestamp: $ts, command: $cmd, reason: $reason, action: "block"}' >> "$HOME/.ntm/logs/blocked.jsonl"
-    else
-        # Fallback without proper escaping (best effort)
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"action\":\"block\"}" >> "$HOME/.ntm/logs/blocked.jsonl"
-    fi
-
-    exit 1
-fi
-
-# Pass through to real git
-exec "$REAL_GIT" "$@"
-`
-
-const rmWrapperScript = `#!/bin/bash
-# NTM Safety Wrapper for rm
-# Intercepts destructive rm commands
-
-REAL_RM=$(which -a rm | grep -v "$HOME/.ntm/bin" | head -1)
-if [ -z "$REAL_RM" ]; then
-    REAL_RM="/bin/rm"
-fi
-
-# Check command against policy
-check_result=$(ntm safety check "rm $*" --json 2>&1)
-exit_code=$?
-
-# ntm safety check exits 0 for allow/approve, 1 for block
-if [ $exit_code -eq 1 ]; then
-    # Command was blocked
-    reason=$(echo "$check_result" | jq -r '.reason // "Policy violation"' 2>/dev/null)
-    echo "NTM Safety: Command blocked" >&2
-    echo "  Reason: $reason" >&2
-    echo "  Command: rm $*" >&2
-
-    # Log the blocked command (use jq for proper JSON escaping)
-    mkdir -p "$HOME/.ntm/logs"
-    if command -v jq >/dev/null 2>&1; then
-        jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --arg cmd "rm $*" \
-              --arg reason "${reason:-Policy violation}" \
-              '{timestamp: $ts, command: $cmd, reason: $reason, action: "block"}' >> "$HOME/.ntm/logs/blocked.jsonl"
-    else
-        # Fallback without proper escaping (best effort)
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"action\":\"block\"}" >> "$HOME/.ntm/logs/blocked.jsonl"
-    fi
-
-    exit 1
-fi
-
-# Pass through to real rm
-exec "$REAL_RM" "$@"
-`
-
-const claudeHookScript = `#!/bin/bash
-# NTM Safety Hook for Claude Code
-# PreToolUse hook that validates Bash commands
-
-# Claude Code command hooks receive the event payload as JSON on stdin.
-HOOK_INPUT="$(cat)"
-if [ -n "$HOOK_INPUT" ] && command -v jq >/dev/null 2>&1; then
-    TOOL_NAME="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_name // empty' 2>/dev/null)"
-    COMMAND="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
-else
-    TOOL_NAME=""
-    COMMAND=""
-fi
-
-# Fall back to legacy env vars if a caller still provides them directly.
-if [ -z "$TOOL_NAME" ]; then
-    TOOL_NAME="${CLAUDE_TOOL_NAME:-}"
-fi
-if [ -z "$COMMAND" ]; then
-    COMMAND="${CLAUDE_TOOL_INPUT_command:-}"
-fi
-
-# Only process Bash tool calls
-if [ "$TOOL_NAME" != "Bash" ]; then
-    exit 0
-fi
-
-if [ -z "$COMMAND" ]; then
-    exit 0
-fi
-
-# Check against policy
-check_result=$(ntm safety check "$COMMAND" --json 2>&1)
-exit_code=$?
-
-# ntm safety check exits 0 for allow/approve, 1 for block
-if [ $exit_code -eq 1 ]; then
-    # Command was blocked
-    reason=$(echo "$check_result" | jq -r '.reason // "Policy violation"' 2>/dev/null)
-
-    # Log the blocked command (use jq for proper JSON escaping)
-    mkdir -p "$HOME/.ntm/logs"
-    session="${NTM_SESSION:-unknown}"
-    agent="${CLAUDE_AGENT_TYPE:-claude}"
-    if command -v jq >/dev/null 2>&1; then
-        jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --arg session "$session" \
-              --arg agent "$agent" \
-              --arg cmd "$COMMAND" \
-              --arg reason "${reason:-Policy violation}" \
-              '{timestamp: $ts, session: $session, agent: $agent, command: $cmd, reason: $reason, action: "block"}' >> "$HOME/.ntm/logs/blocked.jsonl"
-    else
-        # Fallback without proper escaping (best effort)
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"action\":\"block\"}" >> "$HOME/.ntm/logs/blocked.jsonl"
-    fi
-
-    # Return error to Claude Code
-    echo "BLOCKED: $reason" >&2
-    exit 2
-fi
-
-exit 0
-`

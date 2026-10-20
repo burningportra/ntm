@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // CoordinatorAgent is the runtime identity assigned to a workflow role.
@@ -47,6 +48,7 @@ type RuntimeCoordinator struct {
 }
 
 type activeTransition struct {
+	index      int
 	transition Transition
 	trigger    RuntimeTrigger
 }
@@ -71,7 +73,7 @@ func NewCoordinator(template *WorkflowTemplate, agents []CoordinatorAgent, regis
 	case CoordParallel:
 		return &ParallelCoordinator{RuntimeCoordinator: base}, nil
 	case CoordReviewGate:
-		return &ReviewGateCoordinator{RuntimeCoordinator: base, approvals: make(map[string]struct{})}, nil
+		return &ReviewGateCoordinator{RuntimeCoordinator: base}, nil
 	default:
 		return nil, fmt.Errorf("unsupported coordination type %q", template.Coordination)
 	}
@@ -104,6 +106,71 @@ func (c *RuntimeCoordinator) Start(ctx *TriggerContext) error {
 	return nil
 }
 
+// StartAt restores a checkpoint without replaying earlier transitions or
+// mutating the reusable template. Only the saved stage's watchers start.
+// Elapsed-time triggers retain their original start time, including downtime;
+// later transitions receive the live clock rather than this startup clock.
+func (c *RuntimeCoordinator) StartAt(ctx *TriggerContext, stage string, startedAt time.Time, nextByRole map[string]int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		return errors.New("workflow coordinator is already started")
+	}
+	if ctx == nil || startedAt.IsZero() || startedAt.After(ctx.now()) {
+		return errors.New("workflow checkpoint has an invalid stage start time")
+	}
+	validStage := c.template.Flow == nil && c.template.Coordination == CoordParallel && stage == ""
+	if flow := c.template.Flow; flow != nil && stage != "" {
+		validStage = flow.Initial == stage
+		for _, candidate := range flow.Stages {
+			validStage = validStage || candidate == stage
+		}
+		for _, tr := range flow.Transitions {
+			validStage = validStage || tr.From == stage || tr.To == stage
+		}
+	}
+	if !validStage {
+		return fmt.Errorf("workflow checkpoint stage %q is not in the template", stage)
+	}
+	counts := make(map[string]int)
+	for _, agent := range c.agents {
+		counts[agent.Role]++
+	}
+	routing := make(map[string]int, len(nextByRole))
+	for role, next := range nextByRole {
+		if counts[role] == 0 || next < 0 {
+			return fmt.Errorf("workflow checkpoint has invalid routing for role %q", role)
+		}
+		routing[role] = next % counts[role]
+	}
+	c.stage = stage
+	c.nextByRole = routing
+	c.triggerCtx = cloneTriggerContext(ctx)
+	if c.template.Flow != nil {
+		startCtx := cloneTriggerContext(ctx)
+		startCtx.Now = func() time.Time { return startedAt }
+		if err := c.startStageLocked(startCtx); err != nil {
+			c.triggerCtx = nil
+			return err
+		}
+	}
+	c.started = true
+	return nil
+}
+
+// RoutingState snapshots the round-robin cursors after choosing a stage's
+// participants, so a resumed run neither changes those participants nor
+// unfairly restarts every role at its first pane.
+func (c *RuntimeCoordinator) RoutingState() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make(map[string]int, len(c.nextByRole))
+	for role, next := range c.nextByRole {
+		result[role] = next
+	}
+	return result
+}
+
 // Stop stops all active trigger watchers. It may be called repeatedly.
 func (c *RuntimeCoordinator) Stop() error {
 	c.mu.Lock()
@@ -129,9 +196,15 @@ func (c *RuntimeCoordinator) Evaluate(ctx *TriggerContext) (bool, error) {
 		return false, errors.New("workflow coordinator is not started")
 	}
 	for _, active := range c.active {
-		fired, err := active.trigger.Check(ctx)
-		if err != nil {
-			return false, fmt.Errorf("check %s trigger: %w", active.transition.Trigger.Type, err)
+		var fired bool
+		if active.transition.Trigger.Type == TriggerAgentSays && ctx != nil && ctx.TransitionEvidence != nil {
+			fired = ctx.TransitionEvidence[active.index]
+		} else {
+			var err error
+			fired, err = active.trigger.Check(ctx)
+			if err != nil {
+				return false, fmt.Errorf("check %s trigger: %w", active.transition.Trigger.Type, err)
+			}
 		}
 		if fired {
 			if err := c.transitionLocked(ctx, active.transition); err != nil {
@@ -184,7 +257,7 @@ func (c *RuntimeCoordinator) transitionLocked(ctx *TriggerContext, transition Tr
 }
 
 func (c *RuntimeCoordinator) startStageLocked(ctx *TriggerContext) error {
-	for _, transition := range c.template.Flow.Transitions {
+	for index, transition := range c.template.Flow.Transitions {
 		if transition.From != c.stage {
 			continue
 		}
@@ -198,7 +271,7 @@ func (c *RuntimeCoordinator) startStageLocked(ctx *TriggerContext) error {
 			_ = c.stopTriggersLocked()
 			return fmt.Errorf("start %s trigger: %w", transition.Trigger.Type, err)
 		}
-		c.active = append(c.active, activeTransition{transition: transition, trigger: trigger})
+		c.active = append(c.active, activeTransition{index: index, transition: transition, trigger: trigger})
 	}
 	return nil
 }
@@ -210,6 +283,12 @@ func cloneTriggerContext(ctx *TriggerContext) *TriggerContext {
 	clone := *ctx
 	clone.Outputs = append([]AgentOutput(nil), ctx.Outputs...)
 	clone.Activities = append([]AgentActivity(nil), ctx.Activities...)
+	if ctx.TransitionEvidence != nil {
+		clone.TransitionEvidence = make(map[int]bool, len(ctx.TransitionEvidence))
+		for index, matched := range ctx.TransitionEvidence {
+			clone.TransitionEvidence[index] = matched
+		}
+	}
 	return &clone
 }
 
@@ -302,53 +381,81 @@ func (c *ParallelCoordinator) Agents() []CoordinatorAgent {
 	return append([]CoordinatorAgent(nil), c.agents...)
 }
 
-// ReviewGateCoordinator records reviewer approvals and reports when the
-// configured any/all/quorum threshold is reached.
+// ReviewGateCoordinator checks whether the approvals for one transition meet
+// its configured any/all/quorum threshold.
 type ReviewGateCoordinator struct {
 	*RuntimeCoordinator
-	approvals map[string]struct{}
 }
 
-// Approve records a reviewer approval. Duplicate approvals are idempotent.
-func (c *ReviewGateCoordinator) Approve(agentID string) (bool, error) {
-	if strings.TrimSpace(agentID) == "" {
-		return false, errors.New("reviewer agent ID is required")
-	}
+// CheckApprovals validates the exact set of agents whose output matched a
+// transition during the current stage visit. transitionIndex refers to the
+// template's complete Flow.Transitions slice, not only its outgoing transitions.
+// The caller owns the stage-specific evidence; this method never retains votes
+// between calls. Duplicate agent IDs count once, and an empty trigger role makes
+// every workflow agent eligible.
+func (c *ReviewGateCoordinator) CheckApprovals(transitionIndex int, agentIDs []string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.started {
 		return false, errors.New("workflow coordinator is not started")
 	}
-	if !c.template.Flow.RequireApproval {
+	flow := c.template.Flow
+	if flow == nil || !flow.RequireApproval {
 		return false, errors.New("workflow review gate does not require approval")
 	}
+	if transitionIndex < 0 || transitionIndex >= len(flow.Transitions) {
+		return false, fmt.Errorf("workflow approval transition index %d is out of range", transitionIndex)
+	}
+	transition := flow.Transitions[transitionIndex]
+	if transition.From != c.stage {
+		return false, fmt.Errorf("workflow approval transition %d leaves stage %q, not current stage %q", transitionIndex, transition.From, c.stage)
+	}
+	if transition.Trigger.Type != TriggerAgentSays {
+		return false, fmt.Errorf("workflow approval transition %d is not an agent_says trigger", transitionIndex)
+	}
 
+	role := transition.Trigger.Role
 	reviewers := make(map[string]struct{})
 	for _, agent := range c.agents {
-		if agent.Role == "reviewer" {
+		if role == "" || agent.Role == role {
+			if strings.TrimSpace(agent.ID) == "" {
+				return false, errors.New("workflow approver agent ID is required")
+			}
 			reviewers[agent.ID] = struct{}{}
 		}
-	}
-	if _, ok := reviewers[agentID]; !ok {
-		return false, fmt.Errorf("agent %q is not a reviewer for this workflow", agentID)
-	}
-	c.approvals[agentID] = struct{}{}
-	mode := c.template.Flow.ApprovalMode
-	if mode == "" {
-		mode = "any"
 	}
 	reviewerCount := len(reviewers)
 	if reviewerCount == 0 {
 		return false, errors.New("workflow review gate has no reviewer agents")
 	}
 	required := 1
-	if mode == "all" {
+	switch flow.ApprovalMode {
+	case "", "any":
+	case "all":
 		required = reviewerCount
-	} else if mode == "quorum" {
-		required = c.template.Flow.Quorum
+	case "quorum":
+		required = flow.Quorum
+		if required < 1 {
+			return false, errors.New("workflow review gate quorum must be at least 1")
+		}
+	default:
+		return false, fmt.Errorf("invalid workflow approval mode %q", flow.ApprovalMode)
 	}
 	if required > reviewerCount {
 		return false, fmt.Errorf("workflow review gate requires %d approvals but has only %d reviewer agents", required, reviewerCount)
 	}
-	return len(c.approvals) >= required, nil
+	approvals := make(map[string]struct{}, len(agentIDs))
+	for _, agentID := range agentIDs {
+		if strings.TrimSpace(agentID) == "" {
+			return false, errors.New("reviewer agent ID is required")
+		}
+		if _, ok := reviewers[agentID]; !ok {
+			if role == "" {
+				return false, fmt.Errorf("agent %q is not part of this workflow", agentID)
+			}
+			return false, fmt.Errorf("agent %q does not hold approver role %q for this workflow", agentID, role)
+		}
+		approvals[agentID] = struct{}{}
+	}
+	return len(approvals) >= required, nil
 }

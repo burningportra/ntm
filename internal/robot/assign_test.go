@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // =============================================================================
@@ -303,68 +305,26 @@ func TestParsePriority_Assign(t *testing.T) {
 // Confidence Calculation Tests
 // =============================================================================
 
-func TestCalculateConfidence_BalancedStrategy(t *testing.T) {
+func TestCalculateConfidence_SimpleIsCapabilityScore(t *testing.T) {
 	bead := bv.BeadPreview{ID: "bd-test", Title: "Fix login bug", Priority: "P1"}
-	conf := calculateConfidence("claude", bead, "balanced")
+	conf := calculateConfidence("claude", bead)
 
 	if conf < 0 || conf > 1.0 {
 		t.Errorf("confidence %f should be between 0.0 and 1.0", conf)
 	}
+	// Simple strategy confidence is the raw capability score, no adjustments.
+	if want := AgentStrength("claude", "bug"); conf != want {
+		t.Errorf("confidence %f should equal capability score %f", conf, want)
+	}
 }
 
-func TestCalculateConfidence_SpeedStrategy(t *testing.T) {
-	bead := bv.BeadPreview{ID: "bd-test", Title: "Add feature", Priority: "P2"}
-
-	speedConf := calculateConfidence("claude", bead, "speed")
-	balancedConf := calculateConfidence("claude", bead, "balanced")
-
-	// Speed should average with 0.9, so typically higher than balanced
-	if speedConf < 0 || speedConf > 1.0 {
-		t.Errorf("speed confidence %f out of range", speedConf)
-	}
-	// Speed uses (base + 0.9) / 2, so should generally be >= 0.45
-	if speedConf < 0.45 {
-		t.Errorf("speed confidence %f suspiciously low (formula should average with 0.9)", speedConf)
-	}
-	_ = balancedConf
-}
-
-func TestCalculateConfidence_DependencyStrategy(t *testing.T) {
-	// High priority bead should get a boost in dependency strategy
+func TestCalculateConfidence_PriorityDoesNotAdjustSimple(t *testing.T) {
+	// Simple strategy applies no strategy scoring: priority never shifts confidence.
 	p0Bead := bv.BeadPreview{ID: "bd-test", Title: "Some task", Priority: "P0"}
-	p1Bead := bv.BeadPreview{ID: "bd-test", Title: "Some task", Priority: "P1"}
 	p3Bead := bv.BeadPreview{ID: "bd-test", Title: "Some task", Priority: "P3"}
 
-	p0Conf := calculateConfidence("claude", p0Bead, "dependency")
-	p1Conf := calculateConfidence("claude", p1Bead, "dependency")
-	p3Conf := calculateConfidence("claude", p3Bead, "dependency")
-
-	// P0 and P1 should get a boost over P3
-	if p0Conf <= p3Conf {
-		t.Errorf("P0 confidence (%f) should be higher than P3 (%f) in dependency strategy", p0Conf, p3Conf)
-	}
-	if p1Conf <= p3Conf {
-		t.Errorf("P1 confidence (%f) should be higher than P3 (%f) in dependency strategy", p1Conf, p3Conf)
-	}
-}
-
-func TestCalculateConfidence_QualityStrategy(t *testing.T) {
-	bead := bv.BeadPreview{ID: "bd-test", Title: "Write unit tests", Priority: "P2"}
-	conf := calculateConfidence("claude", bead, "quality")
-
-	// Quality strategy doesn't modify base confidence currently
-	if conf < 0 || conf > 1.0 {
-		t.Errorf("quality confidence %f out of range", conf)
-	}
-}
-
-func TestCalculateConfidence_CapAt095(t *testing.T) {
-	// Dependency strategy caps at 0.95
-	bead := bv.BeadPreview{ID: "bd-test", Title: "Fix critical bug", Priority: "P0"}
-	conf := calculateConfidence("claude", bead, "dependency")
-
-	if conf > 0.95 {
-		t.Errorf("confidence %f should not exceed 0.95", conf)
+	if p0 := calculateConfidence("claude", p0Bead); p0 != calculateConfidence("claude", p3Bead) {
+		t.Errorf("simple confidence should ignore priority, P0 gave %f", p0)
 	}
 }
 
@@ -374,15 +334,15 @@ func TestCalculateConfidence_CapAt095(t *testing.T) {
 
 func TestGenerateReasoning_HighStrengthAgent(t *testing.T) {
 	bead := bv.BeadPreview{ID: "bd-test", Title: "Fix login bug", Priority: "P0"}
-	reasoning := generateReasoning("claude", bead, "balanced")
+	reasoning := generateReasoning("claude", bead)
 
 	if reasoning == "" {
 		t.Error("reasoning should not be empty")
 	}
 
-	// Should contain strategy reasoning
-	if !strings.Contains(reasoning, "balanced") {
-		t.Errorf("reasoning %q should mention balanced strategy", reasoning)
+	// Simple strategy names the sequential pairing honestly.
+	if !strings.Contains(reasoning, "simple sequential pairing") {
+		t.Errorf("reasoning %q should name the simple sequential pairing", reasoning)
 	}
 
 	// P0 should get "critical priority" reasoning
@@ -393,40 +353,20 @@ func TestGenerateReasoning_HighStrengthAgent(t *testing.T) {
 
 func TestGenerateReasoning_P1Priority(t *testing.T) {
 	bead := bv.BeadPreview{ID: "bd-test", Title: "Some task", Priority: "P1"}
-	reasoning := generateReasoning("claude", bead, "speed")
+	reasoning := generateReasoning("claude", bead)
 
 	if !strings.Contains(reasoning, "high priority") {
 		t.Errorf("reasoning %q should mention high priority for P1", reasoning)
 	}
-	if !strings.Contains(reasoning, "speed") {
-		t.Errorf("reasoning %q should mention speed strategy", reasoning)
-	}
-}
-
-func TestGenerateReasoning_AllStrategies(t *testing.T) {
-	bead := bv.BeadPreview{ID: "bd-test", Title: "Some task", Priority: "P2"}
-	strategies := []string{"balanced", "speed", "quality", "dependency"}
-
-	for _, strategy := range strategies {
-		t.Run(strategy, func(t *testing.T) {
-			reasoning := generateReasoning("claude", bead, strategy)
-			if reasoning == "" {
-				t.Error("reasoning should not be empty")
-			}
-			if !strings.Contains(reasoning, strategy) {
-				t.Errorf("reasoning %q should mention strategy %q", reasoning, strategy)
-			}
-		})
-	}
 }
 
 func TestGenerateReasoning_DefaultFallback(t *testing.T) {
-	// P2 bead with unknown strategy should still produce output
+	// P2 bead produces output without any priority callout.
 	bead := bv.BeadPreview{ID: "bd-test", Title: "Integration work", Priority: "P2"}
-	reasoning := generateReasoning("claude", bead, "unknown")
+	reasoning := generateReasoning("claude", bead)
 
 	if reasoning == "" {
-		t.Error("reasoning should not be empty even with unknown strategy")
+		t.Error("reasoning should not be empty for a P2 bead")
 	}
 }
 
@@ -533,7 +473,8 @@ func TestGenerateAssignments_BasicFlow(t *testing.T) {
 	}
 	idleAgents := []string{"%12", "%22"}
 
-	recs := generateAssignments(agents, beads, "balanced", idleAgents)
+	// "simple" pins the historical sequential pairing behavior.
+	recs := planAssignments(agents, beads, nil, "simple", idleAgents)
 
 	if len(recs) != 2 {
 		t.Fatalf("expected 2 recommendations, got %d", len(recs))
@@ -564,7 +505,7 @@ func TestGenerateAssignments_MoreAgentsThanBeads(t *testing.T) {
 	}
 	idleAgents := []string{"%12", "%13", "%14"}
 
-	recs := generateAssignments(agents, beads, "balanced", idleAgents)
+	recs := planAssignments(agents, beads, nil, "balanced", idleAgents)
 
 	if len(recs) != 1 {
 		t.Fatalf("expected 1 recommendation (only 1 bead), got %d", len(recs))
@@ -582,7 +523,7 @@ func TestGenerateAssignments_MoreBeadsThanAgents(t *testing.T) {
 	}
 	idleAgents := []string{"%12"}
 
-	recs := generateAssignments(agents, beads, "balanced", idleAgents)
+	recs := planAssignments(agents, beads, nil, "balanced", idleAgents)
 
 	if len(recs) != 1 {
 		t.Fatalf("expected 1 recommendation (only 1 idle agent), got %d", len(recs))
@@ -601,7 +542,7 @@ func TestGenerateAssignments_NoIdleAgents(t *testing.T) {
 	}
 	idleAgents := []string{} // None idle
 
-	recs := generateAssignments(agents, beads, "balanced", idleAgents)
+	recs := planAssignments(agents, beads, nil, "balanced", idleAgents)
 
 	if len(recs) != 0 {
 		t.Errorf("expected 0 recommendations with no idle agents, got %d", len(recs))
@@ -614,7 +555,7 @@ func TestGenerateAssignments_NoBeads(t *testing.T) {
 	}
 	idleAgents := []string{"%12"}
 
-	recs := generateAssignments(agents, nil, "balanced", idleAgents)
+	recs := planAssignments(agents, nil, nil, "balanced", idleAgents)
 
 	if len(recs) != 0 {
 		t.Errorf("expected 0 recommendations with no beads, got %d", len(recs))
@@ -630,7 +571,7 @@ func TestGenerateAssignments_RecommendationFields(t *testing.T) {
 	}
 	idleAgents := []string{"%25"}
 
-	recs := generateAssignments(agents, beads, "quality", idleAgents)
+	recs := planAssignments(agents, beads, nil, "quality", idleAgents)
 
 	if len(recs) != 1 {
 		t.Fatalf("expected 1 recommendation, got %d", len(recs))
@@ -712,19 +653,32 @@ func TestClassifyAssignableActionableRecommendationsExplainsExclusions(t *testin
 	}
 }
 
-func TestUnassignedBeadsForAgentCapacity(t *testing.T) {
+func TestUnassignedBeadsBeyondRecommendations(t *testing.T) {
 	ready := []bv.BeadPreview{
 		{ID: "bd-1", Title: "First"},
 		{ID: "bd-2", Title: "Second"},
 		{ID: "bd-3", Title: "Third"},
 	}
-	if got, want := unassignedBeadsForAgentCapacity(ready, 1), []UnassignableBead{
-		{ID: "bd-2", Title: "Second", Reason: "no idle agent available"},
+	// The planner may skip earlier beads: assigning only bd-2 leaves bd-1 and
+	// bd-3 unassigned, keyed by bead ID rather than position. With exactly
+	// one idle agent (fully consumed), the honest reason is capacity.
+	if got, want := unassignedBeadsBeyondRecommendations(ready, []AssignRecommend{{AssignBead: "bd-2"}}, 1), []UnassignableBead{
+		{ID: "bd-1", Title: "First", Reason: "no idle agent available"},
 		{ID: "bd-3", Title: "Third", Reason: "no idle agent available"},
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unassignable capacity beads = %+v, want %+v", got, want)
 	}
-	if got := unassignedBeadsForAgentCapacity(ready, len(ready)); got != nil {
+	// With idle agents to spare, the planner's confidence gate skipped the
+	// beads — "no idle agent available" would be a lie.
+	if got, want := unassignedBeadsBeyondRecommendations(ready, []AssignRecommend{{AssignBead: "bd-2"}}, 3), []UnassignableBead{
+		{ID: "bd-1", Title: "First", Reason: "skipped by planner: no agent matched above the confidence threshold"},
+		{ID: "bd-3", Title: "Third", Reason: "skipped by planner: no agent matched above the confidence threshold"},
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unassignable confidence-gated beads = %+v, want %+v", got, want)
+	}
+	if got := unassignedBeadsBeyondRecommendations(ready, []AssignRecommend{
+		{AssignBead: "bd-1"}, {AssignBead: "bd-2"}, {AssignBead: "bd-3"},
+	}, 3); got != nil {
 		t.Fatalf("unassignable capacity beads = %+v, want nil when every bead is recommended", got)
 	}
 }
@@ -876,51 +830,6 @@ func TestAssignOptions_Defaults(t *testing.T) {
 	}
 }
 
-func TestFilterAssignableActionableRecommendationsAppliesSafetyBeforeLimit(t *testing.T) {
-	recommendations := []bv.TriageRecommendation{
-		{ID: "blocked", Status: "open", BlockedBy: []string{"dependency"}},
-		{ID: "gated", Status: "open", Labels: []string{"  OPERATOR-GATED  "}},
-		{ID: "closed", Status: "closed"},
-		{ID: "   ", Status: "open"},
-		{ID: "missing-status", Title: "Must not assign", Priority: 0},
-		{ID: " first ", Title: " First ", Type: " task ", Status: "ready", Priority: 1},
-		{ID: "second", Title: "Second", Status: " OPEN ", Priority: 2},
-		{ID: " second ", Title: "Duplicate", Status: "ready", Priority: 0},
-		{ID: "third", Title: "Third", Status: "ready", Priority: 3},
-	}
-
-	filtered := filterAssignableActionableRecommendations(recommendations, 2)
-	if len(filtered) != 2 {
-		t.Fatalf("filtered recommendation count = %d, want 2", len(filtered))
-	}
-	if got := []string{filtered[0].ID, filtered[1].ID}; !reflect.DeepEqual(got, []string{"first", "second"}) {
-		t.Fatalf("filtered IDs = %v, want eligible rows after safety filtering", got)
-	}
-	if filtered[0].Title != "First" || filtered[0].Type != "task" {
-		t.Fatalf("trimmed first recommendation = %+v", filtered[0])
-	}
-
-	all := filterAssignableActionableRecommendations(recommendations, 0)
-	if len(all) != 3 {
-		t.Fatalf("uncapped filtered recommendation count = %d, want 3", len(all))
-	}
-	if got := []string{all[0].ID, all[1].ID, all[2].ID}; !reflect.DeepEqual(got, []string{"first", "second", "third"}) {
-		t.Fatalf("uncapped filtered IDs = %v", got)
-	}
-	for _, recommendation := range all {
-		if recommendation.ID == "missing-status" {
-			t.Fatalf("blank-status recommendation escaped robot assignment safety boundary: %+v", recommendation)
-		}
-	}
-	previews := filterAssignableBeadPreviews(recommendations, 2)
-	if got := []bv.BeadPreview{
-		{ID: "first", Title: "First", Priority: "P1", Type: "task"},
-		{ID: "second", Title: "Second", Priority: "P2"},
-	}; !reflect.DeepEqual(previews, got) {
-		t.Fatalf("assignable previews = %+v, want %+v", previews, got)
-	}
-}
-
 func TestFilterAssignableActionableRecommendationsIsolatesConcurrentProjectPolicies(t *testing.T) {
 	projectA := t.TempDir()
 	projectB := t.TempDir()
@@ -993,7 +902,7 @@ func TestLoadAuthoritativeAssignmentPolicyInstallsConfiguredGatesAndFailsClosed(
 	if err != nil {
 		t.Fatalf("load authoritative assignment policy: %v", err)
 	}
-	if effective == nil || !bv.IsOperatorGatedLabel("release-approval") || !bv.IsOperatorGatedLabel("operator-gated") {
+	if effective == nil || !slices.Contains(bv.OperatorGatedLabels(), "release-approval") || !slices.Contains(bv.OperatorGatedLabels(), "operator-gated") {
 		t.Fatalf("installed operator gates = %v", bv.OperatorGatedLabels())
 	}
 	if !bv.IsOperatorGatedLabelForProject(projectDir, "release-approval") || !bv.IsOperatorGatedLabelForProject(projectDir, "operator-gated") {
@@ -1004,7 +913,7 @@ func TestLoadAuthoritativeAssignmentPolicyInstallsConfiguredGatesAndFailsClosed(
 	if _, err := loadAuthoritativeAssignmentPolicy(projectDir, missing, true); err == nil || !strings.Contains(err.Error(), "explicitly selected config") {
 		t.Fatalf("missing required global policy error = %v", err)
 	}
-	if !bv.IsOperatorGatedLabel("release-approval") {
+	if !slices.Contains(bv.OperatorGatedLabels(), "release-approval") {
 		t.Fatal("failed policy load mutated the previously installed gate vocabulary")
 	}
 	if !bv.IsOperatorGatedLabelForProject(projectDir, "release-approval") {
@@ -1091,6 +1000,17 @@ func TestSetAssignErrorClassifiesMissingDependenciesAndInternalFailures(t *testi
 				t.Fatalf("setAssignError(%v) = %+v, want %s failure", test.err, output.RobotResponse, test.wantCode)
 			}
 		})
+	}
+}
+
+// GH #283: a tracker or checkout that changed while work was read is a typed,
+// retryable refusal, not an INTERNAL_ERROR with the code buried in its text.
+func TestSetAssignErrorTypesStaleWorkSource(t *testing.T) {
+	output := &AssignOutput{RobotResponse: NewRobotResponse(true)}
+	err := fmt.Errorf("read actionable Beads work: %w", &worksource.StaleError{Reason: "tracker changed during source capture"})
+	setAssignError(output, err, "generic hint")
+	if output.Success || output.ErrorCode != ErrCodeStaleWorkCoordination || output.Hint != staleWorkHint {
+		t.Fatalf("setAssignError(stale) = %+v, want %s with the stale-work hint", output.RobotResponse, ErrCodeStaleWorkCoordination)
 	}
 }
 

@@ -45,8 +45,8 @@ type RoutingScore struct {
 type PaneHealthInfo struct {
 	Status       string   // "ok", "warning", "error", "unknown"
 	Issues       []string // Issue messages
-	RestartCount int      // Restarts in last hour
-	Uptime       int      // Seconds of uptime
+	RestartCount int      // Automatic restarts the session monitor recorded in the last hour
+	Uptime       int      // Seconds since the pane's shell incarnation started (0 = unknown)
 }
 
 // PanelID identifies a dashboard panel.
@@ -140,8 +140,8 @@ type Model struct {
 	theme theme.Theme
 	icons icons.IconSet
 
-	// Compaction detection and recovery
-	compaction *status.CompactionRecoveryIntegration
+	// Compaction detection for display; recovery belongs to the session monitor
+	compaction *status.CompactionDetector
 
 	// Per-pane status tracking, keyed by tmux's stable physical pane identity.
 	// Pane.Index is window-local and therefore cannot distinguish 0.0 from 1.0.
@@ -322,6 +322,21 @@ type Model struct {
 	fetchingWorkflow     bool
 	showWorkflowPanel    bool
 
+	// C6-wire panels: quota, ratelimit, accounts toggled into the sidebar.
+	// [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+	quotaPanel          *panels.QuotaPanel
+	rateLimitPanel      *panels.RateLimitPanel
+	accountsPanel       *panels.AccountsPanel
+	showQuotaPanel      bool
+	showRateLimitPanel  bool
+	showAccountsPanel   bool
+	fetchingQuota       bool
+	fetchingOAuthHealth bool
+	fetchingAccounts    bool
+	lastQuotaFetch      time.Time
+	lastOAuthFetch      time.Time
+	lastAccountsFetch   time.Time
+
 	// Data for new panels
 	beadsSummary             bv.BeadsSummary
 	beadsReady               []bv.BeadPreview
@@ -444,7 +459,6 @@ type PostQuitAction struct {
 // PaneStatus tracks the status of a pane including compaction state.
 type PaneStatus struct {
 	LastCompaction *time.Time // When compaction was last detected
-	RecoverySent   bool       // Whether recovery prompt was sent
 	State          string     // "working", "idle", "error", "compacted"
 
 	// Context usage tracking
@@ -471,7 +485,7 @@ type PaneStatus struct {
 	HealthStatus  string   // "ok", "warning", "error", "unknown"
 	HealthIssues  []string // List of issue messages (rate limit, crash, etc.)
 	RestartCount  int      // Number of restarts in last hour
-	UptimeSeconds int      // Seconds since agent started (negative = uptime from tracker)
+	UptimeSeconds int      // Seconds since the pane's shell incarnation started (0 = unknown)
 
 	// Rotation tracking
 	IsRotating     bool       // True when agent rotation is in progress
@@ -538,7 +552,7 @@ func New(session, projectDir string) Model {
 		tier:                       layout.TierForWidth(80),
 		theme:                      t,
 		icons:                      ic,
-		compaction:                 status.NewCompactionRecoveryIntegrationDefault(),
+		compaction:                 status.NewCompactionDetector(5 * time.Minute),
 		paneStatus:                 make(map[string]PaneStatus),
 		observer:                   status.NewSessionObserver(detector),
 		agentStatuses:              make(map[string]status.AgentStatus),
@@ -603,6 +617,9 @@ func New(session, projectDir string) Model {
 		conflictsPanel:       panels.NewConflictsPanel(),
 		rotationConfirmPanel: panels.NewRotationConfirmPanel(),
 		workflowPanel:        panels.NewWorkflowPanel(),
+		quotaPanel:           panels.NewQuotaPanel(),
+		rateLimitPanel:       panels.NewRateLimitPanel(),
+		accountsPanel:        panels.NewAccountsPanel(),
 		velocityByType:       make(map[string][]float64),
 
 		// Init() only kicks off the critical first-paint session fetch. Everything
@@ -794,13 +811,6 @@ func (m *Model) rebuildPaneList() tea.Cmd {
 	cmd := m.paneList.SetItems(toPaneItems(m.panes, m.paneStatus, m.beadsReady, m.theme))
 	m.setPaneListSelectionByPaneID(prevSelectedID)
 	return cmd
-}
-
-// NewWithInterval creates a dashboard with custom refresh interval.
-func NewWithInterval(session, projectDir string, interval time.Duration) Model {
-	m := New(session, projectDir)
-	m.refreshInterval = interval
-	return m
 }
 
 // Init implements tea.Model.

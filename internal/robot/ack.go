@@ -6,10 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/cm"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -77,11 +77,12 @@ const ackCaptureLines = 200
 
 // AckOptions configures the PrintAck operation
 type AckOptions struct {
-	Session   string   // Target session name
-	Message   string   // The message that was sent (for echo detection)
-	Panes     []string // Specific pane indices to monitor
-	TimeoutMs int      // How long to wait for acknowledgments (default 30000)
-	PollMs    int      // How often to poll for changes (default 500)
+	Session    string   // Target session name
+	Message    string   // The message that was sent (for echo detection)
+	Panes      []string // Specific pane indices to monitor
+	AgentTypes []string // Only watch panes of these agent types (aliases accepted; empty = any type)
+	TimeoutMs  int      // How long to wait for acknowledgments (default 30000)
+	PollMs     int      // How often to poll for changes (default 500)
 }
 
 // GetAck monitors panes for acknowledgment after a send operation and returns the result.
@@ -135,7 +136,7 @@ func GetAck(opts AckOptions) (*AckOutput, error) {
 		return output, nil
 	}
 
-	targetPanes, targetErr := resolveAckTargets(panes, opts.Panes)
+	targetPanes, targetErr := resolveAckTargets(panes, opts.Panes, opts.AgentTypes)
 	if targetErr != nil {
 		output.Failed = append(output.Failed, AckFailure{Pane: "selector", Reason: targetErr.Error()})
 		output.RobotResponse = NewErrorResponse(
@@ -281,39 +282,6 @@ func ackPaneAgentType(pane tmux.Pane) string {
 	return detectAgentType(pane.Title)
 }
 
-func ackPaneTMUXAgentType(pane tmux.Pane) tmux.AgentType {
-	switch ackPaneAgentType(pane) {
-	case "claude":
-		return tmux.AgentClaude
-	case "codex":
-		return tmux.AgentCodex
-	case "gemini":
-		return tmux.AgentGemini
-	case "pi":
-		return tmux.AgentPi
-	case "kimi":
-		return tmux.AgentKimi
-	case "muse":
-		return tmux.AgentMuse
-	case "antigravity":
-		return tmux.AgentAntigravity
-	case "cursor":
-		return tmux.AgentCursor
-	case "windsurf":
-		return tmux.AgentWindsurf
-	case "aider":
-		return tmux.AgentAider
-	case "oc":
-		return tmux.AgentOpencode
-	case "ollama":
-		return tmux.AgentOllama
-	case "user":
-		return tmux.AgentUser
-	default:
-		return tmux.AgentUnknown
-	}
-}
-
 func shouldSkipDefaultAgentPane(pane tmux.Pane, agentType string) bool {
 	if pane.Index == 0 && agentType == "unknown" {
 		return true
@@ -321,10 +289,17 @@ func shouldSkipDefaultAgentPane(pane tmux.Pane, agentType string) bool {
 	return agentType == "user"
 }
 
-func resolveAckTargets(panes []tmux.Pane, selectors []string) ([]tmux.Pane, error) {
+// resolveAckTargets picks the panes an ack watches: the explicit selectors
+// when given, otherwise every agent pane; a --type list then narrows either
+// set, as it does for --robot-send and --robot-interrupt.
+func resolveAckTargets(panes []tmux.Pane, selectors, agentTypes []string) ([]tmux.Pane, error) {
 	ordered := tmux.SortPanesByTopology(panes)
 	if len(selectors) > 0 {
-		return tmux.ResolvePaneSelectors(ordered, selectors, false)
+		resolved, err := tmux.ResolvePaneSelectors(ordered, selectors, false)
+		if err != nil {
+			return nil, err
+		}
+		return keepPanesOfAgentTypes(resolved, agentTypes, ackPaneAgentType), nil
 	}
 	targets := make([]tmux.Pane, 0, len(ordered))
 	for _, pane := range ordered {
@@ -332,22 +307,7 @@ func resolveAckTargets(panes []tmux.Pane, selectors []string) ([]tmux.Pane, erro
 			targets = append(targets, pane)
 		}
 	}
-	return targets, nil
-}
-
-func selectAckTargets(panes []tmux.Pane, paneFilterMap map[string]bool) []tmux.Pane {
-	selectors := make([]string, 0, len(paneFilterMap))
-	for selector := range paneFilterMap {
-		selectors = append(selectors, selector)
-	}
-	sort.Strings(selectors)
-	targets, _ := resolveAckTargets(panes, selectors)
-	return targets
-}
-
-// detectAcknowledgment checks if the agent has acknowledged the input
-func detectAcknowledgment(initialOutput, currentOutput, message, paneTitle string) (AckType, bool) {
-	return detectAcknowledgmentForAgent(initialOutput, currentOutput, message, detectAgentType(paneTitle))
+	return keepPanesOfAgentTypes(targets, agentTypes, ackPaneAgentType), nil
 }
 
 func detectAcknowledgmentForAgent(initialOutput, currentOutput, message, agentType string) (AckType, bool) {
@@ -539,6 +499,13 @@ type SendAndAckOutput struct {
 // GetSendAndAck sends a message and waits for acknowledgment, returning the result.
 // This function returns the data struct directly, enabling CLI/REST parity.
 func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// First, send the message
 	sentAt := time.Now().UTC()
 	trace := normalizeActuationTrace(opts.RequestID, opts.CorrelationID, opts.IdempotencyKey)
@@ -698,6 +665,28 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 			},
 		}), nil
 	}
+	// Perform CM memory rule injection if enabled (bd-3j6hm), mirroring the
+	// GetSend path. The injected rule IDs feed the automatic outcome report
+	// after a confirmed acknowledgment. cm being unavailable records a skip
+	// reason and the send proceeds unmodified.
+	var memoryInfo *CMInjectionInfo
+	memCfg := DefaultCMInjectConfig()
+	if opts.MemoryInject != nil {
+		memCfg = *opts.MemoryInject
+	}
+	if opts.WithMemory && len(targetPanes) > 0 {
+		memCfg, memoryInfo = prepareCMSendContext(ctx, opts.Session, targetPanes, memCfg)
+		if memoryInfo == nil {
+			opts.Message, memoryInfo = InjectCMRules(ctx, opts.Message, opts.Message, memCfg)
+			// Feedback belongs to the exact daemon/session that supplied the
+			// rules, even if PID files change while acknowledgment is pending.
+			memCfg.Outcome = memoryInfo.outcome
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// A pane with no baseline is excluded from acknowledgment tracking below
 	// rather than diffed against an empty string, which would return the whole
 	// scrollback and confirm an ack the agent never gave.
@@ -707,7 +696,7 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 		paneKey := targetKeys[i]
 		// Capture initial state before sending
 		captured, err := func() (string, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
 			return tmux.CapturePaneOutputContext(ctx, pane.ID, ackCaptureLines)
 		}()
@@ -717,16 +706,17 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 	}
 
 	sendOutput := SendOutput{
-		RobotResponse:  NewRobotResponse(true), // Will be updated based on results
-		Session:        opts.Session,
-		SentAt:         sentAt,
-		Blocked:        false,
-		Redaction:      redactionSummary,
-		Warnings:       redactionWarnings,
-		Targets:        targetKeys,
-		Successful:     []string{},
-		Failed:         []SendError{},
-		MessagePreview: preview,
+		RobotResponse:   NewRobotResponse(true), // Will be updated based on results
+		Session:         opts.Session,
+		SentAt:          sentAt,
+		Blocked:         false,
+		Redaction:       redactionSummary,
+		Warnings:        redactionWarnings,
+		Targets:         targetKeys,
+		Successful:      []string{},
+		Failed:          []SendError{},
+		MessagePreview:  preview,
+		MemoryInjection: memoryInfo,
 	}
 	if len(targetPanes) == 0 {
 		sendOutput.RobotResponse = NewErrorResponse(
@@ -734,7 +724,7 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 			ErrCodeInvalidFlag,
 			"Check --pane, --panes, --type, --exclude, and --all",
 		)
-	} else {
+	} else if guardSendCommand(ctx, &sendOutput, opts.Message, opts.Session, targetPanes, opts.DryRun) {
 		sendEnter := true
 		if opts.Enter != nil {
 			sendEnter = *opts.Enter
@@ -745,7 +735,7 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 			sendOutput.Failed = append(sendOutput.Failed, SendError{Pane: "dispatch", Error: serviceErr.Error()})
 		} else {
 			prepared, prepareErr := service.Prepare(
-				context.Background(),
+				ctx,
 				robotPreparedDispatchRequest(panes, targetPanes, opts.SendOptions, opts.Message, sendEnter),
 			)
 			finalPreview, finalSummary, finalWarnings := finalRedactor.outputView()
@@ -758,7 +748,7 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 				sendOutput.RobotResponse = robotDispatchPrepareErrorResponse(prepareErr)
 				sendOutput.Failed = append(sendOutput.Failed, SendError{Pane: "dispatch", Error: prepareErr.Error()})
 			} else if opts.DryRun {
-				result, dispatchErr := service.Dispatch(context.Background(), prepared)
+				result, dispatchErr := service.Dispatch(ctx, prepared)
 				if dispatchErr != nil {
 					sendOutput.RobotResponse = NewErrorResponse(dispatchErr, ErrCodeInternalError, "Dispatch dry-run failed")
 					sendOutput.Failed = append(sendOutput.Failed, SendError{Pane: "dispatch", Error: dispatchErr.Error()})
@@ -769,8 +759,10 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 				}
 			} else {
 				publishSendActuationRequest(trace, opts.SendOptions, targetKeys, sendOutput.MessagePreview)
-				result, _ := service.Dispatch(context.Background(), prepared)
+				dispatchStarted := time.Now()
+				result, _ := service.Dispatch(ctx, prepared)
 				applyRobotDispatchResult(&sendOutput, result)
+				recordRobotSendHistory(opts.SendOptions, redactCfg, targetPanes, targetKeys, sendOutput, dispatchStarted)
 			}
 		}
 	}
@@ -815,14 +807,14 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 		opts.AckPollMs = 500
 	}
 
-	// Wait for initial processing delay
-	time.Sleep(100 * time.Millisecond)
+	// Wait for initial processing without retaining a canceled command.
+	waitAckPoll(ctx, 100*time.Millisecond)
 
 	// Poll for acknowledgments
 	deadline := time.Now().Add(time.Duration(opts.AckTimeoutMs) * time.Millisecond)
 	pollInterval := time.Duration(opts.AckPollMs) * time.Millisecond
 
-	for time.Now().Before(deadline) && len(ackOutput.Pending) > 0 {
+	for ctx.Err() == nil && time.Now().Before(deadline) && len(ackOutput.Pending) > 0 {
 		stillPending := []string{}
 
 		for _, paneKey := range ackOutput.Pending {
@@ -840,7 +832,7 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 			}
 
 			captured, err := func() (string, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				defer cancel()
 				return tmux.CapturePaneOutputContext(ctx, targetPane.ID, ackCaptureLines)
 			}()
@@ -879,7 +871,7 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 		ackOutput.Pending = stillPending
 
 		if len(ackOutput.Pending) > 0 {
-			time.Sleep(pollInterval)
+			waitAckPoll(ctx, pollInterval)
 		}
 	}
 
@@ -893,7 +885,18 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 	}
 
 	ackOutput.CompletedAt = time.Now().UTC()
+	if err := ctx.Err(); err != nil {
+		ackOutput.RobotResponse = NewErrorResponse(err, ErrCodeTimeout, "Send completed; acknowledgment tracking was canceled")
+	}
 	publishSendActuationVerification(trace, opts, sendOutput, ackOutput)
+
+	// Automatic outcome feedback (bd-3j6hm): only clear evidence is reported.
+	// A confirmed acknowledgment with no panes left pending is a success for
+	// the injected rules; an ack timeout is ambiguous and reports nothing.
+	// reportCMOutcome is bounded and never fails the send.
+	if ctx.Err() == nil && shouldReportCMSendOutcome(opts.WithMemory, memoryInfo, len(ackOutput.Confirmations), ackOutput.TimedOut) {
+		reportCMOutcome(memCfg, cm.OutcomeSuccess, memoryInfo.RulesInjected)
+	}
 
 	combined := NewRobotResponse(true)
 	if !sendOutput.Success {
@@ -909,55 +912,13 @@ func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
 	}, nil
 }
 
-func selectSendAndAckTargets(panes []tmux.Pane, excludeMap, paneFilterMap, typeFilterMap map[string]bool, all bool) ([]tmux.Pane, []string) {
-	hasPaneFilter := len(paneFilterMap) > 0
-	hasTypeFilter := len(typeFilterMap) > 0
-
-	var targetPanes []tmux.Pane
-	var targetKeys []string
-	for _, pane := range panes {
-		paneKey := fmt.Sprintf("%d", pane.Index)
-
-		if excludeMap[paneKey] || excludeMap[pane.ID] {
-			continue
-		}
-		if hasPaneFilter && !paneFilterMap[paneKey] && !paneFilterMap[pane.ID] {
-			continue
-		}
-
-		agentType := ackPaneAgentType(pane)
-		if hasTypeFilter && !typeFilterMap[agentType] {
-			continue
-		}
-		if !all && !hasPaneFilter && !hasTypeFilter && shouldSkipDefaultAgentPane(pane, agentType) {
-			continue
-		}
-
-		targetPanes = append(targetPanes, pane)
-		targetKeys = append(targetKeys, paneKey)
+func waitAckPoll(ctx context.Context, delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
 	}
-
-	return targetPanes, targetKeys
-}
-
-func sendAndAckToPane(
-	pane tmux.Pane,
-	message string,
-	enterOverride *bool,
-	send func(target, keys string, enter bool, enterDelay time.Duration, agentType tmux.AgentType) error,
-) error {
-	sendEnter := true
-	if enterOverride != nil {
-		sendEnter = *enterOverride
-	}
-
-	enterDelay := tmux.DefaultEnterDelay
-	agentType := ackPaneAgentType(pane)
-	if pane.Type == tmux.AgentUser || agentType == "user" || agentType == "unknown" {
-		enterDelay = tmux.ShellEnterDelay
-	}
-
-	return send(pane.ID, message, sendEnter, enterDelay, ackPaneTMUXAgentType(pane))
 }
 
 // PrintSendAndAck sends a message and waits for acknowledgment.

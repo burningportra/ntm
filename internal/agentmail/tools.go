@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
-	pathpkg "path"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/Dicklesworthstone/ntm/internal/reservationpath"
 )
 
 // attachTokenFromField adds the token of the agent named by args[agentField]
@@ -60,7 +64,7 @@ func (c *Client) EnsureProject(ctx context.Context, projectKey string) (*Project
 
 	// Use retry logic for project creation as it's often the first call made
 	// by multiple agents starting simultaneously.
-	result, err := c.callToolWithBusyRetry(ctx, "ensure_project", args, 3*time.Second, 3)
+	result, err := c.callToolWithBusyRetry(ctx, "ensure_project", args, 3*time.Second, busyMaxRetries())
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +107,48 @@ func (c *Client) LookupProject(ctx context.Context, projectKey string) (*Project
 	return &project, nil
 }
 
+// attachPaneBinding adds the caller's tmux pane id to a registration call's
+// arguments when it is a bare %N address, which is the only shape the server's
+// pane-binding contract accepts. Registration works without a pane binding, so
+// an empty or non-bare id (a composite session:window:pane label, say) is
+// simply omitted rather than failing the call.
+func attachPaneBinding(args map[string]interface{}, paneID string) {
+	if bare, ok := BareTmuxPaneID(paneID); ok {
+		args["pane_id"] = bare
+	}
+}
+
+// callRegistrationTool runs an identity registration tool call. Servers
+// without the pane-binding contract — the Python Agent Mail server, whose
+// strict argument validation answers "pane_id: Unexpected keyword argument" —
+// reject the whole registration over the optional pane_id, leaving every
+// spawned pane without an identity (GH #333). Registration works without a
+// pane binding, so such a rejection is retried once without it.
+func (c *Client) callRegistrationTool(ctx context.Context, toolName string, args map[string]interface{}) (json.RawMessage, error) {
+	result, err := c.callToolWithBusyRetry(ctx, toolName, args, 3*time.Second, busyMaxRetries())
+	if err == nil || !paneBindingUnsupported(err) {
+		return result, err
+	}
+	if _, bound := args["pane_id"]; !bound {
+		return result, err
+	}
+	delete(args, "pane_id")
+	return c.callToolWithBusyRetry(ctx, toolName, args, 3*time.Second, busyMaxRetries())
+}
+
+// paneBindingUnsupported reports whether a registration failed because the
+// server does not accept the pane_id argument at all.
+func paneBindingUnsupported(err error) bool {
+	var rejection *ToolRejectionError
+	if !errors.As(err, &rejection) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "pane_id") &&
+		(strings.Contains(msg, "unexpected keyword") || strings.Contains(msg, "unexpected argument") ||
+			strings.Contains(msg, "unknown argument") || strings.Contains(msg, "unknown field"))
+}
+
 // RegisterAgent registers an agent in a project.
 func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (*Agent, error) {
 	args := map[string]interface{}{
@@ -116,6 +162,7 @@ func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (
 	if opts.TaskDescription != "" {
 		args["task_description"] = opts.TaskDescription
 	}
+	attachPaneBinding(args, opts.PaneID)
 
 	// Re-claim path: include the agent's registration token when known so
 	// the server can authenticate us as the existing identity instead of
@@ -123,7 +170,7 @@ func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (
 	// server returns a fresh token in the response.
 	c.attachTokenFromField(ctx, args, "registration_token", "name")
 
-	result, err := c.callToolWithBusyRetry(ctx, "register_agent", args, 3*time.Second, 3)
+	result, err := c.callRegistrationTool(ctx, "register_agent", args)
 	if err != nil {
 		return nil, err
 	}
@@ -150,8 +197,9 @@ func (c *Client) CreateAgentIdentity(ctx context.Context, opts RegisterAgentOpti
 	if opts.TaskDescription != "" {
 		args["task_description"] = opts.TaskDescription
 	}
+	attachPaneBinding(args, opts.PaneID)
 
-	result, err := c.callToolWithBusyRetry(ctx, "create_agent_identity", args, 3*time.Second, 3)
+	result, err := c.callRegistrationTool(ctx, "create_agent_identity", args)
 	if err != nil {
 		return nil, err
 	}
@@ -579,51 +627,6 @@ func (c *Client) SummarizeThread(ctx context.Context, opts SummarizeThreadOption
 	}, nil
 }
 
-// ReservePaths requests file path reservations.
-func (c *Client) ReservePaths(ctx context.Context, opts FileReservationOptions) (*ReservationResult, error) {
-	args := map[string]interface{}{
-		"project_key": opts.ProjectKey,
-		"agent_name":  opts.AgentName,
-		"paths":       opts.Paths,
-	}
-	if opts.TTLSeconds > 0 {
-		args["ttl_seconds"] = opts.TTLSeconds
-	}
-	if opts.Exclusive {
-		args["exclusive"] = true
-	}
-	if opts.Reason != "" {
-		args["reason"] = opts.Reason
-	}
-
-	c.attachRegistrationToken(ctx, args)
-	result, err := c.callTool(ctx, "file_reservation_paths", args)
-	if err != nil {
-		return nil, err
-	}
-
-	var reservationResult ReservationResult
-	if err := json.Unmarshal(result, &reservationResult); err != nil {
-		return nil, NewAPIError("file_reservation_paths", 0, err)
-	}
-
-	// Neither server names the holder in a grant ({id, path_pattern,
-	// exclusive, reason, expires_ts}), because every grant goes to the agent
-	// the call named. A grant that does name a holder keeps it.
-	for i := range reservationResult.Granted {
-		if reservationResult.Granted[i].AgentName == "" {
-			reservationResult.Granted[i].AgentName = opts.AgentName
-		}
-	}
-
-	// Check for conflicts
-	if len(reservationResult.Conflicts) > 0 {
-		return &reservationResult, fmt.Errorf("%w: %d conflicts", ErrReservationConflict, len(reservationResult.Conflicts))
-	}
-
-	return &reservationResult, nil
-}
-
 // ReleaseReservations releases file path reservations.
 func (c *Client) ReleaseReservations(ctx context.Context, projectKey, agentName string, paths []string, ids []int) (*ReleaseReservationsResult, error) {
 	args := map[string]interface{}{
@@ -649,6 +652,29 @@ func (c *Client) ReleaseReservations(ctx context.Context, projectKey, agentName 
 	}
 
 	return &releaseResult, nil
+}
+
+// CleanupPaneIdentities invokes the cleanup_pane_identities MCP tool, which
+// removes stale per-pane identity files for tmux panes that no longer exist
+// (the server checks live tmux panes itself and no-ops when tmux is down).
+// Pass an empty projectKey to clean up across all projects.
+func (c *Client) CleanupPaneIdentities(ctx context.Context, projectKey string) (*CleanupPaneIdentitiesResult, error) {
+	args := map[string]interface{}{}
+	if projectKey != "" {
+		args["project_key"] = projectKey
+	}
+
+	result, err := c.callTool(ctx, "cleanup_pane_identities", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var cleanupResult CleanupPaneIdentitiesResult
+	if err := json.Unmarshal(result, &cleanupResult); err != nil {
+		return nil, NewAPIError("cleanup_pane_identities", 0, err)
+	}
+
+	return &cleanupResult, nil
 }
 
 // RenewReservations extends the TTL of existing reservations using options struct.
@@ -683,15 +709,23 @@ func (c *Client) RenewReservations(ctx context.Context, opts RenewReservationsOp
 // If the Agent Mail server does not support this tool, callers will receive an error rather
 // than an empty slice so the CLI can surface the limitation instead of misreporting "no locks".
 func (c *Client) ListReservations(ctx context.Context, projectKey, agentName string, allAgents bool) ([]FileReservation, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("reservation listing requires a context")
+	}
+	ctx, cancel := context.WithTimeout(ctx, LongTimeout)
+	defer cancel()
 	// Preferred: use the MCP resource view.
 	// Resource URI: resource://file_reservations/{slug}?active_only=true
 	//
 	// The server accepts either project slug or human_key in {slug}; we pass projectKey
 	// (usually an absolute path) URL-escaped for compatibility.
-	uri := fmt.Sprintf("resource://file_reservations/%s?active_only=true&format=json", url.PathEscape(projectKey))
+	uri := activeReservationsURI(projectKey)
 
 	result, err := c.ReadResource(ctx, uri)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		// Fallback for older Agent Mail deployments: try legacy tools.
 		args := map[string]interface{}{
 			"project_key": projectKey,
@@ -732,70 +766,7 @@ func (c *Client) ListReservations(ctx context.Context, projectKey, agentName str
 		return reservations, nil
 	}
 
-	var resourceResp struct {
-		Contents []struct {
-			Text string `json:"text"`
-		} `json:"contents"`
-	}
-	if unmarshalErr := json.Unmarshal(result, &resourceResp); unmarshalErr != nil {
-		return nil, NewAPIError("resource://file_reservations", 0, unmarshalErr)
-	}
-	if len(resourceResp.Contents) == 0 || strings.TrimSpace(resourceResp.Contents[0].Text) == "" {
-		return []FileReservation{}, nil
-	}
-
-	// Resource format:
-	// [
-	//   { "id": 1, "agent": "BlueLake", "path_pattern": "...", ... },
-	//   ...
-	// ]
-	var raw []struct {
-		ID          int       `json:"id"`
-		ProjectID   int       `json:"project_id"`
-		Agent       string    `json:"agent"`
-		AgentName   string    `json:"agent_name"`
-		PathPattern string    `json:"path_pattern"`
-		Exclusive   bool      `json:"exclusive"`
-		Reason      string    `json:"reason"`
-		CreatedTS   FlexTime  `json:"created_ts"`
-		ExpiresTS   FlexTime  `json:"expires_ts"`
-		ReleasedTS  *FlexTime `json:"released_ts,omitempty"`
-	}
-
-	if unmarshalErr := json.Unmarshal([]byte(resourceResp.Contents[0].Text), &raw); unmarshalErr != nil {
-		return nil, NewAPIError("resource://file_reservations", 0, unmarshalErr)
-	}
-
-	reservations := make([]FileReservation, 0, len(raw))
-	for _, r := range raw {
-		name := r.Agent
-		if name == "" {
-			name = r.AgentName
-		}
-		reservations = append(reservations, FileReservation{
-			ID:          r.ID,
-			ProjectID:   r.ProjectID,
-			PathPattern: r.PathPattern,
-			AgentName:   name,
-			Exclusive:   r.Exclusive,
-			Reason:      r.Reason,
-			CreatedTS:   r.CreatedTS,
-			ExpiresTS:   r.ExpiresTS,
-			ReleasedTS:  r.ReleasedTS,
-		})
-	}
-
-	if agentName != "" && !allAgents {
-		filtered := make([]FileReservation, 0, len(reservations))
-		for _, r := range reservations {
-			if r.AgentName == agentName {
-				filtered = append(filtered, r)
-			}
-		}
-		reservations = filtered
-	}
-
-	return reservations, nil
+	return c.readReservationPages(ctx, projectKey, agentName, allAgents, uri, result)
 }
 
 // StartSession is a macro that starts a project session (ensure project, register agent, fetch inbox).
@@ -930,65 +901,87 @@ func (c *Client) ContactHandshake(ctx context.Context, opts ContactHandshakeOpti
 	return &handshakeResult, nil
 }
 
-// SendOverseerMessage sends a Human Overseer message. On mcp-agent-mail
-// >=2.13 (the current server line) this uses the MCP `send_message`
-// tool with a registered `HumanOverseer` agent — the legacy
-// `/mail/{slug}/overseer/send` HTTP endpoint is no longer exposed by
-// many deployments and was returning 404 (#146).
-//
-// The MCP path:
-//
-//  1. Ensures the project exists.
-//  2. Registers a `HumanOverseer` agent (idempotent — re-registering
-//     just refreshes its activity timestamp on the server).
-//  3. Sends via `send_message` with `importance=high`, the configured
-//     thread id, and a `HumanOverseerPreamble` prepended to the body.
-//
-// As a back-compat fallback (older servers that still expose the HTTP
-// endpoint and don't accept `HumanOverseer` as an agent name), if MCP
-// send_message reports the special "human-overseer-not-supported"
-// error path we retry against the HTTP endpoint. Most callers will
-// never hit that branch.
+// SendOverseerMessage uses the server's audited human intervention route.
+// Only a missing route permits a legacy MCP send, using an already provisioned
+// identity. Never register the reserved name, downgrade a rejected intervention,
+// or retry an ambiguous send (which could duplicate delivery).
 func (c *Client) SendOverseerMessage(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
-	// Prefer the MCP path. Need ProjectKey for the MCP tools (the
-	// server-side project_key is an absolute path, not the URL slug).
-	// Legacy callers that only have a ProjectSlug fall through to
-	// the HTTP route and the server validates recipients/subject
-	// shape there.
-	projectKey := opts.ProjectKey
-	if projectKey == "" {
-		return c.sendOverseerMessageHTTP(ctx, opts)
+	invalid := func(message string) (*OverseerSendResult, error) {
+		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %s", ErrInvalidRequest, message))
+	}
+	opts.ProjectSlug = strings.TrimSpace(opts.ProjectSlug)
+	if opts.ProjectSlug == "" && strings.TrimSpace(opts.ProjectKey) == "" {
+		return invalid("project_slug or project_key is required")
+	}
+	if opts.Reason == "" {
+		opts.Reason = DefaultOverseerReason
+	}
+	opts.Reason = strings.TrimSpace(opts.Reason)
+	if !utf8.ValidString(opts.Reason) || opts.Reason == "" || utf8.RuneCountInString(opts.Reason) > MaxOverseerReasonLength {
+		return invalid("intervention reason must contain 1 to 500 valid Unicode characters")
+	}
+	if subject := strings.TrimSpace(opts.Subject); !utf8.ValidString(subject) || subject == "" || utf8.RuneCountInString(subject) > 200 {
+		return invalid("subject must contain 1 to 200 valid Unicode characters")
+	}
+	if body := strings.TrimSpace(opts.BodyMD); !utf8.ValidString(body) || body == "" || utf8.RuneCountInString(body) > 50000 {
+		return invalid("message body must contain 1 to 50,000 valid Unicode characters")
+	}
+	if !utf8.ValidString(opts.ThreadID) {
+		return invalid("thread_id must contain valid Unicode characters")
+	}
+	opts.ThreadID = strings.TrimSpace(opts.ThreadID)
+
+	// Normalize a copy, so repeated names neither duplicate a legacy delivery nor
+	// require multiple-recipient confirmation for a single effective recipient.
+	recipients := make([]string, 0, len(opts.Recipients))
+	seen := make(map[string]bool, len(opts.Recipients))
+	for _, recipient := range opts.Recipients {
+		name := strings.TrimSpace(recipient)
+		if name == "" || !utf8.ValidString(name) {
+			return invalid("recipient names must be nonempty valid Unicode strings")
+		}
+		key := strings.ToLower(name)
+		if !seen[key] {
+			recipients = append(recipients, name)
+			seen[key] = true
+		}
+	}
+	if len(recipients) == 0 || len(recipients) > 100 {
+		return invalid("between 1 and 100 recipients must be specified")
+	}
+	opts.Recipients = recipients
+
+	// Resolve the server's slug instead of guessing a potentially different
+	// project's identity from its filesystem path.
+	if opts.ProjectSlug == "" {
+		project, err := c.EnsureProject(ctx, opts.ProjectKey)
+		if err != nil {
+			return nil, fmt.Errorf("resolving overseer project: %w", err)
+		}
+		if project.Slug == "" {
+			return invalid("server returned no project slug for overseer delivery")
+		}
+		opts.ProjectSlug = project.Slug
+	}
+	result, err := c.sendOverseerMessageHTTP(ctx, opts)
+	if err == nil || !errors.Is(err, ErrNotImplemented) || opts.ProjectKey == "" {
+		return result, err
+	}
+	legacyToken := c.RegistrationToken(opts.ProjectKey, HumanOverseerAgentName)
+	if strings.TrimSpace(legacyToken) == "" {
+		return nil, fmt.Errorf("overseer intervention route unavailable and no existing authorized HumanOverseer identity is configured: %w", err)
 	}
 
-	// 1. Ensure project — idempotent, cheap, and gets us a stable
-	//    handle the server understands even if this is the very first
-	//    overseer call against this project.
-	if _, err := c.EnsureProject(ctx, projectKey); err != nil {
-		// EnsureProject failure isn't fatal for the overseer flow on
-		// older servers that auto-create on first message, so we
-		// don't return here — but record it for diagnostics if MCP
-		// itself also fails below.
-		_ = err
-	}
-
-	// 2. Register / re-claim the HumanOverseer agent. This is
-	//    idempotent on the server and gives us a registration_token
-	//    (cached automatically via rememberRegistrationToken).
-	if _, err := c.RegisterAgent(ctx, RegisterAgentOptions{
-		ProjectKey:      projectKey,
-		Name:            HumanOverseerAgentName,
-		Program:         "ntm",
-		Model:           "human",
-		TaskDescription: "Out-of-band instructions from the human operator",
-	}); err != nil {
-		// Fall back to the legacy HTTP endpoint when MCP registration
-		// fails outright (e.g. older server without identity support).
-		return c.sendOverseerMessageHTTP(ctx, opts)
-	}
-
-	body := HumanOverseerPreamble + opts.BodyMD
-	send, err := c.SendMessage(ctx, SendMessageOptions{
-		ProjectKey: projectKey,
+	// Only an absent route and an already authorized legacy identity permit this
+	// compatibility path. The server must still validate its existing sender token.
+	// A scoped client also prevents redirected MCP sends from replaying this
+	// mutation, without changing another caller's transport or MCP session.
+	legacyClient := NewClient(WithBaseURL(c.baseURL), WithToken(c.bearerToken))
+	legacyClient.httpClient = c.overseerHTTPClient()
+	legacyClient.SetRegistrationToken(opts.ProjectKey, HumanOverseerAgentName, legacyToken)
+	body := HumanOverseerPreamble + "Human intervention reason: " + opts.Reason + "\n\n" + opts.BodyMD
+	send, err := legacyClient.SendMessage(ctx, SendMessageOptions{
+		ProjectKey: opts.ProjectKey,
 		SenderName: HumanOverseerAgentName,
 		To:         opts.Recipients,
 		Subject:    opts.Subject,
@@ -997,53 +990,57 @@ func (c *Client) SendOverseerMessage(ctx context.Context, opts OverseerMessageOp
 		ThreadID:   opts.ThreadID,
 	})
 	if err != nil {
-		// MCP route refused (e.g. server doesn't allow a Human-Overseer
-		// agent and there's no contact yet). Try the HTTP endpoint as
-		// a last resort — operators running newer servers won't take
-		// this branch.
-		if httpResult, httpErr := c.sendOverseerMessageHTTP(ctx, opts); httpErr == nil {
-			return httpResult, nil
-		}
-		return nil, err
+		return nil, fmt.Errorf("legacy overseer send requires an existing authorized HumanOverseer identity; use a server with the overseer intervention route: %w", err)
 	}
 
-	// Map send_message's SendResult (per-recipient deliveries) onto
-	// OverseerSendResult so the CLI's output shape is unchanged.
-	result := &OverseerSendResult{
-		Success:    true,
-		Recipients: opts.Recipients,
+	// Preserve actual delivery evidence. An empty, partial, or inconsistent MCP
+	// receipt must not become a success for the originally requested recipients.
+	result = &OverseerSendResult{
+		Success: len(send.Deliveries) > 0,
 	}
 	for _, d := range send.Deliveries {
-		if d.Payload == nil {
+		if d.Payload == nil || d.Payload.ID <= 0 {
+			result.Success = false
 			continue
 		}
 		if result.MessageID == 0 {
 			result.MessageID = d.Payload.ID
+		} else if result.MessageID != d.Payload.ID {
+			result.Success = false
 		}
 		if !d.Payload.CreatedTS.IsZero() && result.SentAt.IsZero() {
 			result.SentAt = d.Payload.CreatedTS
 		}
+		result.Recipients = append(result.Recipients, d.Payload.To...)
 	}
-	return result, nil
+	return result, validateOverseerReceipt(result, opts.Recipients, 0)
 }
 
-// sendOverseerMessageHTTP is the legacy HTTP REST path. Kept for
-// back-compat against older servers that still expose
-// `/mail/{slug}/overseer/send`. Newer deployments (the v2.13.x line
-// the #146 reporter is on) typically 404 here.
+// overseerHTTPClient retains the configured transport and timeout but forbids
+// redirected sends. Copying the HTTP client avoids changing concurrent callers.
+func (c *Client) overseerHTTPClient() *http.Client {
+	client := *c.httpClient
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &client
+}
+
+// sendOverseerMessageHTTP leaves identity provisioning, policy bypass, preamble,
+// importance, and audit recording to the server's designated intervention route.
+// A client built with WithDisabled refuses without contacting the server.
 func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
 	if c.disabled {
 		return nil, NewAPIError("overseer_send", 0, ErrDisabled)
 	}
-	if opts.ProjectSlug == "" {
-		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("project_slug required for HTTP fallback path"))
-	}
-
 	// Build request body
 	reqBody := map[string]interface{}{
-		"recipients": opts.Recipients,
-		"subject":    opts.Subject,
-		"body_md":    opts.BodyMD,
+		"intent":           "human_overseer_send",
+		"reason":           opts.Reason,
+		"confirm_multiple": len(opts.Recipients) > 1,
+		"recipients":       opts.Recipients,
+		"subject":          opts.Subject,
+		"body_md":          opts.BodyMD,
 	}
 	if opts.ThreadID != "" {
 		reqBody["thread_id"] = opts.ThreadID
@@ -1059,56 +1056,114 @@ func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessa
 	// Encode path segments to ensure valid URL
 	url := fmt.Sprintf("%s/mail/%s/overseer/send", httpBaseURL, url.PathEscape(opts.ProjectSlug))
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, NewAPIError("overseer_send", 0, err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	if c.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	// A redirected POST must not become a GET or replay the intervention at a
+	// different authorization surface.
+	resp, err := c.overseerHTTPClient().Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, NewAPIError("overseer_send", 0, ErrTimeout)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, NewAPIError("overseer_send", 0, ctx.Err())
 		}
-		return nil, NewAPIError("overseer_send", 0, ErrServerUnavailable)
+		var netErr net.Error
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %w", ErrTimeout, err))
+		}
+		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %w", ErrServerUnavailable, err))
 	}
 	defer resp.Body.Close()
 
-	// Read response body (limit to 10MB to prevent DoS/OOM)
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	// Read one extra byte so an oversized response is explicitly ambiguous,
+	// never mistaken for an absent route after silently truncating its error.
+	const maxResponseBody = 10 << 20
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
 	if err != nil {
-		return nil, NewAPIError("overseer_send", 0, err)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, NewAPIError("overseer_send", 0, ctx.Err())
+		}
+		var netErr net.Error
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			return nil, NewAPIError("overseer_send", 0, fmt.Errorf("%w: %w", ErrTimeout, err))
+		}
+		return nil, responseBodyReadError(ctx, "overseer_send", err)
+	}
+	if len(respBody) > maxResponseBody {
+		return nil, NewAPIError("overseer_send", resp.StatusCode, errors.New("overseer response exceeds 10 MiB (send was not retried; inspect the inbox before resending)"))
 	}
 
-	// Check HTTP status
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("%w: invalid or missing bearer token", ErrUnauthorized))
-	}
-	if resp.StatusCode == http.StatusBadRequest {
-		// Try to extract error message from response
-		var errResp struct {
-			Detail string `json:"detail"`
-		}
-		if json.Unmarshal(respBody, &errResp) == nil && errResp.Detail != "" {
-			return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("%s", errResp.Detail))
-		}
-		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("bad request"))
-	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
+		message := strings.ToLower(resp.Status)
+		if detail := httpErrorDetail(respBody); detail != "" {
+			message += ": " + detail
+		}
+		cause := error(nil)
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			cause = ErrUnauthorized
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			cause = ErrInvalidRequest
+		case http.StatusNotFound, http.StatusMethodNotAllowed:
+			// A structured rejection may mean an unknown project or a policy
+			// denial, rather than an absent route. Malformed or truncated JSON
+			// is ambiguous too, regardless of the advertised content type.
+			trimmed := bytes.TrimSpace(respBody)
+			looksJSON := len(trimmed) > 0 && strings.ContainsRune("{[\"", rune(trimmed[0]))
+			isJSON := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json")
+			if !json.Valid(respBody) && !looksJSON && !isJSON {
+				cause = ErrNotImplemented
+			} else if resp.StatusCode == http.StatusNotFound {
+				cause = ErrNotFound
+			}
+		}
+		if cause != nil {
+			return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("%w: %s", cause, message))
+		}
+		return nil, NewAPIError("overseer_send", resp.StatusCode, errors.New(message))
 	}
 
 	// Parse response
 	var result OverseerSendResult
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, NewAPIError("overseer_send", 0, err)
+		return nil, NewAPIError("overseer_send", resp.StatusCode, fmt.Errorf("invalid delivery receipt (send was not retried): %w", err))
 	}
+	if !result.Success || result.MessageID <= 0 {
+		message := "server did not confirm overseer delivery (send was not retried)"
+		if detail := httpErrorDetail(respBody); detail != "" {
+			message += ": " + detail
+		}
+		return &result, NewAPIError("overseer_send", resp.StatusCode, errors.New(message))
+	}
+	return &result, validateOverseerReceipt(&result, opts.Recipients, resp.StatusCode)
+}
 
-	return &result, nil
+func validateOverseerReceipt(result *OverseerSendResult, recipients []string, statusCode int) error {
+	if !result.Success || result.MessageID <= 0 {
+		return NewAPIError("overseer_send", statusCode, fmt.Errorf("server did not confirm overseer delivery (send was not retried; inspect the inbox before resending)"))
+	}
+	// Python servers can return success after silently dropping unknown names.
+	// Keep the actual receipt and report incomplete/unexpected delivery instead
+	// of claiming every selected recipient was reached or retrying the message.
+	delivered := make(map[string]bool, len(result.Recipients))
+	for _, name := range result.Recipients {
+		delivered[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	complete := len(delivered) == len(recipients) && len(delivered) == len(result.Recipients)
+	for _, name := range recipients {
+		complete = complete && delivered[strings.ToLower(name)]
+	}
+	if !complete {
+		return NewAPIError("overseer_send", statusCode, fmt.Errorf("message %d delivery mismatch: requested %v; server reported %v (send was not retried; inspect the inbox before resending)", result.MessageID, recipients, result.Recipients))
+	}
+	return nil
 }
 
 // ListProjectAgents lists all agents registered in a project.
@@ -1319,6 +1374,11 @@ func reservationActiveAt(reservation FileReservation, now time.Time) bool {
 	if reservation.ReleasedTS != nil {
 		return false
 	}
+	// Missing expiry evidence cannot clear an exclusive lease. This also
+	// protects legacy listing responses, which may omit expires_ts.
+	if reservation.ExpiresTS.Time.IsZero() {
+		return true
+	}
 	return !now.After(reservation.ExpiresTS.Time)
 }
 
@@ -1333,93 +1393,11 @@ func reservationsConflict(a, b FileReservation) bool {
 }
 
 func reservationPatternsOverlap(a, b string) bool {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	if a == "" || b == "" {
-		return false
-	}
-	if a == b {
-		return true
-	}
-	return matchesReservationPattern(a, b) || matchesReservationPattern(b, a)
+	return reservationpath.MayOverlap(a, b)
 }
 
 func matchesReservationPattern(path, pattern string) bool {
-	if path == pattern {
-		return true
-	}
-
-	if strings.Contains(pattern, "**") {
-		parts := strings.SplitN(pattern, "**", 2)
-		prefix := parts[0]
-		suffix := ""
-		if len(parts) > 1 {
-			suffix = strings.TrimPrefix(parts[1], "/")
-		}
-
-		if !strings.HasPrefix(path, prefix) {
-			return false
-		}
-		if suffix == "" {
-			return true
-		}
-
-		remaining := strings.TrimPrefix(path, prefix)
-		if strings.Contains(suffix, "*") {
-			return matchesReservationSuffixPattern(remaining, suffix)
-		}
-		return strings.HasSuffix(remaining, suffix)
-	}
-
-	if strings.Contains(pattern, "*") {
-		matched, err := pathpkg.Match(pattern, path)
-		if err == nil && matched {
-			return true
-		}
-		// path.Match keeps '*' within one path segment. The fallback is only
-		// for basename globs (for example, "*.go") that deliberately apply
-		// anywhere in the repository; applying it to a qualified pattern
-		// would allow '*' to cross a directory boundary.
-		if strings.Contains(pattern, "/") {
-			return false
-		}
-		return matchesReservationWildcardPattern(path, pattern)
-	}
-
-	return strings.HasPrefix(path, pattern+"/")
-}
-
-func matchesReservationWildcardPattern(path, pattern string) bool {
-	parts := strings.Split(pattern, "*")
-	if !strings.HasPrefix(path, parts[0]) {
-		return false
-	}
-	if !strings.HasSuffix(path, parts[len(parts)-1]) {
-		return false
-	}
-
-	remaining := path
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		idx := strings.Index(remaining, part)
-		if idx == -1 {
-			return false
-		}
-		remaining = remaining[idx+len(part):]
-	}
-	return true
-}
-
-func matchesReservationSuffixPattern(path, suffixPattern string) bool {
-	suffixSegments := strings.Count(suffixPattern, "/") + 1
-	pathParts := strings.Split(path, "/")
-	if len(pathParts) < suffixSegments {
-		return false
-	}
-	trailingPath := strings.Join(pathParts[len(pathParts)-suffixSegments:], "/")
-	return matchesReservationWildcardPattern(trailingPath, suffixPattern)
+	return reservationpath.Matches(pattern, path)
 }
 
 // GetReservation retrieves a specific file reservation by ID.

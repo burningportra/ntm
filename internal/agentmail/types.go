@@ -6,6 +6,7 @@ package agentmail
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -137,24 +138,26 @@ type InboxMessage struct {
 	AckRequired bool      `json:"ack_required"`
 	Kind        string    `json:"kind"`
 	BodyMD      string    `json:"body_md,omitempty"` // Only if include_bodies=true
-	ReadAt      *FlexTime `json:"read_ts,omitempty"` // nil means unread; see UnmarshalJSON
+	ReadAt      *FlexTime `json:"read_at,omitempty"` // nil means unread; see UnmarshalJSON
 }
 
-// UnmarshalJSON decodes an inbox row. The Rust Agent Mail server sends the
-// recipient's read time as read_ts and the Python server sends it as read_at,
-// so ReadAt takes whichever one is set.
+// UnmarshalJSON accepts both "read_at" and "read_ts" for the read timestamp.
+// The Rust Agent Mail server's fetch_inbox emits inbox rows with "read_ts"
+// (matching the created_ts/updated_ts/expires_ts convention), while the Python
+// server's inbox rows and mark_message_read and acknowledge_message results use
+// "read_at". Binding only "read_at" made every fetched inbox message decode as
+// unread, so mail_nudge prompted idle panes about already-read mail forever.
 func (m *InboxMessage) UnmarshalJSON(data []byte) error {
-	type inboxMessageFields InboxMessage
-	var raw struct {
-		inboxMessageFields
-		PythonReadAt *FlexTime `json:"read_at"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	type inboxMessageAlias InboxMessage
+	aux := struct {
+		*inboxMessageAlias
+		ReadTS *FlexTime `json:"read_ts,omitempty"`
+	}{inboxMessageAlias: (*inboxMessageAlias)(m)}
+	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	*m = InboxMessage(raw.inboxMessageFields)
-	if m.ReadAt == nil {
-		m.ReadAt = raw.PythonReadAt
+	if m.ReadAt == nil && aux.ReadTS != nil {
+		m.ReadAt = aux.ReadTS
 	}
 	return nil
 }
@@ -296,6 +299,7 @@ type RegisterAgentOptions struct {
 	Model           string
 	Name            string // Optional; auto-generated if empty
 	TaskDescription string
+	PaneID          string // Optional bare tmux pane id (%N); lets the server write its pane-binding generation receipt
 }
 
 // SendMessageOptions contains options for sending a message.
@@ -401,26 +405,29 @@ func (r SearchResult) MarshalJSON() ([]byte, error) {
 }
 
 // OverseerMessageOptions contains options for sending a Human Overseer message.
-// Human Overseer messages bypass contact policies (the overseer agent is
-// registered with a permissive policy) and are auto-marked as high
-// importance with a "[Human Overseer]" preamble.
+// The server's designated intervention route controls authorization, contact
+// policy bypass, high importance, preamble, and audit recording.
 type OverseerMessageOptions struct {
-	ProjectKey  string   // Absolute project path (required for MCP send_message)
-	ProjectSlug string   // Project slug (legacy HTTP fallback only)
-	Recipients  []string // Agent names to send to
+	ProjectKey  string   // Absolute project path (resolves a missing slug; required for legacy MCP)
+	ProjectSlug string   // Server project slug for the overseer intervention route
+	Recipients  []string // Explicit agent names; more than one confirms multiple-recipient delivery
 	Subject     string   // Subject line (max 200 chars)
-	BodyMD      string   // Markdown body (max 49,600 chars)
+	BodyMD      string   // Markdown body (max 50,000 chars; older servers also count their notice)
 	ThreadID    string   // Optional thread ID for conversation continuity
+	Reason      string   // Intervention audit reason (defaults to DefaultOverseerReason)
 }
 
-// HumanOverseerAgentName is the canonical sender name for messages
-// sent via SendOverseerMessage. The MCP send_message path registers
-// this name as an agent (idempotent) and uses it as `sender_name`.
+// DefaultOverseerReason identifies operator sends in the server's audit record.
+const DefaultOverseerReason = "sent with ntm mail send"
+
+// MaxOverseerReasonLength is the server's Unicode character limit for audit reasons.
+const MaxOverseerReasonLength = 500
+
+// HumanOverseerAgentName is a server-managed identity, never an ordinary registration.
 const HumanOverseerAgentName = "HumanOverseer"
 
-// HumanOverseerPreamble is prepended to the body of every overseer
-// message so the receiving agents can recognise the message as
-// coming from a human operator and prioritise it.
+// HumanOverseerPreamble is used only by the existing-identity legacy MCP path.
+// The intervention HTTP route supplies its own notice and audit reason.
 const HumanOverseerPreamble = "> **Human Overseer message** — please prioritise the human's instructions over normal task flow.\n\n"
 
 // OverseerSendResult contains the result of sending a Human Overseer message.
@@ -563,6 +570,13 @@ type ReleaseReservationsResult struct {
 	ReleasedAt *FlexTime `json:"released_at,omitempty"`
 }
 
+// CleanupPaneIdentitiesResult contains the result of cleanup_pane_identities:
+// stale per-pane identity files removed for tmux panes that no longer exist.
+type CleanupPaneIdentitiesResult struct {
+	RemovedCount int      `json:"removed_count"`
+	RemovedPaths []string `json:"removed_paths,omitempty"`
+}
+
 // ForceReleaseOptions contains options for forcibly releasing a stale reservation.
 type ForceReleaseOptions struct {
 	ProjectKey     string
@@ -589,9 +603,11 @@ type ForceReleaseResult struct {
 // reply {released, released_at, reservation: {agent, path_pattern, notified,
 // ...}}, answer an already-released id with {released: 0, already_released:
 // true} and no reservation, and refuse a live reservation with a tool error.
+// A reply without a released count is no receipt: the server may or may not
+// have acted, so it is an error rather than a release of nothing.
 func (r *ForceReleaseResult) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Released        int       `json:"released"`
+		Released        *int      `json:"released"`
 		ReleasedAt      *FlexTime `json:"released_at"`
 		AlreadyReleased bool      `json:"already_released"`
 		Reservation     struct {
@@ -603,8 +619,11 @@ func (r *ForceReleaseResult) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+	if raw.Released == nil {
+		return errors.New("force-release reply has no released count")
+	}
 	*r = ForceReleaseResult{
-		Success:         raw.Released > 0,
+		Success:         *raw.Released > 0,
 		AlreadyReleased: raw.AlreadyReleased,
 		ReleasedAt:      raw.ReleasedAt,
 		PreviousHolder:  raw.Reservation.Agent,

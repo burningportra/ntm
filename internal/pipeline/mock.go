@@ -19,34 +19,105 @@ import (
 // with Executor.SetTmuxClient to avoid touching a live tmux server.
 type TmuxClient interface {
 	GetPanes(session string) ([]tmux.Pane, error)
-	// SubmitPrompt types prompt into target and submits it the way a pane
-	// of agentType needs.
-	SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error
+	// PrepareDelivery applies the shared live-agent and composer preflight.
+	// It never sends prompt bytes. A marked pre-actuation failure allows the
+	// live executor to retain proof that its own attempt was never sent.
+	PrepareDelivery(ctx context.Context, pane tmux.Pane, agentType string) error
+	PasteKeys(target, content string, enter bool) error
 	CapturePaneOutput(target string, lines int) (string, error)
+	// VerifySubmission confirms that a payload just pasted into target
+	// actually left the agent's composer (ntm#320). A nil error means the
+	// submission is confirmed, or that this agent kind has no verifier and
+	// makes no claim; a non-nil error means the composer is still visibly
+	// holding the payload after a bounded rescue, so the dispatch must NOT be
+	// treated as delivered and must never be waited on for completion.
+	VerifySubmission(ctx context.Context, target, message, agentType string, paneWidth int) error
+}
+
+// agentPromptSender is the agent-aware prompt send: the text the way a pane of
+// agentType takes it and the Enters it needs. realTmuxClient and
+// MockTmuxClient implement it; an injected TmuxClient without it keeps
+// PasteKeys. It only actuates: callers run PrepareDelivery before it and
+// VerifySubmission after it.
+type agentPromptSender interface {
+	SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error
+}
+
+// submitAgentPrompt sends prompt to target with the client's agent-aware send
+// when it has one, else with PasteKeys and one Enter.
+func submitAgentPrompt(ctx context.Context, client TmuxClient, target, agentType, prompt string) error {
+	if sender, ok := client.(agentPromptSender); ok {
+		return sender.SubmitPrompt(ctx, target, tmux.AgentType(agentType), prompt)
+	}
+	return client.PasteKeys(target, prompt, true)
 }
 
 type realTmuxClient struct{}
+
+// Endpoint identifies the tmux server namespace used by physical pane IDs.
+// It is optional on TmuxClient so existing injected clients remain compatible.
+func (realTmuxClient) Endpoint() string {
+	if tmux.DefaultClient.Remote == "" {
+		return "local"
+	}
+	return "ssh:" + tmux.DefaultClient.Remote
+}
 
 func (realTmuxClient) GetPanes(session string) ([]tmux.Pane, error) {
 	return tmux.GetPanes(session)
 }
 
-// SubmitPrompt goes through dispatch.TMUXDeliverer.SubmitPrompt, the submit
-// path ntm send uses: typed with send-keys and a 100 ms Enter, a multi-line
-// prompt reached Claude and Codex as keystrokes and stayed an unsent draft in
-// Muse.
+func (realTmuxClient) GetPanesContext(ctx context.Context, session string) ([]tmux.Pane, error) {
+	return tmux.GetPanesContext(ctx, session)
+}
+
+func (realTmuxClient) PrepareDelivery(ctx context.Context, pane tmux.Pane, agentType string) error {
+	_, err := dispatch.PrepareTMUXDelivery(ctx, dispatch.Delivery{Target: dispatch.Target{
+		Pane: pane, Ref: pane.Ref(), AgentType: tmux.AgentType(agentType),
+	}})
+	return err
+}
+
+func (realTmuxClient) PasteKeys(target, content string, enter bool) error {
+	return tmux.PasteKeys(target, content, enter)
+}
+
+// SubmitPrompt sends prompt with the protocol ntm send plans for agentType
+// (dispatch.DefaultProtocolPlanner): the agent-aware text send (a paste for a
+// multi-line prompt) and the double Enter for agent panes, one Enter after
+// the shell delay for user and unknown panes. PasteKeys typed every prompt
+// with a 100 ms Enter, so a multi-line prompt reached Claude and Codex as
+// keystrokes and stayed an unsent draft in Muse. The preflight and the
+// submission check stay with the caller.
 func (realTmuxClient) SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error {
-	return dispatch.TMUXDeliverer{}.SubmitPrompt(ctx, target, agentType, prompt)
+	plan, err := dispatch.DefaultProtocolPlanner{}.PlanDelivery(ctx, dispatch.Target{AgentType: agentType}, true)
+	if err != nil {
+		return err
+	}
+	if plan.Protocol == dispatch.ProtocolDoubleEnter {
+		return tmux.DefaultClient.SendKeysForAgentDoubleEnterContext(ctx, target, prompt, agentType)
+	}
+	return tmux.DefaultClient.SendKeysForAgentWithDelayContext(ctx, target, prompt, true, plan.EnterDelay, agentType)
 }
 
 func (realTmuxClient) CapturePaneOutput(target string, lines int) (string, error) {
 	return tmux.CapturePaneOutput(target, lines)
 }
 
-// MockTmuxPaste records one SubmitPrompt call made against the mock.
+func (realTmuxClient) CapturePaneOutputContext(ctx context.Context, target string, lines int) (string, error) {
+	return tmux.CapturePaneOutputContext(ctx, target, lines)
+}
+
+func (realTmuxClient) VerifySubmission(ctx context.Context, target, message, agentType string, paneWidth int) error {
+	return dispatch.VerifyAgentSubmission(ctx, target, message, tmux.AgentType(agentType), paneWidth)
+}
+
+// MockTmuxPaste records one PasteKeys or SubmitPrompt call made against the
+// mock. AgentType is set only by SubmitPrompt, which always submits.
 type MockTmuxPaste struct {
 	Target    string
 	Content   string
+	Enter     bool
 	AgentType tmux.AgentType
 }
 
@@ -57,6 +128,14 @@ type mockTmuxPaneState struct {
 	pastes  []MockTmuxPaste
 }
 
+// MockTmuxVerification records one VerifySubmission call made against the mock.
+type MockTmuxVerification struct {
+	Target    string
+	Message   string
+	AgentType string
+	PaneWidth int
+}
+
 // MockTmuxClient is a deterministic in-memory tmux substitute for executor tests.
 type MockTmuxClient struct {
 	mu           sync.Mutex
@@ -64,6 +143,61 @@ type MockTmuxClient struct {
 	scripter     *AgentScripter
 	deliveryGate <-chan struct{}
 	deliveryWG   sync.WaitGroup
+	// verifier decides the outcome of VerifySubmission. Nil means "always
+	// confirmed", which is what an agent that submits normally looks like.
+	verifier      func(target, message, agentType string) error
+	verifications []MockTmuxVerification
+}
+
+// SetSubmissionVerifier installs the outcome of future VerifySubmission calls.
+// Returning a non-nil error models a composer that is still holding the
+// payload after the bounded rescue — the stranded-prompt case from ntm#320.
+// Passing nil restores the default "always confirmed" behavior.
+func (m *MockTmuxClient) SetSubmissionVerifier(fn func(target, message, agentType string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.verifier = fn
+}
+
+// VerificationHistory returns a copy of the recorded VerifySubmission calls,
+// so a test can assert that dispatch verified before waiting and that it
+// verified exactly once per send.
+func (m *MockTmuxClient) VerificationHistory() []MockTmuxVerification {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	history := make([]MockTmuxVerification, len(m.verifications))
+	copy(history, m.verifications)
+	return history
+}
+
+// VerifySubmission records the call and returns the installed verdict.
+func (m *MockTmuxClient) VerifySubmission(ctx context.Context, target, message, agentType string, paneWidth int) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	m.mu.Lock()
+	m.verifications = append(m.verifications, MockTmuxVerification{
+		Target:    target,
+		Message:   message,
+		AgentType: agentType,
+		PaneWidth: paneWidth,
+	})
+	verifier := m.verifier
+	m.mu.Unlock()
+	if verifier == nil {
+		return nil
+	}
+	return verifier(target, message, agentType)
+}
+
+// PrepareDelivery models a ready composer while retaining the shared refusal
+// for an agent that exited to a shell. Tests of visible UI gates can override
+// this method with realTmuxClient.PrepareDelivery and a captured-screen fixture.
+func (m *MockTmuxClient) PrepareDelivery(ctx context.Context, pane tmux.Pane, _ string) error {
+	if err := ctx.Err(); err != nil {
+		return dispatch.GuaranteeNoDeliveryActuation(err)
+	}
+	return dispatch.GuaranteeNoDeliveryActuation(dispatch.RefuseDeadAgentPane(pane))
 }
 
 // NewMockTmuxClient creates a mock with optional global pane fixtures.
@@ -85,7 +219,8 @@ func (m *MockTmuxClient) AddPane(session string, pane tmux.Pane) {
 	m.panes[pane.ID] = &mockTmuxPaneState{session: session, pane: pane}
 }
 
-// SetAgentScripter installs scripted responses for future SubmitPrompt calls.
+// SetAgentScripter installs scripted responses for future PasteKeys and
+// SubmitPrompt calls.
 func (m *MockTmuxClient) SetAgentScripter(scripter *AgentScripter) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -106,6 +241,7 @@ func (m *MockTmuxClient) Reset() {
 		state.output = ""
 		state.pastes = nil
 	}
+	m.verifications = nil
 	if m.scripter != nil {
 		m.scripter.Reset()
 	}
@@ -135,7 +271,7 @@ func (m *MockTmuxClient) AppendPaneOutput(target, output string) error {
 	return nil
 }
 
-// PasteHistory returns a copy of the recorded SubmitPrompt calls.
+// PasteHistory returns a copy of the recorded PasteKeys and SubmitPrompt calls.
 func (m *MockTmuxClient) PasteHistory(target string) ([]MockTmuxPaste, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -169,9 +305,19 @@ func (m *MockTmuxClient) GetPanes(session string) ([]tmux.Pane, error) {
 	return panes, nil
 }
 
+// PasteKeys records the prompt and appends it to the target pane's output.
+func (m *MockTmuxClient) PasteKeys(target, content string, enter bool) error {
+	return m.recordPaste(MockTmuxPaste{Target: target, Content: content, Enter: enter})
+}
+
 // SubmitPrompt records the prompt with its agent type and appends it, with
 // the submitting newline, to the target pane's output.
 func (m *MockTmuxClient) SubmitPrompt(_ context.Context, target string, agentType tmux.AgentType, content string) error {
+	return m.recordPaste(MockTmuxPaste{Target: target, Content: content, Enter: true, AgentType: agentType})
+}
+
+func (m *MockTmuxClient) recordPaste(paste MockTmuxPaste) error {
+	target, content := paste.Target, paste.Content
 	m.mu.Lock()
 	_, ok := m.panes[target]
 	scripter := m.scripter
@@ -199,12 +345,11 @@ func (m *MockTmuxClient) SubmitPrompt(_ context.Context, target string, agentTyp
 		m.mu.Unlock()
 		return fmt.Errorf("mock tmux pane %q not found", target)
 	}
-	state.pastes = append(state.pastes, MockTmuxPaste{
-		Target:    target,
-		Content:   content,
-		AgentType: agentType,
-	})
-	state.output += content + "\n"
+	state.pastes = append(state.pastes, paste)
+	state.output += content
+	if paste.Enter {
+		state.output += "\n"
+	}
 	m.mu.Unlock()
 
 	if hasScriptedResponse {
@@ -275,6 +420,9 @@ func normalizeMockPane(pane tmux.Pane, ordinal int) tmux.Pane {
 	}
 	if pane.Index == 0 {
 		pane.Index = ordinal
+	}
+	if pane.PID == 0 {
+		pane.PID = 10000 + ordinal
 	}
 	return pane
 }

@@ -68,6 +68,11 @@ type MailCheckAgentHints struct {
 
 // MailCheckOptions configures the GetMailCheck operation
 type MailCheckOptions struct {
+	// Client is the Agent Mail client to use. The CLI passes its fully
+	// configured client (config-file URL/token plus hydrated per-project
+	// registration tokens); when nil, an environment-configured default
+	// client is constructed, preserving direct-caller behavior.
+	Client        *agentmail.Client
 	Project       string
 	Agent         string
 	Thread        string
@@ -303,8 +308,13 @@ func GetMailCheck(opts MailCheckOptions) (*MailCheckOutput, error) {
 		}, nil
 	}
 
-	// Create Agent Mail client
-	client := newAgentMailClient(opts.Project)
+	// Use the injected (configured) Agent Mail client when the caller
+	// supplied one; otherwise build one from the merged [agent_mail] config
+	// for the project, like every other robot Agent Mail client.
+	client := opts.Client
+	if client == nil {
+		client = newAgentMailClient(opts.Project)
+	}
 
 	// Check availability
 	if !client.IsAvailable() {
@@ -312,7 +322,7 @@ func GetMailCheck(opts MailCheckOptions) (*MailCheckOutput, error) {
 			RobotResponse: NewErrorResponse(
 				fmt.Errorf("Agent Mail not available"),
 				ErrCodeDependencyMissing,
-				"Start Agent Mail server: mcp-agent-mail or ensure it's running",
+				"Ensure the Agent Mail server (mcp-agent-mail) is running and the configured Agent Mail URL/token are correct",
 			),
 			Project:  opts.Project,
 			Messages: []MailCheckMessage{},
@@ -556,14 +566,6 @@ func mailCheckMessageFromEntry(entry mailCheckInboxEntry, includeBodies bool) Ma
 	}
 }
 
-func mailCheckMessageFromInbox(msg agentmail.InboxMessage, recipient string, includeBodies bool) MailCheckMessage {
-	return mailCheckMessageFromEntry(mailCheckInboxEntry{
-		Message:    msg,
-		Recipients: []string{recipient},
-		AllRead:    msg.ReadAt != nil,
-	}, includeBodies)
-}
-
 // PrintMailCheck outputs mail check results as JSON.
 // This is a thin wrapper around GetMailCheck() for CLI output.
 func PrintMailCheck(opts MailCheckOptions) error {
@@ -572,24 +574,4 @@ func PrintMailCheck(opts MailCheckOptions) error {
 		return err
 	}
 	return encodeTerminalRobotOutput(output, output.RobotResponse, "robot mail check failed")
-}
-
-// truncateStringMail truncates a string to the specified rune length, then adds "..." if truncated.
-// Respects UTF-8 rune boundaries to avoid producing invalid strings.
-// Named differently to avoid redeclaration with tui_parity.go's truncateString.
-func truncateStringMail(s string, maxLen int) string {
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return strings.TrimSpace(s)
-	}
-	if maxLen <= 3 {
-		return strings.TrimSpace(string(runes[:maxLen]))
-	}
-	// Find a good break point within the rune slice
-	truncated := string(runes[:maxLen])
-	// Try to break at last space
-	if lastSpace := strings.LastIndex(truncated, " "); lastSpace > len(truncated)/2 {
-		truncated = truncated[:lastSpace]
-	}
-	return strings.TrimSpace(truncated) + "..."
 }

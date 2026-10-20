@@ -11,6 +11,34 @@ import (
 	"time"
 )
 
+// Test-only registry accessors retained after the exported production
+// wrappers were removed as dead code; registry tests still need direct
+// lookup/list/reset access.
+
+// GetPipelineExecution returns a pipeline by run ID.
+func GetPipelineExecution(runID string) *PipelineExecution {
+	return getPipeline(runID)
+}
+
+// GetAllPipelines returns all tracked pipelines.
+func GetAllPipelines() []*PipelineExecution {
+	pipelineMu.RLock()
+	defer pipelineMu.RUnlock()
+
+	result := make([]*PipelineExecution, 0, len(pipelineRegistry))
+	for _, exec := range pipelineRegistry {
+		result = append(result, exec)
+	}
+	return result
+}
+
+// ClearPipelineRegistry clears the pipeline registry between tests.
+func ClearPipelineRegistry() {
+	pipelineMu.Lock()
+	pipelineRegistry = make(map[string]*PipelineExecution)
+	pipelineMu.Unlock()
+}
+
 // captureStdout captures stdout during function execution
 func captureStdout(t *testing.T, f func()) string {
 	t.Helper()
@@ -1753,15 +1781,17 @@ steps:
 		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, output)
 	}
 
-	state, err := LoadState(tmpDir, result.RunID)
-	if err != nil {
-		t.Fatalf("LoadState(%q) failed: %v", result.RunID, err)
+	// Dry runs are write-free (82dda265): the start-from outcome is reported
+	// in the output's progress, and no checkpoint may be persisted.
+	if !result.DryRun || result.Status != string(StatusCompleted) {
+		t.Fatalf("dry run result = %+v, want completed dry run", result)
 	}
-	if got := state.Steps["step1"]; got.Status != StatusSkipped || got.SkipReason != StartFromSkipReason {
-		t.Fatalf("step1 result = %#v, want start-from skipped", got)
+	progress := result.Progress
+	if progress.Total != 3 || progress.Skipped != 1 || progress.Completed != 2 || progress.SkipKindCounts[SkipKindStartFrom] != 1 {
+		t.Fatalf("progress = %+v, want step1 start-from skipped and step2/step3 completed", progress)
 	}
-	if got := state.Steps["step2"]; got.Status != StatusCompleted {
-		t.Fatalf("step2 status = %v, want completed", got.Status)
+	if _, err := LoadState(tmpDir, result.RunID); err == nil {
+		t.Fatalf("dry run persisted checkpoint for %q", result.RunID)
 	}
 }
 

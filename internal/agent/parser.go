@@ -17,11 +17,6 @@ func NewParser() Parser {
 	return &parserImpl{config: DefaultParserConfig()}
 }
 
-// NewParserWithConfig creates a parser with custom configuration.
-func NewParserWithConfig(cfg ParserConfig) Parser {
-	return &parserImpl{config: cfg}
-}
-
 // Parse analyzes terminal output and returns structured agent state.
 // It performs the following steps:
 // 1. Detect agent type from output patterns
@@ -45,6 +40,10 @@ func (p *parserImpl) ParseWithHint(output string, hint AgentType) (*AgentState, 
 	// Step 1: Detect agent type
 	if canonicalHint := hint.Canonical(); canonicalHint.IsValid() {
 		state.Type = canonicalHint
+	} else if IsPluginType(canonicalHint) {
+		// A registered agent plugin is a real type: keep it so its declared
+		// readiness patterns drive classification (ntm#260).
+		state.Type = pluginKey(string(canonicalHint))
 	} else {
 		state.Type = p.DetectAgentType(cleanOutput)
 	}
@@ -87,6 +86,18 @@ func (p *parserImpl) DetectAgentType(output string) AgentType {
 	}
 	if codHeaderPattern.MatchString(output) {
 		return AgentTypeCodex
+	}
+
+	// Grok Build has a distinctive banner/status-line signature ("Grok Build
+	// 1.0.5" / "Grok 4.6 (high)").
+	if grokHeaderPattern.MatchString(output) {
+		return AgentTypeGrok
+	}
+
+	// Oh My Pi (omp): the welcome banner's top edge ("╭─── omp v18.2.3") on a
+	// fresh screen, otherwise its structurally unique status-line composer box.
+	if ompHeaderPattern.MatchString(output) || ParseOmpComposer(output).Found {
+		return AgentTypeOmp
 	}
 
 	// Antigravity patterns (checked before Gemini so an agy pane is not
@@ -216,12 +227,34 @@ func (p *parserImpl) extractMetrics(output string, state *AgentState) {
 		if mb := extractFloat(gmiMemoryPattern, output); mb != nil {
 			state.MemoryMB = mb
 		}
+		// Current Gemini labels context usage explicitly in its footer.
+		// Convert used to remaining for routing and low-context decisions;
+		// provider quota percentages must never trigger context rotation.
+		if state.Type == AgentTypeGemini {
+			if used, ok := GeminiContextUsage(output); ok {
+				remaining := 100 - used
+				state.ContextRemaining = &remaining
+				state.IsContextLow = remaining < p.config.ContextLowThreshold
+			}
+		}
 
 	case AgentTypeClaudeCode:
 		// Claude doesn't give explicit metrics
 		// We rely on warning messages instead
 		if matchAny(output, ccContextWarnings) {
 			state.IsContextLow = true
+		}
+
+	case AgentTypeOmp:
+		// omp embeds a context gauge in the composer's status line
+		// ("────6%────…262K───╮" / "6.0%/262K"): the percentage is context
+		// USED, so remaining is its complement.
+		if usedPct, _, ok := OmpContextUsage(output); ok {
+			remaining := 100 - usedPct
+			state.ContextRemaining = &remaining
+			if remaining < p.config.ContextLowThreshold {
+				state.IsContextLow = true
+			}
 		}
 
 	case AgentTypePi, AgentTypeKimi, AgentTypeMuse, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeOllama:
@@ -262,7 +295,7 @@ func (p *parserImpl) detectStateFlags(output string, state *AgentState) {
 	// the spinner-vs-turn-ended ordering in the live tail and is biased to
 	// false-WORKING, so trusting it can never mislabel a busy agent as idle.
 	if state.Type == AgentTypeClaudeCode {
-		if ClaudeActivelyWorking(output) {
+		if ClaudeActivelyWorking(output, 0) {
 			// Definitively working: a live spinner is the most-recent dynamic
 			// marker. Idle is impossible here regardless of the box being drawn.
 			state.IsWorking = true
@@ -278,6 +311,82 @@ func (p *parserImpl) detectStateFlags(output string, state *AgentState) {
 		// matches that linger after a turn ends. Otherwise fall back to the
 		// substring working heuristics so mid-stream content (code blocks, file
 		// operations) with no spinner frame in the capture still reads as work.
+		if state.IsIdle {
+			state.IsWorking = false
+		} else {
+			state.IsWorking = rawIsWorking
+		}
+		state.IsInError = p.detectError(output, state.Type)
+		return
+	}
+
+	// Grok Build gets the same live-tail treatment as Claude Code: its
+	// bordered composer ("│ ❯ …") is permanent chrome drawn even while a turn
+	// is in flight, so the braille-spinner activity line / "Esc:cancel" footer
+	// hint is the authoritative working signal and must win over the
+	// idle-looking composer (GH#251 phase 2, verified against grok 1.0.5).
+	if state.Type == AgentTypeGrok {
+		if GrokActivelyWorking(output, 0) {
+			state.IsWorking = true
+			state.IsIdle = false
+			if len(state.WorkIndicators) == 0 {
+				state.WorkIndicators = []string{"grok_live_spinner"}
+			}
+			state.IsInError = p.detectError(output, state.Type)
+			return
+		}
+		if state.IsIdle {
+			state.IsWorking = false
+		} else {
+			state.IsWorking = rawIsWorking
+		}
+		state.IsInError = p.detectError(output, state.Type)
+		return
+	}
+
+	// Oh My Pi draws its bordered composer box at all times, so the in-flight
+	// spinner/elapsed timer in the box's top border and the Esc-hint activity
+	// line above it are the authoritative working signals and must win over
+	// the idle-looking box (verified against live omp v18.2.3 captures).
+	if state.Type == AgentTypeOmp {
+		if OmpActivelyWorking(output, 0) {
+			state.IsWorking = true
+			state.IsIdle = false
+			if len(state.WorkIndicators) == 0 {
+				state.WorkIndicators = []string{"omp_live_spinner"}
+			}
+			state.IsInError = p.detectError(output, state.Type)
+			return
+		}
+		if _, failed := OmpProviderError(output); failed {
+			// A failed turn is not a completed one: the composer accepts input,
+			// but the pane is waiting for a retry ("continue"), not new work.
+			state.IsIdle = false
+			state.IsWorking = false
+			state.IsInError = true
+			return
+		}
+		if state.IsIdle {
+			state.IsWorking = false
+		} else {
+			state.IsWorking = rawIsWorking
+		}
+		state.IsInError = p.detectError(output, state.Type)
+		return
+	}
+
+	// Antigravity keeps its composer/footer visible during work. The live
+	// "esc to cancel" hint is authoritative and must beat the prompt chrome.
+	if state.Type == AgentTypeAntigravity {
+		if AntigravityActivelyWorking(output, 0) {
+			state.IsWorking = true
+			state.IsIdle = false
+			if len(state.WorkIndicators) == 0 {
+				state.WorkIndicators = []string{"antigravity_live_cancel"}
+			}
+			state.IsInError = p.detectError(output, state.Type)
+			return
+		}
 		if state.IsIdle {
 			state.IsWorking = false
 		} else {
@@ -310,7 +419,9 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, ccRateLimitPatterns)
 	case AgentTypeCodex:
 		return matchAny(recentOutput, codRateLimitPatterns)
-	case AgentTypeGemini, AgentTypeAntigravity:
+	case AgentTypeGemini:
+		return len(geminiRateLimitIndicators(output)) > 0
+	case AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiRateLimitPatterns)
 	case AgentTypePi:
 		return matchAny(recentOutput, piRateLimitPatterns)
@@ -324,12 +435,22 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, windsurfRateLimitPatterns)
 	case AgentTypeAider:
 		return matchAny(recentOutput, aiderRateLimitPatterns)
-	case AgentTypeOpencode:
-		// Only the notice above the last turn counts: an earlier turn's
-		// quota error stays in the transcript after later turns succeed.
-		return OpencodeRateLimited(output)
 	case AgentTypeOllama:
 		return matchAny(recentOutput, ollamaRateLimitPatterns)
+	case AgentTypeOpencode:
+		// With the prompt box drawn, only the notice above the last turn
+		// counts: an earlier turn's quota error stays in the transcript after
+		// later turns succeed.
+		if opencodePromptBoxDrawn(output) {
+			return OpencodeRateLimited(output)
+		}
+		return matchAny(recentOutput, ocRateLimitPatterns)
+	case AgentTypeGrok:
+		return matchAny(recentOutput, grokRateLimitPatterns)
+	case AgentTypeOmp:
+		// No omp rate-limit frame has been captured; transcript mentions of
+		// rate limits must not park the pane (see the omp pattern notes).
+		return false
 	default:
 		// Check all patterns for unknown type
 		return matchAny(recentOutput, ccRateLimitPatterns) ||
@@ -355,9 +476,11 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 	case AgentTypeClaudeCode:
 		return matchAny(recentOutput, ccWorkingPatterns)
 	case AgentTypeCodex:
-		return matchAny(recentOutput, codWorkingPatterns)
-	case AgentTypeGemini, AgentTypeAntigravity:
-		return matchAny(recentOutput, gmiWorkingPatterns)
+		return CodexActivelyWorking(output, 0) || matchAny(recentOutput, codWorkingPatterns)
+	case AgentTypeGemini:
+		return DetectGeminiTurn(output) == GeminiTurnWorking || matchAny(recentOutput, gmiWorkingPatterns)
+	case AgentTypeAntigravity:
+		return AntigravityActivelyWorking(output, 0) || matchAny(recentOutput, gmiWorkingPatterns)
 	case AgentTypePi:
 		// Pi's status indicator is its only in-flight marker. Words such as
 		// "running" or the "Thinking..." label of a collapsed thinking block
@@ -373,13 +496,29 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, windsurfWorkingPatterns)
 	case AgentTypeAider:
 		return matchAny(recentOutput, aiderWorkingPatterns)
-	case AgentTypeOpencode:
-		// The progress bar below the prompt box is opencode's only in-flight
-		// marker; the box itself stays drawn for the whole turn.
-		return OpencodeActivelyWorking(output)
 	case AgentTypeOllama:
 		return matchAny(recentOutput, ollamaWorkingPatterns)
+	case AgentTypeGrok:
+		return GrokActivelyWorking(output, 0) || matchAny(recentOutput, grokWorkingPatterns)
+	case AgentTypeOpencode:
+		// The progress bar below the prompt box is opencode's in-flight
+		// marker; the box itself stays drawn for the whole turn, and the
+		// transcript can quote the interrupt hint, so the substring patterns
+		// only count when no box is drawn.
+		if opencodePromptBoxDrawn(output) {
+			return OpencodeActivelyWorking(output, 0)
+		}
+		return OpencodeActivelyWorking(output, 0) || matchAny(recentOutput, ocWorkingPatterns)
+	case AgentTypeOmp:
+		// The composer-anchored in-flight signals are authoritative; loose
+		// transcript keywords would keep a finished omp pane "working".
+		return OmpActivelyWorking(output, 0)
 	default:
+		// A registered plugin with declared Working patterns is authoritative
+		// for its own type; the generic union below is for truly unknown types.
+		if pp, ok := LookupPluginPatterns(agentType); ok && len(pp.Working) > 0 {
+			return PluginActivelyWorking(output, agentType, 0)
+		}
 		// Check all patterns for unknown type
 		return matchAny(recentOutput, ccWorkingPatterns) ||
 			matchAny(recentOutput, codWorkingPatterns) ||
@@ -418,7 +557,7 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		// relative order of the spinner vs. turn-ended markers in the live tail
 		// (see patterns.go) and is biased to false-WORKING when ambiguous, so
 		// gating on it here can never produce a false-idle for a busy agent.
-		if ClaudeActivelyWorking(output) {
+		if ClaudeActivelyWorking(output, 0) {
 			return false
 		}
 		// Idle when a finished-turn prompt is showing. This covers both the
@@ -435,11 +574,19 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		}
 		return false
 	case AgentTypeCodex:
-		return matchAnyRegex(lastLines, codIdlePatterns)
-	case AgentTypeGemini, AgentTypeAntigravity:
-		// Gemini (and its successor Antigravity) are trickier - check for prompt
-		// or lack of working indicators
-		return matchAnyRegex(lastLines, gmiIdlePatterns)
+		// Codex keeps its chevron visible throughout a turn. Use the same
+		// live-work veto as the canonical detector, including spinners above
+		// the composer and truncated interrupt hints in narrow panes.
+		return !CodexActivelyWorking(output, 0) && matchAnyRegex(lastLines, codIdlePatterns)
+	case AgentTypeGemini:
+		// The composer persists while a response runs; its live cancel hint
+		// or spinner must veto idle, including when drawn above the prompt.
+		return DetectGeminiTurn(output) == GeminiTurnIdle
+	case AgentTypeAntigravity:
+		if AntigravityActivelyWorking(output, 0) {
+			return false
+		}
+		return matchAnyRegex(lastLines, agyIdlePatterns)
 	case AgentTypePi:
 		// Pi's footer runs below the editor, so the editor is anchored from
 		// the bottom of the whole capture rather than read from lastLines.
@@ -459,13 +606,46 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		return matchAnyRegex(lastLines, windsurfIdlePatterns)
 	case AgentTypeAider:
 		return matchAnyRegex(lastLines, aiderIdlePatterns)
-	case AgentTypeOpencode:
-		// opencode draws no prompt glyph: its prompt is a box above the
-		// footer, anchored from the bottom of the whole capture as for Pi.
-		return OpencodeIdlePromptShowing(output)
 	case AgentTypeOllama:
 		return matchAnyRegex(lastLines, ollamaIdlePatterns)
+	case AgentTypeGrok:
+		// Empty output with a known grok pane reads as idle (fresh spawn),
+		// mirroring the Claude arm. A live in-flight marker vetoes idle: the
+		// bordered composer is permanent chrome drawn during work.
+		if strings.TrimSpace(lastLines) == "" {
+			return true
+		}
+		if GrokActivelyWorking(output, 0) {
+			return false
+		}
+		return matchAnyRegex(lastLines, grokIdlePatterns)
+	case AgentTypeOpencode:
+		// Mirrors the grok arm: a fresh pane with no output reads as idle.
+		// Otherwise opencode draws no prompt glyph: its prompt is a box above
+		// the footer, anchored from the bottom of the whole capture as for Pi,
+		// with the empty-composer hint text as the idle signal when no box is
+		// drawn (OpencodeIdlePromptShowing).
+		if strings.TrimSpace(lastLines) == "" {
+			return true
+		}
+		return OpencodeIdlePromptShowing(output)
+	case AgentTypeOmp:
+		// Unlike grok/Claude, a blank omp pane is NOT idle: omp draws nothing
+		// for ~1s after launch and its composer appears in the same frame as
+		// the banner, so only a visible, quiet composer box is idle evidence.
+		return OmpIdlePromptShowing(output)
 	default:
+		// A registered plugin with declared readiness patterns: its Working
+		// patterns veto idle, its Idle patterns decide; with no Idle patterns
+		// declared fall through to the generic union (ntm#260).
+		if pp, ok := LookupPluginPatterns(agentType); ok && pp.Declared() {
+			if PluginActivelyWorking(output, agentType, 0) {
+				return false
+			}
+			if idle, declared := PluginIdlePromptShowing(lastLines, agentType); declared {
+				return idle
+			}
+		}
 		// Check all idle patterns for unknown type
 		return matchAnyRegex(lastLines, ccIdlePatterns) ||
 			matchAnyRegex(lastLines, codIdlePatterns) ||
@@ -487,7 +667,7 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 
 	switch agentType {
 	case AgentTypeClaudeCode:
-		switch DetectClaudeTurnState(output) {
+		switch DetectClaudeTurnState(output, 0) {
 		case ClaudeTurnWorking, ClaudeTurnEnded:
 			return false
 		case ClaudeTurnError:
@@ -495,6 +675,13 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 		}
 		return matchAny(recentOutput, ccErrorPatterns)
 	case AgentTypeCodex:
+		// A live turn can be repairing a tool failure or discussing an
+		// earlier error. Do not recommend intervention in active work merely
+		// because that transcript text is still visible. Rate-limit handling
+		// remains the higher-priority blocking path in detectStateFlags.
+		if CodexActivelyWorking(output, 0) {
+			return false
+		}
 		return matchAny(recentOutput, codErrorPatterns)
 	case AgentTypeGemini, AgentTypeAntigravity:
 		return matchAny(recentOutput, gmiErrorPatterns)
@@ -510,13 +697,29 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, windsurfErrorPatterns)
 	case AgentTypeAider:
 		return matchAny(recentOutput, aiderErrorPatterns)
+	case AgentTypeOllama:
+		return matchAny(recentOutput, ollamaErrorPatterns)
+	case AgentTypeGrok:
+		return matchAny(recentOutput, grokErrorPatterns)
 	case AgentTypeOpencode:
 		// The prompt box and its footer fill the last lines, so the error
 		// that ended a turn sits above them, out of recentOutput's reach.
-		return OpencodeErrorShowing(output)
-	case AgentTypeOllama:
-		return matchAny(recentOutput, ollamaErrorPatterns)
+		if opencodePromptBoxDrawn(output) {
+			return OpencodeErrorShowing(output)
+		}
+		return matchAny(recentOutput, ocErrorPatterns)
+	case AgentTypeOmp:
+		// The dismissable provider-error block is recognised structurally
+		// (framed above a quiet composer), so a block left over while a
+		// retried turn runs never reads as an error.
+		if _, ok := OmpProviderError(output); ok {
+			return true
+		}
+		return matchAny(recentOutput, ompErrorPatterns)
 	default:
+		if pp, ok := LookupPluginPatterns(agentType); ok && len(pp.Error) > 0 {
+			return PluginErrorShowing(recentOutput, agentType)
+		}
 		// Check all patterns for unknown type
 		return matchAny(recentOutput, ccErrorPatterns) ||
 			matchAny(recentOutput, codErrorPatterns) ||
@@ -541,7 +744,9 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		return collectMatches(recentOutput, ccRateLimitPatterns)
 	case AgentTypeCodex:
 		return collectMatches(recentOutput, codRateLimitPatterns)
-	case AgentTypeGemini, AgentTypeAntigravity:
+	case AgentTypeGemini:
+		return geminiRateLimitIndicators(output)
+	case AgentTypeAntigravity:
 		return collectMatches(recentOutput, gmiRateLimitPatterns)
 	case AgentTypePi:
 		return collectMatches(recentOutput, piRateLimitPatterns)
@@ -555,10 +760,17 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		return collectMatches(recentOutput, windsurfRateLimitPatterns)
 	case AgentTypeAider:
 		return collectMatches(recentOutput, aiderRateLimitPatterns)
-	case AgentTypeOpencode:
-		return []string{"opencode_rate_limit_notice"}
 	case AgentTypeOllama:
 		return collectMatches(recentOutput, ollamaRateLimitPatterns)
+	case AgentTypeOpencode:
+		if opencodePromptBoxDrawn(output) {
+			return []string{"opencode_rate_limit_notice"}
+		}
+		return collectMatches(recentOutput, ocRateLimitPatterns)
+	case AgentTypeGrok:
+		return collectMatches(recentOutput, grokRateLimitPatterns)
+	case AgentTypeOmp:
+		return nil
 	default:
 		// Collect from all for unknown type
 		matches := collectMatches(recentOutput, ccRateLimitPatterns)
@@ -584,9 +796,23 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 	case AgentTypeClaudeCode:
 		return collectMatches(recentOutput, ccWorkingPatterns)
 	case AgentTypeCodex:
-		return collectMatches(recentOutput, codWorkingPatterns)
-	case AgentTypeGemini, AgentTypeAntigravity:
-		return collectMatches(recentOutput, gmiWorkingPatterns)
+		matches := collectMatches(recentOutput, codWorkingPatterns)
+		if CodexActivelyWorking(output, 0) {
+			matches = append(matches, "codex_live_activity")
+		}
+		return matches
+	case AgentTypeGemini:
+		matches := collectMatches(recentOutput, gmiWorkingPatterns)
+		if DetectGeminiTurn(output) == GeminiTurnWorking {
+			matches = append(matches, "gemini_live_activity")
+		}
+		return matches
+	case AgentTypeAntigravity:
+		matches := collectMatches(recentOutput, gmiWorkingPatterns)
+		if AntigravityActivelyWorking(output, 0) {
+			matches = append(matches, "antigravity_live_cancel")
+		}
+		return matches
 	case AgentTypePi:
 		return []string{"pi_status_indicator"}
 	case AgentTypeKimi:
@@ -599,10 +825,25 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 		return collectMatches(recentOutput, windsurfWorkingPatterns)
 	case AgentTypeAider:
 		return collectMatches(recentOutput, aiderWorkingPatterns)
-	case AgentTypeOpencode:
-		return []string{"opencode_progress_bar"}
 	case AgentTypeOllama:
 		return collectMatches(recentOutput, ollamaWorkingPatterns)
+	case AgentTypeOpencode:
+		if opencodePromptBoxDrawn(output) {
+			return []string{"opencode_progress_bar"}
+		}
+		return collectMatches(recentOutput, ocWorkingPatterns)
+	case AgentTypeGrok:
+		matches := collectMatches(recentOutput, grokWorkingPatterns)
+		if len(matches) == 0 && GrokActivelyWorking(output, 0) {
+			matches = []string{"grok_live_spinner"}
+		}
+		return matches
+	case AgentTypeOmp:
+		matches := collectMatches(recentOutput, ompWorkingPatterns)
+		if len(matches) == 0 && OmpActivelyWorking(output, 0) {
+			matches = []string{"omp_live_spinner"}
+		}
+		return matches
 	default:
 		matches := collectMatches(recentOutput, ccWorkingPatterns)
 		matches = append(matches, collectMatches(recentOutput, codWorkingPatterns)...)

@@ -100,6 +100,23 @@ func (l *AuditLogger) LogBlocked(command, pane, session, rule, dcgOutput string)
 	return l.writeEntry(entry)
 }
 
+// LogChecked logs a completed check-cycle event. Exactly one entry is written
+// per command run through a DCG check, regardless of outcome, so consumers
+// (e.g. ntm --robot-dcg-status) can report a real commands-checked counter.
+func (l *AuditLogger) LogChecked(command, pane, session, rule, dcgOutput string) error {
+	entry := AuditEntry{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Event:     "command_checked",
+		Command:   command,
+		Pane:      pane,
+		Session:   session,
+		Rule:      rule,
+		DCGOutput: dcgOutput,
+	}
+
+	return l.writeEntry(entry)
+}
+
 // writeEntry marshals and writes an entry to the log
 func (l *AuditLogger) writeEntry(entry AuditEntry) error {
 	l.mu.Lock()
@@ -183,25 +200,6 @@ func (l *AuditLogger) checkRotation() error {
 	return nil
 }
 
-// Flush flushes any buffered data to disk
-func (l *AuditLogger) Flush() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return nil
-	}
-
-	if err := l.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush buffer: %w", err)
-	}
-	if err := l.file.Sync(); err != nil {
-		return fmt.Errorf("failed to sync file: %w", err)
-	}
-
-	return nil
-}
-
 // Close flushes and closes the audit logger
 func (l *AuditLogger) Close() error {
 	l.mu.Lock()
@@ -225,9 +223,4 @@ func (l *AuditLogger) Close() error {
 	}
 
 	return nil
-}
-
-// Path returns the path to the audit log file
-func (l *AuditLogger) Path() string {
-	return l.path
 }

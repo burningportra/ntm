@@ -104,11 +104,27 @@ func (m *Meta) HasMore() bool {
 	return m.NextCursor != ""
 }
 
-// Aggregations contains aggregated stats from search results
+// Aggregations is the aggregations object of
+// `cass search --aggregate=agent,workspace,date,match_type`: count buckets for
+// each requested field.
 type Aggregations struct {
-	Agents     map[string]int `json:"agents,omitempty"`
-	Workspaces map[string]int `json:"workspaces,omitempty"`
-	Tags       map[string]int `json:"tags,omitempty"`
+	Agent     *AggregationBuckets `json:"agent,omitempty"`
+	Workspace *AggregationBuckets `json:"workspace,omitempty"`
+	Date      *AggregationBuckets `json:"date,omitempty"`
+	MatchType *AggregationBuckets `json:"match_type,omitempty"`
+}
+
+// AggregationBuckets lists a field's most frequent values, largest first;
+// OtherCount counts the matches past cass's bucket cap.
+type AggregationBuckets struct {
+	Buckets    []AggregationBucket `json:"buckets"`
+	OtherCount int                 `json:"other_count"`
+}
+
+// AggregationBucket is one field value and how many matches carry it.
+type AggregationBucket struct {
+	Key   string `json:"key"`
+	Count int    `json:"count"`
 }
 
 // SearchResponse represents the full response from a CASS search
@@ -186,6 +202,7 @@ type DBInfo struct {
 	OpenSkipped   bool   `json:"open_skipped"`
 	CountsSkipped bool   `json:"counts_skipped"`
 	SizeBytes     int64  `json:"size_bytes"`
+	DBBytes       int64  `json:"db_bytes"` // current cass name for the database size
 	Healthy       bool   `json:"healthy"`
 	SessionCount  int64  `json:"session_count"`
 	Conversations int64  `json:"conversations"`
@@ -203,7 +220,8 @@ func (d DBInfo) IsUsable() bool {
 	return d.Healthy || d.Opened || (d.Exists && d.Path != "")
 }
 
-// Pending tracks items waiting to be indexed
+// Pending tracks items waiting to be indexed. Current cass reports sessions;
+// Files comes from the legacy status schema.
 type Pending struct {
 	Sessions int `json:"sessions"`
 	Files    int `json:"files"`
@@ -252,6 +270,12 @@ func (s *StatusResponse) UnmarshalJSON(data []byte) error {
 	// omit conversations/messages rather than surfacing misleading zeros.
 	if s.Database.OpenSkipped {
 		s.Database.CountsSkipped = true
+	}
+	if s.Database.SizeBytes == 0 {
+		s.Database.SizeBytes = s.Database.DBBytes
+	}
+	if s.Index.Documents == 0 {
+		s.Index.Documents = s.Index.DocCount
 	}
 	if s.LastIndexedAt.IsZero() {
 		s.LastIndexedAt = FlexTime{Time: s.Index.EffectiveLastIndexedAt(FlexTime{})}
@@ -343,40 +367,12 @@ type CASSError struct {
 	Hint    string `json:"hint,omitempty"`
 }
 
-func (e CASSError) Error() string {
-	if e.Hint != "" {
-		return fmt.Sprintf("%s (hint: %s)", e.Message, e.Hint)
-	}
-	return e.Message
-}
-
 // Message represents a chat message in a timeline
 type Message struct {
 	ID        string    `json:"id"`
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	Timestamp *FlexTime `json:"timestamp,omitempty"`
-}
-
-// TimestampTime returns the message timestamp as time.Time
-func (m Message) TimestampTime() time.Time {
-	if m.Timestamp == nil {
-		return time.Time{}
-	}
-	return m.Timestamp.Time
-}
-
-// TimelineEntry represents an event in the timeline
-type TimelineEntry struct {
-	ID        string   `json:"id"`
-	Type      string   `json:"type"`
-	Timestamp FlexTime `json:"timestamp"`
-	Data      any      `json:"data"`
-}
-
-// TimestampTime returns the entry timestamp as time.Time
-func (e TimelineEntry) TimestampTime() time.Time {
-	return e.Timestamp.Time
 }
 
 // SearchOptions configures a search request

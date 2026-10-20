@@ -144,12 +144,6 @@ const (
 // CompleteIdleThreshold is the time without activity to consider "complete".
 const CompleteIdleThreshold = 5 * time.Second
 
-// GetWait executes the wait operation and returns the response data.
-// Returns the response and normalized robot exit code (0=success, 1=error).
-func GetWait(opts WaitOptions) (*WaitResponse, int) {
-	return GetWaitContext(context.Background(), opts)
-}
-
 // GetWaitContext executes the wait operation while honoring caller cancellation.
 // The CLI and HTTP transports pass their request context so disconnects and
 // interrupt signals stop pending polling instead of waiting for the full timeout.
@@ -162,11 +156,61 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 		return waitContextCanceledResponse(opts, startTime, err), 1
 	}
 
+	// Bound lookup, polling, and captures by both caller cancellation and the
+	// wait's own deadline. The caller's cancellation takes precedence.
+	deadline := startTime.Add(opts.Timeout)
+	waitCtx, cancelWait := context.WithDeadline(ctx, deadline)
+	defer cancelWait()
+
+	var hasAttention, hasConvergence bool
+	var attentionCursor int64
+	var convergenceState ConvergenceState
+	var lastProductivity *ProductivityOutput
+	var lastPending []string
+	var lastAttentionResult *AttentionConditionResult
+
+	// Every interrupted read and result publication uses the same response
+	// path, so a late observation cannot turn a timeout into success.
+	interruptionResponse := func() *WaitResponse {
+		if err := ctx.Err(); err != nil {
+			return waitContextCanceledResponse(opts, startTime, err)
+		}
+		if time.Now().Before(deadline) {
+			return nil
+		}
+		resp := &WaitResponse{
+			RobotResponse: NewErrorResponse(
+				fmt.Errorf("timeout after %v", opts.Timeout),
+				ErrCodeTimeout,
+				"Try increasing --timeout or check agent status with --robot-activity",
+			),
+			Session:       opts.Session,
+			Condition:     opts.Condition,
+			WaitedSeconds: time.Since(startTime).Seconds(),
+			Agents:        []WaitAgentInfo{},
+			AgentsPending: append([]string(nil), lastPending...),
+		}
+		if hasAttention {
+			if lastAttentionResult == nil {
+				lastAttentionResult = newAttentionConditionResult("", attentionCursor, attentionCursor, 0)
+			}
+			resp.CursorInfo = buildWaitCursorInfo(lastAttentionResult)
+		}
+		if hasConvergence {
+			resp.Productivity = lastProductivity
+			resp.ConvergenceStreak = convergenceState.ConvergedStreak
+		}
+		return resp
+	}
+
 	// Validate session exists. SessionExists is intentionally a convenience
 	// boolean for callers that do not need diagnostics; wait is an API surface
 	// and must preserve a tmux control-plane failure instead of misreporting it
 	// as a missing session.
-	exists, err := tmux.SessionExistsContext(ctx, opts.Session)
+	exists, err := tmux.SessionExistsContext(waitCtx, opts.Session)
+	if response := interruptionResponse(); response != nil {
+		return response, 1
+	}
 	if err != nil {
 		return &WaitResponse{
 			RobotResponse: NewErrorResponse(
@@ -240,19 +284,14 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 	// Mixed waits are ANDed across all requested surfaces.
 	conditions := strings.Split(opts.Condition, ",")
 	paneConditions, attentionConditions, convergenceConditions := splitWaitConditions(conditions)
-	hasAttention := len(attentionConditions) > 0
-	hasConvergence := len(convergenceConditions) > 0
-	attentionCursor := initialAttentionWaitCursor(opts, hasAttention)
-	var convergenceState ConvergenceState
-	var lastProductivity *ProductivityOutput
+	hasAttention = len(attentionConditions) > 0
+	hasConvergence = len(convergenceConditions) > 0
+	attentionCursor = initialAttentionWaitCursor(opts, hasAttention)
 
 	// Set default count for --any mode
 	if opts.WaitForAny && opts.CountN <= 0 {
 		opts.CountN = 1
 	}
-
-	// Start waiting
-	deadline := startTime.Add(opts.Timeout)
 
 	// Create activity monitor
 	monitor := NewActivityMonitor(nil)
@@ -261,13 +300,11 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 	// Key: paneID, Value: true if agent was in target state at start AND has since left it
 	sawTransition := make(map[string]bool)
 	initiallyInTarget := make(map[string]bool)
-	firstPoll := true
-	var lastPending []string
-	var lastAttentionResult *AttentionConditionResult
+	var attentionState attentionWaitState
 
 	for {
-		if err := ctx.Err(); err != nil {
-			return waitContextCanceledResponse(opts, startTime, err), 1
+		if response := interruptionResponse(); response != nil {
+			return response, 1
 		}
 		if waitStore != nil {
 			canceled, err := waitStore.IsRobotWaitHandleCanceled(waitID)
@@ -285,38 +322,15 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 				}, 1
 			}
 		}
-		// Check timeout
-		if time.Now().After(deadline) {
-			elapsed := time.Since(startTime)
-			resp := &WaitResponse{
-				RobotResponse: NewErrorResponse(
-					fmt.Errorf("timeout after %v", opts.Timeout),
-					ErrCodeTimeout,
-					"Try increasing --timeout (or deprecated --wait-timeout) or check agent status with --robot-activity",
-				),
-				Session:       opts.Session,
-				Condition:     opts.Condition,
-				WaitedSeconds: elapsed.Seconds(),
-				Agents:        []WaitAgentInfo{},
-				AgentsPending: append([]string(nil), lastPending...),
-			}
-			if hasAttention {
-				if lastAttentionResult == nil {
-					lastAttentionResult = newAttentionConditionResult("", attentionCursor, attentionCursor, 0)
-				}
-				resp.CursorInfo = buildWaitCursorInfo(lastAttentionResult)
-			}
-			if hasConvergence {
-				resp.Productivity = lastProductivity
-				resp.ConvergenceStreak = convergenceState.ConvergedStreak
-			}
-			return resp, 1
-		}
 
 		var activities []*AgentActivity
+		var unobservedPanes []string
 		needPaneState := len(paneConditions) > 0 || opts.ExitOnError || opts.RequireTransition || len(waitPaneSelectors(opts)) > 0
 		if needPaneState {
-			panes, err := tmux.GetPanes(opts.Session)
+			panes, err := tmux.GetPanesContext(waitCtx, opts.Session)
+			if response := interruptionResponse(); response != nil {
+				return response, 1
+			}
 			if err != nil {
 				return &WaitResponse{
 					RobotResponse: NewErrorResponse(
@@ -353,28 +367,47 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 				}, 1
 			}
 
+			// A timeout during the first capture must retain the selected
+			// physical targets, even before a complete poll can classify them.
+			lastPending = make([]string, 0, len(filteredPanes))
 			for _, pane := range filteredPanes {
+				lastPending = append(lastPending, pane.ID)
+			}
+			for _, pane := range filteredPanes {
+				if response := interruptionResponse(); response != nil {
+					return response, 1
+				}
 				classifier := monitor.GetOrCreate(pane.ID)
 				if at := waitPaneAgentType(pane); at != "" && at != "unknown" && at != "user" {
 					classifier.SetAgentType(at)
 				}
-				activity, err := classifier.Classify()
-				if err != nil {
-					// Pane may have disappeared, continue.
+				// Preserve the classifier's 20-line capture and three-second
+				// per-pane bound while also honoring this wait's context.
+				captureCtx, cancelCapture := context.WithTimeout(waitCtx, 3*time.Second)
+				output, captureErr := tmux.CaptureForStatusDetectionContext(captureCtx, pane.ID)
+				cancelCapture()
+				if response := interruptionResponse(); response != nil {
+					return response, 1
+				}
+				if captureErr != nil {
+					unobservedPanes = append(unobservedPanes, pane.ID)
+					continue
+				}
+				activity, err := classifier.ClassifyWithOutput(output)
+				if err != nil || activity == nil {
+					// A failed observation is not evidence that this target is
+					// ready. Keep it pending instead of shrinking the ALL set.
+					unobservedPanes = append(unobservedPanes, pane.ID)
 					continue
 				}
 				activities = append(activities, activity)
 			}
 
+			if response := interruptionResponse(); response != nil {
+				return response, 1
+			}
 			if opts.RequireTransition && len(paneConditions) > 0 {
-				for _, a := range activities {
-					inTarget := meetsAllWaitConditions(a, paneConditions)
-					if firstPoll {
-						initiallyInTarget[a.PaneID] = inTarget
-					} else if initiallyInTarget[a.PaneID] && !inTarget {
-						sawTransition[a.PaneID] = true
-					}
-				}
+				recordWaitTransitions(activities, paneConditions, initiallyInTarget, sawTransition)
 			}
 
 			if opts.ExitOnError {
@@ -400,21 +433,21 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 				}
 			}
 		}
-		firstPoll = false
 
-		paneMet := len(paneConditions) == 0
-		var matching []WaitAgentInfo
-		if len(paneConditions) > 0 {
-			var met bool
-			met, matching, lastPending = checkWaitConditionMetWithTransition(activities, opts, paneConditions, initiallyInTarget, sawTransition)
-			paneMet = met
-		} else {
-			lastPending = nil
-		}
+		paneMet, matching, pending := checkWaitPaneObservations(
+			activities, unobservedPanes, opts, paneConditions, initiallyInTarget, sawTransition,
+		)
+		lastPending = pending
 
 		attentionMet := !hasAttention
 		if hasAttention {
-			lastAttentionResult = checkAttentionConditions(attentionConditions, attentionCursor, opts.Session, opts.Profile)
+			// Event predicates latch once witnessed; pane and convergence
+			// predicates below must still hold in the current poll. Do not
+			// consume later events while waiting for those live predicates.
+			lastAttentionResult = checkAttentionConditionsWithState(attentionConditions, attentionCursor, opts.Session, opts.Profile, &attentionState)
+			if response := interruptionResponse(); response != nil {
+				return response, 1
+			}
 			if lastAttentionResult != nil && lastAttentionResult.CursorExpired != nil {
 				cursorErr := lastAttentionResult.CursorExpired
 				details := cursorErr.ToDetails()
@@ -464,6 +497,11 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 			}
 		}
 
+		// A late read or predicate evaluation cannot publish success after
+		// cancellation or the wait deadline.
+		if response := interruptionResponse(); response != nil {
+			return response, 1
+		}
 		if attentionMet && paneMet && convergenceMet {
 			elapsed := time.Since(startTime)
 			return &WaitResponse{
@@ -479,11 +517,9 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 			}, 0
 		}
 
-		// Sleep and poll again, but let request cancellation interrupt the wait
-		// rather than stranding a CLI process or HTTP handler until timeout.
-		if !waitForPollOrCancellation(ctx, opts.PollInterval) {
-			return waitContextCanceledResponse(opts, startTime, ctx.Err()), 1
-		}
+		// Both the caller and this wait's deadline interrupt a long poll.
+		// The next loop iteration reports either through the shared path above.
+		waitForPollOrCancellation(waitCtx, opts.PollInterval)
 	}
 }
 
@@ -564,12 +600,6 @@ func initialAttentionWaitCursor(opts WaitOptions, hasAttention bool) int64 {
 	return GetAttentionFeed().Stats().NewestCursor
 }
 
-// PrintWait executes the wait operation and outputs JSON.
-// Returns exit code 0 on success and 1 for every wait failure.
-func PrintWait(opts WaitOptions) int {
-	return PrintWaitContext(context.Background(), opts)
-}
-
 // PrintWaitContext executes --robot-wait with cancellation-aware polling.
 func PrintWaitContext(ctx context.Context, opts WaitOptions) int {
 	resp, exitCode := GetWaitContext(ctx, opts)
@@ -642,16 +672,6 @@ func isAttentionBasedCondition(condition string) bool {
 	}
 }
 
-// hasAttentionBasedConditions returns true if any of the conditions require the attention feed.
-func hasAttentionBasedConditions(conditions []string) bool {
-	for _, c := range conditions {
-		if isAttentionBasedCondition(strings.TrimSpace(c)) {
-			return true
-		}
-	}
-	return false
-}
-
 func splitWaitConditions(conditions []string) ([]string, []string, []string) {
 	paneConditions := make([]string, 0, len(conditions))
 	attentionConditions := make([]string, 0, len(conditions))
@@ -714,56 +734,11 @@ func resolveWaitPanes(panes []tmux.Pane, opts WaitOptions) ([]tmux.Pane, error) 
 	return result, nil
 }
 
-// filterWaitPanes preserves the legacy pure-filter helper for internal callers.
-// Production paths use resolveWaitPanes so selector errors fail loud.
-func filterWaitPanes(panes []tmux.Pane, opts WaitOptions) []tmux.Pane {
-	result, _ := resolveWaitPanes(panes, opts)
-	return result
-}
-
 func waitPaneAgentType(pane tmux.Pane) string {
 	if resolved := ResolveAgentType(string(pane.Type)); resolved != "" && resolved != "unknown" {
 		return resolved
 	}
 	return detectAgentType(pane.Title)
-}
-
-// checkWaitConditionMet checks if the wait condition is satisfied.
-// Returns: met (bool), matching agents, pending agents
-func checkWaitConditionMet(activities []*AgentActivity, opts WaitOptions) (bool, []WaitAgentInfo, []string) {
-	if len(activities) == 0 {
-		return false, nil, nil
-	}
-
-	// Parse composed conditions
-	conditions := strings.Split(opts.Condition, ",")
-
-	var matchingAgents []WaitAgentInfo
-	var pendingAgents []string
-
-	now := time.Now()
-
-	for _, activity := range activities {
-		if meetsAllWaitConditions(activity, conditions) {
-			matchingAgents = append(matchingAgents, WaitAgentInfo{
-				Pane:      activity.PaneID,
-				State:     string(activity.State),
-				MetAt:     FormatTimestamp(now),
-				AgentType: activity.AgentType,
-			})
-		} else {
-			pendingAgents = append(pendingAgents, activity.PaneID)
-		}
-	}
-
-	// Determine if condition is met based on --any vs ALL
-	if opts.WaitForAny {
-		// With --any, need at least CountN agents matching
-		return len(matchingAgents) >= opts.CountN, matchingAgents, pendingAgents
-	}
-
-	// Default: ALL agents must match (no pending)
-	return len(pendingAgents) == 0 && len(matchingAgents) > 0, matchingAgents, pendingAgents
 }
 
 // checkWaitConditionMetWithTransition is like checkWaitConditionMet but handles
@@ -940,6 +915,18 @@ func newAttentionConditionResult(condition string, observedCursor, nextCursor, o
 // checkAttentionConditions checks if all requested attention-based conditions
 // are met. Multiple attention conditions are ANDed together.
 func checkAttentionConditions(conditions []string, sinceCursor int64, session, profile string) *AttentionConditionResult {
+	return checkAttentionConditionsWithState(conditions, sinceCursor, session, profile, &attentionWaitState{})
+}
+
+// checkAttentionConditionsWithState preserves witnesses across bounded replay
+// pages for a single wait. The stateless wrapper keeps one-shot checks isolated.
+func checkAttentionConditionsWithState(conditions []string, sinceCursor int64, session, profile string, waitState *attentionWaitState) *AttentionConditionResult {
+	if waitState != nil && waitState.completed != nil {
+		// Preserve the original cursor handoff while a mixed wait is still
+		// waiting for live pane/convergence predicates. Later events belong
+		// to the next consumer, and retention cannot erase a witnessed event.
+		return waitState.completed
+	}
 	feed := GetAttentionFeed()
 	if feed == nil {
 		return nil
@@ -989,41 +976,10 @@ func checkAttentionConditions(conditions []string, sinceCursor int64, session, p
 		result.Details["profile"] = profile
 	}
 
-	matchedConditions := make([]string, 0, len(conditions))
-	matchCounts := make(map[string]int, len(conditions))
-	var decisiveMatch *singleAttentionConditionMatch
-
-	for _, cond := range conditions {
-		c := strings.TrimSpace(cond)
-		if !isAttentionBasedCondition(c) {
-			continue
-		}
-
-		match := checkSingleAttentionCondition(c, events)
-		if match == nil {
-			return result
-		}
-
-		matchedConditions = append(matchedConditions, c)
-		matchCounts[c] = match.TriggerCount
-		if decisiveMatch == nil || (match.TriggerEvent != nil && decisiveMatch.TriggerEvent != nil &&
-			match.TriggerEvent.Cursor > decisiveMatch.TriggerEvent.Cursor) {
-			decisiveMatch = match
-		}
+	if waitState == nil {
+		waitState = &attentionWaitState{}
 	}
-
-	if decisiveMatch == nil {
-		return result
-	}
-
-	result.Met = true
-	result.Condition = decisiveMatch.Condition
-	result.TriggerEvent = decisiveMatch.TriggerEvent
-	result.TriggerCount = decisiveMatch.TriggerCount
-	result.ObservedCursor = decisiveMatch.TriggerEvent.Cursor
-	result.Details["matched_conditions"] = matchedConditions
-	result.Details["match_count_by_condition"] = matchCounts
-	return result
+	return waitState.observe(conditions, events, result)
 }
 
 // checkSingleAttentionCondition checks a single attention-based condition.
@@ -1107,37 +1063,4 @@ func buildWaitCursorInfo(result *AttentionConditionResult) *WaitCursorInfo {
 		NextCursor:     result.NextCursor,
 		OldestCursor:   result.OldestCursor,
 	}
-}
-
-// countByActionability counts events with a specific actionability level.
-func countByActionability(events []AttentionEvent, level Actionability) int {
-	count := 0
-	for _, ev := range events {
-		if ev.Actionability == level {
-			count++
-		}
-	}
-	return count
-}
-
-// countByType counts events with a specific event type.
-func countByType(events []AttentionEvent, eventType EventType) int {
-	count := 0
-	for _, ev := range events {
-		if ev.Type == eventType {
-			count++
-		}
-	}
-	return count
-}
-
-// countByCategory counts events with a specific category.
-func countByCategory(events []AttentionEvent, category EventCategory) int {
-	count := 0
-	for _, ev := range events {
-		if ev.Category == category {
-			count++
-		}
-	}
-	return count
 }

@@ -1,15 +1,22 @@
 # syntax=docker/dockerfile:1.24.0@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 
 # Build stage
-FROM golang:1.26.5-alpine3.24@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
+# Must satisfy go.mod's `go` line: the official image sets GOTOOLCHAIN=local,
+# so an older Go refuses `go mod download` outright.
+FROM golang:1.26.9-alpine3.24@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies. The base images are digest-pinned; packages come
+# from that Alpine branch unpinned, because the branch keeps only its newest
+# build of each package. Exact pins (and even `~3.6` minor pins) stopped
+# resolving within weeks as tmux, ca-certificates and tzdata moved on, which
+# broke every build.
+# hadolint ignore=DL3018
 RUN apk add --no-cache \
-    git=2.54.0-r0 \
-    ca-certificates=20260611-r0 \
-    tzdata=2026b-r0
+    git \
+    ca-certificates \
+    tzdata
 
 # Copy module metadata first for better caching.
 # This repo uses a local replace for Bubble Tea, so its module files must be
@@ -26,8 +33,11 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 ARG DATE=unknown
 
+# Same tags as the release binaries (.goreleaser.yaml): the image is a release
+# artifact, so it ships the real `ensemble spawn`, not the untagged stub.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
+    -tags=ensemble_experimental \
     -ldflags="-s -w \
         -X github.com/Dicklesworthstone/ntm/internal/cli.Version=${VERSION} \
         -X github.com/Dicklesworthstone/ntm/internal/cli.Commit=${COMMIT} \
@@ -38,13 +48,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # Runtime stage
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
-# Install runtime dependencies
+# Install runtime dependencies (unpinned from the pinned branch; see above).
+# hadolint ignore=DL3018
 RUN apk add --no-cache \
-    tmux=3.6b-r0 \
-    ca-certificates=20260611-r0 \
-    tzdata=2026b-r0 \
-    bash=5.3.9-r1 \
-    zsh=5.9-r7
+    tmux \
+    ca-certificates \
+    tzdata \
+    bash \
+    zsh
 
 # Create non-root user
 RUN adduser -D -g '' ntm

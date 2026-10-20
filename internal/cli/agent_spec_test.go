@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/spf13/cobra"
@@ -210,11 +211,11 @@ func TestResolveAgentModel_Precedence(t *testing.T) {
 	hermes.Defaults.Model = "google/gemini-2.5-flash"
 	// A plugin entry keyed to a built-in type proves the global default wins
 	// over a plugin default (this branch is never reached for built-ins).
-	ccPlugin := plugins.AgentPlugin{Name: "cc"}
-	ccPlugin.Defaults.Model = "plugin/should-not-win"
+	codPlugin := plugins.AgentPlugin{Name: string(AgentTypeCodex)}
+	codPlugin.Defaults.Model = "plugin/should-not-win"
 	pluginMap := map[string]plugins.AgentPlugin{
-		"hermes": hermes,
-		"cc":     ccPlugin,
+		"hermes":               hermes,
+		string(AgentTypeCodex): codPlugin,
 	}
 
 	// 1. Explicit model on the spec wins over the plugin default.
@@ -223,11 +224,11 @@ func TestResolveAgentModel_Precedence(t *testing.T) {
 	}
 
 	// 2. Global config default for a built-in type wins over any plugin default.
-	wantDefault := cfg.Models.DefaultClaude
+	wantDefault := cfg.Models.DefaultCodex
 	if wantDefault == "" {
-		t.Fatal("expected a non-empty default claude model in config.Default()")
+		t.Fatal("expected a non-empty default codex model in config.Default()")
 	}
-	if got := resolveAgentModel(AgentTypeClaude, "", pluginMap); got != wantDefault {
+	if got := resolveAgentModel(AgentTypeCodex, "", pluginMap); got != wantDefault {
 		t.Errorf("global default: got %q, want %q", got, wantDefault)
 	}
 
@@ -456,14 +457,16 @@ func TestResolveModel_WithConfig(t *testing.T) {
 		modelSpec string
 		want      string
 	}{
-		{"claude alias opus", AgentTypeClaude, "opus", "claude-opus-4-8"},
-		{"claude alias sonnet", AgentTypeClaude, "sonnet", "claude-sonnet-4-6"},
+		{"claude alias opus", AgentTypeClaude, "opus", "opus"},
+		{"claude alias architect", AgentTypeClaude, "architect", "opus"},
+		{"claude alias sonnet", AgentTypeClaude, "sonnet", "sonnet"},
 		{"codex alias o3", AgentTypeCodex, "o3", "o3"},
 		{"gemini alias flash", AgentTypeGemini, "flash", "gemini-3-flash"},
 		{"grok exact account model", AgentTypeGrok, "account-current", "account-current"},
 		{"grok default delegated", AgentTypeGrok, "", ""},
 		{"unknown alias passthrough", AgentTypeClaude, "unknown-custom", "unknown-custom"},
-		{"claude default", AgentTypeClaude, "", "claude-opus-4-8"},
+		// Empty: Claude Code picks its own default model (ntm#334).
+		{"claude default delegated", AgentTypeClaude, "", ""},
 		{"codex default", AgentTypeCodex, "", config.DefaultCodexModel},
 		{"gemini default", AgentTypeGemini, "", "gemini-3-pro-preview"},
 	}
@@ -665,50 +668,109 @@ func TestAgentSpecsValue_StringDelegatesToSpecs(t *testing.T) {
 	}
 }
 
-// TestAgentSpecsValue_AgyRelaxedModelCharset covers sharp edge #2 (ntm#210):
-// Antigravity display model names contain spaces and parentheses (e.g.
-// "Gemini 3.1 Pro (High)"), which the default model charset rejects. The agy
-// flag path must accept them via the relaxed charset, while the strict charset
-// still applies to every other agent type.
-func TestAgentSpecsValue_AgyRelaxedModelCharset(t *testing.T) {
-	// agy accepts the spaced/parenthesized display name.
-	var agySpecs AgentSpecs
-	agy := NewAgentSpecsValue(AgentTypeAntigravity, &agySpecs)
-	if err := agy.Set("1:Gemini 3.1 Pro (High)"); err != nil {
-		t.Fatalf("agy Set(%q) unexpected error: %v", "1:Gemini 3.1 Pro (High)", err)
-	}
-	if len(agySpecs) != 1 {
-		t.Fatalf("agy specs len = %d, want 1", len(agySpecs))
-	}
-	if agySpecs[0].Type != AgentTypeAntigravity {
-		t.Errorf("Type = %s, want agy", agySpecs[0].Type)
-	}
-	if agySpecs[0].Count != 1 {
-		t.Errorf("Count = %d, want 1", agySpecs[0].Count)
-	}
-	if agySpecs[0].Model != "Gemini 3.1 Pro (High)" {
-		t.Errorf("Model = %q, want %q", agySpecs[0].Model, "Gemini 3.1 Pro (High)")
-	}
-
-	// A charset-safe alias also parses for agy.
-	var aliasSpecs AgentSpecs
-	if err := NewAgentSpecsValue(AgentTypeAntigravity, &aliasSpecs).Set("2:gemini-3-pro-high"); err != nil {
-		t.Errorf("agy Set(alias) unexpected error: %v", err)
-	}
-
-	// The SAME spaced model name is REJECTED for a non-agy type (strict charset).
-	var geminiSpecs AgentSpecs
-	if err := NewAgentSpecsValue(AgentTypeGemini, &geminiSpecs).Set("1:Gemini 3.1 Pro (High)"); err == nil {
-		t.Error("gemini Set with spaced model should fail the strict charset, but succeeded")
-	}
-
-	// Even under the relaxed agy charset, shell metacharacters remain rejected
-	// (defense-in-depth against injection).
-	for _, bad := range []string{"1:a;b", "1:a|b", "1:a$b", "1:a`b`", "1:a&&b"} {
-		var s AgentSpecs
-		if err := NewAgentSpecsValue(AgentTypeAntigravity, &s).Set(bad); err == nil {
-			t.Errorf("agy Set(%q) should be rejected (shell metachar), but succeeded", bad)
+// Antigravity is hard-pinned by its launcher. Accepting a user model here used
+// to preserve the requested value in the pane title while launching the pinned
+// model, making the title and robot metadata false (GH#269).
+func TestAgentSpecsValue_AgyRejectsModelOverride(t *testing.T) {
+	for _, value := range []string{
+		"1:gemini-3.1-pro-high",
+		"1:Gemini 4 Argon (High)",
+	} {
+		var specs AgentSpecs
+		err := NewAgentSpecsValue(AgentTypeAntigravity, &specs).Set(value)
+		if err == nil || !strings.Contains(err.Error(), "model is pinned") {
+			t.Errorf("agy Set(%q) error = %v, want pinned-model rejection", value, err)
 		}
+		if len(specs) != 0 {
+			t.Errorf("agy Set(%q) appended rejected spec: %+v", value, specs)
+		}
+	}
+
+	var countOnly AgentSpecs
+	if err := NewAgentSpecsValue(AgentTypeAntigravity, &countOnly).Set("2"); err != nil {
+		t.Fatalf("agy count-only spec rejected: %v", err)
+	}
+	if len(countOnly) != 1 || countOnly[0].Count != 2 || countOnly[0].Model != "" {
+		t.Fatalf("agy count-only spec = %+v, want count 2 with no advertised model", countOnly)
+	}
+}
+
+func TestValidateAgentModelOverridesRejectsProgrammaticAgyModel(t *testing.T) {
+	for _, model := range []string{"gemini-3.1-pro-high", config.AntigravityRequiredModel} {
+		err := validateAgentModelOverrides([]FlatAgent{{
+			Type:  AgentTypeAntigravity,
+			Index: 1,
+			Model: model,
+		}}, nil)
+		if err == nil || !strings.Contains(err.Error(), "model is pinned") {
+			t.Errorf("validateAgentModelOverrides(%q) error = %v, want pinned-model rejection", model, err)
+		}
+	}
+
+	if err := validateAgentModelOverrides([]FlatAgent{{
+		Type:  AgentTypeAntigravity,
+		Index: 1,
+	}}, nil); err != nil {
+		t.Fatalf("count-only agy spec rejected: %v", err)
+	}
+}
+
+func TestValidateAgentModelOverridesAllowsPinnedAgyPersonas(t *testing.T) {
+	pinned := &persona.Persona{
+		Name:      "agy-reviewer",
+		AgentType: "antigravity",
+		Model:     config.AntigravityRequiredModel,
+	}
+
+	expanded, err := expandProfileAgents([]*persona.Persona{pinned}, nil)
+	if err != nil {
+		t.Fatalf("expand AGY profile: %v", err)
+	}
+	if err := validateSpawnAgentTypes(expanded, nil, nil); err != nil {
+		t.Fatalf("profile-expanded pinned-model AGY persona rejected: %v", err)
+	}
+
+	personaMap := map[string]*persona.Persona{"agy-reviewer": pinned}
+	if err := validateAgentModelOverrides([]FlatAgent{{
+		Type:  AgentTypeAntigravity,
+		Index: 1,
+		Model: "agy-reviewer",
+	}}, personaMap); err != nil {
+		t.Fatalf("mapped pinned-model AGY persona rejected: %v", err)
+	}
+	if err := validateAgentSpecModelOverrides(AgentSpecs{{
+		Type:  AgentTypeAntigravity,
+		Count: 1,
+		Model: "agy-reviewer",
+	}}, personaMap); err != nil {
+		t.Fatalf("add-style pinned-model AGY persona rejected: %v", err)
+	}
+}
+
+func TestValidateAgentModelOverridesRejectsDivergentAgyPersonaModel(t *testing.T) {
+	divergent := &persona.Persona{
+		Name:      "agy-reviewer",
+		AgentType: "antigravity",
+		Model:     "gemini-3.1-pro-high",
+	}
+
+	err := validateAgentModelOverrides([]FlatAgent{{
+		Type:    AgentTypeAntigravity,
+		Index:   1,
+		Model:   divergent.Model,
+		Persona: divergent,
+	}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "persona") || !strings.Contains(err.Error(), "model is pinned") {
+		t.Fatalf("divergent attached AGY persona error = %v, want pinned-model persona rejection", err)
+	}
+
+	err = validateAgentSpecModelOverrides(AgentSpecs{{
+		Type:  AgentTypeAntigravity,
+		Count: 1,
+		Model: "agy-reviewer",
+	}}, map[string]*persona.Persona{"agy-reviewer": divergent})
+	if err == nil || !strings.Contains(err.Error(), "persona") || !strings.Contains(err.Error(), "model is pinned") {
+		t.Fatalf("divergent mapped AGY persona error = %v, want pinned-model persona rejection", err)
 	}
 }
 

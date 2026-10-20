@@ -49,19 +49,6 @@ func TestIsPersonaName(t *testing.T) {
 	}
 }
 
-func TestDetectPalettePath(t *testing.T) {
-	// Test explicit path
-	cfg := &Config{PaletteFile: "/custom/path.md"}
-	if path := DetectPalettePath(cfg); path != "/custom/path.md" {
-		t.Errorf("Expected /custom/path.md, got %s", path)
-	}
-
-	// Test nil config
-	if path := DetectPalettePath(nil); path != "" {
-		t.Errorf("Expected empty path for nil config, got %s", path)
-	}
-}
-
 func TestScannerDefaultsGetTimeout(t *testing.T) {
 	d := ScannerDefaults{Timeout: "60s"}
 	if d.GetTimeout() != 60*time.Second {
@@ -146,77 +133,6 @@ func TestThresholdConfigShouldFail(t *testing.T) {
 			t.Error("Should not fail when disabled")
 		}
 	})
-}
-
-func TestLoadProjectScannerConfig(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Test no config
-	cfg, err := LoadProjectScannerConfig(tmpDir)
-	if err != nil {
-		t.Fatalf("LoadProjectScannerConfig failed: %v", err)
-	}
-	// Should return defaults
-	if cfg.Defaults.Timeout != "120s" {
-		t.Errorf("Expected default timeout 120s, got %s", cfg.Defaults.Timeout)
-	}
-
-	// Test .ntm.yaml
-	yamlContent := `
-scanner:
-  defaults:
-    timeout: 30s
-`
-	os.WriteFile(filepath.Join(tmpDir, ".ntm.yaml"), []byte(yamlContent), 0644)
-
-	cfg, err = LoadProjectScannerConfig(tmpDir)
-	if err != nil {
-		t.Fatalf("LoadProjectScannerConfig failed: %v", err)
-	}
-	if cfg.Defaults.Timeout != "30s" {
-		t.Errorf("Expected timeout 30s from yaml, got %s", cfg.Defaults.Timeout)
-	}
-
-	// Unknown scanner fields should fail instead of being silently ignored.
-	badContent := `
-scanner:
-  defaults:
-    timeout: 45s
-    legacy: true
-`
-	if err := os.WriteFile(filepath.Join(tmpDir, ".ntm.yaml"), []byte(badContent), 0644); err != nil {
-		t.Fatalf("Write bad .ntm.yaml failed: %v", err)
-	}
-
-	_, err = LoadProjectScannerConfig(tmpDir)
-	if err == nil {
-		t.Fatal("expected error for unknown scanner field")
-	}
-	if !strings.Contains(err.Error(), "field legacy not found") {
-		t.Fatalf("expected unknown field error, got %v", err)
-	}
-
-	// Other top-level sections should still be ignored when scanner is valid.
-	mixedContent := `
-scanner:
-  defaults:
-    timeout: 50s
-webhooks:
-  - name: test
-    url: https://example.com
-    events: [scan.completed]
-`
-	if err := os.WriteFile(filepath.Join(tmpDir, ".ntm.yaml"), []byte(mixedContent), 0644); err != nil {
-		t.Fatalf("Write mixed .ntm.yaml failed: %v", err)
-	}
-
-	cfg, err = LoadProjectScannerConfig(tmpDir)
-	if err != nil {
-		t.Fatalf("LoadProjectScannerConfig with mixed sections failed: %v", err)
-	}
-	if cfg.Defaults.Timeout != "50s" {
-		t.Errorf("Expected timeout 50s from mixed yaml, got %s", cfg.Defaults.Timeout)
-	}
 }
 
 func TestInitProjectConfigForce(t *testing.T) {
@@ -1346,7 +1262,7 @@ func TestApplySafetyProfileDefaults_Mappings(t *testing.T) {
 			cfg := &Config{
 				Safety:    SafetyConfig{Profile: tt.profile},
 				Redaction: RedactionConfig{Mode: "off"},
-				Preflight: PreflightConfig{Enabled: false, Strict: false},
+				Preflight: PreflightConfig{Strict: false},
 				Privacy:   PrivacyConfig{Enabled: false},
 				Integrations: IntegrationsConfig{
 					DCG: DCGConfig{AllowOverride: false},
@@ -1358,9 +1274,8 @@ func TestApplySafetyProfileDefaults_Mappings(t *testing.T) {
 			if cfg.Safety.Profile != tt.wantProfile {
 				t.Fatalf("Safety.Profile=%q, want %q", cfg.Safety.Profile, tt.wantProfile)
 			}
-			if cfg.Preflight.Enabled != tt.preflightEnabled || cfg.Preflight.Strict != tt.preflightStrict {
-				t.Fatalf("Preflight={enabled:%v strict:%v}, want {enabled:%v strict:%v}",
-					cfg.Preflight.Enabled, cfg.Preflight.Strict, tt.preflightEnabled, tt.preflightStrict)
+			if cfg.Preflight.Strict != tt.preflightStrict {
+				t.Fatalf("Preflight.Strict=%v, want %v", cfg.Preflight.Strict, tt.preflightStrict)
 			}
 			if cfg.Redaction.Mode != tt.redactionMode {
 				t.Fatalf("Redaction.Mode=%q, want %q", cfg.Redaction.Mode, tt.redactionMode)
@@ -1462,9 +1377,8 @@ profile = %q
 			if cfg.Privacy.Enabled != tt.wantPrivacy {
 				t.Fatalf("Privacy.Enabled=%v, want %v", cfg.Privacy.Enabled, tt.wantPrivacy)
 			}
-			if cfg.Preflight.Enabled != tt.wantPreflightOn || cfg.Preflight.Strict != tt.wantPreflightStrict {
-				t.Fatalf("Preflight={enabled:%v strict:%v}, want {enabled:%v strict:%v}",
-					cfg.Preflight.Enabled, cfg.Preflight.Strict, tt.wantPreflightOn, tt.wantPreflightStrict)
+			if cfg.Preflight.Strict != tt.wantPreflightStrict {
+				t.Fatalf("Preflight.Strict=%v, want %v", cfg.Preflight.Strict, tt.wantPreflightStrict)
 			}
 			if cfg.Integrations.DCG.AllowOverride != tt.wantAllowOverride {
 				t.Fatalf("Integrations.DCG.AllowOverride=%v, want %v", cfg.Integrations.DCG.AllowOverride, tt.wantAllowOverride)

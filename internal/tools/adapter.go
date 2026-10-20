@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -46,18 +47,6 @@ func ParseStandardVersion(output string) (Version, error) {
 		Patch: patch,
 		Raw:   output,
 	}, nil
-}
-
-// parseVersion is the generic version parser that extracts X.Y.Z from any string.
-// It is used by tools with simple version output formats (GIIL, RU, XF, DCG, UBS, etc.).
-func parseVersion(output string) (Version, error) {
-	return ParseStandardVersion(output)
-}
-
-// parseACFSVersion extracts version from ACFS output.
-// ACFS uses simple "X.Y.Z" format, so we delegate to the standard parser.
-func parseACFSVersion(output string) (Version, error) {
-	return ParseStandardVersion(output)
 }
 
 // LimitedBuffer is a bytes.Buffer that errors on overflow.
@@ -188,6 +177,29 @@ type ToolInfo struct {
 	Capabilities []Capability `json:"capabilities,omitempty"`
 	Path         string       `json:"path,omitempty"`
 	Health       HealthStatus `json:"health"`
+	// Disabled reports that the caller's configuration turned this
+	// integration off, so the tool was never probed: no Detect, no
+	// `<tool> --version`, no health subprocess. Installed/Version/Path are
+	// unset on a disabled entry because nothing looked (ntm#313). It is
+	// distinct from Installed=false, which means "we looked and it is not
+	// on PATH".
+	Disabled bool `json:"disabled,omitempty"`
+}
+
+// DisabledToolInfo builds the inventory entry for a tool the configuration
+// has turned off. It is the single shape every disabled tool reports, and it
+// runs no subprocess.
+func DisabledToolInfo(name ToolName) *ToolInfo {
+	return &ToolInfo{
+		Name:      name,
+		Installed: false,
+		Disabled:  true,
+		Health: HealthStatus{
+			Healthy:     false,
+			Message:     "disabled by configuration (not probed)",
+			LastChecked: time.Now(),
+		},
+	}
 }
 
 // Adapter defines the interface that all tool adapters must implement
@@ -206,9 +218,6 @@ type Adapter interface {
 
 	// Health checks if the tool is functioning correctly
 	Health(ctx context.Context) (*HealthStatus, error)
-
-	// HasCapability checks if a specific capability is available
-	HasCapability(ctx context.Context, cap Capability) bool
 
 	// Info returns complete tool information
 	Info(ctx context.Context) (*ToolInfo, error)
@@ -248,6 +257,33 @@ func (a *BaseAdapter) Timeout() time.Duration {
 // SetTimeout sets the default operation timeout
 func (a *BaseAdapter) SetTimeout(t time.Duration) {
 	a.timeout = t
+}
+
+// helpText runs a tool's help command and returns what it printed on either
+// stream: ubs and ru print help on stderr, pt and rano on stdout, and some
+// exit non-zero, so only the text matters.
+func helpText(ctx context.Context, timeout time.Duration, path string, args ...string) string {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.WaitDelay = time.Second
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	_ = cmd.Run()
+	return out.String()
+}
+
+// cliErrorLine picks a CLI's "Error: ..." line out of stderr, which may also
+// carry log lines (ms's storage layer logs WARNs there, for instance).
+func cliErrorLine(stderr string) string {
+	for _, line := range strings.Split(stderr, "\n") {
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, "Error:") {
+			return line
+		}
+	}
+	return strings.TrimSpace(stderr)
 }
 
 // Info returns complete tool information using the adapter methods

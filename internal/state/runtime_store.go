@@ -24,6 +24,15 @@ const (
 	DefaultSourceHealthRetention     = 24 * time.Hour
 	DefaultIncidentReopenWindow      = time.Hour
 	DefaultResolvedIncidentRetention = 7 * 24 * time.Hour
+	// DefaultSendOperationRetention bounds how long completed idempotent
+	// operation receipts (send #245, interrupt) remain queryable before GC
+	// prunes them.
+	DefaultSendOperationRetention = 7 * 24 * time.Hour
+	// DefaultOutputSeqWatermarkRetention bounds how long an untouched
+	// output-sequence watermark row (#246) survives before GC prunes it.
+	// Pruning is contract-safe: the next observation of that scope mints a
+	// fresh epoch, which is exactly what consumers must handle anyway.
+	DefaultOutputSeqWatermarkRetention = 30 * 24 * time.Hour
 )
 
 // RuntimeGCConfig defines the bounded cleanup windows for the runtime layer.
@@ -46,15 +55,8 @@ type RuntimeGCResult struct {
 	ExpiredAttentionEvents int64 `json:"expired_attention_events"`
 	ExpiredAuditEvents     int64 `json:"expired_audit_events"`
 	ExpiredAuditDecisions  int64 `json:"expired_audit_decisions"`
-}
-
-// DefaultRuntimeGCConfig returns conservative cleanup windows for routine maintenance.
-func DefaultRuntimeGCConfig() RuntimeGCConfig {
-	return RuntimeGCConfig{
-		ProjectionGracePeriod:     DefaultRuntimeProjectionGCGrace,
-		SourceHealthRetention:     DefaultSourceHealthRetention,
-		ResolvedIncidentRetention: DefaultResolvedIncidentRetention,
-	}
+	ExpiredSendOperations  int64 `json:"expired_send_operations"`
+	ExpiredOutputSeqRows   int64 `json:"expired_output_seq_rows"`
 }
 
 func normalizeRuntimeGCConfig(cfg RuntimeGCConfig) RuntimeGCConfig {
@@ -1337,7 +1339,32 @@ func (s *Store) RunGC(cfg RuntimeGCConfig) (RuntimeGCResult, error) {
 	if result.ExpiredAuditDecisions, err = s.GCExpiredAuditDecisions(); err != nil {
 		return result, err
 	}
+	if result.ExpiredSendOperations, err = s.GCCompletedSendOperations(0); err != nil {
+		return result, err
+	}
+	if result.ExpiredOutputSeqRows, err = s.GCStaleOutputSeqWatermarks(0); err != nil {
+		return result, err
+	}
 	return result, nil
+}
+
+// GCStaleOutputSeqWatermarks prunes output-sequence watermark rows (#246)
+// whose scope has not been observed within the retention window — dead
+// sessions and replaced panes would otherwise accumulate rows forever.
+// Only the output_seq watermark type is touched; velocity baselines keep
+// their pre-existing lifecycle.
+func (s *Store) GCStaleOutputSeqWatermarks(retention time.Duration) (int64, error) {
+	if retention <= 0 {
+		retention = DefaultOutputSeqWatermarkRetention
+	}
+	cutoff := time.Now().UTC().Add(-retention)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return execRowsAffected(s.db,
+		`DELETE FROM output_watermarks WHERE watermark_type = 'output_seq' AND updated_at < ?`,
+		"gc stale output-seq watermarks", cutoff)
 }
 
 // =============================================================================
@@ -2193,20 +2220,6 @@ func (s *Store) ListOpenIncidents() ([]Incident, error) {
 	return incidents, rows.Err()
 }
 
-func (s *Store) getRecentResolvedIncidentByFingerprint(fingerprint string, within time.Duration) (*Incident, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if within <= 0 {
-		within = DefaultIncidentReopenWindow
-	}
-	incident, err := queryRecentResolvedIncidentByFingerprint(s.db, fingerprint, time.Now().UTC().Add(-within))
-	if err != nil {
-		return nil, fmt.Errorf("get recent resolved incident by fingerprint: %w", err)
-	}
-	return incident, nil
-}
-
 // CreateOrUpdateIncident deduplicates durable incidents by stable fingerprint.
 func (s *Store) CreateOrUpdateIncident(incident *Incident) (*Incident, error) {
 	now := time.Now().UTC()
@@ -2468,6 +2481,76 @@ func (s *Store) SetWatermark(wm *OutputWatermark) error {
 		return fmt.Errorf("set watermark: %w", err)
 	}
 	return nil
+}
+
+// ClaimWatermark advances a watermark only while its stored last_ts still
+// matches expected, and reports whether the claim succeeded.
+//
+// It exists for watermarks that gate an ACTION rather than merely record
+// progress. Those callers read the watermark, decide, and write it back — and
+// between the read and the write they do real work (a subprocess, a network
+// round trip), so two processes can both read "not recently done", both pass
+// their gates, and both act. A plain SetWatermark cannot detect that; this can,
+// by refusing the second write.
+//
+// expected is the last_ts the caller read, or nil when it read no row (or a row
+// with no timestamp). A false return means another writer claimed the slot
+// first and the caller must not perform the action.
+func (s *Store) ClaimWatermark(wm *OutputWatermark, expected *time.Time) (bool, error) {
+	if wm == nil {
+		return false, fmt.Errorf("claim watermark requires a watermark")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var (
+		result sql.Result
+		err    error
+	)
+	if expected == nil {
+		// Nothing was there to gate on: only an insert is correct, because a
+		// row appearing now means a concurrent claimant created it.
+		result, err = s.db.Exec(`
+			INSERT INTO output_watermarks (
+				watermark_type, scope, last_cursor, last_ts,
+				baseline_cursor, baseline_ts, baseline_hash, consumer, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(watermark_type, scope) DO NOTHING`,
+			wm.WatermarkType, wm.Scope, wm.LastCursor, wm.LastTs,
+			wm.BaselineCursor, wm.BaselineTs, wm.BaselineHash,
+			wm.Consumer, wm.CreatedAt, wm.UpdatedAt,
+		)
+	} else {
+		result, err = s.db.Exec(`
+			INSERT INTO output_watermarks (
+				watermark_type, scope, last_cursor, last_ts,
+				baseline_cursor, baseline_ts, baseline_hash, consumer, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(watermark_type, scope) DO UPDATE SET
+				last_cursor = excluded.last_cursor,
+				last_ts = excluded.last_ts,
+				baseline_cursor = excluded.baseline_cursor,
+				baseline_ts = excluded.baseline_ts,
+				baseline_hash = excluded.baseline_hash,
+				consumer = excluded.consumer,
+				updated_at = excluded.updated_at
+			WHERE output_watermarks.last_ts = ?`,
+			wm.WatermarkType, wm.Scope, wm.LastCursor, wm.LastTs,
+			wm.BaselineCursor, wm.BaselineTs, wm.BaselineHash,
+			wm.Consumer, wm.CreatedAt, wm.UpdatedAt,
+			*expected,
+		)
+	}
+	if err != nil {
+		return false, fmt.Errorf("claim watermark: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim watermark: %w", err)
+	}
+	return affected > 0, nil
 }
 
 // SetWatermark inserts or updates a watermark in an existing transaction.
@@ -3034,4 +3117,314 @@ func DecodeJSON(data string, v interface{}) error {
 		return nil
 	}
 	return json.Unmarshal([]byte(data), v)
+}
+
+// =============================================================================
+// Send Operations (idempotent robot actuations: send #245, interrupt)
+// =============================================================================
+
+// ErrSendOperationClaimLost means the caller no longer owns an operation in
+// the required phase. It must not actuate panes, discard another claim, or
+// report a receipt as saved after receiving this error.
+var ErrSendOperationClaimLost = errors.New("send operation claim is no longer owned in the required phase")
+
+const sendOperationSelectColumns = `
+	operation_id, session_name, kind, binding_hash, payload_sha256,
+	payload_bytes, status, COALESCE(outcome_json, ''), created_at, completed_at,
+	claim_token, dispatch_started_at, targets_json`
+
+type sendOperationScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanSendOperation(scanner sendOperationScanner) (*SendOperation, error) {
+	op := &SendOperation{}
+	var targetsJSON string
+	err := scanner.Scan(
+		&op.OperationID, &op.SessionName, &op.Kind, &op.BindingHash, &op.PayloadSHA256,
+		&op.PayloadBytes, &op.Status, &op.OutcomeJSON, &op.CreatedAt, &op.CompletedAt,
+		&op.ClaimToken, &op.DispatchStartedAt, &targetsJSON,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(targetsJSON), &op.Targets); err != nil {
+		return nil, fmt.Errorf("decode send operation targets: %w", err)
+	}
+	if op.Targets == nil {
+		op.Targets = []string{}
+	}
+	return op, nil
+}
+
+func newSendOperationClaimToken() (string, error) {
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate send operation claim token: %w", err)
+	}
+	return fmt.Sprintf("%x", token), nil
+}
+
+func sendOperationTargetsJSON(targets []string) (string, error) {
+	if targets == nil {
+		targets = []string{}
+	}
+	data, err := json.Marshal(targets)
+	if err != nil {
+		return "", fmt.Errorf("encode send operation targets: %w", err)
+	}
+	return string(data), nil
+}
+
+// ClaimSendOperation atomically claims a (session, operation ID) pair for
+// execution. INSERT ... ON CONFLICT makes the claim race-safe across
+// processes: exactly one caller creates the row (claimed=true) and every
+// other caller observes the existing row, whose kind and binding it must
+// validate before deciding between replay and conflict. An empty Kind claims
+// as OperationKindSend. RETURNING captures the winning claim itself instead
+// of a later row that another process may have changed or replaced.
+func (s *Store) ClaimSendOperation(op *SendOperation) (existing *SendOperation, claimed bool, err error) {
+	if op == nil || op.OperationID == "" {
+		return nil, false, fmt.Errorf("claim send operation: operation ID is required")
+	}
+	if op.SessionName == "" {
+		return nil, false, fmt.Errorf("claim send operation: session name is required")
+	}
+	kind := op.Kind
+	if kind == "" {
+		kind = OperationKindSend
+	}
+	claimToken, err := newSendOperationClaimToken()
+	if err != nil {
+		return nil, false, err
+	}
+	targetsJSON, err := sendOperationTargetsJSON(op.Targets)
+	if err != nil {
+		return nil, false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	createdAt := op.CreatedAt.UTC()
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	stored, err := scanSendOperation(s.db.QueryRow(`
+		INSERT INTO send_operations (
+			operation_id, session_name, kind, binding_hash, payload_sha256,
+			payload_bytes, status, outcome_json, created_at, claim_token, targets_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+		ON CONFLICT (operation_id, session_name) DO NOTHING
+		RETURNING `+sendOperationSelectColumns,
+		op.OperationID, op.SessionName, kind, op.BindingHash, op.PayloadSHA256,
+		op.PayloadBytes, SendOperationInProgress, createdAt, claimToken, targetsJSON,
+	))
+	if err != nil {
+		return nil, false, fmt.Errorf("claim send operation: %w", err)
+	}
+	if stored != nil {
+		return stored, true, nil
+	}
+
+	// No row was inserted, so this is an observation, never execution
+	// authority. A subsequent takeover must compare its token atomically.
+	stored, err = s.getSendOperationLocked(op.OperationID, op.SessionName)
+	if err != nil {
+		return nil, false, err
+	}
+	if stored == nil {
+		return nil, false, fmt.Errorf("claim send operation: row vanished after claim")
+	}
+	return stored, false, nil
+}
+
+// TakeOverStaleSendOperation reclaims only an observed, stale attempt that
+// has not crossed the durable dispatch boundary. Age alone never proves
+// that no input was delivered. A fresh token fences the previous claimant;
+// the atomic returned row is the successor's authority. Nil means no claim
+// matched, including when another contender already won.
+func (s *Store) TakeOverStaleSendOperation(operationID, sessionName, bindingHash, expectedClaimToken string, staleBefore time.Time) (*SendOperation, error) {
+	if operationID == "" || sessionName == "" || expectedClaimToken == "" {
+		return nil, fmt.Errorf("take over send operation: operation ID, session, and observed claim token are required")
+	}
+	claimToken, err := newSendOperationClaimToken()
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stored, err := scanSendOperation(s.db.QueryRow(`
+		UPDATE send_operations
+		SET created_at = ?, claim_token = ?
+		WHERE operation_id = ? AND session_name = ? AND binding_hash = ?
+			AND claim_token = ? AND status = ? AND created_at < ?
+			AND dispatch_started_at IS NULL
+		RETURNING `+sendOperationSelectColumns,
+		time.Now().UTC(), claimToken, operationID, sessionName, bindingHash,
+		expectedClaimToken, SendOperationInProgress, staleBefore.UTC(),
+	))
+	if err != nil {
+		return nil, fmt.Errorf("take over send operation: %w", err)
+	}
+	return stored, nil
+}
+
+// StartSendOperation freezes the exact prepared payload digest and targets
+// and records the dispatch boundary before the caller mutates any pane.
+// An attempt may start only once. Any later retry must reconcile the durable
+// result instead of repeating a possibly delivered actuation.
+func (s *Store) StartSendOperation(op *SendOperation) (*SendOperation, error) {
+	if op == nil || op.OperationID == "" || op.SessionName == "" || op.ClaimToken == "" {
+		return nil, fmt.Errorf("start send operation: operation ID, session, and claim token are required")
+	}
+	targetsJSON, err := sendOperationTargetsJSON(op.Targets)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stored, err := scanSendOperation(s.db.QueryRow(`
+		UPDATE send_operations
+		SET dispatch_started_at = ?, payload_sha256 = ?, payload_bytes = ?, targets_json = ?
+		WHERE operation_id = ? AND session_name = ? AND claim_token = ?
+			AND status = ? AND dispatch_started_at IS NULL
+		RETURNING `+sendOperationSelectColumns,
+		time.Now().UTC(), op.PayloadSHA256, op.PayloadBytes, targetsJSON,
+		op.OperationID, op.SessionName, op.ClaimToken, SendOperationInProgress,
+	))
+	if err != nil {
+		return nil, fmt.Errorf("start send operation: %w", err)
+	}
+	if stored == nil {
+		return nil, fmt.Errorf("start send operation: %w", ErrSendOperationClaimLost)
+	}
+	return stored, nil
+}
+
+// ReleaseSendOperation relinquishes the caller's unstarted claim after a
+// preflight failure, leaving the ID retryable. Started claims and receipts
+// must remain durable; an old claimant cannot release a successor's row.
+func (s *Store) ReleaseSendOperation(operationID, sessionName, claimToken string) error {
+	if operationID == "" || sessionName == "" || claimToken == "" {
+		return fmt.Errorf("release send operation: operation ID, session, and claim token are required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	affected, err := execRowsAffected(s.db, `
+		DELETE FROM send_operations
+		WHERE operation_id = ? AND session_name = ? AND claim_token = ?
+			AND status = ? AND dispatch_started_at IS NULL`,
+		"release send operation", operationID, sessionName, claimToken, SendOperationInProgress,
+	)
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("release send operation: %w", ErrSendOperationClaimLost)
+	}
+	return nil
+}
+
+// CompleteSendOperation records the outcome of a claimed operation. The
+// outcome JSON is the durable receipt returned verbatim on replays and by
+// receipt queries. Failed ownership is an error, never a false success.
+func (s *Store) CompleteSendOperation(operationID, sessionName, claimToken, outcomeJSON string, completedAt time.Time) error {
+	if operationID == "" || sessionName == "" || claimToken == "" {
+		return fmt.Errorf("complete send operation: operation ID, session, and claim token are required")
+	}
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	affected, err := execRowsAffected(s.db, `
+		UPDATE send_operations
+		SET status = ?, outcome_json = ?, completed_at = ?
+		WHERE operation_id = ? AND session_name = ? AND claim_token = ? AND status = ?`,
+		"complete send operation",
+		SendOperationCompleted, outcomeJSON, completedAt.UTC(),
+		operationID, sessionName, claimToken, SendOperationInProgress,
+	)
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("complete send operation: %w", ErrSendOperationClaimLost)
+	}
+	return nil
+}
+
+// GetSendOperation returns the durable record for a (session, operation ID)
+// pair, or nil when unknown.
+func (s *Store) GetSendOperation(operationID, sessionName string) (*SendOperation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getSendOperationLocked(operationID, sessionName)
+}
+
+// GetSendOperationsByID returns every session's record for an operation ID,
+// newest first. Receipt queries use this because the caller may not know
+// (or care) which session a historic operation ran in.
+func (s *Store) GetSendOperationsByID(operationID string) ([]SendOperation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`SELECT `+sendOperationSelectColumns+`
+		FROM send_operations WHERE operation_id = ?
+		ORDER BY created_at DESC`,
+		operationID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get send operations: %w", err)
+	}
+	defer rows.Close()
+
+	var ops []SendOperation
+	for rows.Next() {
+		op, err := scanSendOperation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan send operation: %w", err)
+		}
+		ops = append(ops, *op)
+	}
+	return ops, rows.Err()
+}
+
+// GCCompletedSendOperations prunes completed operation records older than
+// the retention window so the receipt table stays bounded.
+func (s *Store) GCCompletedSendOperations(retention time.Duration) (int64, error) {
+	if retention <= 0 {
+		retention = DefaultSendOperationRetention
+	}
+	cutoff := time.Now().UTC().Add(-retention)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return execRowsAffected(s.db,
+		`DELETE FROM send_operations WHERE status = ? AND completed_at < ?`,
+		"gc completed send operations", SendOperationCompleted, cutoff)
+}
+
+func (s *Store) getSendOperationLocked(operationID, sessionName string) (*SendOperation, error) {
+	op, err := scanSendOperation(s.db.QueryRow(`SELECT `+sendOperationSelectColumns+`
+		FROM send_operations WHERE operation_id = ? AND session_name = ?`,
+		operationID, sessionName,
+	))
+	if err != nil {
+		return nil, fmt.Errorf("get send operation: %w", err)
+	}
+	return op, nil
 }

@@ -50,19 +50,18 @@ Commands that operate globally (no session context) are bool flags:
 
 ### 1.3 Tool Bridges
 
-External tool integrations follow `--robot-<tool>-<action>` pattern with **separate modifier flags**:
+External tool integrations follow the `--robot-<tool>-<action>` pattern. Search
+bridges take the query as the flag's value; shared modifiers stay unprefixed:
 
 ```bash
-# CORRECT: Bool flag + separate modifiers
-ntm --robot-jfp-search --query="debugging" --limit=10
-ntm --robot-cass-search --query="auth error" --since=7d
-ntm --robot-xf-search --query="rust async" --limit=20
+ntm --robot-cass-search="auth error" --since=7d --limit=20
+ntm --robot-jfp-search="debugging"
+ntm --robot-xf-search="rust async" --xf-limit=20
 ntm --robot-dcg-check --command="rm -rf /data"
-ntm --robot-mail-check --project=myproj --agent=cc_1
+ntm --robot-mail-check --mail-project=myproj --mail-agent=cc_1
 
-# AVOID: Inline values in main flag (legacy pattern)
-ntm --robot-jfp-search="debugging"      # Deprecated
-ntm --robot-cass-search="auth error"    # Deprecated
+# AVOID: tool-prefixed copies of shared modifiers (deprecated aliases)
+ntm --robot-cass-search="auth error" --cass-since=7d --cass-limit=20
 ```
 
 ### 1.3.1 Flywheel Tool Bridges (Inventory + Wrappers)
@@ -76,17 +75,17 @@ ntm --robot-tools
 Tool bridges are **optional**. When a tool is missing, robot commands return `DEPENDENCY_MISSING` with an actionable hint. Use `--robot-tools` and `--robot-capabilities` to confirm which wrappers are supported in your build.
 
 **Implemented today**
-- **JFP** (JeffreysPrompts): `--robot-jfp-status`, `--robot-jfp-list`, `--robot-jfp-search`, `--robot-jfp-show`, `--robot-jfp-suggest`, `--robot-jfp-install`, `--robot-jfp-export`, `--robot-jfp-update`, `--robot-jfp-installed`, `--robot-jfp-categories`, `--robot-jfp-tags`, `--robot-jfp-bundles`
+- **JFP** (JeffreysPrompts): `--robot-jfp-status`, `--robot-jfp-list`, `--robot-jfp-search`, `--robot-jfp-show`, `--robot-jfp-suggest`, `--robot-jfp-export`, `--robot-jfp-update`, `--robot-jfp-categories`, `--robot-jfp-tags`, `--robot-jfp-bundles`
 - **ACFS** (Flywheel setup/bootstrapping): `--robot-acfs-status` (alias: `--robot-setup`)
 - **MS** (Meta Skill): `--robot-ms-search`, `--robot-ms-show`
 - **DCG** (Destructive Command Guard): `--robot-dcg-status`
 - **SLB** (two-person approvals): `--robot-slb-pending`, `--robot-slb-approve`, `--robot-slb-deny`
+- **RU** (repo updater): `--robot-ru-sync` — shipped
+- **GIIL** (image fetch): `--robot-giil-fetch` — shipped
+- **XF** (archive search): `--robot-xf-search`, `--robot-xf-status` — shipped
 
 **Planned / rolling out** (names follow `--robot-<tool>-<action>`; confirm via `--robot-capabilities`)
-- **RU** (repo updater): `--robot-ru-*`
-- **UBS** (Ultimate Bug Scanner): `--robot-ubs-*`
-- **GIIL** (image fetch): `--robot-giil-*`
-- **XF** (archive search): `--robot-xf-*`
+- **UBS** (Ultimate Bug Scanner): `--robot-ubs-*` (the human CLI already ships `ntm scan` / `ntm bugs`)
 
 ### 1.4 Resource Lookups
 
@@ -129,15 +128,15 @@ Note: `--robot-limit` and `--robot-offset` are accepted as explicit aliases for 
 
 **Example (Correct):**
 ```bash
-ntm --robot-cass-search --query="auth" --limit=20 --since=7d
-ntm --robot-alerts --alerts-type=error --alerts-session=myproject
+ntm --robot-cass-search="auth" --limit=20 --since=7d
+ntm --robot-alerts --alerts-type=error --session=myproject
 ntm --robot-wait=myproject --timeout=2m --panes=1,2
 ```
 
 **Example (Deprecated):**
 ```bash
 ntm --robot-cass-search="auth" --cass-limit=20 --cass-since=7d  # Old pattern
-ntm --robot-alerts --type=error --session=myproject  # Old pattern
+ntm --robot-alerts --alerts-session=myproject                  # Old pattern
 ```
 
 ### 2.2 Tool-Specific Modifiers
@@ -149,7 +148,9 @@ Only use tool prefix for options unique to that tool:
 | `--spawn-cc=N` | Claude agents to spawn | spawn-specific |
 | `--spawn-cod=N` | Codex agents to spawn | spawn-specific |
 | `--spawn-agy=N` | Antigravity agents to spawn | spawn-specific |
-| `--spawn-grok=N` | Grok Build agents to spawn (phase one: launch only) | spawn-specific |
+| `--spawn-grok=N` | Grok Build agents to spawn | spawn-specific |
+| `--spawn-omp=N[:model[:effort]]` | Oh My Pi (`omp`) agents to spawn; effort maps to `--thinking` | spawn-specific |
+| `--spawn-oc=N[:model]` | OpenCode (`oc`) agents to spawn; model is `provider/model` | spawn-specific |
 | `--spawn-gmi=N` | Gemini agents to spawn (legacy) | spawn-specific |
 | `--spawn-kimi=N` | Kimi agents to spawn | spawn-specific |
 | `--spawn-muse=N` | Muse Code agents to spawn | spawn-specific |
@@ -158,9 +159,10 @@ Only use tool prefix for options unique to that tool:
 | `--xf-mode=semantic` | XF search mode | xf-specific |
 | `--bulk-strategy=S` | Bulk assign strategy | bulk-assign-specific |
 
-Grok Build phase one does not automate the authenticated fullscreen TUI. Robot
-send, retasking interrupt, restart, readiness waits, assignment, and restore-time
-relaunch return `NOT_IMPLEMENTED` before mutating a Grok pane.
+Grok Build phase 2 (GH#251) automates the authenticated fullscreen TUI: robot
+send, retasking interrupt, restart, readiness waits (`--spawn-wait`), assignment
+(`--spawn-assign-work`), and restore-time relaunch work on Grok panes. Personas
+are refused because the Grok Build CLI has no system-prompt mechanism.
 
 ### 2.3 Aliases for Backward Compatibility
 
@@ -276,10 +278,11 @@ as complete.
 | Operation | Evidence to inspect | Meaning and limitations |
 |---|---|---|
 | `--robot-send` | `targets`, `successful`, and `failed` | A successful target received the tmux delivery attempt. This is dispatch evidence only; it does not prove the agent processed the prompt. |
-| `--robot-send` with `--verify-render` | One `render_evidence` entry per target; require `delivered_and_rendered: true` for every target | NTM captures bounded pane output before and after dispatch. `delivered_and_rendered` requires dispatch success, both captures, and a changed rendered output. Missing, unchanged, or unavailable evidence makes the overall response `success: false`; it proves rendered delivery, not prompt comprehension. |
+| `--robot-send` with `--verify-render` | One `render_evidence` entry per target; require `delivered_and_rendered: true` for every target | NTM captures bounded pane output before and after dispatch; a delivered pane whose screen still matches the baseline is re-captured for up to ~2s, because TUIs such as Claude Code redraw their composer shortly after a paste lands (this matters most for `--enter=false`). `delivered_and_rendered` requires dispatch success, both captures, and a changed rendered output. Missing, unchanged, or unavailable evidence makes the overall response `success: false`; it proves rendered delivery, not prompt comprehension. |
 | `--robot-send` with `--track` | `send` plus `ack.confirmations`, `ack.pending`, `ack.failed`, and `ack.timed_out` | The strongest prompt-consumption evidence. A confirmation reports its `ack_type`, time, and latency. Pending or timed-out panes require follow-up; do not retry blindly. |
 | `--robot-tail=SESSION --fresh` | Per-pane `capture_collected_at`, `capture_provenance`, and optional `capture_error` | A direct post-action observation. `capture_provenance: "live"` is fresh capture evidence; `"unavailable"` means the pane was not observed and is not evidence of no effect. |
 | `--robot-spawn` with `--spawn-wait` | The command waits up to `--spawn-timeout` for ready observations | Readiness-gated spawn evidence. A timeout is an error rather than a claim that all agents booted; inspect the resulting session with a fresh tail. |
+| `--robot-spawn` with `--spawn-prompt` | Per-agent `prompt_deliveries[]` (`prompt_sent`, `delivered_at`, `error`) and the `stagger.schedule[]` it was paced on | Dispatch evidence after the implied readiness wait, through the same idle-gated dispatch port as robot send. Any `prompt_sent: false` fails the envelope with `PROMPT_SEND_FAILED`; like `--robot-send` without `--track`, it does not prove the agent processed the prompt. |
 | `--robot-exit-cli`, `--robot-kill-agent`, and restart/relaunch paths | Per-pane `results`, including `shell_pid`, `agent_pids`, `shell_preserved`, and `verification_failed`; restart output also includes `pane_shell_pids`, `process_alive`, and relaunch status | Process/lifecycle evidence. `verification_failed` means observation failed, not that a pane was destroyed. A respawn must show a changed `pane_shell_pids.after`; unchanged or absent PID evidence is not a verified restart. |
 
 The durable attention feed mirrors actuation progress as `request`, `outcome`,
@@ -293,7 +296,7 @@ Example: dispatch a prompt and require bounded downstream evidence rather than
 assuming that an accepted keypress was consumed.
 
 ```bash
-ntm --robot-send=payments --msg='Run focused tests and report the result.' --track --ack-timeout=30s
+ntm --robot-send=payments --msg='Run focused tests and report the result.' --track --timeout=30s
 ntm --robot-send=payments --msg='Run focused tests and report the result.' --verify-render
 ntm --robot-tail=payments --fresh --panes=1,2
 ```
@@ -314,7 +317,9 @@ results for remediation instead of reporting a verified outcome.
 | `AGENT_NOT_FOUND` | Agent does not exist |
 | `THREAD_NOT_FOUND` | Thread does not exist |
 | `INVALID_FLAG` | Invalid flag combination |
+| `INVALID_ARGS` | Required argument missing or empty (e.g. `--robot-send` without a usable `--msg`/`--msg-file`) |
 | `INVALID_INPUT` | Invalid parameter value |
+| `DEPENDENCY_MISSING` | Required external tool not installed or vanished mid-run |
 | `MISSING_REQUIRED` | Required parameter missing |
 | `TIMEOUT` | Operation timed out |
 | `NOT_IMPLEMENTED` | Feature not yet available |
@@ -336,6 +341,7 @@ results for remediation instead of reporting a verified outcome.
 - `NOT_IMPLEMENTED` → exit 2
 - `MISSING_REQUIRED` → exit 1
 - `INVALID_FLAG` → exit 1
+- `INVALID_ARGS` → exit 1
 - `INVALID_INPUT` → exit 1
 - `SESSION_NOT_FOUND` → exit 1
 - All other errors → exit 1
@@ -759,7 +765,7 @@ ntm --robot-schema=all
 | `inspect` | Pane inspection | `--robot-inspect-pane` |
 | `ensemble` | Ensemble state | `--robot-ensemble` |
 | `ensemble_spawn` | Ensemble creation | `--robot-ensemble-spawn` |
-| `beads_list` | Bead listing | `--robot-bead-list` |
+| `beads_list` | Bead listing | `--robot-beads-list` |
 | `assign` | Work assignment | `--robot-assign` |
 | `triage` | Triage analysis | `--robot-triage` |
 | `health` | Health check | `--robot-health` |

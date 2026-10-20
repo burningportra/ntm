@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 // UnifiedDetector implements the Detector interface by combining
@@ -75,7 +76,11 @@ func (d *UnifiedDetector) AnalyzeAt(paneID, paneName, agentType string, output s
 		LastActive: lastActivity,
 		UpdatedAt:  observedAt,
 		State:      StateUnknown,
-		LastOutput: truncateOutput(output, d.config.OutputPreviewLength),
+		// The preview is the agent's transcript, not the chrome pinned below
+		// it. A blind tail truncation showed the composer and the status line
+		// instead of any real output — on a multi-line status line, nothing
+		// but the status line (ntm#322).
+		LastOutput: LastMeaningfulOutput(output, normalizedAgentType, d.config.OutputPreviewLength),
 	}
 
 	state, errType := d.determineStateAt(output, normalizedAgentType, lastActivity, observedAt)
@@ -120,6 +125,21 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 	threshold := time.Duration(d.config.ActivityThreshold) * time.Second
 	isLowVelocity := observedAt.Sub(lastActivity) >= threshold
 
+	// Gemini's live frame is pane-local evidence, unlike window_activity.
+	// Honor it on the first observation too: a busy sibling must not starve
+	// a ready Gemini pane, and a quiet response must not look idle merely
+	// because its input placeholder remains visible.
+	if agentType == string(agent.AgentTypeGemini) {
+		switch agent.DetectGeminiTurn(StripANSI(output)) {
+		case agent.GeminiTurnWorking:
+			return StateWorking, ErrorNone
+		case agent.GeminiTurnIdle:
+			return StateIdle, ErrorNone
+		case agent.GeminiTurnRateLimited:
+			return StateError, ErrorRateLimit
+		}
+	}
+
 	// Claude Code: the live-tail spinner classifier is authoritative and must
 	// outrank the velocity heuristic. A long "thinking" turn produces no new
 	// scrollback lines (low velocity) yet is unambiguously working; conversely a
@@ -127,7 +147,7 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 	// ClaudeActivelyWorking is biased to false-WORKING, so trusting it here can
 	// only ever err on the safe side.
 	if agentType == string(agent.AgentTypeClaudeCode) {
-		if agent.ClaudeActivelyWorking(output) {
+		if agent.ClaudeActivelyWorking(output, 0) {
 			return StateWorking, ErrorNone
 		}
 		if DetectIdleFromOutput(output, agentType) {
@@ -142,7 +162,7 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 	// timestamp. CodexActivelyWorking deliberately ignores markers that have
 	// scrolled out of the live window.
 	if agentType == string(agent.AgentTypeCodex) {
-		if agent.CodexActivelyWorking(output) {
+		if agent.CodexActivelyWorking(output, 0) {
 			return StateWorking, ErrorNone
 		}
 		// #234: mirror the Claude arm above. Codex only had the positive
@@ -154,6 +174,33 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 		// CodexActivelyWorking is biased to false-WORKING and has already
 		// returned false here, so trusting the idle chrome cannot mask a live
 		// turn.
+		if DetectIdleFromOutput(output, agentType) {
+			return StateIdle, ErrorNone
+		}
+	}
+
+	// Antigravity's composer remains visible while a turn runs, so its live
+	// cancel hint must win over both the prompt and activity recency. Once
+	// that hint is gone, a quiet composer is authoritative even on the first
+	// observation: a busy sibling refreshes the window-scoped timestamp, not
+	// this pane's work state (GH#344).
+	if agentType == string(agent.AgentTypeAntigravity) {
+		if agent.AntigravityActivelyWorking(output, 0) {
+			return StateWorking, ErrorNone
+		}
+		if DetectIdleFromOutput(output, agentType) {
+			return StateIdle, ErrorNone
+		}
+	}
+
+	// Grok Build mirrors the Claude/Codex arms above: its bordered composer is
+	// permanent chrome and its live activity line renders ABOVE the composer,
+	// so the shared in-flight classifier outranks both velocity and the
+	// prompt-line scan (GH#251 phase 2, live grok 1.0.5 captures).
+	if agentType == string(agent.AgentTypeGrok) {
+		if agent.GrokActivelyWorking(output, 0) {
+			return StateWorking, ErrorNone
+		}
 		if DetectIdleFromOutput(output, agentType) {
 			return StateIdle, ErrorNone
 		}
@@ -187,17 +234,19 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 		}
 	}
 
-	// opencode likewise: the progress bar below its prompt box is the only
-	// live-turn marker, and a box with no bar is waiting for input. A draft
-	// in the box is idle here but not an idle prompt, so
-	// observationConfidence keeps it from being dispatched to. The notice
-	// above the last turn decides first: opencode keeps the bar up while it
-	// retries a 429 or 5xx without end, and an error that ended the turn
-	// leaves an empty box that new work would only fail in again. Neither
-	// is work or a pane waiting for input, so both read as an error, which
-	// also keeps --robot-is-working's rate-limit and error verdicts from
-	// being overridden as live work. Notices above earlier turns do not
-	// count.
+	// opencode keeps its prompt box drawn while a turn runs, so its in-flight
+	// marker outranks velocity (ntm#261): the progress bar below the box, or
+	// the `esc interrupt` footer where no box is drawn. A box with no bar is
+	// waiting for input. A draft in the box is idle here but not an idle
+	// prompt, so observationConfidence keeps it from being dispatched to;
+	// where no box is drawn, the empty composer's hint text is the idle
+	// evidence (DetectIdleFromOutput). The notice above the last turn
+	// decides first: opencode keeps the bar up while it retries a 429 or 5xx
+	// without end, and an error that ended the turn leaves an empty box that
+	// new work would only fail in again. Neither is work or a pane waiting
+	// for input, so both read as an error, which also keeps
+	// --robot-is-working's rate-limit and error verdicts from being
+	// overridden as live work. Notices above earlier turns do not count.
 	if agentType == string(agent.AgentTypeOpencode) {
 		if agent.OpencodeRateLimited(output) {
 			return StateError, ErrorRateLimit
@@ -205,10 +254,42 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 		if agent.OpencodeErrorShowing(output) {
 			return StateError, ErrorGeneric
 		}
-		if agent.OpencodeActivelyWorking(output) {
+		if agent.OpencodeActivelyWorking(output, 0) {
 			return StateWorking, ErrorNone
 		}
-		if agent.OpencodePromptShowing(output) {
+		if agent.OpencodePromptShowing(output) || DetectIdleFromOutput(output, agentType) {
+			return StateIdle, ErrorNone
+		}
+	}
+
+	// Oh My Pi draws its status-line composer box at all times; the spinner +
+	// elapsed timer in the box's top border and the Esc-hint activity line
+	// above it exist only while a turn runs, so they outrank velocity and the
+	// quiet box is idle evidence once both are gone (live omp v18.2.3).
+	if agentType == string(agent.AgentTypeOmp) {
+		if agent.OmpActivelyWorking(output, 0) {
+			return StateWorking, ErrorNone
+		}
+		// A failed turn leaves a dismissable provider-error block above the
+		// quiet composer. It is an error (retryable by sending any message),
+		// not idle-after-completion, so it must outrank the idle composer.
+		if summary, failed := agent.OmpProviderError(output); failed {
+			return StateError, ompProviderErrorType(summary)
+		}
+		if DetectIdleFromOutput(output, agentType) {
+			return StateIdle, ErrorNone
+		}
+	}
+
+	// Registered plugin agents with declared readiness patterns get the same
+	// treatment as the built-ins above (ntm#260): their Working patterns are
+	// authoritative and their Idle patterns outrank the velocity gate, which
+	// is window-scoped and kept fresh by any busy sibling pane.
+	if pp, ok := agent.LookupPluginPatterns(agent.AgentType(agentType)); ok && pp.Declared() {
+		if agent.PluginActivelyWorking(output, agent.AgentType(agentType), 0) {
+			return StateWorking, ErrorNone
+		}
+		if DetectIdleFromOutput(output, agentType) {
 			return StateIdle, ErrorNone
 		}
 	}
@@ -289,6 +370,8 @@ func isKnownAgentType(agentType string) bool {
 		agent.AgentTypeCursor,
 		agent.AgentTypeWindsurf,
 		agent.AgentTypeAider,
+		agent.AgentTypeOpencode,
+		agent.AgentTypeOmp,
 		agent.AgentTypeOllama:
 		return true
 	default:
@@ -327,6 +410,20 @@ func museComposerShowing(output string) bool {
 		}
 	}
 	return false
+}
+
+// ompProviderErrorType classifies an omp provider-error summary. Only the
+// authentication shape has been captured live ("401 Invalid API Key");
+// everything else ("server_error: ERROR") is a generic, retryable provider
+// error. No omp rate-limit frame has been captured, so none is inferred.
+func ompProviderErrorType(summary string) ErrorType {
+	lower := strings.ToLower(summary)
+	for _, auth := range []string{"401", "403", "invalid api key", "unauthorized", "forbidden", "authentication"} {
+		if strings.Contains(lower, auth) {
+			return ErrorAuth
+		}
+	}
+	return ErrorGeneric
 }
 
 // looksLikeIdle applies heuristics to detect likely idle state when
@@ -444,7 +541,12 @@ func (d *UnifiedDetector) Detect(paneID string) (AgentStatus, error) {
 			output = retry
 		}
 	}
-	status.LastOutput = truncateOutput(output, d.config.OutputPreviewLength)
+	// A first, type-agnostic preview (blank and prompt lines dropped, no
+	// agent-specific chrome stripping yet). The agent type is only resolved
+	// further down, and there are error returns in between — this keeps those
+	// paths carrying a preview, as they always have. It is refined once the
+	// type is known (ntm#322).
+	status.LastOutput = LastMeaningfulOutput(output, "", d.config.OutputPreviewLength)
 
 	// Pane-local activity refinement (ntm#213): #{window_activity} is the best
 	// signal tmux offers, but it is window-scoped — any neighbor pane's output
@@ -472,6 +574,10 @@ func (d *UnifiedDetector) Detect(paneID string) (AgentStatus, error) {
 	}
 	status.PaneName = pane.Title
 	status.AgentType = string(pane.Type)
+
+	// Now that the agent type is known, the preview can drop that agent's
+	// composer and status line rather than showing them as "recent output".
+	status.LastOutput = LastMeaningfulOutput(output, status.AgentType, d.config.OutputPreviewLength)
 
 	// Use shared logic
 	state, errType := d.determineState(output, status.AgentType, status.LastActive)
@@ -894,8 +1000,19 @@ func (o *SessionObserver) buildPaneObservation(cache *sessionObservationCache, p
 		lastActivity = contentChangedAt
 	}
 
-	status := o.detector.AnalyzeAt(pane.Pane.ID, pane.Pane.Title, normalizedAgentType, output, lastActivity, observedAt)
-	confidence := observationConfidence(status, output)
+	// A capture returns scrollback ABOVE the visible screen. Transient TUI
+	// markers — codex's "Working" spinner above all — are authoritative only
+	// while they are on screen, so classifying the whole capture lets a marker
+	// that scrolled away hours ago pin a short pane to "working" forever
+	// (ntm#301). Keep the full capture for content-change history and
+	// diagnostics; classify only the current viewport when tmux gave us its
+	// height.
+	classificationOutput := output
+	if pane.Pane.Height > 0 {
+		classificationOutput = util.GetLastNLines(output, pane.Pane.Height)
+	}
+	status := o.detector.AnalyzeAt(pane.Pane.ID, pane.Pane.Title, normalizedAgentType, classificationOutput, lastActivity, observedAt)
+	confidence := observationConfidence(status, classificationOutput)
 	observation.Current = StateObservation{
 		Status:     status,
 		ObservedAt: observedAt,
@@ -1042,56 +1159,4 @@ func truncateOutput(s string, maxLen int) string {
 	}
 
 	return s[start:]
-}
-
-// GetStateSummary returns a summary of states for a set of statuses
-func GetStateSummary(statuses []AgentStatus) map[AgentState]int {
-	summary := make(map[AgentState]int)
-	for _, s := range statuses {
-		summary[s.State]++
-	}
-	return summary
-}
-
-// FilterByState returns only statuses matching the given state
-func FilterByState(statuses []AgentStatus, state AgentState) []AgentStatus {
-	var filtered []AgentStatus
-	for _, s := range statuses {
-		if s.State == state {
-			filtered = append(filtered, s)
-		}
-	}
-	return filtered
-}
-
-// FilterByAgentType returns only statuses for the given agent type
-func FilterByAgentType(statuses []AgentStatus, agentType string) []AgentStatus {
-	normalizedAgentType := string(agent.AgentType(agentType).Canonical())
-	var filtered []AgentStatus
-	for _, s := range statuses {
-		if string(agent.AgentType(s.AgentType).Canonical()) == normalizedAgentType {
-			filtered = append(filtered, s)
-		}
-	}
-	return filtered
-}
-
-// HasErrors returns true if any status is in error state
-func HasErrors(statuses []AgentStatus) bool {
-	for _, s := range statuses {
-		if s.State == StateError {
-			return true
-		}
-	}
-	return false
-}
-
-// AllHealthy returns true if all statuses are healthy (idle or working)
-func AllHealthy(statuses []AgentStatus) bool {
-	for _, s := range statuses {
-		if !s.IsHealthy() {
-			return false
-		}
-	}
-	return len(statuses) > 0
 }

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -88,7 +89,7 @@ type Request struct {
 	Delay                 time.Duration
 	StopOnFailure         bool
 	DryRun                bool
-	// ClearInput performs the per-agent composer clear (Escape ritual + C-u)
+	// ClearInput performs the per-agent composer clear (agent-specific keys)
 	// and verifies emptiness before typing the prompt (ntm-5p0b / AP-16):
 	// codex TUIs concatenate a fresh send onto leftover buffer text after an
 	// interrupt, corrupting both.
@@ -269,10 +270,6 @@ type ProtocolPlanner interface {
 // ProtocolPlannerFunc adapts a function to ProtocolPlanner.
 type ProtocolPlannerFunc func(context.Context, Target, bool) (ProtocolPlan, error)
 
-func (f ProtocolPlannerFunc) PlanDelivery(ctx context.Context, target Target, submit bool) (ProtocolPlan, error) {
-	return f(ctx, target, submit)
-}
-
 // DefaultProtocolPlanner mirrors NTM's established agent and shell protocols.
 type DefaultProtocolPlanner struct{}
 
@@ -335,6 +332,33 @@ func (d TMUXDeliverer) client() *tmux.Client {
 	return tmux.DefaultClient
 }
 
+// validateTMUXDeliveryProtocol rejects malformed transport plans before any
+// pane inspection or actuation. Service.Prepare normally validates plans, but
+// TMUXDeliverer is also a public port implementation and must fail
+// deterministically when called directly.
+func validateTMUXDeliveryProtocol(delivery Delivery) error {
+	if delivery.EnterDelay < 0 || delivery.SecondEnterDelay < 0 {
+		return errors.New("tmux delivery delays cannot be negative")
+	}
+	switch delivery.Protocol {
+	case ProtocolStageOnly:
+		if delivery.EnterDelay != 0 || delivery.SecondEnterDelay != 0 {
+			return errors.New("tmux stage-only protocol cannot include enter delays")
+		}
+	case ProtocolSingleEnter:
+		if delivery.SecondEnterDelay != 0 {
+			return errors.New("tmux single-enter protocol cannot include a second-enter delay")
+		}
+	case ProtocolDoubleEnter:
+		if delivery.EnterDelay != tmux.DoubleEnterFirstDelay || delivery.SecondEnterDelay != tmux.DoubleEnterSecondDelay {
+			return fmt.Errorf("tmux double-enter protocol requires delays %s and %s", tmux.DoubleEnterFirstDelay, tmux.DoubleEnterSecondDelay)
+		}
+	default:
+		return fmt.Errorf("unsupported delivery protocol %q", delivery.Protocol)
+	}
+	return nil
+}
+
 // RefuseDeadAgentPane rejects delivery to an agent-typed pane whose CLI has
 // exited back to a bare shell (ntm-0g0b): the keystrokes would land in zsh —
 // possibly EXECUTING message text as shell commands — while the send reported
@@ -350,18 +374,38 @@ func RefuseDeadAgentPane(pane tmux.Pane) error {
 		pane.Ref().Physical(), pane.Title, pane.Command)
 }
 
+// GuaranteeNoDeliveryActuation marks a delivery failure that provably happened
+// BEFORE any byte of the message was typed into the target. Only such a failure
+// is safe for a caller with a durable idempotency barrier to retry; everything
+// after the first keystroke stays outcome-unknown and fails closed.
+func GuaranteeNoDeliveryActuation(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &guaranteedNoDeliveryActuationError{err: err}
+}
+
+// IsGuaranteedNoDeliveryActuation reports whether err is marked as having
+// happened before any actuation.
+func IsGuaranteedNoDeliveryActuation(err error) bool {
+	var marked *guaranteedNoDeliveryActuationError
+	return errors.As(err, &marked)
+}
+
+type guaranteedNoDeliveryActuationError struct{ err error }
+
+func (e *guaranteedNoDeliveryActuationError) Error() string { return e.err.Error() }
+func (e *guaranteedNoDeliveryActuationError) Unwrap() error { return e.err }
+
 func (d TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	if err := RefuseDeadAgentPane(delivery.Target.Pane); err != nil {
-		return err
+	if err := validateTMUXDeliveryProtocol(delivery); err != nil {
+		return GuaranteeNoDeliveryActuation(err)
 	}
-	target := delivery.Target.Ref.ID
-	if target == "" {
-		target = fmt.Sprintf("%s:%s", delivery.Session, delivery.Target.Ref.Physical())
-	}
-	if err := d.ClearComposerForDelivery(ctx, target, delivery); err != nil {
+	target, err := d.PrepareTMUXDelivery(ctx, delivery)
+	if err != nil {
 		return err
 	}
 	client := d.client()
@@ -371,13 +415,10 @@ func (d TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 	case ProtocolSingleEnter:
 		return client.SendKeysForAgentWithDelayContext(ctx, target, delivery.Message, true, delivery.EnterDelay, delivery.Target.AgentType)
 	case ProtocolDoubleEnter:
-		if delivery.EnterDelay != tmux.DoubleEnterFirstDelay || delivery.SecondEnterDelay != tmux.DoubleEnterSecondDelay {
-			return fmt.Errorf("tmux double-enter protocol requires delays %s and %s", tmux.DoubleEnterFirstDelay, tmux.DoubleEnterSecondDelay)
-		}
 		if err := client.SendKeysForAgentDoubleEnterContext(ctx, target, delivery.Message, delivery.Target.AgentType); err != nil {
 			return err
 		}
-		return d.VerifyAgentSubmission(ctx, target, delivery.Message, delivery.Target.AgentType)
+		return d.VerifyAgentSubmission(ctx, target, delivery.Message, delivery.Target.AgentType, delivery.Target.Pane.Width)
 	default:
 		return fmt.Errorf("unsupported delivery protocol %q", delivery.Protocol)
 	}
@@ -385,8 +426,9 @@ func (d TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 
 // SubmitPrompt types prompt into the pane target and submits it with the
 // protocol DefaultProtocolPlanner picks for agentType: an agent pane gets the
-// agent-aware text send (a paste for a multi-line prompt), the double Enter
-// and, for Claude and Codex, the submission check that ntm send and
+// live-agent, trust-dialog and composer-readiness gates, the agent-aware text
+// send (a paste for a multi-line prompt), the double Enter and, for agents
+// with a submission verifier, the submission check that ntm send and
 // --robot-send use, while a user or unknown pane gets one Enter after the
 // shell delay. Callers that address one pane outside a dispatch plan, such as
 // ntm controller, pipeline steps, the swarm prompt injector, checkpoint
@@ -407,12 +449,82 @@ func (d TMUXDeliverer) SubmitPrompt(ctx context.Context, target string, agentTyp
 	})
 }
 
-// ClearComposerForDelivery runs the pre-send composer clear when the
-// delivery requests it (ntm-5p0b). A composer that POSITIVELY still holds
-// text after the clear is a distinct hard failure — typing into it would
-// concatenate and corrupt both payloads — while an unverifiable clear
-// (no marker visible) proceeds best-effort. User/unknown panes are skipped:
-// C-u in an operator shell would kill whatever the human was typing.
+// PrepareTMUXDelivery checks the shared live-agent and composer gates before
+// any message bytes are sent. Pipelines call this same preflight around their
+// durable send intent while retaining ownership of paste and verification.
+// Every error guarantees no message actuation, so a still-live owner may
+// durably record non-delivery for its own intent; an interrupted owner cannot.
+// It runs on tmux.DefaultClient; TMUXDeliverer.PrepareTMUXDelivery runs the
+// same gates on the deliverer's client.
+func PrepareTMUXDelivery(ctx context.Context, delivery Delivery) (string, error) {
+	return TMUXDeliverer{}.PrepareTMUXDelivery(ctx, delivery)
+}
+
+// PrepareTMUXDelivery runs the pre-actuation delivery gates through the
+// deliverer's client (see the package-level PrepareTMUXDelivery).
+func (d TMUXDeliverer) PrepareTMUXDelivery(ctx context.Context, delivery Delivery) (string, error) {
+	if err := contextError(ctx); err != nil {
+		return "", GuaranteeNoDeliveryActuation(err)
+	}
+	if err := RefuseDeadAgentPane(delivery.Target.Pane); err != nil {
+		return "", GuaranteeNoDeliveryActuation(err)
+	}
+	target := delivery.Target.Ref.ID
+	if target == "" {
+		target = fmt.Sprintf("%s:%s", delivery.Session, delivery.Target.Ref.Physical())
+	}
+	// An unnumbered trust menu can reuse the composer's cursor (GH#325),
+	// while Antigravity has no composer detector at all. Check the actual
+	// decision frame BEFORE composer clearing or any prompt bytes: text
+	// containing 'n' can otherwise quit Grok straight into the user's shell.
+	// This refusal is retry-safe; explicit dialog answers use a different
+	// surface and do not pass through normal prompt delivery.
+	client := d.client()
+	canonical := delivery.Target.AgentType.Canonical()
+	if canonical.IsValid() && canonical != tmux.AgentUser && canonical != tmux.AgentUnknown {
+		capture, captureErr := client.CapturePaneVisibleContext(ctx, target)
+		if err := contextError(ctx); err != nil {
+			return "", GuaranteeNoDeliveryActuation(err)
+		}
+		if captureErr == nil && agent.TrustDialogVisible(capture) {
+			return "", GuaranteeNoDeliveryActuation(fmt.Errorf(
+				"PANE_INTERACTIVE_GATE: pane %s is showing a workspace trust dialog; no prompt or clearing keys were sent; inspect with --robot-dialogs and explicitly answer with --robot-answer-dialog before retrying", target))
+		}
+	}
+	// --clear-input may safely leave Codex transcript browsing with one
+	// Escape; readiness is checked again after that verified recovery.
+	if canonical == tmux.AgentCodex {
+		if err := d.ClearComposerForDelivery(ctx, target, delivery); err != nil {
+			return "", GuaranteeNoDeliveryActuation(err)
+		}
+	}
+	// Fail closed on panes that cannot accept typed input yet (bd-dp9oy):
+	// a Claude/codex TUI still initializing, or showing a trust dialog or
+	// menu instead of its input box, silently swallows pasted prompts while
+	// the send reports success. The check fails open on capture problems and
+	// unknown agent types, so it can only refuse when the screen positively
+	// shows neither a composer nor working-state chrome.
+	if ready, reason := client.ComposerReadyForDelivery(ctx, target, delivery.Target.AgentType, delivery.Target.Pane.Width); !ready {
+		return "", GuaranteeNoDeliveryActuation(fmt.Errorf("pane %s not ready for delivery: %s", target, reason))
+	}
+	if canonical != tmux.AgentCodex {
+		if err := d.ClearComposerForDelivery(ctx, target, delivery); err != nil {
+			return "", GuaranteeNoDeliveryActuation(err)
+		}
+	}
+	if err := contextError(ctx); err != nil {
+		return "", GuaranteeNoDeliveryActuation(err)
+	}
+	return target, nil
+}
+
+// ClearComposerForDelivery runs the pre-send composer clear through the
+// deliverer's client when the delivery requests it (ntm-5p0b). A composer
+// that POSITIVELY still holds text after the clear is a distinct hard
+// failure — typing into it would concatenate and corrupt both payloads —
+// while an unverifiable clear (no marker visible) proceeds best-effort.
+// User/unknown panes are skipped: C-u in an operator shell would kill
+// whatever the human was typing.
 func (d TMUXDeliverer) ClearComposerForDelivery(ctx context.Context, target string, delivery Delivery) error {
 	if !delivery.ClearInput {
 		return nil
@@ -421,14 +533,40 @@ func (d TMUXDeliverer) ClearComposerForDelivery(ctx context.Context, target stri
 	if canonical == tmux.AgentUser || canonical == tmux.AgentUnknown || !canonical.IsValid() {
 		return nil
 	}
-	cleared, verified, err := d.client().ClearComposerContext(ctx, target, delivery.Target.AgentType)
+	result, err := d.client().ClearComposerContext(ctx, target, delivery.Target.AgentType)
 	if err != nil {
 		return fmt.Errorf("COMPOSER_CLEAR_FAILED: pane %s: %w", delivery.Target.Ref.Physical(), err)
 	}
-	if !cleared && verified {
-		return fmt.Errorf("COMPOSER_NOT_CLEARED: pane %s composer still holds text after the clear sequence; inspect with --robot-tail before resending", delivery.Target.Ref.Physical())
+	if !result.Cleared && result.Verified {
+		return fmt.Errorf("COMPOSER_NOT_CLEARED: pane %s %s; inspect with --robot-tail before resending",
+			delivery.Target.Ref.Physical(), composerBlockerDetail(result))
 	}
 	return nil
+}
+
+// composerBlockerDetail renders the typed reason a composer could not be
+// cleared. "Still holds text" was the only thing --clear-input could ever say,
+// which left operators unable to tell ordinary stranded input from queued
+// messages from a pane parked on a modal (ntm#300).
+func composerBlockerDetail(result tmux.ComposerClearResult) string {
+	switch result.Blocker {
+	case tmux.ComposerBlockerModal:
+		if result.Residual != "" {
+			return fmt.Sprintf("is showing %s; no prompt or Enter was sent; return with Escape before retrying", result.Residual)
+		}
+		return "is showing a dialog or picker, not an input box, so the composer was not touched (answering it needs a deliberate keystroke)"
+	case tmux.ComposerBlockerQueued:
+		return fmt.Sprintf("still reports queued messages after %d clear rounds; a new prompt would not be the next thing the agent processes", result.Rounds)
+	default:
+		residual := strings.TrimSpace(result.Residual)
+		if runes := []rune(residual); len(runes) > 120 {
+			residual = string(runes[:120]) + "…"
+		}
+		if residual == "" {
+			return fmt.Sprintf("composer still holds text after %d clear rounds", result.Rounds)
+		}
+		return fmt.Sprintf("composer still holds text after %d clear rounds: %q", result.Rounds, residual)
+	}
 }
 
 // VerifyAgentSubmission closes the gap between "keys were sent" and "the
@@ -442,23 +580,47 @@ func (d TMUXDeliverer) ClearComposerForDelivery(ctx context.Context, target stri
 // "delivered" keeps meaning "submitted". Verification infrastructure errors
 // (a capture hiccup) are logged but do not fail an already-delivered send.
 // Agent types without a verifier return nil immediately.
-func (d TMUXDeliverer) VerifyAgentSubmission(ctx context.Context, target, message string, agentType tmux.AgentType) error {
+//
+// paneWidth is the real tmux pane width threaded into the width-adaptive
+// working detectors (bd-eeifh); pass 0 when unknown. It runs on
+// tmux.DefaultClient; TMUXDeliverer.VerifyAgentSubmission runs the same check
+// on the deliverer's client.
+func VerifyAgentSubmission(ctx context.Context, target, message string, agentType tmux.AgentType, paneWidth int) error {
+	return TMUXDeliverer{}.VerifyAgentSubmission(ctx, target, message, agentType, paneWidth)
+}
+
+// VerifyAgentSubmission runs the submission check through the deliverer's
+// client (see the package-level VerifyAgentSubmission).
+func (d TMUXDeliverer) VerifyAgentSubmission(ctx context.Context, target, message string, agentType tmux.AgentType, paneWidth int) error {
 	var (
 		confirmed, rescued bool
 		err                error
 		kind               string
 	)
+	client := d.client()
 	switch agentType.Canonical() {
 	case tmux.AgentCodex:
 		kind = "codex"
-		confirmed, rescued, err = d.client().VerifyCodexSubmissionContext(ctx, target, message)
+		confirmed, rescued, err = client.VerifyCodexSubmissionContext(ctx, target, message, paneWidth)
 	case tmux.AgentClaude:
 		kind = "claude"
-		confirmed, rescued, err = d.client().VerifyClaudeSubmissionContext(ctx, target, message)
+		confirmed, rescued, err = client.VerifyClaudeSubmissionContext(ctx, target, message, paneWidth)
+	case tmux.AgentGrok:
+		kind = "grok"
+		confirmed, rescued, err = client.VerifyGrokSubmissionContext(ctx, target, message, paneWidth)
+	case tmux.AgentOmp:
+		kind = "omp"
+		confirmed, rescued, err = client.VerifyOmpSubmissionContext(ctx, target, message, paneWidth)
+	case tmux.AgentOpencode:
+		kind = "opencode"
+		confirmed, rescued, err = client.VerifyOpencodeSubmissionContext(ctx, target, message, paneWidth)
 	default:
 		return nil
 	}
 	if err != nil {
+		if errors.Is(err, tmux.ErrCodexTranscriptBrowsing) {
+			return fmt.Errorf("pane %s: %w", target, err)
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -494,10 +656,6 @@ type LifecycleHooks struct {
 
 // PacerFunc adapts a function to Pacer.
 type PacerFunc func(context.Context, Pace) error
-
-func (f PacerFunc) Wait(ctx context.Context, pace Pace) error {
-	return f(ctx, pace)
-}
 
 // TimerPacer implements context-aware wall-clock pacing.
 type TimerPacer struct{}

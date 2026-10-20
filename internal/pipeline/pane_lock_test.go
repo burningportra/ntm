@@ -1,0 +1,468 @@
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// newLockExecutor builds an executor whose pane locks live under dir.
+func newLockExecutor(dir string, wait time.Duration) *Executor {
+	return NewExecutor(ExecutorConfig{
+		Session:      "lock-test",
+		ProjectDir:   dir,
+		PaneLockWait: wait,
+	})
+}
+
+// TestPaneLockIsExclusiveAcrossExecutors is the ntm#324 regression at the unit
+// level. Two Executors model two `ntm pipeline run` processes: each builds its
+// own in-memory paneLocks map, so only the file lock can separate them.
+func TestPaneLockIsExclusiveAcrossExecutors(t *testing.T) {
+	dir := t.TempDir()
+	a := newLockExecutor(dir, 100*time.Millisecond)
+	b := newLockExecutor(dir, 100*time.Millisecond)
+
+	releaseA, err := a.acquirePaneLockCrossProcess(context.Background(), "%117")
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+
+	// While A owns the pane, B must not be admitted.
+	_, err = b.acquirePaneLockCrossProcess(context.Background(), "%117")
+	if err == nil {
+		t.Fatal("second executor acquired a pane the first still owns; dispatch is not exclusive")
+	}
+	if !errors.Is(err, ErrPaneBusyOtherProcess) {
+		t.Fatalf("want ErrPaneBusyOtherProcess, got %v", err)
+	}
+
+	// After A releases, B goes next.
+	releaseA()
+	releaseB, err := b.acquirePaneLockCrossProcess(context.Background(), "%117")
+	if err != nil {
+		t.Fatalf("second executor blocked after the first released: %v", err)
+	}
+	releaseB()
+}
+
+// TestPaneLockDoesNotSerializeDifferentPanes guards against the lock being too
+// coarse: two executors working different panes must not contend.
+func TestPaneLockDoesNotSerializeDifferentPanes(t *testing.T) {
+	dir := t.TempDir()
+	a := newLockExecutor(dir, 100*time.Millisecond)
+	b := newLockExecutor(dir, 100*time.Millisecond)
+
+	releaseA, err := a.acquirePaneLockCrossProcess(context.Background(), "%1")
+	if err != nil {
+		t.Fatalf("acquire %%1: %v", err)
+	}
+	defer releaseA()
+
+	releaseB, err := b.acquirePaneLockCrossProcess(context.Background(), "%2")
+	if err != nil {
+		t.Fatalf("a lock on %%1 blocked an unrelated pane %%2: %v", err)
+	}
+	releaseB()
+}
+
+// TestPaneLockWaitsThenFailsTyped pins the contention policy: the later
+// pipeline waits for the owner, and on expiry reports a typed
+// not-dispatched reason rather than hanging or pasting.
+func TestPaneLockWaitsThenFailsTyped(t *testing.T) {
+	dir := t.TempDir()
+	const wait = 300 * time.Millisecond
+
+	owner := newLockExecutor(dir, wait)
+	waiter := newLockExecutor(dir, wait)
+
+	releaseOwner, err := owner.acquirePaneLockCrossProcess(context.Background(), "%9")
+	if err != nil {
+		t.Fatalf("owner acquire: %v", err)
+	}
+
+	// Release midway through the waiter's budget: it must succeed by waiting.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(wait / 3)
+		releaseOwner()
+	}()
+
+	start := time.Now()
+	release, err := waiter.acquirePaneLockCrossProcess(context.Background(), "%9")
+	elapsed := time.Since(start)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("waiter gave up on a pane that freed inside the budget: %v", err)
+	}
+	release()
+	if elapsed < wait/4 {
+		t.Errorf("waiter returned in %s without waiting for the owner", elapsed)
+	}
+
+	// Now hold it for the whole budget: the waiter must fail, typed.
+	releaseOwner2, err := owner.acquirePaneLockCrossProcess(context.Background(), "%9")
+	if err != nil {
+		t.Fatalf("owner re-acquire: %v", err)
+	}
+	defer releaseOwner2()
+
+	start = time.Now()
+	_, err = waiter.acquirePaneLockCrossProcess(context.Background(), "%9")
+	elapsed = time.Since(start)
+
+	if !errors.Is(err, ErrPaneBusyOtherProcess) {
+		t.Fatalf("want ErrPaneBusyOtherProcess after the budget expired, got %v", err)
+	}
+	if elapsed < wait {
+		t.Errorf("failed after %s, before the %s budget elapsed", elapsed, wait)
+	}
+	// Generous upper bound on purpose: this only needs to catch "waits
+	// forever", and a tight multiple would flake when the suite saturates the
+	// machine — which is how several of this repo's timeout-sensitive tests
+	// already misbehave under load.
+	if elapsed > wait*10 {
+		t.Errorf("waited %s, far beyond the %s budget", elapsed, wait)
+	}
+}
+
+// TestPaneLockHonorsCallerCancellation verifies an operator cancelling the run
+// is reported as cancelled, not as a busy pane.
+func TestPaneLockHonorsCallerCancellation(t *testing.T) {
+	dir := t.TempDir()
+	owner := newLockExecutor(dir, time.Minute)
+	waiter := newLockExecutor(dir, time.Minute)
+
+	releaseOwner, err := owner.acquirePaneLockCrossProcess(context.Background(), "%5")
+	if err != nil {
+		t.Fatalf("owner acquire: %v", err)
+	}
+	defer releaseOwner()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = waiter.acquirePaneLockCrossProcess(ctx, "%5")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled on operator cancellation, got %v", err)
+	}
+	if errors.Is(err, ErrPaneBusyOtherProcess) {
+		t.Error("operator cancellation was misreported as a busy pane")
+	}
+}
+
+// TestPaneLockReleaseFreesInProcessLockToo guards the layering: the returned
+// release must drop BOTH the file lock and the in-memory channel, or the same
+// executor deadlocks against itself on the next step.
+func TestPaneLockReleaseFreesInProcessLockToo(t *testing.T) {
+	dir := t.TempDir()
+	e := newLockExecutor(dir, 500*time.Millisecond)
+
+	for i := 0; i < 3; i++ {
+		release, err := e.acquirePaneLockCrossProcess(context.Background(), "%3")
+		if err != nil {
+			t.Fatalf("acquire %d failed; a previous release did not free both locks: %v", i, err)
+		}
+		release()
+	}
+}
+
+// TestPaneLockFailedAcquireReleasesLocalLock covers the error path: when the
+// file lock cannot be taken, the in-process lock must be handed back, or the
+// pane stays wedged inside this process for the rest of the run.
+func TestPaneLockFailedAcquireReleasesLocalLock(t *testing.T) {
+	dir := t.TempDir()
+	owner := newLockExecutor(dir, 50*time.Millisecond)
+	waiter := newLockExecutor(dir, 50*time.Millisecond)
+
+	releaseOwner, err := owner.acquirePaneLockCrossProcess(context.Background(), "%7")
+	if err != nil {
+		t.Fatalf("owner acquire: %v", err)
+	}
+
+	if _, err := waiter.acquirePaneLockCrossProcess(context.Background(), "%7"); !errors.Is(err, ErrPaneBusyOtherProcess) {
+		t.Fatalf("want busy, got %v", err)
+	}
+	releaseOwner()
+
+	// The waiter's own in-process lock must be free again.
+	done := make(chan error, 1)
+	go func() {
+		release, err := waiter.acquirePaneLockCrossProcess(context.Background(), "%7")
+		if err == nil {
+			release()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("retry after a failed acquire: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry deadlocked: the failed acquire leaked the in-process pane lock")
+	}
+}
+
+// A missing project directory disables project state, not pane ownership.
+// The shared per-user lock must still serialize independent executors.
+func TestPaneLockWithoutProjectDirIsExclusive(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	a := newLockExecutor("", 50*time.Millisecond)
+	b := newLockExecutor("", 50*time.Millisecond)
+
+	releaseA, err := a.acquirePaneLockCrossProcess(context.Background(), "%1")
+	if err != nil {
+		t.Fatalf("acquire without ProjectDir: %v", err)
+	}
+	held := true
+	defer func() {
+		if held {
+			releaseA()
+		}
+	}()
+
+	if unexpected, err := b.acquirePaneLockCrossProcess(context.Background(), "%1"); !errors.Is(err, ErrPaneBusyOtherProcess) {
+		if unexpected != nil {
+			unexpected()
+		}
+		t.Fatalf("missing ProjectDir bypassed pane ownership: %v", err)
+	}
+
+	// The same executor still serializes itself.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if unexpected, err := a.acquirePaneLockCrossProcess(ctx, "%1"); !errors.Is(err, context.DeadlineExceeded) {
+		if unexpected != nil {
+			unexpected()
+		}
+		t.Fatalf("in-process contention did not honor cancellation: %v", err)
+	}
+
+	releaseA()
+	held = false
+	releaseB, err := b.acquirePaneLockCrossProcess(context.Background(), "%1")
+	if err != nil {
+		t.Fatalf("failed acquisition leaked a lock: %v", err)
+	}
+	releaseB()
+}
+
+// TestPaneLockDryRunTakesNoFileLock covers the parallel dispatch path, which
+// (unlike the prompt and template paths) has no dry-run early return before
+// the lock. A dry run dispatches nothing, so it must not take a real lock:
+// --dry-run may not write to .ntm, and every dry-run step reports the same
+// synthetic pane id, so two previews of one project would otherwise serialize
+// on a single key and the second would fail as "pane busy".
+func TestPaneLockDryRunTakesNoFileLock(t *testing.T) {
+	dir := t.TempDir()
+
+	newDryRun := func() *Executor {
+		return NewExecutor(ExecutorConfig{
+			Session:      "dry",
+			ProjectDir:   dir,
+			DryRun:       true,
+			PaneLockWait: 200 * time.Millisecond,
+		})
+	}
+
+	a, b := newDryRun(), newDryRun()
+
+	releaseA, err := a.acquirePaneLockCrossProcess(context.Background(), "dry-run-pane")
+	if err != nil {
+		t.Fatalf("dry-run acquire: %v", err)
+	}
+	defer releaseA()
+
+	// A second preview of the same project must not be blocked by the first.
+	releaseB, err := b.acquirePaneLockCrossProcess(context.Background(), "dry-run-pane")
+	if err != nil {
+		t.Fatalf("a concurrent dry run was blocked by another dry run: %v", err)
+	}
+	releaseB()
+
+	// And nothing may have been written under .ntm.
+	if entries, err := os.ReadDir(filepath.Join(dir, ".ntm", pipelineStateDirName, paneLockDirName)); err == nil && len(entries) > 0 {
+		t.Errorf("--dry-run created %d lock file(s); a dry run must write nothing", len(entries))
+	}
+}
+
+// TestPaneLockEmptyPaneIDIsNoop covers steps with no pane target.
+func TestPaneLockEmptyPaneIDIsNoop(t *testing.T) {
+	e := newLockExecutor(t.TempDir(), time.Second)
+	release, err := e.acquirePaneLockCrossProcess(context.Background(), "")
+	if err != nil {
+		t.Fatalf("empty pane id: %v", err)
+	}
+	release()
+}
+
+// TestPaneLockFileNameIsPathSafe verifies a pane identity cannot escape the
+// lock directory or collide across distinct panes.
+func TestPaneLockFileNameIsPathSafe(t *testing.T) {
+	hostile := []string{
+		"../../etc/passwd",
+		"..",
+		".",
+		"%1/../../../tmp/x",
+		"sess:0.1",
+		strings.Repeat("a", 500),
+		"a\x00b",
+	}
+
+	seen := map[string]string{}
+	for _, paneID := range append(hostile, "%1", "%2", "%117") {
+		name := paneLockFileName(paneID)
+
+		if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+			t.Errorf("pane %q produced an unsafe lock file name %q", paneID, name)
+		}
+		if filepath.Base(name) != name {
+			t.Errorf("pane %q produced a non-basename lock file name %q", paneID, name)
+		}
+		if prev, dup := seen[name]; dup {
+			t.Errorf("panes %q and %q collide on lock file %q", prev, paneID, name)
+		}
+		seen[name] = paneID
+	}
+}
+
+// TestPaneLockRendezvousSurvivesPathSpelling is the exclusion-failure guard
+// that matters most in practice: two processes that mean the same project may
+// hold different spellings of its path (relative vs absolute, or a symlinked
+// /var vs /private/var on macOS). If they normalize differently they lock
+// different files and BOTH proceed, which looks exactly like no locking.
+func TestPaneLockRendezvousSurvivesPathSpelling(t *testing.T) {
+	dir := t.TempDir()
+
+	// A symlink to the same project, the shape macOS temp paths take.
+	link := filepath.Join(t.TempDir(), "linked-project")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	// A relative spelling of the same directory.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(wd, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, spelling := range []struct {
+		name string
+		path string
+	}{
+		{"symlinked path", link},
+		{"relative path", rel},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			direct := newLockExecutor(dir, 100*time.Millisecond)
+			other := newLockExecutor(spelling.path, 100*time.Millisecond)
+
+			release, err := direct.acquirePaneLockCrossProcess(context.Background(), "%77")
+			if err != nil {
+				t.Fatalf("acquire via canonical path: %v", err)
+			}
+			defer release()
+
+			if _, err := other.acquirePaneLockCrossProcess(context.Background(), "%77"); !errors.Is(err, ErrPaneBusyOtherProcess) {
+				t.Errorf("a %s of the same project did not contend (err=%v); the two spellings locked different files",
+					spelling.name, err)
+			}
+		})
+	}
+}
+
+// TestPaneLockCreatesLockUnderProjectState verifies the lock file lands in the
+// project's pipeline state tree, where a second process will look for it.
+func TestPaneLockCreatesLockUnderProjectState(t *testing.T) {
+	dir := t.TempDir()
+	e := newLockExecutor(dir, time.Second)
+
+	release, err := e.acquirePaneLockCrossProcess(context.Background(), "%42")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer release()
+
+	want := filepath.Join(dir, ".ntm", pipelineStateDirName, paneLockDirName)
+	entries, err := os.ReadDir(want)
+	if err != nil {
+		t.Fatalf("lock directory %s not created: %v", want, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want exactly 1 lock file in %s, got %d", want, len(entries))
+	}
+}
+
+// TestApplyPaneLockFailureClassifies pins the two operator-visible outcomes.
+func TestApplyPaneLockFailureClassifies(t *testing.T) {
+	t.Run("busy pane is typed and says nothing was sent", func(t *testing.T) {
+		var result StepResult
+		applyPaneLockFailure(&result, "%117", ErrPaneBusyOtherProcess)
+
+		if result.SkipKind != SkipKindPaneBusy {
+			t.Errorf("SkipKind = %q, want %q", result.SkipKind, SkipKindPaneBusy)
+		}
+		if !strings.Contains(result.SkipReason, "%117") {
+			t.Errorf("reason must name the pane: %q", result.SkipReason)
+		}
+		if !strings.Contains(result.SkipReason, "nothing was sent") {
+			t.Errorf("reason must state that no prompt was dispatched: %q", result.SkipReason)
+		}
+	})
+
+	t.Run("cancellation stays cancelled", func(t *testing.T) {
+		var result StepResult
+		applyPaneLockFailure(&result, "%117", context.Canceled)
+
+		if result.SkipKind != SkipKindCancelled {
+			t.Errorf("SkipKind = %q, want %q", result.SkipKind, SkipKindCancelled)
+		}
+		if !strings.Contains(result.SkipReason, "cancelled") {
+			t.Errorf("reason = %q, want it to say cancelled", result.SkipReason)
+		}
+	})
+
+	t.Run("a lock failure names the real error, not a cancellation", func(t *testing.T) {
+		var result StepResult
+		applyPaneLockFailure(&result, "%117", errors.New("permission denied"))
+
+		if strings.Contains(result.SkipReason, "cancelled") {
+			t.Errorf("a lock failure was reported as a cancellation that never happened: %q", result.SkipReason)
+		}
+		if !strings.Contains(result.SkipReason, "permission denied") {
+			t.Errorf("reason must carry the underlying error: %q", result.SkipReason)
+		}
+		if !strings.Contains(result.SkipReason, "%117") {
+			t.Errorf("reason must name the pane: %q", result.SkipReason)
+		}
+	})
+
+	// Every outcome must leave the step re-runnable on resume: nothing was
+	// dispatched, so resume has to retry rather than treat it as done.
+	t.Run("every outcome is re-run on resume", func(t *testing.T) {
+		for _, err := range []error{ErrPaneBusyOtherProcess, context.Canceled, errors.New("disk full")} {
+			var result StepResult
+			applyPaneLockFailure(&result, "%117", err)
+			if !shouldRerunStep(result) {
+				t.Errorf("a step that never dispatched (%v) would not be re-run on resume", err)
+			}
+		}
+	})
+}

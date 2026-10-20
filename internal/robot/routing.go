@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"math/rand"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 // AgentMailConfig holds configuration for Agent Mail integration in routing.
@@ -76,26 +78,29 @@ func DefaultRoutingConfig() RoutingConfig {
 // defaultRoutingContextLines aligns with --robot-context default (root.go uses 1000 when --lines is unset).
 const defaultRoutingContextLines = 1000
 
-// getContextUsageByPane returns a map of pane index -> context usage percent.
+// getContextUsageByPane returns physical pane ID -> context usage percent.
+// Pane indices are local to a window and cannot identify context evidence.
 // Returns nil if context usage can't be computed.
-func getContextUsageByPane(session string) map[int]float64 {
+func getContextUsageByPane(session string) map[string]float64 {
 	output, err := GetContext(session, defaultRoutingContextLines)
 	if err != nil || output == nil || !output.Success {
 		return nil
 	}
 
-	usage := make(map[int]float64, len(output.Agents))
+	usage := make(map[string]float64, len(output.Agents))
 	for _, agent := range output.Agents {
-		usage[agent.PaneIdx] = agent.UsagePercent
+		if agent.PaneID != "" {
+			usage[agent.PaneID] = agent.UsagePercent
+		}
 	}
 	return usage
 }
 
-func contextUsageForPane(usage map[int]float64, paneIndex int) float64 {
+func contextUsageForPane(usage map[string]float64, paneID string) float64 {
 	if usage == nil {
 		return 0
 	}
-	if value, ok := usage[paneIndex]; ok {
+	if value, ok := usage[paneID]; ok {
 		return value
 	}
 	return 0
@@ -103,7 +108,7 @@ func contextUsageForPane(usage map[int]float64, paneIndex int) float64 {
 
 // scoredAgentForRouting keeps every route surface aligned with the activity
 // classifier's authoritative pane state, including live rate-limit evidence.
-func scoredAgentForRouting(pane tmux.Pane, agentType string, activity *AgentActivity, contextUsage map[int]float64) ScoredAgent {
+func scoredAgentForRouting(pane tmux.Pane, agentType string, activity *AgentActivity, contextUsage map[string]float64) ScoredAgent {
 	return ScoredAgent{
 		PaneID:       pane.ID,
 		AgentType:    agentType,
@@ -111,7 +116,7 @@ func scoredAgentForRouting(pane tmux.Pane, agentType string, activity *AgentActi
 		State:        activity.State,
 		Confidence:   activity.Confidence,
 		Velocity:     activity.Velocity,
-		ContextUsage: contextUsageForPane(contextUsage, pane.Index),
+		ContextUsage: contextUsageForPane(contextUsage, pane.ID),
 		LastActivity: activity.LastOutput,
 		HealthState:  deriveHealthState(activity.State),
 		RateLimited:  activity.RateLimited,
@@ -149,9 +154,14 @@ type ScoredAgent struct {
 
 // ScoreBreakdown shows how the score was calculated.
 type ScoreBreakdown struct {
-	ContextScore  float64 `json:"context_score"`  // 0-100
-	StateScore    float64 `json:"state_score"`    // -100 to 100, normalized to 0-100
-	RecencyScore  float64 `json:"recency_score"`  // 0-100
+	ContextScore float64 `json:"context_score"` // 0-100
+	StateScore   float64 `json:"state_score"`   // -100 to 100, normalized to 0-100
+	RecencyScore float64 `json:"recency_score"` // 0-100
+	// AffinityMatch is the fraction (0-1) of the files named in the prompt
+	// that this agent holds live Agent Mail reservations for. It is the
+	// signal the affinity strategy ranks by, and it is measured whenever
+	// reservation data is wired — independent of whether the bonus is on.
+	AffinityMatch float64 `json:"affinity_match"`
 	AffinityBonus float64 `json:"affinity_bonus"` // 0-20 (if enabled)
 
 	// Weighted contributions
@@ -168,6 +178,10 @@ const (
 	HealthDegraded    HealthState = "degraded"
 	HealthUnhealthy   HealthState = "unhealthy"
 	HealthRateLimited HealthState = "rate_limited"
+	// HealthBlocked: parked on an interactive gate screen (trust dialog,
+	// login gate). Not dispatchable and not auto-restartable — a restart
+	// cannot answer a dialog; a human keystroke can (bd-jf22c).
+	HealthBlocked HealthState = "blocked"
 )
 
 // =============================================================================
@@ -382,17 +396,6 @@ func NewAgentScorer(cfg RoutingConfig) *AgentScorer {
 	}
 }
 
-// NewAgentScorerWithReservations creates a scorer with Agent Mail reservation support.
-func NewAgentScorerWithReservations(cfg RoutingConfig, client *agentmail.Client, projectKey string) *AgentScorer {
-	scorer := NewAgentScorer(cfg)
-
-	if cfg.AgentMail.Enabled && client != nil && projectKey != "" {
-		scorer.reservationCache = NewReservationCache(client, projectKey, cfg.AgentMail.CacheTTL)
-	}
-
-	return scorer
-}
-
 // NewAgentScorerFromConfig creates a scorer using config file settings.
 // Callers should pass a config loaded via config.Load() or config.Default(),
 // which already include canonical routing defaults.
@@ -430,6 +433,140 @@ func NewAgentScorerFromConfig(cfg *config.Config) *AgentScorer {
 // SetReservationCache sets the reservation cache for Agent Mail integration.
 func (s *AgentScorer) SetReservationCache(cache *ReservationCache) {
 	s.reservationCache = cache
+}
+
+// resolveAffinityProjectKey resolves the Agent Mail project key for
+// reservation-affinity wiring with the same SESSION-FIRST precedence the CLI
+// uses (internal/cli resolveAgentMailProjectKey, bd-2rtl8): the session's
+// persisted Agent Mail registry/agent-info project key wins, then the
+// configured projects_base session directory, and only then the caller's
+// working directory. An orchestrator invoking --robot-send from OUTSIDE the
+// repo previously keyed ListReservations on its own cwd, silently degrading
+// the bonus to 0 or matching another project's identically-named patterns.
+func resolveAffinityProjectKey(cfg *config.Config, session string) string {
+	cwdProject := util.ResolveProjectDir("")
+
+	sessionProject := ""
+	if cfg != nil && strings.TrimSpace(session) != "" {
+		sessionProject = cfg.GetProjectDir(session)
+	}
+
+	savedProject := ""
+	if strings.TrimSpace(session) != "" {
+		if registry, err := agentmail.LoadBestSessionAgentRegistry(session, sessionProject, cwdProject); err == nil && registry != nil {
+			savedProject = registry.ProjectKey
+		}
+		if info, err := agentmail.LoadBestSessionAgent(session, savedProject, sessionProject, cwdProject); err == nil && info != nil {
+			savedProject = affinityProjectKeyPreference(savedProject, info.ProjectKey, "")
+		}
+	}
+
+	return affinityProjectKeyPreference(savedProject, sessionProject, cwdProject)
+}
+
+// affinityProjectKeyPreference returns the first USABLE candidate in
+// precedence order (session-saved, session-configured, cwd). Usability is
+// scored the same way the CLI scores project dirs so a stand-in path like a
+// nonexistent projects_base/<session> directory never beats a real checkout.
+func affinityProjectKeyPreference(candidates ...string) string {
+	for _, c := range candidates {
+		if strings.TrimSpace(c) == "" {
+			continue
+		}
+		if util.ProjectDirScore(c) > 0 {
+			return c
+		}
+	}
+	return ""
+}
+
+// sharedReservationCaches holds one ReservationCache per project key for the
+// lifetime of the process, so the configured CacheTTL actually amortizes
+// Agent Mail round-trips: constructing a fresh cache per GetRoute /
+// GetRouteRecommendation call left lastFetch at zero, making NeedsRefresh
+// always true and every affinity-enabled send pay a blocking fetch (up to the
+// 3s timeout against a wedged-but-accepting server) — the "30s TTL" was
+// pretense (bd-2rtl8).
+var (
+	sharedReservationCachesMu sync.Mutex
+	sharedReservationCaches   = make(map[string]*ReservationCache)
+)
+
+// sharedReservationCache returns the process-wide reservation cache for a
+// project key, creating it on first use. An existing cache keeps its client
+// and fetch history; only the TTL is updated if configuration changed.
+func sharedReservationCache(client *agentmail.Client, projectKey string, ttl time.Duration) *ReservationCache {
+	if ttl == 0 {
+		ttl = 30 * time.Second
+	}
+	sharedReservationCachesMu.Lock()
+	defer sharedReservationCachesMu.Unlock()
+
+	if rc, ok := sharedReservationCaches[projectKey]; ok {
+		rc.mu.Lock()
+		rc.ttl = ttl
+		rc.mu.Unlock()
+		return rc
+	}
+	rc := NewReservationCache(client, projectKey, ttl)
+	sharedReservationCaches[projectKey] = rc
+	return rc
+}
+
+// reservationAffinityRefreshTimeout bounds the best-effort Agent Mail
+// reservation fetch at scorer setup. Affinity is enrichment, never a gate: an
+// absent or wedged Agent Mail server must not stall routing or a send — the
+// bonus simply degrades to 0 (bd-ws2-wire-or-delete-ykmcz.3).
+const reservationAffinityRefreshTimeout = 3 * time.Second
+
+// wireReservationAffinity populates the reservation cache at route/send time
+// so the affinity signal is real instead of permanently 0
+// (bd-ws2-wire-or-delete-ykmcz.3, WIRE-MINIMAL).
+//
+// The signal is wanted when [routing] affinity_enabled=true (the bonus is
+// mixed into every strategy's score) or when the caller explicitly routes
+// with the affinity strategy (which ranks by the signal itself, so asking
+// for it is the opt-in). Either way it also needs [agent_mail] enabled=true:
+// reservations are the only source of affinity. When wanted, it resolves
+// the project key SESSION-FIRST with the same precedence the CLI uses
+// (persisted session registry, then configured session dir, then cwd —
+// bd-2rtl8), constructs an Agent Mail client from the same config/env
+// precedence the CLI uses (env AGENT_MAIL_URL/AGENT_MAIL_TOKEN override
+// config), attaches the process-shared TTL ReservationCache with one
+// best-effort TTL-bounded refresh, and loads the persisted pane→agent-name
+// mapping from the session agent registry. Everything is best-effort: any
+// failure leaves the scorer exactly as it was before wiring (affinity
+// measures 0, so the affinity strategy falls back to least-loaded).
+func (s *AgentScorer) wireReservationAffinity(cfg *config.Config, session string, strategy StrategyName) {
+	if cfg == nil || !cfg.AgentMail.Enabled {
+		return
+	}
+	if !s.config.AffinityEnabled && strategy != StrategyAffinity {
+		return
+	}
+	projectKey := resolveAffinityProjectKey(cfg, session)
+	if projectKey == "" {
+		slog.Warn("[robot.route] affinity: cannot resolve project key; bonus degrades to 0", "session", session)
+		return
+	}
+
+	opts := []agentmail.Option{agentmail.WithProjectKey(projectKey)}
+	opts = append(opts, agentmail.ConfigOptions(cfg.AgentMail.URL, cfg.AgentMail.Token)...)
+	client := agentmail.NewClient(opts...)
+	agentmail.HydrateClientTokensForProject(client, projectKey)
+
+	s.config.AgentMail.Enabled = true
+	s.SetReservationCache(sharedReservationCache(client, projectKey, s.config.AgentMail.CacheTTL))
+	if loaded := s.LoadAgentMappingFromRegistry(session, projectKey); loaded == 0 {
+		slog.Debug("[robot.route] affinity: no persisted pane→agent mapping for session", "session", session)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), reservationAffinityRefreshTimeout)
+	defer cancel()
+	if err := s.reservationCache.EnsureFresh(ctx); err != nil {
+		slog.Warn("[robot.route] affinity: reservation cache refresh failed; bonus degrades to 0",
+			"session", session, "error", err)
+	}
 }
 
 // SetAgentMapping sets the mapping from pane IDs to Agent Mail agent names.
@@ -622,9 +759,14 @@ func (s *AgentScorer) calculateScoreComponents(agent *ScoredAgent, prompt string
 	// 3. Recency Score (0-100)
 	breakdown.RecencyScore = s.recencyToScore(agent.LastActivity)
 
-	// 4. Affinity Bonus (0-20)
-	if s.config.AffinityEnabled && prompt != "" {
-		breakdown.AffinityBonus = s.calculateAffinity(agent, prompt)
+	// 4. Affinity: the match is measured whenever reservations are wired
+	// (the affinity strategy ranks by it); the bonus (0-AffinityBonus) is
+	// added to the score only when affinity_enabled is on.
+	if prompt != "" {
+		breakdown.AffinityMatch = s.affinityMatch(agent, prompt)
+		if s.config.AffinityEnabled {
+			breakdown.AffinityBonus = s.config.AffinityBonus * breakdown.AffinityMatch
+		}
 	}
 
 	// Calculate weighted contributions
@@ -682,8 +824,11 @@ func (s *AgentScorer) recencyToScore(lastActivity time.Time) float64 {
 	return 70
 }
 
-// calculateAffinity calculates affinity bonus based on prompt matching.
-func (s *AgentScorer) calculateAffinity(agent *ScoredAgent, prompt string) float64 {
+// affinityMatch returns the fraction (0-1) of the file paths named in the
+// prompt that the pane's mapped Agent Mail identity holds live reservations
+// for. It is 0 when Agent Mail is not wired, the pane has no mapped
+// identity, or the prompt names no files.
+func (s *AgentScorer) affinityMatch(agent *ScoredAgent, prompt string) float64 {
 	// If Agent Mail integration is not enabled or no cache, return 0
 	if !s.config.AgentMail.Enabled || s.reservationCache == nil {
 		return 0
@@ -718,15 +863,7 @@ func (s *AgentScorer) calculateAffinity(agent *ScoredAgent, prompt string) float
 		}
 	}
 
-	if matches == 0 {
-		return 0
-	}
-
-	// Scale bonus based on match ratio (more matches = higher bonus, capped at config max).
-	matchRatio := float64(matches) / float64(len(filePaths))
-	bonus := s.config.AffinityBonus * matchRatio
-
-	return bonus
+	return float64(matches) / float64(len(filePaths))
 }
 
 // checkExclusion checks if an agent should be excluded from routing.
@@ -841,44 +978,11 @@ func (s *AgentScorer) GetAvailableAgents(scored []ScoredAgent) []ScoredAgent {
 	return available
 }
 
-// FilterByType filters agents by agent type (cc, cod, gmi).
-func FilterByType(agents []ScoredAgent, agentType string) []ScoredAgent {
-	if agentType == "" {
-		return agents
-	}
-
-	var filtered []ScoredAgent
-	for _, agent := range agents {
-		if strings.EqualFold(agent.AgentType, agentType) {
-			filtered = append(filtered, agent)
-		}
-	}
-	return filtered
-}
-
-// FilterByPanes filters agents by pane indices.
-func FilterByPanes(agents []ScoredAgent, paneIndices []int) []ScoredAgent {
-	if len(paneIndices) == 0 {
-		return agents
-	}
-
-	indexSet := make(map[int]bool)
-	for _, idx := range paneIndices {
-		indexSet[idx] = true
-	}
-
-	var filtered []ScoredAgent
-	for _, agent := range agents {
-		if indexSet[agent.PaneIndex] {
-			filtered = append(filtered, agent)
-		}
-	}
-	return filtered
-}
-
-// ExcludePanes excludes specific pane indices from the list.
-func ExcludePanes(agents []ScoredAgent, excludeIndices []int) []ScoredAgent {
-	if len(excludeIndices) == 0 {
+// ExcludePanes applies explicit index exclusions and physical-pane exclusions.
+// Automatic filters use IDs so a sibling window's local index cannot remove
+// an otherwise eligible target.
+func ExcludePanes(agents []ScoredAgent, excludeIndices []int, excludeIDs []string) []ScoredAgent {
+	if len(excludeIndices) == 0 && len(excludeIDs) == 0 {
 		return agents
 	}
 
@@ -886,10 +990,14 @@ func ExcludePanes(agents []ScoredAgent, excludeIndices []int) []ScoredAgent {
 	for _, idx := range excludeIndices {
 		excludeSet[idx] = true
 	}
+	excludeIDSet := make(map[string]bool, len(excludeIDs))
+	for _, id := range excludeIDs {
+		excludeIDSet[id] = true
+	}
 
 	var filtered []ScoredAgent
 	for _, agent := range agents {
-		if !excludeSet[agent.PaneIndex] {
+		if !excludeSet[agent.PaneIndex] && !excludeIDSet[agent.PaneID] {
 			filtered = append(filtered, agent)
 		}
 	}
@@ -924,14 +1032,30 @@ const (
 
 	// StrategyExplicit uses user-specified pane directly.
 	StrategyExplicit StrategyName = "explicit"
+
+	// StrategyAffinity prefers the agent holding Agent Mail file reservations
+	// for the files the prompt names; it falls back to least-loaded when no
+	// available agent holds any.
+	StrategyAffinity StrategyName = "affinity"
 )
 
 // RoutingContext provides context for routing decisions.
 type RoutingContext struct {
-	Prompt       string // For affinity matching
-	LastAgent    string // For sticky routing (pane ID of last used agent)
-	ExcludePanes []int  // Pane indices to exclude
-	ExplicitPane int    // For explicit routing (-1 = not set)
+	Prompt         string   // For affinity matching
+	LastAgent      string   // For sticky routing (pane ID of last used agent)
+	ExcludePanes   []int    // Explicit pane indices to exclude
+	ExcludePaneIDs []string // Physical pane IDs excluded by automatic filters
+	ExplicitPane   int      // For explicit routing (-1 = not set)
+	// RotationCursor is the persisted round-robin cursor from session routing
+	// state (bd-ws1-truth-safety-l5ddi.10): the index the PREVIOUS send's
+	// selected pane held in its candidate list. It only counts as routing
+	// history when HasRotationCursor is true (guarding the zero-value trap:
+	// index 0 is a valid cursor). It anchors the rotation when LastAgent's
+	// pane no longer resolves: the vanished pane's successor now sits AT the
+	// cursor position, so the rotation starts there without advancing
+	// (bd-88um4).
+	RotationCursor    int
+	HasRotationCursor bool
 }
 
 // RoutingStrategy defines the interface for routing strategies.
@@ -1007,13 +1131,28 @@ func (s *FirstAvailableStrategy) Select(agents []ScoredAgent, ctx RoutingContext
 }
 
 // rotationAnchorIndex resolves the index the next rotation step starts from,
-// and reports whether that anchor came from genuine ROUTING history.
+// and reports whether the rotation should ADVANCE one step past that anchor
+// (true = the anchor itself was already routed to; false = start AT the
+// anchor).
 //
 // Precedence matters. An explicit LastAgent (pane ID) wins because it survives
-// process boundaries. The in-process cursor comes next: once this Router has
-// actually routed, the cursor IS routing history. Only with neither does the
-// rotation fall back to observed pane activity — and that fallback is not
-// routing history at all, which is why it returns false.
+// process boundaries AND is immune to positional drift: panes inserted or
+// removed elsewhere in the candidate list cannot shift a pane-ID anchor.
+//
+// The persisted rotation cursor comes next, and it is reached only when the
+// previously routed pane no longer resolves in the current candidate list —
+// i.e. the pane vanished. The cursor was that pane's index at selection time,
+// so after the removal the list shrank at/before that index and the VANISHED
+// PANE'S SUCCESSOR now sits AT the cursor position. Advancing past it would
+// skip the successor (A,B,C,D with cursor on B; kill B -> D, starving C —
+// bd-88um4), so the cursor anchors WITHOUT advancing. A cursor past the end
+// (the vanished pane was last) wraps to index 0, which is likewise the
+// successor.
+//
+// The in-process cursor comes next: once this Router has actually routed, the
+// cursor IS routing history. Only with none of the above does the rotation
+// fall back to observed pane activity — and that fallback is not routing
+// history at all, so it starts AT the idlest agent.
 //
 // The old order preferred activity over the cursor, and used "most recently
 // ACTIVE" as a stand-in for "most recently ROUTED". Those are different facts:
@@ -1027,6 +1166,17 @@ func rotationAnchorIndex(agents []ScoredAgent, ctx RoutingContext, cursor int, r
 				return i, true
 			}
 		}
+	}
+	// Persisted rotation cursor from session routing state
+	// (bd-ws1-truth-safety-l5ddi.10): the previously routed pane vanished, so
+	// its successor sits AT the cursor position — anchor without advancing
+	// (bd-88um4).
+	if ctx.HasRotationCursor && ctx.RotationCursor >= 0 {
+		idx := ctx.RotationCursor
+		if idx >= len(agents) {
+			idx = 0
+		}
+		return idx, false
 	}
 	if routed && cursor >= 0 && cursor < len(agents) {
 		return cursor, true
@@ -1153,13 +1303,15 @@ func (s *RandomStrategy) Select(agents []ScoredAgent, ctx RoutingContext) *Score
 		return nil
 	}
 
-	// Use injected random function or simple modulo
+	// Use the injected random function (tests inject a seeded source), or
+	// real randomness. The old nil-randFunc fallback was len/2 — a
+	// deterministic "random" strategy that always picked the middle agent
+	// (bd-ws1-truth-safety-l5ddi.10).
 	idx := 0
 	if s.randFunc != nil {
 		idx = s.randFunc(len(available))
 	} else {
-		// Deterministic fallback for testing
-		idx = len(available) / 2
+		idx = rand.Intn(len(available))
 	}
 
 	return available[idx]
@@ -1215,6 +1367,43 @@ func (s *ExplicitStrategy) Select(agents []ScoredAgent, ctx RoutingContext) *Sco
 	return nil
 }
 
+// AffinityStrategy selects the available agent with the strongest
+// reservation affinity to the prompt: the highest fraction of prompt-named
+// files covered by its live Agent Mail reservations
+// (ScoreBreakdown.AffinityMatch), with the composite score breaking ties.
+//
+// It declines (returns nil) when no available agent has any affinity — Agent
+// Mail is off, no pane maps to a reservation holder, or the prompt names no
+// reserved file — so the router's least-loaded fallback takes the prompt and
+// the result honestly reports fallback_used instead of passing an arbitrary
+// pick off as an affinity match.
+type AffinityStrategy struct{}
+
+func (s *AffinityStrategy) Name() StrategyName {
+	return StrategyAffinity
+}
+
+func (s *AffinityStrategy) Select(agents []ScoredAgent, ctx RoutingContext) *ScoredAgent {
+	var best *ScoredAgent
+	for i := range agents {
+		candidate := &agents[i]
+		match := candidate.ScoreDetail.AffinityMatch
+		// !(match > 0) also rejects NaN, which compares false to everything.
+		if candidate.Excluded || !(match > 0) {
+			continue
+		}
+		if best == nil {
+			best = candidate
+			continue
+		}
+		bestMatch := best.ScoreDetail.AffinityMatch
+		if match > bestMatch || (match == bestMatch && candidate.Score > best.Score) {
+			best = candidate
+		}
+	}
+	return best
+}
+
 // =============================================================================
 // Router
 // =============================================================================
@@ -1241,6 +1430,7 @@ func NewRouter() *Router {
 	r.RegisterStrategy(&RandomStrategy{})
 	r.RegisterStrategy(NewStickyStrategy())
 	r.RegisterStrategy(&ExplicitStrategy{})
+	r.RegisterStrategy(&AffinityStrategy{})
 
 	// Default fallback order
 	r.fallbackOrder = []RoutingStrategy{
@@ -1273,8 +1463,8 @@ func (r *Router) Route(agents []ScoredAgent, strategy StrategyName, ctx RoutingC
 	}
 
 	// Apply exclusion from context
-	if len(ctx.ExcludePanes) > 0 {
-		agents = ExcludePanes(agents, ctx.ExcludePanes)
+	if len(ctx.ExcludePanes) > 0 || len(ctx.ExcludePaneIDs) > 0 {
+		agents = ExcludePanes(agents, ctx.ExcludePanes, ctx.ExcludePaneIDs)
 	}
 
 	// Get the strategy
@@ -1366,6 +1556,7 @@ func GetStrategyNames() []StrategyName {
 		StrategyRandom,
 		StrategySticky,
 		StrategyExplicit,
+		StrategyAffinity,
 	}
 }
 
@@ -1373,7 +1564,8 @@ func GetStrategyNames() []StrategyName {
 func IsValidStrategy(name StrategyName) bool {
 	switch name {
 	case StrategyLeastLoaded, StrategyFirstAvailable, StrategyRoundRobin,
-		StrategyRoundRobinAvailable, StrategyRandom, StrategySticky, StrategyExplicit:
+		StrategyRoundRobinAvailable, StrategyRandom, StrategySticky, StrategyExplicit,
+		StrategyAffinity:
 		return true
 	default:
 		return false

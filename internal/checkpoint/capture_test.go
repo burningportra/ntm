@@ -92,56 +92,6 @@ func TestCapturer_FindByPattern_NoSession(t *testing.T) {
 // Capturer.List (bd-9czd7)
 // =============================================================================
 
-func TestCapturer_List(t *testing.T) {
-	t.Parallel()
-	storage := NewStorageWithDir(t.TempDir())
-	capturer := NewCapturerWithStorage(storage)
-	session := "list-session"
-
-	// Save 3 checkpoints with different times
-	times := []time.Time{
-		time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC),
-		time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
-		time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC),
-	}
-	for i, ts := range times {
-		cp := &Checkpoint{
-			ID:   fmt.Sprintf("20260101-%02d0000-000%d-cp", ts.Hour(), i),
-			Name: fmt.Sprintf("cp-%d", i), SessionName: session,
-			CreatedAt: ts, Session: SessionState{},
-		}
-		if err := storage.Save(cp); err != nil {
-			t.Fatalf("Save: %v", err)
-		}
-	}
-
-	list, err := capturer.List(session)
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(list) != 3 {
-		t.Fatalf("List returned %d, want 3", len(list))
-	}
-	// Verify newest first
-	if !list[0].CreatedAt.After(list[1].CreatedAt) {
-		t.Errorf("expected newest first: %v vs %v", list[0].CreatedAt, list[1].CreatedAt)
-	}
-}
-
-func TestCapturer_List_Empty(t *testing.T) {
-	t.Parallel()
-	storage := NewStorageWithDir(t.TempDir())
-	capturer := NewCapturerWithStorage(storage)
-
-	list, err := capturer.List("no-session")
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(list) != 0 {
-		t.Errorf("expected 0, got %d", len(list))
-	}
-}
-
 // =============================================================================
 // Capturer.GetLatest (bd-9czd7)
 // =============================================================================
@@ -807,7 +757,7 @@ func TestCapturer_CaptureGitState(t *testing.T) {
 	c := NewCapturer()
 
 	// Test success case
-	state, err := c.captureGitState(tmpDir, "session", "chk-1")
+	state, err := c.captureGitState(tmpDir, "session", "chk-1", false)
 	if err != nil {
 		t.Errorf("captureGitState failed on valid repo: %v", err)
 	}
@@ -824,7 +774,7 @@ func TestCapturer_CaptureGitState(t *testing.T) {
 		t.Fatalf("Failed to remove .git/HEAD: %v", err)
 	}
 
-	_, err = c.captureGitState(tmpDir, "session", "chk-2")
+	_, err = c.captureGitState(tmpDir, "session", "chk-2", false)
 	if err == nil {
 		t.Error("captureGitState should fail on corrupt repo")
 	}
@@ -863,7 +813,7 @@ func TestCapturer_CaptureGitState_DirtySavesPatch(t *testing.T) {
 		t.Fatalf("Failed to create checkpoint dir: %v", err)
 	}
 
-	state, err := c.captureGitState(tmpDir, "session", checkpointID)
+	state, err := c.captureGitState(tmpDir, "session", checkpointID, false)
 	if err != nil {
 		t.Fatalf("captureGitState failed on dirty repo: %v", err)
 	}
@@ -992,7 +942,11 @@ func TestRunGitCommandReturnsWhenDescendantHoldsStdout(t *testing.T) {
 	if !errors.Is(err, exec.ErrWaitDelay) {
 		t.Fatalf("runGitCommand error = %v, want exec.ErrWaitDelay", err)
 	}
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
+	// The descendant holds stdout for 10s; a WaitDelay-bounded return is ~2s
+	// plus two re-execs of this test binary, which under -race take well over
+	// a second on their own. 6s still separates "bounded" from "waited for
+	// the descendant" by a wide margin.
+	if elapsed := time.Since(started); elapsed > 6*time.Second {
 		t.Fatalf("runGitCommand returned after %s, want WaitDelay-bounded return", elapsed)
 	}
 	if cmd.ProcessState == nil {
@@ -1007,4 +961,63 @@ func mustParsePID(t *testing.T, raw string) int {
 		t.Fatalf("parse descendant pid %q: %v", raw, err)
 	}
 	return pid
+}
+
+// TestCapturer_CaptureGitState_PatchWriteFailureIsReported is the silent
+// data-loss regression. The uncommitted diff is the single artifact a
+// checkpoint exists to preserve, and the write error was discarded:
+//
+//	if err := c.storage.SaveGitPatch(...); err == nil {
+//	    state.PatchFile = GitPatchFile
+//	}
+//
+// A full disk, a quota, or an EIO therefore produced a checkpoint that looked
+// complete — Captured=true, IsDirty=true, PatchFile="" — with the work gone and
+// nothing said in the metadata, the logs, or Verify(). Create() already maps a
+// git error to GitSkipCaptureFailed ("A failed capture is recorded as such
+// rather than left looking clean"), so the error has to reach it.
+func TestCapturer_CaptureGitState_PatchWriteFailureIsReported(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if err := exec.Command("git", "-C", tmpDir, "init").Run(); err != nil {
+		t.Skipf("git unavailable: %v", err)
+	}
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@example.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test User").Run()
+
+	readme := filepath.Join(tmpDir, "README.md")
+	if err := os.WriteFile(readme, []byte("committed\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", tmpDir, "add", ".").Run()
+	exec.Command("git", "-C", tmpDir, "commit", "-m", "initial").Run()
+
+	// Uncommitted change: this is the content that must not vanish quietly.
+	if err := os.WriteFile(readme, []byte("uncommitted work\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Root the checkpoint store beneath a regular file so creating the
+	// checkpoint directory fails with ENOTDIR. This models a full disk or an
+	// unwritable store without depending on file permissions, which a test
+	// running as root would ignore.
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := &Capturer{storage: &Storage{BaseDir: filepath.Join(blocker, "checkpoints")}}
+
+	state, err := c.captureGitState(tmpDir, "session", "chk-patchfail", false)
+
+	if err == nil {
+		t.Fatalf("captureGitState reported success while the patch could not be written; "+
+			"the checkpoint would claim IsDirty=%v with PatchFile=%q and the diff is lost",
+			state.IsDirty, state.PatchFile)
+	}
+	if !strings.Contains(err.Error(), "git patch") {
+		t.Errorf("error = %v, want it to name the git patch write", err)
+	}
+	if state.PatchFile != "" {
+		t.Errorf("PatchFile = %q, want empty when the write failed", state.PatchFile)
+	}
 }

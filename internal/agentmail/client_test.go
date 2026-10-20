@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -124,8 +125,13 @@ func TestIsAvailable(t *testing.T) {
 		t.Fatal("nil-context availability probe reported success")
 	}
 
-	// Mock MCP JSON-RPC server for health_check
+	// Mock MCP JSON-RPC server for health_check. It exposes no cheap liveness
+	// endpoint, so the availability probe must fall back to the tool call.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		var req JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -164,6 +170,10 @@ func TestIsAvailable(t *testing.T) {
 func TestIsAvailableContextRetriesTransientProbeFailures(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		n := calls.Add(1)
 		if n <= 2 {
 			// Transient failure: refuse the first two probes.
@@ -191,13 +201,18 @@ func TestIsAvailableContextRetriesTransientProbeFailures(t *testing.T) {
 	}
 }
 
-// TestIsAvailableContextProbesWithPing guards bd-izmjq: the availability probe
-// must not run the health_check tool, which performs full server diagnostics
-// and took 11-13 s on a busy server, so a live server always looked down.
+// TestIsAvailableContextProbesWithPing guards bd-izmjq: when the server has no
+// usable liveness endpoint, the availability probe must not run the
+// health_check tool, which performs full server diagnostics and took 11-13 s
+// on a busy server, so a live server always looked down.
 func TestIsAvailableContextProbesWithPing(t *testing.T) {
 	var mu sync.Mutex
 	var methods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		var req JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -208,7 +223,7 @@ func TestIsAvailableContextProbesWithPing(t *testing.T) {
 		mu.Unlock()
 		if req.Method != "ping" {
 			// A diagnostic call slower than the whole probe budget.
-			time.Sleep(2 * availabilityProbeBudget)
+			time.Sleep(2 * availabilityProbeBudget())
 		}
 		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
 	}))
@@ -219,8 +234,8 @@ func TestIsAvailableContextProbesWithPing(t *testing.T) {
 	if !client.IsAvailableContext(context.Background()) {
 		t.Fatalf("reachable server reported unavailable: %v", client.LastAvailabilityError())
 	}
-	if elapsed := time.Since(started); elapsed >= availabilityProbeBudget {
-		t.Fatalf("availability probe took %v, want well under the %v budget", elapsed, availabilityProbeBudget)
+	if elapsed := time.Since(started); elapsed >= availabilityProbeBudget() {
+		t.Fatalf("availability probe took %v, want well under the %v budget", elapsed, availabilityProbeBudget())
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -235,6 +250,10 @@ func TestIsAvailableContextProbesWithPing(t *testing.T) {
 func TestIsAvailableContextRetriesOverloadedServer(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		var req JSONRPCRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if calls.Add(1) == 1 {
@@ -259,6 +278,10 @@ func TestIsAvailableContextRetriesOverloadedServer(t *testing.T) {
 
 func TestIsAvailableContextTreatsUnknownPingAsReachable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		var req JSONRPCRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{
@@ -276,23 +299,21 @@ func TestIsAvailableContextTreatsUnknownPingAsReachable(t *testing.T) {
 
 func TestIsAvailableContextRetriesResponseBodyTransportFailure(t *testing.T) {
 	var calls atomic.Int32
-	client := NewClient(
-		WithBaseURL("http://agentmail.invalid/"),
-		WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			call := calls.Add(1)
-			body := io.ReadCloser(readErrorCloser{err: io.ErrUnexpectedEOF})
-			if call > 1 {
-				body = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":2,"result":{"status":"ok"}}`))
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Status:     "200 OK",
-				Body:       body,
-				Header:     make(http.Header),
-				Request:    req,
-			}, nil
-		})}),
-	)
+	client := NewClient(WithBaseURL("http://agentmail.invalid/"))
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		call := calls.Add(1)
+		body := io.ReadCloser(readErrorCloser{err: io.ErrUnexpectedEOF})
+		if call > 1 {
+			body = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":2,"result":{"status":"ok"}}`))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       body,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})}
 
 	if !client.IsAvailableContext(context.Background()) {
 		t.Fatalf("availability did not recover after a transient response-body read failure: %v", client.LastAvailabilityError())
@@ -306,27 +327,26 @@ func TestIsAvailableContextRetriesResponseBodyTransportFailure(t *testing.T) {
 }
 
 func TestAvailabilityProbeBudgetBoundsAllAttempts(t *testing.T) {
-	if availabilityProbeBudget <= 0 || availabilityProbeBudget >= 2*time.Second {
-		t.Fatalf("availability probe budget must be positive and below 2s, got %v", availabilityProbeBudget)
+	budget := availabilityProbeBudget()
+	if budget <= 0 || budget >= 2*time.Second {
+		t.Fatalf("availability probe budget must be positive and below 2s, got %v", budget)
 	}
 
 	var calls atomic.Int32
-	client := NewClient(
-		WithBaseURL("http://agentmail.invalid/"),
-		WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			calls.Add(1)
-			<-req.Context().Done()
-			return nil, req.Context().Err()
-		})}),
-	)
+	client := NewClient(WithBaseURL("http://agentmail.invalid/"))
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
 
 	started := time.Now()
 	if client.IsAvailableContext(context.Background()) {
 		t.Fatal("deadline-bound availability probe reported success")
 	}
 	elapsed := time.Since(started)
-	if elapsed < availabilityProbeBudget-100*time.Millisecond {
-		t.Fatalf("availability probe returned before its budget: elapsed=%v budget=%v", elapsed, availabilityProbeBudget)
+	if elapsed < budget-100*time.Millisecond {
+		t.Fatalf("availability probe returned before its budget: elapsed=%v budget=%v", elapsed, budget)
 	}
 	if elapsed >= 2*time.Second {
 		t.Fatalf("availability probe exceeded the strict 2s bound: %v", elapsed)
@@ -383,7 +403,11 @@ func TestIsAvailableContextPermanentFailuresAreOneShot(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var calls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					http.NotFound(w, r)
+					return
+				}
 				calls.Add(1)
 				w.WriteHeader(tt.statusCode)
 				_, _ = w.Write([]byte(tt.body))
@@ -503,7 +527,11 @@ func TestWaitForAvailabilityRetryHonorsCallerCancellation(t *testing.T) {
 
 func TestIsAvailableContextInvalidatedFailureThenSuccessClearsDiagnostic(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		if calls.Add(1) == 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -593,16 +621,14 @@ func TestIsAvailableContextCancelsWhileAnotherHealthCheckOwnsLock(t *testing.T) 
 func TestAvailabilityProbeBudgetIncludesLockContention(t *testing.T) {
 	firstProbeStarted := make(chan struct{}, 1)
 	var calls atomic.Int32
-	client := NewClient(
-		WithBaseURL("http://agentmail.invalid/"),
-		WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if calls.Add(1) == 1 {
-				firstProbeStarted <- struct{}{}
-			}
-			<-req.Context().Done()
-			return nil, req.Context().Err()
-		})}),
-	)
+	client := NewClient(WithBaseURL("http://agentmail.invalid/"))
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			firstProbeStarted <- struct{}{}
+		}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
 
 	ownerCtx, cancelOwner := context.WithCancel(context.Background())
 	ownerDone := make(chan bool, 1)
@@ -627,7 +653,7 @@ func TestAvailabilityProbeBudgetIncludesLockContention(t *testing.T) {
 
 	// Leave the waiter less than a fresh probe budget after the owner releases
 	// the lock. A per-attempt deadline would therefore exceed the total bound.
-	time.Sleep(availabilityProbeBudget - 350*time.Millisecond)
+	time.Sleep(availabilityProbeBudget() - 350*time.Millisecond)
 	cancelOwner()
 	select {
 	case available := <-ownerDone:
@@ -1234,41 +1260,6 @@ func TestBaseURL(t *testing.T) {
 	}
 }
 
-func TestWithHTTPClient(t *testing.T) {
-	t.Parallel()
-
-	customClient := &http.Client{Timeout: 5 * time.Minute}
-	c := NewClient(WithHTTPClient(customClient))
-
-	if c.httpClient != customClient {
-		t.Error("expected custom HTTP client to be set")
-	}
-}
-
-func TestWithHTTPClientNilKeepsDefaultClient(t *testing.T) {
-	t.Parallel()
-
-	c := NewClient(WithHTTPClient(nil))
-	if c.httpClient == nil {
-		t.Fatal("WithHTTPClient(nil) left client without an HTTP transport")
-	}
-	if c.httpClient.Timeout != DefaultTimeout {
-		t.Errorf("default HTTP timeout = %v, want %v", c.httpClient.Timeout, DefaultTimeout)
-	}
-}
-
-func TestWithTimeout(t *testing.T) {
-	t.Parallel()
-
-	// WithTimeout modifies an existing httpClient's timeout
-	customClient := &http.Client{Timeout: 10 * time.Second}
-	c := NewClient(WithHTTPClient(customClient), WithTimeout(60*time.Second))
-
-	if c.httpClient.Timeout != 60*time.Second {
-		t.Errorf("expected timeout 60s, got %v", c.httpClient.Timeout)
-	}
-}
-
 func TestHttpBaseURL(t *testing.T) {
 	t.Parallel()
 
@@ -1279,8 +1270,15 @@ func TestHttpBaseURL(t *testing.T) {
 	}{
 		{"MCP URL with trailing slash", "http://127.0.0.1:8765/mcp/", "http://127.0.0.1:8765"},
 		{"MCP URL without trailing slash", "http://127.0.0.1:8765/mcp", "http://127.0.0.1:8765"},
-		{"non-MCP URL with trailing slash", "http://example.com/api/", "http://example.com/api"},
-		{"non-MCP URL without trailing slash", "http://example.com/api", "http://example.com/api"},
+		{"stateless API with trailing slash", "http://example.com/api/", "http://example.com"},
+		{"stateless API without trailing slash", "http://example.com/api", "http://example.com"},
+		{"proxied MCP", "http://example.com/agent-mail/mcp/", "http://example.com/agent-mail"},
+		{"proxied stateless API", "http://example.com/agent-mail/api/", "http://example.com/agent-mail"},
+		{"escaped proxy prefix", "http://example.com/proxy%2Fprefix/api/", "http://example.com/proxy%2Fprefix"},
+		{"unrelated endpoint", "http://example.com/myapi/", "http://example.com/myapi"},
+		{"MCP in middle of path", "http://example.com/mcp/nested/", "http://example.com/mcp/nested"},
+		{"MCP named host", "http://mcp/", "http://mcp"},
+		{"API named host", "http://api/", "http://api"},
 		{"root URL with trailing slash", "http://localhost:8000/", "http://localhost:8000"},
 	}
 
@@ -1291,6 +1289,45 @@ func TestHttpBaseURL(t *testing.T) {
 			got := c.httpBaseURL()
 			if got != tc.want {
 				t.Errorf("httpBaseURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOverseerHTTPPreservesProxyPrefix(t *testing.T) {
+	t.Parallel()
+
+	for _, endpoint := range []string{"/prefix/mcp", "/prefix/mcp/", "/prefix/api", "/prefix/api/"} {
+		t.Run(endpoint, func(t *testing.T) {
+			t.Parallel()
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.Method != http.MethodPost || r.URL.Path != "/prefix/mail/project/overseer/send" {
+					t.Errorf("request = %s %s, want POST /prefix/mail/project/overseer/send", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"success":true,"message_id":57,"recipients":["BlueLake"],"sent_at":"2026-10-17T15:00:00Z"}`)
+			}))
+			defer server.Close()
+
+			client := NewClient(WithBaseURL(server.URL + endpoint))
+			result, err := client.SendOverseerMessage(t.Context(), OverseerMessageOptions{
+				ProjectSlug: "project",
+				Recipients:  []string{"BlueLake"},
+				Subject:     "Checkpoint",
+				BodyMD:      "Please save your work.",
+			})
+			if err != nil {
+				t.Fatalf("SendOverseerMessage through %s: %v", endpoint, err)
+			}
+			if result.MessageID != 57 || !result.Success {
+				t.Fatalf("unexpected send receipt: %+v", result)
+			}
+			if got := requests.Load(); got != 1 {
+				t.Fatalf("request count = %d, want one send", got)
 			}
 		})
 	}
@@ -1663,5 +1700,481 @@ func TestDisabledClientNeverContactsServer(t *testing.T) {
 	}
 	if n := requests.Load(); n != 0 {
 		t.Fatalf("server saw %d requests, want 0", n)
+	}
+}
+
+func TestExtractMCPContentTypedToolRejection(t *testing.T) {
+	t.Run("rejection_with_message", func(t *testing.T) {
+		_, err := extractMCPContent(json.RawMessage(`{
+			"content": [{"type": "text", "text": "Agent 'NTM-Coordinator' not found"}],
+			"isError": true
+		}`))
+		if err == nil || !IsToolRejection(err) {
+			t.Fatalf("extractMCPContent error=%v, want typed tool rejection", err)
+		}
+		if IsServerUnavailable(err) || IsTimeout(err) {
+			t.Fatalf("tool rejection misclassified as ambiguous transport failure: %v", err)
+		}
+	})
+
+	t.Run("busy_rejection_keeps_transient_classification", func(t *testing.T) {
+		_, err := extractMCPContent(json.RawMessage(`{
+			"content": [{"type": "text", "text": "database is busy"}],
+			"isError": true
+		}`))
+		if err == nil || !IsToolRejection(err) || !IsTransientBusy(err) {
+			t.Fatalf("busy rejection lost a classification: rejection=%v busy=%v err=%v",
+				IsToolRejection(err), IsTransientBusy(err), err)
+		}
+	})
+
+	t.Run("rejection_without_message", func(t *testing.T) {
+		_, err := extractMCPContent(json.RawMessage(`{"isError": true}`))
+		if err == nil || !IsToolRejection(err) {
+			t.Fatalf("extractMCPContent error=%v, want typed tool rejection", err)
+		}
+	})
+}
+
+// TestIsAvailableSlowHealthCheckToolStillAvailable is the #295 regression: a
+// server that answers the cheap liveness endpoint instantly must be reported
+// available even when the MCP `health_check` tool — a full archive/SQLite
+// inventory on a real mailbox — takes far longer than the probe budget. The
+// old probe called only the tool, so every reservation verb refused against a
+// healthy, granting server.
+func TestIsAvailableSlowHealthCheckToolStillAvailable(t *testing.T) {
+	var toolCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ready"}`))
+			return
+		}
+		toolCalls.Add(1)
+		// Far beyond the probe budget, like health_check on a large store.
+		time.Sleep(3 * time.Second)
+		statusJSON, _ := json.Marshal(HealthStatus{Status: "ok"})
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: 1, Result: statusJSON})
+	}))
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	started := time.Now()
+	if !client.IsAvailableContext(context.Background()) {
+		t.Fatalf("server with instant liveness reported unavailable: %v", client.LastAvailabilityError())
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("liveness-based probe took %v; it must not wait on the health_check tool", elapsed)
+	}
+	if got := toolCalls.Load(); got != 0 {
+		t.Fatalf("availability probe called the heavy health_check tool %d times, want 0", got)
+	}
+	if err := client.LastAvailabilityError(); err != nil {
+		t.Fatalf("available server retained a diagnostic: %v", err)
+	}
+}
+
+// TestIsAvailableFallsBackToPingWithoutLivenessEndpoint keeps the positive
+// control: a server with no /health endpoint is still judged by the MCP
+// dispatch path, through the ping rather than the health_check tool (bd-izmjq).
+func TestIsAvailableFallsBackToPingWithoutLivenessEndpoint(t *testing.T) {
+	var mu sync.Mutex
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		var req JSONRPCRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		methods = append(methods, req.Method)
+		mu.Unlock()
+		statusJSON, _ := json.Marshal(HealthStatus{Status: "ok"})
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: statusJSON})
+	}))
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	if !client.IsAvailableContext(context.Background()) {
+		t.Fatalf("MCP-only server reported unavailable: %v", client.LastAvailabilityError())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(methods) != 1 || methods[0] != "ping" {
+		t.Fatalf("fallback sent %v, want exactly one ping", methods)
+	}
+}
+
+// TestIsAvailableDownServerStaysUnavailable is the negative control: the
+// liveness-first probe must not make a dead server look alive, and must keep
+// the terminal reason.
+func TestIsAvailableDownServerStaysUnavailable(t *testing.T) {
+	client := NewClient(WithBaseURL("http://127.0.0.1:1/mcp/"))
+	if client.IsAvailableContext(context.Background()) {
+		t.Fatal("unreachable server reported available")
+	}
+	if err := client.LastAvailabilityError(); err == nil {
+		t.Fatal("unreachable server left no diagnostic")
+	}
+}
+
+// TestLivenessURLDerivesOriginRoot pins that the liveness endpoint is resolved
+// against the server origin, not against the MCP mount path.
+func TestLivenessURLDerivesOriginRoot(t *testing.T) {
+	tests := []struct {
+		base string
+		want string
+	}{
+		{base: "http://127.0.0.1:8765/mcp/", want: "http://127.0.0.1:8765/health"},
+		{base: "https://mail.example.test/a/b/mcp/", want: "https://mail.example.test/health"},
+	}
+	for _, tt := range tests {
+		c := NewClient(WithBaseURL(tt.base))
+		got, err := c.livenessURL()
+		if err != nil {
+			t.Fatalf("livenessURL(%q) error = %v", tt.base, err)
+		}
+		if got != tt.want {
+			t.Fatalf("livenessURL(%q) = %q, want %q", tt.base, got, tt.want)
+		}
+	}
+}
+
+// TestAvailabilityProbeBudgetHonorsEnvOverride covers the operator escape
+// hatch requested in #295 for servers with no liveness endpoint and a mailbox
+// large enough that health_check cannot land inside the default budget.
+func TestAvailabilityProbeBudgetHonorsEnvOverride(t *testing.T) {
+	if got := availabilityProbeBudget(); got != defaultAvailabilityProbeBudget {
+		t.Fatalf("default budget = %v, want %v", got, defaultAvailabilityProbeBudget)
+	}
+	t.Setenv(ProbeBudgetEnv, "4s")
+	if got := availabilityProbeBudget(); got != 4*time.Second {
+		t.Fatalf("overridden budget = %v, want 4s", got)
+	}
+	for _, bad := range []string{"", "not-a-duration", "0s", "-1s"} {
+		t.Setenv(ProbeBudgetEnv, bad)
+		if got := availabilityProbeBudget(); got != defaultAvailabilityProbeBudget {
+			t.Fatalf("budget with %q = %v, want the default %v", bad, got, defaultAvailabilityProbeBudget)
+		}
+	}
+}
+
+// statefulMCPServer mimics the Python Agent Mail server's stateful /mcp
+// endpoint (FastMCP streamable HTTP with stateless_http=False), verified live
+// against it for GH #333: a request without a session is answered HTTP 400
+// with a JSON-RPC "Missing session ID" error, an unknown session HTTP 400 with
+// a plain-text body, and initialize issues the id in an Mcp-Session-Id header.
+type statefulMCPServer struct {
+	mu            sync.Mutex
+	sessions      map[string]bool
+	next          int
+	initializes   int
+	notifications int
+	toolCalls     int
+	omitSessionID bool
+}
+
+func (s *statefulMCPServer) forgetSessions() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions = map[string]bool{}
+}
+
+func (s *statefulMCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req JSONRPCRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessions == nil {
+		s.sessions = map[string]bool{}
+	}
+	sid := r.Header.Get("Mcp-Session-Id")
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case req.Method == "initialize":
+		s.initializes++
+		s.next++
+		id := fmt.Sprintf("sess-%d", s.next)
+		s.sessions[id] = true
+		if !s.omitSessionID {
+			w.Header().Set("Mcp-Session-Id", id)
+		}
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{"protocolVersion":"2025-03-26"}`)})
+	case sid == "":
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Bad Request: Missing session ID"}}`)
+	case !s.sessions[sid]:
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "Bad Request: No valid session ID provided")
+	case req.Method == "notifications/initialized":
+		s.notifications++
+		w.WriteHeader(http.StatusAccepted)
+	case req.Method == "tools/call":
+		s.toolCalls++
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{"id":1,"slug":"proj","human_key":"/data/projects/proj"}`)})
+	default:
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{Code: -32601, Message: "unknown method"}})
+	}
+}
+
+// A stateful MCP endpoint rejected every sessionless ntm call with HTTP 400,
+// so spawn reported "ensure_project failed (HTTP 400)" (GH #333). The client
+// now performs the handshake once and reuses the session.
+func TestCallToolEstablishesMCPSessionWhenServerRequiresOne(t *testing.T) {
+	t.Parallel()
+	state := &statefulMCPServer{}
+	server := httptest.NewServer(state)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	for i := 0; i < 3; i++ {
+		project, err := c.EnsureProject(context.Background(), "/data/projects/proj")
+		if err != nil {
+			t.Fatalf("EnsureProject #%d: %v", i+1, err)
+		}
+		if project.Slug != "proj" {
+			t.Fatalf("slug = %q, want proj", project.Slug)
+		}
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.initializes != 1 || state.notifications != 1 {
+		t.Fatalf("handshake ran initialize=%d notified=%d times, want exactly once each", state.initializes, state.notifications)
+	}
+	if state.toolCalls != 3 {
+		t.Fatalf("tool calls reaching the server = %d, want 3", state.toolCalls)
+	}
+}
+
+// A server restart invalidates the held session; the next call re-handshakes
+// instead of failing with the plain-text 400.
+func TestCallToolReestablishesExpiredMCPSession(t *testing.T) {
+	t.Parallel()
+	state := &statefulMCPServer{}
+	server := httptest.NewServer(state)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	if _, err := c.EnsureProject(context.Background(), "/data/projects/proj"); err != nil {
+		t.Fatalf("first EnsureProject: %v", err)
+	}
+	state.forgetSessions()
+	if _, err := c.EnsureProject(context.Background(), "/data/projects/proj"); err != nil {
+		t.Fatalf("EnsureProject after session loss: %v", err)
+	}
+	if got := c.mcpSessionID(); got != "sess-2" {
+		t.Fatalf("session after re-handshake = %q, want sess-2", got)
+	}
+}
+
+func TestCallToolFailsClearlyWhenInitializeIssuesNoSession(t *testing.T) {
+	t.Parallel()
+	state := &statefulMCPServer{omitSessionID: true}
+	server := httptest.NewServer(state)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	_, err := c.EnsureProject(context.Background(), "/data/projects/proj")
+	if err == nil || !strings.Contains(err.Error(), "Mcp-Session-Id") {
+		t.Fatalf("EnsureProject error = %v, want missing Mcp-Session-Id explanation", err)
+	}
+}
+
+// A 400 that is not about sessions must not trigger a handshake, and its
+// error must carry the server's own explanation instead of a bare status.
+func TestCallToolNonSessionHTTPErrorQuotesServerDetail(t *testing.T) {
+	t.Parallel()
+	var initializes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "initialize" {
+			initializes.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"unknown field `+"`extra`"+`"}}`)
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	_, err := c.EnsureProject(context.Background(), "/data/projects/proj")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("error = %v, want APIError with HTTP 400", err)
+	}
+	if !strings.Contains(err.Error(), "unknown field `extra`") {
+		t.Fatalf("error %q does not quote the server's detail", err)
+	}
+	if initializes.Load() != 0 {
+		t.Fatalf("non-session 400 triggered %d initialize handshakes", initializes.Load())
+	}
+}
+
+func TestHTTPErrorDetailResponseFormats(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"Rust REST error", `{"error":"Intervention reason is required"}`, "Intervention reason is required"},
+		{"legacy REST detail", `{"detail":"At least one valid recipient is required"}`, "At least one valid recipient is required"},
+		{"JSON-RPC error", `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Missing session ID"}}`, "Missing session ID"},
+		{"REST error object", `{"error":{"message":"Intervention denied","code":"forbidden"}}`, "Intervention denied"},
+		{"complementary detail", `{"error":"Unauthorized","detail":"Supply a valid bearer token"}`, "Unauthorized: Supply a valid bearer token"},
+		{"object with detail", `{"error":{"message":"Invalid request"},"detail":"Unknown recipient BlueLkae"}`, "Invalid request: Unknown recipient BlueLkae"},
+		{"duplicate explanation", `{"error":"  Invalid\nrecipient  ","detail":"Invalid recipient"}`, "Invalid recipient"},
+		{"empty primary explanation", `{"error":" \t ","detail":"Supply a reason"}`, "Supply a reason"},
+		{"null error with detail", `{"error":null,"detail":"Supply a reason"}`, "Supply a reason"},
+		{"unrecognized detail retains error", `{"error":{"message":"Invalid request"},"detail":{"field":"reason"}}`, "Invalid request"},
+		{"plain response", " upstream\n\tservice unavailable ", "upstream service unavailable"},
+		{"unrecognized JSON", `{"unexpected":"upstream refused request"}`, `{"unexpected":"upstream refused request"}`},
+		{"malformed JSON", `{"error":`, `{"error":`},
+		{"empty body", "", ""},
+		{"bounded Unicode", `{"error":"` + strings.Repeat("界", maxErrorDetailLen+1) + `"}`, strings.Repeat("界", maxErrorDetailLen) + "…"},
+		{"bounded plain response", strings.Repeat("a", maxErrorDetailLen+1), strings.Repeat("a", maxErrorDetailLen) + "…"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := httpErrorDetail([]byte(tc.body)); got != tc.want {
+				t.Fatalf("httpErrorDetail() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCallToolRESTHTTPErrorIncludesActionableDetail(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		`{"error":"Invalid project","detail":"Provide an absolute project path"}`,
+		`{"error":{"message":"Invalid project"},"detail":"Provide an absolute project path"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+
+			client := NewClient(WithBaseURL(server.URL + "/mcp/"))
+			_, err := client.EnsureProject(t.Context(), "relative-project")
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+				t.Fatalf("error = %v, want HTTP 400 APIError", err)
+			}
+			if !strings.Contains(err.Error(), "Invalid project: Provide an absolute project path") {
+				t.Fatalf("error omits actionable server detail: %v", err)
+			}
+			if got := requests.Load(); got != 1 {
+				t.Fatalf("request count = %d, want one rejected request", got)
+			}
+		})
+	}
+}
+
+func TestReadResourceEstablishesMCPSession(t *testing.T) {
+	t.Parallel()
+	state := &statefulMCPServer{}
+	server := httptest.NewServer(state)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	_, err := c.ReadResource(context.Background(), "resource://projects")
+	// The fake answers resources/read with method-not-found; reaching that
+	// JSON-RPC error proves the request got past the session gate.
+	if err == nil || !strings.Contains(err.Error(), "unknown method") {
+		t.Fatalf("ReadResource error = %v, want the post-handshake JSON-RPC error", err)
+	}
+	if c.mcpSessionID() == "" {
+		t.Fatal("ReadResource did not establish an MCP session")
+	}
+}
+
+// Concurrent first calls on one client (spawn registers every pane in
+// parallel) must share a single handshake: the goroutines that lose the race
+// reuse the session the winner established instead of opening their own.
+func TestCallToolConcurrentCallsShareOneMCPSession(t *testing.T) {
+	t.Parallel()
+	state := &statefulMCPServer{}
+	server := httptest.NewServer(state)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	const callers = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.EnsureProject(context.Background(), "/data/projects/proj"); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent EnsureProject: %v", err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.initializes != 1 || state.notifications != 1 {
+		t.Fatalf("concurrent callers ran initialize=%d notified=%d times, want exactly once each", state.initializes, state.notifications)
+	}
+	if state.toolCalls != callers {
+		t.Fatalf("tool calls reaching the server = %d, want %d", state.toolCalls, callers)
+	}
+}
+
+// A server that keeps rejecting the session even right after a successful
+// handshake must not drive the client into a handshake loop: one handshake
+// per call, then the server's rejection is returned.
+func TestCallToolPersistentSessionRejectionDoesNotLoop(t *testing.T) {
+	t.Parallel()
+	var initializes, requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var req JSONRPCRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Method {
+		case "initialize":
+			initializes.Add(1)
+			w.Header().Set("Mcp-Session-Id", fmt.Sprintf("sess-%d", initializes.Load()))
+			_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, "Session not found")
+		}
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+	_, err := c.callTool(context.Background(), "ensure_project", map[string]interface{}{"human_key": "/p"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("error = %v, want the server's HTTP 404 session rejection", err)
+	}
+	if got := initializes.Load(); got != 1 {
+		t.Fatalf("initialize handshakes = %d, want 1", got)
+	}
+	// original request + initialize + initialized notification + one retry
+	if got := requests.Load(); got != 4 {
+		t.Fatalf("requests = %d, want 4", got)
 	}
 }

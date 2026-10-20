@@ -474,6 +474,6 @@ Examples:
 }
 
 func init() {
-	rootCmd.AddCommand(newPersonasCmd())
+	// personas is registered with the other configuration commands in root.go.
 	rootCmd.AddCommand(newProfilesCmd())
 }

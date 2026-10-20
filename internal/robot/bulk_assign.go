@@ -15,14 +15,17 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/assign"
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
+	"github.com/Dicklesworthstone/ntm/internal/git"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/util"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 const (
@@ -32,17 +35,26 @@ const (
 
 // BulkAssignOptions configures --robot-bulk-assign behavior.
 type BulkAssignOptions struct {
-	Session            string
-	ConfigPath         string
-	RequireConfig      bool
-	FromBV             bool
-	Strategy           string
-	AllocationJSON     string
-	DryRun             bool
-	Parallel           bool
-	Stagger            time.Duration
-	RequireReservation bool
-	ReservationPaths   []string
+	Session        string
+	ConfigPath     string
+	RequireConfig  bool
+	FromBV         bool
+	Strategy       string
+	AllocationJSON string
+	DryRun         bool
+	Parallel       bool
+	Stagger        time.Duration
+	// ReserveFiles gives every fresh assignment `ntm assign --reserve-files`
+	// semantics: its file scope is reserved exclusively in Agent Mail after
+	// the claim and before dispatch. The scope is ReservationPaths when given,
+	// otherwise the paths discovered from the live bead's title and
+	// description. A bead that names no files, or an unreachable Agent Mail,
+	// refuses that assignment before anything is claimed. The CLI defaults it
+	// to true; --reserve-files=false opts out.
+	ReserveFiles bool
+	// ReservationPaths replaces per-bead discovery with one explicit path set.
+	// It requires ReserveFiles.
+	ReservationPaths []string
 	// SkipPaneSelectors accepts canonical N, W.P, and %N pane selectors.
 	SkipPaneSelectors  []string
 	PromptTemplatePath string
@@ -53,7 +65,12 @@ type BulkAssignOptions struct {
 	// DefaultTemplate is an inline project/user-level configured template
 	// (cfg.Assign.PromptTemplate). It is used when neither PromptTemplatePath
 	// nor DefaultTemplatePath resolves to content, and overrides the built-in const.
-	DefaultTemplate     string
+	DefaultTemplate string
+	// PromptContext enriches each fresh assignment prompt with CASS history
+	// and CM rules (--with-cass / --no-cass / --with-memory), resolved with
+	// the same flag/config precedence as --robot-send. The zero value
+	// disables enrichment.
+	PromptContext       PromptContextOptions
 	Deps                *BulkAssignDependencies
 	projectDir          string
 	operatorGatedLabels []string
@@ -81,12 +98,15 @@ type BulkAssignDependencies struct {
 	GetBeadAssignmentDetails              func(context.Context, string, string) (*bv.BeadAssignmentDetails, error)
 	NewIdempotencyKey                     func() (string, error)
 	ReservationPort                       assignment.ReservationPort
-	ResolveAgentName                      func(context.Context, string, string, string, string) (string, error)
-	ObserveSession                        func(context.Context, string) (statuspkg.SessionObservation, error)
-	DispatchDeliverer                     dispatchsvc.Deliverer
-	DispatchPacer                         dispatchsvc.Pacer
-	LoadRedaction                         func(dir string) (redaction.Config, error)
-	Wait                                  func(context.Context, time.Duration) error
+	// AgentMailClient is the Agent Mail client behind the default reservation
+	// port; nil connects to the session project's configured Agent Mail.
+	AgentMailClient   robotAgentMailReservationClient
+	ResolveAgentName  func(context.Context, string, string, string, string) (string, error)
+	ObserveSession    func(context.Context, string) (statuspkg.SessionObservation, error)
+	DispatchDeliverer dispatchsvc.Deliverer
+	DispatchPacer     dispatchsvc.Pacer
+	LoadRedaction     func(dir string) (redaction.Config, error)
+	Wait              func(context.Context, time.Duration) error
 }
 
 // BeadDetails captures metadata used for bulk prompt templating.
@@ -107,6 +127,8 @@ type BulkAssignOutput struct {
 	UnassignedPanes  []string               `json:"unassigned_panes"`
 	DryRun           bool                   `json:"dry_run,omitempty"`
 	AllocationSource string                 `json:"allocation_source,omitempty"`
+	// WorkSourceMismatch is the STALE_WORK_COORDINATION remediation receipt.
+	WorkSourceMismatch *worksource.StaleError `json:"work_source_mismatch,omitempty"`
 }
 
 // BulkAssignAssignment is a single pane-to-bead allocation.
@@ -124,14 +146,54 @@ type BulkAssignAssignment struct {
 	IdempotencyKey    string `json:"idempotency_key,omitempty"`
 	DispatchReceiptID string `json:"dispatch_receipt_id,omitempty"`
 	ReservationIDs    []int  `json:"reservation_ids,omitempty"`
-	Error             string `json:"error,omitempty"`
-	paneIndex         int
-	paneTitle         string
-	failureCause      error
-	failureCode       string
-	stale             bool
-	staleUpdatedAt    time.Time
-	recovery          *assignment.Assignment
+	// Reservation reports the assignment's Agent Mail file-reservation scope
+	// and outcome once the plan has decided it.
+	Reservation *BulkAssignReservation `json:"reservation,omitempty"`
+	Error       string                 `json:"error,omitempty"`
+	// CASSInjection and MemoryInjection report this assignment's prompt
+	// enrichment, as on --robot-send. Absent when enrichment was not
+	// requested or when a recorded intent was replayed without re-querying.
+	CASSInjection   *CASSInjectionInfo `json:"cass_injection,omitempty"`
+	MemoryInjection *CMInjectionInfo   `json:"memory_injection,omitempty"`
+
+	paneIndex      int
+	paneTitle      string
+	failureCause   error
+	failureCode    string
+	stale          bool
+	staleUpdatedAt time.Time
+	recovery       *assignment.Assignment
+	// reservationPaths is the exact, unredacted path set requested from
+	// Agent Mail; Reservation.Paths is its redacted report.
+	reservationPaths []string
+}
+
+// Bulk assignment reservation sources.
+const (
+	bulkReservationExplicit   = "explicit"
+	bulkReservationDiscovered = "discovered"
+	bulkReservationRecorded   = "recorded"
+	bulkReservationDisabled   = "disabled"
+)
+
+// BulkAssignReservation is one assignment's file-reservation scope and
+// outcome, so an orchestrator can see which files a dispatched agent holds
+// and why an assignment was refused before its claim.
+type BulkAssignReservation struct {
+	// Required is true when the assignment is dispatched only after Agent
+	// Mail grants every path in Paths.
+	Required bool `json:"required"`
+	// Source is where Paths came from: "explicit" (--reservation-paths),
+	// "discovered" (the bead's title and description, as `ntm assign`
+	// finds them), "recorded" (a durable recovery intent), or "disabled"
+	// (--reserve-files=false).
+	Source string `json:"source"`
+	// Paths is the path set the assignment reserves.
+	Paths []string `json:"paths"`
+	// Granted lists the paths Agent Mail granted to the assignee.
+	Granted []string `json:"granted"`
+	// Error explains why the reservation was refused or not granted.
+	Error string `json:"error,omitempty"`
 }
 
 // BulkAssignSummary aggregates assignment stats.
@@ -201,6 +263,14 @@ func GetBulkAssign(ctx context.Context, opts BulkAssignOptions) (*BulkAssignOutp
 		)
 		return output, nil
 	}
+	if !opts.ReserveFiles && len(opts.ReservationPaths) > 0 {
+		output.RobotResponse = NewErrorResponse(
+			errors.New("--reservation-paths conflicts with --reserve-files=false"),
+			ErrCodeInvalidFlag,
+			"Drop --reserve-files=false to reserve those paths, or drop --reservation-paths to assign without reservations",
+		)
+		return output, nil
+	}
 
 	deps := bulkAssignDeps(opts.Deps)
 	strategy, err := normalizeBulkAssignStrategy(opts.Strategy)
@@ -258,12 +328,18 @@ func GetBulkAssign(ctx context.Context, opts BulkAssignOptions) (*BulkAssignOutp
 		)
 		return output, nil
 	}
+	var workSourcePolicy worksource.ProjectPolicy
 	if effectiveConfig != nil {
 		opts.DefaultTemplate = effectiveConfig.Assign.PromptTemplate
 		opts.DefaultTemplatePath = effectiveConfig.Assign.PromptTemplateFile
 		opts.operatorGatedLabels = append([]string(nil), effectiveConfig.Assign.OperatorGatedLabels...)
+		workSourcePolicy = effectiveConfig.Assign.WorkSource.Policy()
 	}
-	if err := bv.ConfigureProjectOperatorGatedLabels(opts.projectDir, opts.operatorGatedLabels); err != nil {
+	err = bv.ConfigureProjectOperatorGatedLabels(opts.projectDir, opts.operatorGatedLabels)
+	if err == nil {
+		err = bv.ConfigureProjectWorkSourcePolicy(opts.projectDir, workSourcePolicy)
+	}
+	if err != nil {
 		output.RobotResponse = NewErrorResponse(
 			fmt.Errorf("register bulk assignment safety policy: %w", err),
 			ErrCodeInvalidFlag,
@@ -308,7 +384,9 @@ func GetBulkAssign(ctx context.Context, opts BulkAssignOptions) (*BulkAssignOutp
 		}
 		code := ErrCodeInternalError
 		hint := "Ensure bv plan output and live br labels are complete and valid"
-		if assignmentDependencyMissing(err) {
+		if staleCode, staleHint, ok := staleWorkError(err); ok {
+			code, hint = staleCode, staleHint
+		} else if assignmentDependencyMissing(err) {
 			code = ErrCodeDependencyMissing
 			hint = "Install bv and br and ensure both are available on PATH"
 		}
@@ -317,6 +395,7 @@ func GetBulkAssign(ctx context.Context, opts BulkAssignOptions) (*BulkAssignOutp
 			code,
 			hint,
 		)
+		output.WorkSourceMismatch = staleWorkReceipt(err)
 		return output, nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -457,7 +536,7 @@ func bulkAssignDeps(custom *BulkAssignDependencies) BulkAssignDependencies {
 		FetchBeadDetails:     fetchBeadDetails,
 		Cwd:                  os.Getwd,
 		PaneCurrentPath: func(ctx context.Context, paneID string) (string, error) {
-			return tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", paneID, "#{pane_current_path}")
+			return tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
 		},
 		LoadStore:                             assignment.LoadStoreStrict,
 		ClaimBead:                             bv.ClaimBeadForAssignment,
@@ -599,6 +678,9 @@ func bulkAssignDeps(custom *BulkAssignDependencies) BulkAssignDependencies {
 	if custom.ReservationPort != nil {
 		deps.ReservationPort = custom.ReservationPort
 	}
+	if custom.AgentMailClient != nil {
+		deps.AgentMailClient = custom.AgentMailClient
+	}
 	if custom.ResolveAgentName != nil {
 		deps.ResolveAgentName = custom.ResolveAgentName
 	}
@@ -714,8 +796,19 @@ func ResolveLiveSessionProject(session string, panes []tmux.Pane, paneCurrentPat
 	})
 }
 
+// ErrNoLivePanes reports that a session offered no live pane to derive a
+// project root from: either it has no panes at all, or every pane is dead
+// (its process exited and remain-on-exit kept the pane for its scrollback).
+// Callers may fall back to persisted session metadata on this error; they
+// must not read it as a project-root disagreement.
+var ErrNoLivePanes = errors.New("no live panes")
+
 // ResolveLiveSessionProjectContext derives one authoritative project root
 // while honoring cancellation of every pane current-directory lookup.
+//
+// Dead panes (tmux #{pane_dead}) are skipped before any lookup: tmux reports
+// an empty current path for them, which is not evidence about the project
+// (ntm#311). An empty or relative path on a live pane still fails closed.
 func ResolveLiveSessionProjectContext(ctx context.Context, session string, panes []tmux.Pane, paneCurrentPath func(context.Context, string) (string, error)) (string, error) {
 	if ctx == nil {
 		return "", errors.New("live session project context is required")
@@ -723,10 +816,25 @@ func ResolveLiveSessionProjectContext(ctx context.Context, session string, panes
 	if paneCurrentPath == nil {
 		return "", fmt.Errorf("resolve live project for session %q: pane current-path lookup is not configured", session)
 	}
+	if len(panes) == 0 {
+		return "", fmt.Errorf("resolve live project for session %q: session has no panes: %w", session, ErrNoLivePanes)
+	}
+	deadPanes := 0
+	// Panes are grouped by physical repository identity, not by visible
+	// checkout path: a base checkout and its linked worktrees are different
+	// paths but one repository (they share one git common directory), and an
+	// `ntm spawn --worktrees` session legitimately spans exactly that shape
+	// (issue #252). Non-git project roots keep their cleaned path as identity,
+	// so genuinely distinct roots still fail closed below.
+	identities := make(map[string]*liveProjectIdentity)
 	roots := make(map[string][]string)
 	for _, pane := range panes {
 		if err := ctx.Err(); err != nil {
 			return "", err
+		}
+		if pane.Dead {
+			deadPanes++
+			continue
 		}
 		paneID := strings.TrimSpace(pane.ID)
 		if paneID == "" {
@@ -746,11 +854,31 @@ func ResolveLiveSessionProjectContext(ctx context.Context, session string, panes
 		}
 		projectDir = filepath.Clean(projectDir)
 		roots[projectDir] = append(roots[projectDir], paneID)
-	}
-	if len(roots) == 1 {
-		for projectDir := range roots {
-			return projectDir, nil
+
+		key := "path\x00" + projectDir
+		commonDir := ""
+		if resolved, commonErr := git.CommonDir(ctx, projectDir); commonErr == nil && resolved != "" {
+			commonDir = resolved
+			key = "git\x00" + commonDir
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
 		}
+		identity := identities[key]
+		if identity == nil {
+			identity = &liveProjectIdentity{commonDir: commonDir, dirs: make(map[string]struct{})}
+			identities[key] = identity
+		}
+		identity.dirs[projectDir] = struct{}{}
+	}
+	if len(identities) == 1 {
+		for _, identity := range identities {
+			return identity.canonicalProjectDir(), nil
+		}
+	}
+	if len(identities) == 0 {
+		// Every pane was dead: nothing disagreed, there was simply no live
+		// pane to ask. Do not report this as a multi-root conflict.
+		return "", fmt.Errorf("resolve live project for session %q: all %d panes are dead (remain-on-exit); %w", session, deadPanes, ErrNoLivePanes)
 	}
 
 	rootNames := make([]string, 0, len(roots))
@@ -765,6 +893,41 @@ func ResolveLiveSessionProjectContext(ctx context.Context, session string, panes
 		parts = append(parts, fmt.Sprintf("%s (%s)", projectDir, strings.Join(paneIDs, ",")))
 	}
 	return "", fmt.Errorf("resolve live project for session %q: panes span multiple project roots: %s", session, strings.Join(parts, "; "))
+}
+
+// liveProjectIdentity groups the visible pane project roots that resolved to
+// one physical repository (or, for non-git roots, to one cleaned path).
+type liveProjectIdentity struct {
+	commonDir string // symlink-resolved git common directory; "" for non-git roots
+	dirs      map[string]struct{}
+}
+
+// canonicalProjectDir picks the authoritative project root for one physical
+// repository. The base checkout — the directory owning the shared common
+// directory, where the controller pane runs — wins over any linked worktree;
+// with no usable base, the lexically-first visible root keeps the result
+// deterministic.
+func (identity *liveProjectIdentity) canonicalProjectDir() string {
+	if len(identity.dirs) == 1 {
+		for projectDir := range identity.dirs {
+			return projectDir
+		}
+	}
+	if identity.commonDir != "" && filepath.Base(identity.commonDir) == ".git" {
+		base := filepath.Dir(identity.commonDir)
+		if _, ok := identity.dirs[base]; ok {
+			return base
+		}
+		if util.ProjectDirScore(base) > 0 {
+			return base
+		}
+	}
+	dirs := make([]string, 0, len(identity.dirs))
+	for projectDir := range identity.dirs {
+		dirs = append(dirs, projectDir)
+	}
+	sort.Strings(dirs)
+	return dirs[0]
 }
 
 func normalizeBulkAssignStrategy(strategy string) (string, error) {
@@ -1501,16 +1664,20 @@ func applyBulkAssignPlan(ctx context.Context, opts BulkAssignOptions, deps BulkA
 		if planned.Status != "planned" {
 			continue
 		}
-		requestedPaths := opts.ReservationPaths
-		if planned.recovery != nil {
-			requestedPaths = planned.recovery.ReservationInputPaths
-		}
-		for _, requestedPath := range requestedPaths {
+		resolveBulkAssignReservation(ctx, opts, deps, planned)
+		reported := make([]string, 0, len(planned.reservationPaths))
+		for _, requestedPath := range planned.reservationPaths {
 			pathResult := redaction.ScanAndRedact(requestedPath, redactionConfig)
-			if len(pathResult.Findings) != 0 && planned.Status != "failed" {
+			if len(pathResult.Findings) != 0 && planned.Status == "planned" {
 				failBulkAssignment(planned, fmt.Errorf("assignment reservation path blocked by redaction policy (%d findings)", len(pathResult.Findings)), "")
-				break
 			}
+			reported = append(reported, redaction.ScanAndRedact(requestedPath, durableRedactionConfig).Output)
+		}
+		planned.Reservation.Paths = reported
+		if planned.Status != "planned" {
+			// A refused assignment never reserves, so it keeps no raw path
+			// that redaction may have just blocked.
+			planned.reservationPaths = nil
 		}
 	}
 
@@ -1537,13 +1704,6 @@ func applyBulkAssignPlan(ctx context.Context, opts BulkAssignOptions, deps BulkA
 	}
 
 	needsDetails := strings.Contains(template, "{bead_type}") || strings.Contains(template, "{bead_deps}")
-	if opts.RequireReservation && len(opts.ReservationPaths) == 0 {
-		for i := range plan.Assignments {
-			if plan.Assignments[i].recovery == nil && plan.Assignments[i].Status == "planned" {
-				failBulkAssignment(&plan.Assignments[i], assignment.ErrReservationPathsRequired, ErrCodeInvalidFlag)
-			}
-		}
-	}
 
 	prompts := make([]string, len(plan.Assignments))
 	for i := range plan.Assignments {
@@ -1590,7 +1750,7 @@ func applyBulkAssignPlan(ctx context.Context, opts BulkAssignOptions, deps BulkA
 		return
 	}
 
-	runtime, runtimeErr := newBulkAtomicRuntime(ctx, deps, output.Session, opts.projectDir, opts.operatorGatedLabels)
+	runtime, runtimeErr := newBulkAtomicRuntime(ctx, deps, output.Session, opts.projectDir, opts.operatorGatedLabels, opts.PromptContext)
 	if runtimeErr != nil {
 		for i := range plan.Assignments {
 			if plan.Assignments[i].Status != "planned" {
@@ -1619,7 +1779,7 @@ func applyBulkAssignPlan(ctx context.Context, opts BulkAssignOptions, deps BulkA
 			failBulkAssignment(assignmentResult, fmt.Errorf("bulk assignment canceled: %w", err), ErrCodeTimeout)
 			return
 		}
-		runtime.execute(workCtx, output.Session, assignmentResult, prompts[index], opts.RequireReservation, opts.ReservationPaths)
+		runtime.execute(workCtx, output.Session, assignmentResult, prompts[index])
 	}
 
 	if opts.Parallel {
@@ -1657,6 +1817,60 @@ func applyBulkAssignPlan(ctx context.Context, opts BulkAssignOptions, deps BulkA
 	}
 
 	finishBulkAssignOutput(output, plan)
+}
+
+// resolveBulkAssignReservation fixes one planned assignment's reservation
+// scope before anything is claimed, with `ntm assign --reserve-files`
+// semantics: explicit --reservation-paths win; otherwise the scope is
+// discovered from the live bead's title and description by the same rule
+// the CLI uses, and a bead that names no files is refused unclaimed
+// (ntm#336). A durable recovery keeps the reservation intent it recorded.
+func resolveBulkAssignReservation(ctx context.Context, opts BulkAssignOptions, deps BulkAssignDependencies, planned *BulkAssignAssignment) {
+	planned.Reservation = &BulkAssignReservation{Paths: []string{}, Granted: []string{}}
+	if recovery := planned.recovery; recovery != nil {
+		planned.Reservation.Required = recovery.ReservationRequired
+		planned.Reservation.Source = bulkReservationRecorded
+		planned.reservationPaths = append([]string(nil), recovery.ReservationInputPaths...)
+		return
+	}
+	if !opts.ReserveFiles {
+		planned.Reservation.Source = bulkReservationDisabled
+		return
+	}
+	planned.Reservation.Required = true
+	if len(opts.ReservationPaths) > 0 {
+		planned.Reservation.Source = bulkReservationExplicit
+		planned.reservationPaths = append([]string(nil), opts.ReservationPaths...)
+		return
+	}
+	planned.Reservation.Source = bulkReservationDiscovered
+	if deps.GetBeadAssignmentDetails == nil {
+		failBulkReservation(planned, errors.New("bead reader for reservation discovery is unavailable"), ErrCodeInternalError)
+		return
+	}
+	details, err := deps.GetBeadAssignmentDetails(ctx, opts.projectDir, planned.Bead)
+	if err == nil && details == nil {
+		err = errors.New("live work-item details are missing")
+	}
+	if err != nil {
+		failBulkReservation(planned, fmt.Errorf("read bead %s to discover its reservation paths: %w", planned.Bead, err), "")
+		return
+	}
+	paths, err := assign.ReservationPathsForAssignment(details.Title, details.Description)
+	if err != nil {
+		failBulkReservation(planned, err, ErrCodeReservationRequired)
+		return
+	}
+	planned.reservationPaths = paths
+}
+
+// failBulkReservation refuses an assignment for a reservation reason and
+// reports that reason on its reservation as well as on the assignment.
+func failBulkReservation(output *BulkAssignAssignment, err error, code string) {
+	if output.Reservation != nil {
+		output.Reservation.Error = err.Error()
+	}
+	failBulkAssignment(output, err, code)
 }
 
 func markPendingBulkAssignmentsCanceled(assignments []BulkAssignAssignment, err error) {
@@ -1730,6 +1944,11 @@ func bulkAssignFailureClass(assignments []BulkAssignAssignment) (string, string)
 			return ErrCodeDispatchUnknown, "Inspect the durable assignment receipt before retrying; delivery outcome is unknown"
 		}
 	}
+	for _, item := range assignments {
+		if item.failureCode == ErrCodeReservationRequired {
+			return ErrCodeReservationRequired, "Inspect assignments[].reservation; start Agent Mail, list the files each bead changes (for example under \"## Owned outputs\"), pass --reservation-paths, or opt out with --reserve-files=false. Refused assignments were not claimed"
+		}
+	}
 	return "ASSIGNMENT_FAILED", "Inspect assignments[].error; no failed target was dispatched"
 }
 
@@ -1748,6 +1967,9 @@ type robotAgentMailReservationRuntime struct {
 	projectID  int
 	registry   *agentmail.SessionAgentRegistry
 	registered map[string]agentmail.Agent
+	// readBead reads the live bead whose file scope a pathless reservation
+	// request reserves (assign.DiscoverReservationPaths).
+	readBead assign.BeadTextReader
 }
 
 func newRobotAgentMailReservationRuntime(
@@ -1801,7 +2023,21 @@ func newRobotAgentMailReservationRuntime(
 	return &robotAgentMailReservationRuntime{
 		client: client, projectKey: projectKey, projectID: project.ID,
 		registry: registry, registered: registered,
+		readBead: bv.BeadTextReader(bv.GetBeadAssignmentDetailsContext),
 	}, nil
+}
+
+// requestedPaths is the exact path set a reservation request covers: the
+// request's own paths, or, for a request that names none (a durable intent
+// recorded with discovery), the bead's file scope discovered exactly as
+// `ntm assign` discovers it. Reserve and ReconcileReservation both use it so
+// they agree on the set.
+func (r *robotAgentMailReservationRuntime) requestedPaths(ctx context.Context, req assignment.ReservationRequest) ([]string, error) {
+	paths := req.RequestedPaths
+	if len(paths) == 0 {
+		paths = assign.DiscoverReservationPaths(ctx, r.projectKey, req, r.readBead)
+	}
+	return validateRobotReservationPaths(paths)
 }
 
 func (r *robotAgentMailReservationRuntime) ResolveRecipient(_ context.Context, projectKey, session, paneID, _ string) (string, error) {
@@ -1845,7 +2081,7 @@ func (r *robotAgentMailReservationRuntime) Reserve(ctx context.Context, req assi
 	if !ok || registered.ProjectID != r.projectID {
 		return lease, assignment.GuaranteeNoReservation(fmt.Errorf("Agent Mail reservation recipient %s is not registered in project %s", req.AgentName, r.projectKey))
 	}
-	requested, err := validateRobotReservationPaths(req.RequestedPaths)
+	requested, err := r.requestedPaths(ctx, req)
 	if err != nil {
 		return lease, assignment.GuaranteeNoReservation(err)
 	}
@@ -1885,10 +2121,8 @@ func (r *robotAgentMailReservationRuntime) Reserve(ctx context.Context, req assi
 		} else {
 			seenIDs[granted.ID] = struct{}{}
 		}
-		// A grant carries no project: the call named r.projectKey, so every
-		// grant it returns is in that project.
-		if granted.AgentName != req.AgentName {
-			validationErrors = append(validationErrors, fmt.Errorf("Agent Mail reservation %d receipt recipient mismatch: got %q, want %q", granted.ID, granted.AgentName, req.AgentName))
+		if granted.ProjectID != r.projectID || granted.AgentName != req.AgentName {
+			validationErrors = append(validationErrors, fmt.Errorf("Agent Mail reservation %d receipt project or recipient mismatch", granted.ID))
 		}
 		if granted.Reason != expectedReason {
 			validationErrors = append(validationErrors, fmt.Errorf("Agent Mail reservation %d receipt reason mismatch", granted.ID))
@@ -1947,7 +2181,7 @@ func (r *robotAgentMailReservationRuntime) ReconcileReservation(ctx context.Cont
 	if r == nil {
 		return assignment.ReservationReconciliation{State: assignment.ReservationReconciliationUnknown}, errors.New("Agent Mail reservation runtime is nil")
 	}
-	requested, err := validateRobotReservationPaths(req.RequestedPaths)
+	requested, err := r.requestedPaths(ctx, req)
 	if err != nil {
 		return assignment.ReservationReconciliation{State: assignment.ReservationReconciliationUnknown}, err
 	}
@@ -1990,8 +2224,8 @@ func (r *robotAgentMailReservationRuntime) ReconcileReservation(ctx context.Cont
 		lease.Granted = append(lease.Granted, reservation.PathPattern)
 		lease.ReservationIDs = append(lease.ReservationIDs, reservation.ID)
 		expiresAt := reservation.ExpiresTS.Time
-		// The listing is the project's own, so its rows carry no project.
-		if !reservation.Exclusive || expiresAt.IsZero() || !expiresAt.After(now) {
+		if reservation.ProjectID != r.projectID || !reservation.Exclusive ||
+			expiresAt.IsZero() || !expiresAt.After(now) {
 			return assignment.ReservationReconciliation{State: assignment.ReservationReconciliationUnknown, Lease: lease}, nil
 		}
 		if lease.ExpiresAt == nil || expiresAt.Before(*lease.ExpiresAt) {
@@ -2036,6 +2270,7 @@ type bulkAtomicRuntime struct {
 	deps                BulkAssignDependencies
 	workDir             string
 	operatorGatedLabels []string
+	promptContext       PromptContextOptions
 	newKey              func() (string, error)
 	observeMu           sync.Mutex
 	observation         statuspkg.SessionObservation
@@ -2052,7 +2287,7 @@ func (r *bulkAtomicRuntime) observeSession(ctx context.Context, session string) 
 	return r.observation, r.observeErr
 }
 
-func newBulkAtomicRuntime(ctx context.Context, deps BulkAssignDependencies, session, workDir string, operatorGatedLabels []string) (*bulkAtomicRuntime, error) {
+func newBulkAtomicRuntime(ctx context.Context, deps BulkAssignDependencies, session, workDir string, operatorGatedLabels []string, promptContext PromptContextOptions) (*bulkAtomicRuntime, error) {
 	if strings.TrimSpace(workDir) == "" {
 		var err error
 		workDir, err = deps.ResolveProject(ctx, session, nil)
@@ -2085,7 +2320,8 @@ func newBulkAtomicRuntime(ctx context.Context, deps BulkAssignDependencies, sess
 	)
 	return &bulkAtomicRuntime{
 		store: store, claimPort: claimPort, dispatchPort: dispatchPort,
-		deps: deps, workDir: workDir, operatorGatedLabels: capturedLabels, newKey: deps.NewIdempotencyKey,
+		deps: deps, workDir: workDir, operatorGatedLabels: capturedLabels, promptContext: promptContext,
+		newKey: deps.NewIdempotencyKey,
 	}, nil
 }
 
@@ -2120,7 +2356,21 @@ func bulkRecoveryNeedsReservationPort(recovery *assignment.Assignment, now time.
 	return recovery.ReservationExpiresAt != nil && !recovery.ReservationExpiresAt.After(now)
 }
 
-func (r *bulkAtomicRuntime) execute(ctx context.Context, session string, output *BulkAssignAssignment, prompt string, requireReservation bool, reservationPaths []string) {
+// reservationRuntime connects the default Agent Mail reservation port for the
+// session's project. An unreachable Agent Mail refuses the assignment before
+// its claim, as `ntm assign --reserve-files` refuses to run without it.
+func (r *bulkAtomicRuntime) reservationRuntime(ctx context.Context, session string) (*robotAgentMailReservationRuntime, error) {
+	mailRuntime, err := newRobotAgentMailReservationRuntime(ctx, r.workDir, session, r.deps.AgentMailClient)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", assignment.ErrReservationRequired, err)
+	}
+	if r.deps.GetBeadAssignmentDetails != nil {
+		mailRuntime.readBead = bv.BeadTextReader(r.deps.GetBeadAssignmentDetails)
+	}
+	return mailRuntime, nil
+}
+
+func (r *bulkAtomicRuntime) execute(ctx context.Context, session string, output *BulkAssignAssignment, prompt string) {
 	if ctx == nil {
 		failBulkAssignment(output, errors.New("bulk assignment context is required"), ErrCodeInternalError)
 		return
@@ -2136,8 +2386,20 @@ func (r *bulkAtomicRuntime) execute(ctx context.Context, session string, output 
 	actor := ""
 	idempotencyKey := ""
 	recoveredIntentSHA256 := ""
-	reservationDiscovery := false
+	baseIntentSHA256 := ""
+	requireReservation := output.Reservation != nil && output.Reservation.Required
+	// Discovered paths are recorded with discovery allowed, as `ntm assign
+	// --pane` records them, so recovery replays the same intent.
+	reservationDiscovery := requireReservation && output.Reservation.Source == bulkReservationDiscovered
+	reservationPaths := append([]string(nil), output.reservationPaths...)
 	occupancyKey := target
+	if output.recovery == nil {
+		// A live row recorded from this same template intent with an enriched
+		// prompt is replayed through the durable-recovery path: its recorded
+		// prompt is delivered (or its receipt replayed) exactly, and cass/cm
+		// are never queried again.
+		output.recovery = robotAtomicContextIntent(r.store, output.Bead, target, output.AgentType, prompt, requireReservation, reservationPaths)
+	}
 	if recovery := output.recovery; recovery != nil {
 		target = strings.TrimSpace(recovery.DispatchTarget)
 		if target == "" {
@@ -2171,9 +2433,9 @@ func (r *bulkAtomicRuntime) execute(ctx context.Context, session string, output 
 				return
 			}
 			if bulkRecoveryNeedsReservationPort(recovery, time.Now().UTC()) && reservationPort == nil {
-				mailRuntime, runtimeErr := newRobotAgentMailReservationRuntime(ctx, r.workDir, session, nil)
+				mailRuntime, runtimeErr := r.reservationRuntime(ctx, session)
 				if runtimeErr != nil {
-					failBulkAssignment(output, runtimeErr, "")
+					failBulkReservation(output, runtimeErr, ErrCodeReservationRequired)
 					return
 				}
 				reservationPort = mailRuntime
@@ -2190,13 +2452,15 @@ func (r *bulkAtomicRuntime) execute(ctx context.Context, session string, output 
 		}
 
 		if requireReservation && reservationPort == nil {
-			mailRuntime, runtimeErr := newRobotAgentMailReservationRuntime(ctx, r.workDir, session, nil)
+			mailRuntime, runtimeErr := r.reservationRuntime(ctx, session)
 			if runtimeErr != nil {
-				failBulkAssignment(output, runtimeErr, "")
+				failBulkReservation(output, runtimeErr, ErrCodeReservationRequired)
 				return
 			}
 			reservationPort = mailRuntime
-			resolveAgentName = mailRuntime.ResolveRecipient
+			if resolveAgentName == nil {
+				resolveAgentName = mailRuntime.ResolveRecipient
+			}
 		}
 		if err := ctx.Err(); err != nil {
 			failBulkAssignment(output, fmt.Errorf("bulk assignment canceled before reservation identity resolution: %w", err), ErrCodeTimeout)
@@ -2226,6 +2490,11 @@ func (r *bulkAtomicRuntime) execute(ctx context.Context, session string, output 
 		if keyErr != nil {
 			failBulkAssignment(output, keyErr, "")
 			return
+		}
+		if !robotAtomicLiveKey(r.store, output.Bead, idempotencyKey) {
+			// A fresh intent: enrich now, before Execute records it, so the
+			// ledger hashes and persists exactly what the agent receives.
+			prompt, baseIntentSHA256 = r.enrichPrompt(ctx, session, output, prompt)
 		}
 	}
 	if actor == "" {
@@ -2273,6 +2542,7 @@ func (r *bulkAtomicRuntime) execute(ctx context.Context, session string, output 
 		Prompt:                    prompt,
 		IdempotencyKey:            idempotencyKey,
 		RecoveredIntentSHA256:     recoveredIntentSHA256,
+		BaseIntentSHA256:          baseIntentSHA256,
 		RequireReservation:        requireReservation,
 		AllowReservationDiscovery: reservationDiscovery,
 		RequestedPaths:            append([]string(nil), reservationPaths...),
@@ -2292,8 +2562,12 @@ func applyBulkAtomicExecutionResult(ctx context.Context, output *BulkAssignAssig
 		output.ClaimActor = result.Assignment.ClaimActor
 		output.ReservationIDs = append([]int(nil), result.Assignment.ReservationIDs...)
 		output.DispatchReceiptID = result.Assignment.DispatchReceiptID
+		reportBulkDurableReservation(output, result.Assignment)
 	}
 	if executeErr != nil {
+		if output.Reservation != nil && output.Reservation.Error == "" && bulkReservationFailure(executeErr) {
+			output.Reservation.Error = redactBulkReservationText(executeErr.Error())[0]
+		}
 		failBulkAssignment(output, executeErr, "")
 		return
 	}
@@ -2314,6 +2588,52 @@ func applyBulkAtomicExecutionResult(ctx context.Context, output *BulkAssignAssig
 		return
 	}
 	failBulkAssignment(output, errors.New("atomic assignment completed without a durable dispatch receipt"), ErrCodeInternalError)
+}
+
+// reportBulkDurableReservation copies the ledger's reservation truth into the
+// assignment's report: the path set Agent Mail was asked for (which a
+// discovery-only recovery intent learns only at reserve time), the granted
+// paths, and any recorded reservation failure. Scope discovered at reserve
+// time never passed the dispatch redaction preflight, so every ledger value
+// is rendered through the built-in secret patterns before it is reported.
+func reportBulkDurableReservation(output *BulkAssignAssignment, durable *assignment.Assignment) {
+	if output.Reservation == nil {
+		output.Reservation = &BulkAssignReservation{
+			Required: durable.ReservationRequired,
+			Source:   bulkReservationRecorded,
+			Paths:    redactBulkReservationText(durable.ReservationInputPaths...),
+		}
+	}
+	if len(durable.ReservationRequested) > 0 {
+		output.Reservation.Paths = redactBulkReservationText(durable.ReservationRequested...)
+	}
+	output.Reservation.Granted = redactBulkReservationText(durable.ReservedPaths...)
+	if strings.TrimSpace(durable.ReservationError) != "" {
+		output.Reservation.Error = redactBulkReservationText(durable.ReservationError)[0]
+	}
+}
+
+// redactBulkReservationText renders reservation paths or errors for the robot
+// report with the built-in secret patterns, independent of the current
+// project policy (a durable replay deliberately loads none).
+func redactBulkReservationText(values ...string) []string {
+	config := redaction.DefaultConfig()
+	config.Mode = redaction.ModeRedact
+	rendered := make([]string, 0, len(values))
+	for _, value := range values {
+		rendered = append(rendered, redaction.ScanAndRedact(value, config).Output)
+	}
+	return rendered
+}
+
+// bulkReservationFailure reports whether an atomic assignment failed on its
+// file reservation rather than on its claim or dispatch.
+func bulkReservationFailure(err error) bool {
+	return errors.Is(err, assignment.ErrReservationRequired) ||
+		errors.Is(err, assignment.ErrReservationPathsRequired) ||
+		errors.Is(err, assignment.ErrReservationOutcomeUnknown) ||
+		assignment.IsReservationReleaseRequired(err) ||
+		assignment.IsGuaranteedNoReservation(err)
 }
 
 func newRobotAtomicClaimPort(workDir string, claim func(context.Context, string, string, string) (bv.BeadClaimResult, error)) assignment.ClaimPort {
@@ -2557,6 +2877,73 @@ func robotAtomicReplayIntent(
 	return existing
 }
 
+// robotAtomicContextIntent returns the live row a re-run of one enriched
+// template intent must replay. The row's prompt was enriched with cass/cm
+// context, so its intent checksum covers the enriched payload; only its
+// recorded pre-enrichment checksum can recognize the caller's template
+// prompt. Rows recorded without enrichment keep matching by prompt in
+// robotAtomicReplayIntent and robotAtomicIdempotencyKey.
+func robotAtomicContextIntent(
+	store *assignment.AssignmentStore,
+	beadID, target, agentType, basePrompt string,
+	requireReservation bool,
+	requestedPaths []string,
+) *assignment.Assignment {
+	if store == nil {
+		return nil
+	}
+	existing := store.Get(beadID)
+	if existing == nil || robotAtomicAssignmentTerminal(existing.Status) || existing.IdempotencyKey == "" ||
+		existing.BaseIntentSHA256 == "" || existing.BaseIntentSHA256 != assignment.PromptSHA256(basePrompt) {
+		return nil
+	}
+	occupancyKey := strings.TrimSpace(existing.OccupancyKey)
+	if occupancyKey == "" {
+		occupancyKey = strings.TrimSpace(existing.DispatchTarget)
+	}
+	if existing.DispatchTarget != target || occupancyKey != target || existing.AgentType != agentType ||
+		existing.ReservationRequired != requireReservation ||
+		!stringSlicesEqualRobot(existing.ReservationInputPaths, requestedPaths) {
+		return nil
+	}
+	return existing
+}
+
+// robotAtomicLiveKey reports whether key already identifies the bead's live
+// ledger row, i.e. robotAtomicIdempotencyKey reused a recorded intent rather
+// than minting a fresh one.
+func robotAtomicLiveKey(store *assignment.AssignmentStore, beadID, key string) bool {
+	if store == nil {
+		return false
+	}
+	existing := store.Get(beadID)
+	return existing != nil && !robotAtomicAssignmentTerminal(existing.Status) && existing.IdempotencyKey == key
+}
+
+// enrichPrompt applies the shared cass/cm prompt-context pipeline to a fresh
+// bulk intent's prompt and records the outcome on output. It returns the
+// prompt to dispatch and, when enrichment ran, the checksum of the template
+// prompt it started from. The bead's labels and description join the
+// retrieval query when the tracker can supply them; a failed lookup only
+// narrows the query to the title and never blocks the assignment.
+func (r *bulkAtomicRuntime) enrichPrompt(ctx context.Context, session string, output *BulkAssignAssignment, prompt string) (string, string) {
+	if !r.promptContext.Enabled() {
+		return prompt, ""
+	}
+	request := AssignmentPrompt{
+		Prompt: prompt, Title: output.BeadTitle, AgentType: output.AgentType,
+		Session: session, ProjectDir: r.workDir,
+	}
+	if r.deps.GetBeadAssignmentDetails != nil {
+		if details, err := r.deps.GetBeadAssignmentDetails(ctx, r.workDir, output.Bead); err == nil && details != nil {
+			request.Labels, request.Description = details.Labels, details.Description
+		}
+	}
+	enriched, cassInjection, memoryInjection := EnrichAssignmentPrompt(ctx, request, r.promptContext)
+	output.CASSInjection, output.MemoryInjection = cassInjection, memoryInjection
+	return enriched, assignment.PromptSHA256(prompt)
+}
+
 func robotAtomicAssignmentTerminal(status assignment.AssignmentStatus) bool {
 	switch status {
 	case assignment.StatusCompleted, assignment.StatusFailed, assignment.StatusReassigned:
@@ -2604,6 +2991,8 @@ func bulkAssignTMUXAgentType(agentType string) tmux.AgentType {
 		return tmux.AgentAider
 	case "oc":
 		return tmux.AgentOpencode
+	case "omp":
+		return tmux.AgentOmp
 	case "ollama":
 		return tmux.AgentOllama
 	case "user":
@@ -2755,15 +3144,6 @@ func parseBulkAssignAllocation(raw string) (map[string]string, error) {
 	}
 
 	return result, nil
-}
-
-// decodeBulkAssignTriage parses bv --robot-triage JSON payloads.
-func decodeBulkAssignTriage(raw []byte) (*bv.TriageResponse, error) {
-	var resp bv.TriageResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, err
-	}
-	return &resp, nil
 }
 
 func fetchBeadTitle(ctx context.Context, dir, beadID string) (string, error) {

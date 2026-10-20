@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,13 +38,35 @@ const (
 	// AvailabilityCacheTTL is how long to cache IsAvailable() results.
 	AvailabilityCacheTTL = 30 * time.Second
 
-	// availabilityProbeBudget bounds all liveness attempts and backoffs. Keep the
-	// probe below two seconds so optional Agent Mail discovery cannot stall CLI
-	// startup when the service is unavailable.
-	availabilityProbeBudget   = 1250 * time.Millisecond
-	availabilityProbeAttempts = 3
-	availabilityProbeBackoff  = 150 * time.Millisecond
+	// defaultAvailabilityProbeBudget bounds all liveness attempts and backoffs.
+	// Keep the probe below two seconds so optional Agent Mail discovery cannot
+	// stall CLI startup when the service is unavailable.
+	defaultAvailabilityProbeBudget = 1250 * time.Millisecond
+	availabilityProbeAttempts      = 3
+	availabilityProbeBackoff       = 150 * time.Millisecond
+
+	// ProbeBudgetEnv overrides the availability probe budget (a Go duration,
+	// e.g. "5s"). Operators whose server has no cheap liveness endpoint and a
+	// large mailbox need more than the default (issue #295).
+	ProbeBudgetEnv = "NTM_AGENT_MAIL_PROBE_BUDGET"
 )
+
+// errLivenessUnsupported marks a liveness probe that the server answered but
+// that cannot decide availability (no such endpoint, or it is auth-walled).
+// The caller falls back to the MCP ping.
+var errLivenessUnsupported = errors.New("agent mail liveness endpoint unsupported")
+
+// availabilityProbeBudget returns the wall-clock budget for one availability
+// probe, honoring ProbeBudgetEnv. An unparseable or non-positive value falls
+// back to the default rather than disabling the guard.
+func availabilityProbeBudget() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(ProbeBudgetEnv)); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultAvailabilityProbeBudget
+}
 
 // Client provides methods to interact with the Agent Mail API.
 type Client struct {
@@ -52,6 +76,12 @@ type Client struct {
 	projectKey  string // Cached project path
 	disabled    bool   // Refuse every call without contacting the server
 	requestID   atomic.Int64
+
+	// MCP session id issued by a stateful server (the Python Agent Mail
+	// server's /mcp endpoint). Empty until a server rejects a sessionless
+	// request; see postJSONRPC.
+	mcpSessionMu sync.Mutex
+	mcpSession   string
 
 	// Per-agent registration tokens. Server-side mcp-agent-mail >=2.13
 	// requires identity-scoped tool calls (fetch_inbox, send_message,
@@ -239,19 +269,131 @@ func WithBaseURL(url string) Option {
 	}
 }
 
+// configuredEndpoint is the `[agent_mail] url`/`token` the running process
+// loaded. NewClient starts from it, so the twenty-odd call sites that build a
+// client with no options (the pre-commit reservation guard, robot
+// reservations, pipeline mail steps, handoff, ...) reach the same server, with
+// the same bearer token, as the ones that pass ConfigOptions explicitly.
+var configuredEndpoint struct {
+	mu      sync.RWMutex
+	baseURL string
+	token   string
+}
+
+// UseConfiguredEndpoint records the process's configured Agent Mail endpoint
+// and bearer token as the defaults for every client NewClient builds. The
+// environment still overrides it (AGENT_MAIL_URL / AGENT_MAIL_TOKEN), and an
+// explicit Option still overrides both. Empty strings clear a value.
+func UseConfiguredEndpoint(baseURL, token string) {
+	configuredEndpoint.mu.Lock()
+	defer configuredEndpoint.mu.Unlock()
+	configuredEndpoint.baseURL = strings.TrimSpace(baseURL)
+	configuredEndpoint.token = strings.TrimSpace(token)
+}
+
+func configuredEndpointDefaults() (baseURL, token string) {
+	configuredEndpoint.mu.RLock()
+	defer configuredEndpoint.mu.RUnlock()
+	return configuredEndpoint.baseURL, configuredEndpoint.token
+}
+
+// ConfigOptions returns the client options implied by a configured Agent Mail
+// endpoint and bearer token, as read from `[agent_mail] url`/`token`, for a
+// caller holding a config other than the one the process recorded with
+// UseConfiguredEndpoint.
+//
+// It applies the same environment-versus-config precedence NewClient does:
+// NewClient reads AGENT_MAIL_URL / AGENT_MAIL_TOKEN before applying options,
+// so a configured value is yielded only when the matching variable is unset
+// and the environment keeps overriding the file. Callers used to open-code
+// this, and the copies had drifted — some honoured the override, some did
+// not, and the doctor probe honoured neither (ntm#316).
+//
+// It deliberately takes strings rather than a *config.Config: internal/config
+// imports this package, so the dependency cannot run the other way.
+func ConfigOptions(baseURL, token string) []Option {
+	var opts []Option
+	if baseURL != "" && os.Getenv("AGENT_MAIL_URL") == "" {
+		opts = append(opts, WithBaseURL(baseURL))
+	}
+	if token != "" && os.Getenv("AGENT_MAIL_TOKEN") == "" {
+		opts = append(opts, WithToken(token))
+	}
+	return opts
+}
+
+// amConfigToken reads HTTP_BEARER_TOKEN from Agent Mail's user config file,
+// $XDG_CONFIG_HOME/mcp-agent-mail/config.env (XDG_CONFIG_HOME only when
+// absolute, else ~/.config), where `am setup` stores the token its server
+// requires. ntm sends it only to a loopback server and only when no token is
+// configured ([agent_mail] token, AGENT_MAIL_TOKEN or WithToken), so a machine
+// set up with am works without copying the token into ntm's config.
+func amConfigToken() string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if !filepath.IsAbs(dir) {
+		home, err := os.UserHomeDir()
+		if err != nil || !filepath.IsAbs(home) {
+			return ""
+		}
+		dir = filepath.Join(home, ".config")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "mcp-agent-mail", "config.env"))
+	if err != nil {
+		return ""
+	}
+	return dotenvValue(string(data), "HTTP_BEARER_TOKEN")
+}
+
+// dotenvValue returns key's value from dotenv text, following am's config.env
+// grammar as far as a token needs: blank and # lines skipped, an `export `
+// prefix allowed, the first '=' splits, a '#' outside quotes that starts the
+// value or follows whitespace begins a comment, one pair of surrounding quotes
+// is removed, and the last assignment wins. am also unescapes backslashes in
+// double quotes and joins adjacent quoted segments; tokens use neither.
+func dotenvValue(contents, key string) string {
+	value := ""
+	for _, line := range strings.Split(contents, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(k) != key {
+			continue
+		}
+		v = stripDotenvComment(strings.TrimSpace(v))
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		value = v
+	}
+	return value
+}
+
+// stripDotenvComment cuts an inline comment from a dotenv value: a '#' outside
+// quotes at the start of the value or after whitespace.
+func stripDotenvComment(v string) string {
+	var quote byte
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '#' && (i == 0 || v[i-1] == ' ' || v[i-1] == '\t'):
+			return strings.TrimRight(v[:i], " \t")
+		}
+	}
+	return v
+}
+
 // WithToken sets the bearer token for authentication.
 func WithToken(token string) Option {
 	return func(c *Client) {
 		c.bearerToken = token
-	}
-}
-
-// WithHTTPClient sets a custom HTTP client.
-func WithHTTPClient(client *http.Client) Option {
-	return func(c *Client) {
-		if client != nil {
-			c.httpClient = client
-		}
 	}
 }
 
@@ -271,15 +413,6 @@ func WithDisabled() Option {
 	}
 }
 
-// WithTimeout sets the default timeout for HTTP requests.
-func WithTimeout(timeout time.Duration) Option {
-	return func(c *Client) {
-		if c.httpClient != nil {
-			c.httpClient.Timeout = timeout
-		}
-	}
-}
-
 // NewClient creates a new Agent Mail client with the given options.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
@@ -295,7 +428,12 @@ func NewClient(opts ...Option) *Client {
 		},
 	}
 
-	// Check environment variables
+	// Configured endpoint, then environment variables, then options.
+	configuredURL, configuredToken := configuredEndpointDefaults()
+	if configuredURL != "" {
+		c.baseURL = configuredURL
+	}
+	c.bearerToken = configuredToken
 	if token := os.Getenv("AGENT_MAIL_TOKEN"); token != "" {
 		c.bearerToken = token
 	}
@@ -313,7 +451,28 @@ func NewClient(opts ...Option) *Client {
 		opt(c)
 	}
 
+	// With no token configured, a local server gets the token `am` set it up
+	// with. Never a remote one: that token is a credential for this machine's
+	// server only.
+	if c.bearerToken == "" && isLoopbackURL(c.baseURL) {
+		c.bearerToken = amConfigToken()
+	}
+
 	return c
+}
+
+// isLoopbackURL reports whether rawURL names localhost or a loopback IP.
+func isLoopbackURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // IsAvailable checks if the Agent Mail server is reachable.
@@ -322,12 +481,13 @@ func (c *Client) IsAvailable() bool {
 	return c.IsAvailableContext(context.Background())
 }
 
-// IsAvailableContext reports whether the Agent Mail server answers an MCP ping
-// at the configured endpoint, honoring caller cancellation. It deliberately
-// does not call the health_check tool: that tool runs the server's full
-// diagnostics (integrity, archive parity, pool pressure) and takes seconds on a
-// busy server, which made a live server look unavailable to every caller.
-// IsAvailable remains the entry point for callers without a lifecycle context.
+// IsAvailableContext reports whether the Agent Mail server answers its cheap
+// liveness endpoint, or an MCP ping at the configured endpoint when it has
+// none, honoring caller cancellation. It deliberately does not call the
+// health_check tool: that tool runs the server's full diagnostics (integrity,
+// archive parity, pool pressure) and takes seconds on a busy server, which made
+// a live server look unavailable to every caller. IsAvailable remains the entry
+// point for callers without a lifecycle context.
 func (c *Client) IsAvailableContext(ctx context.Context) bool {
 	if ctx == nil {
 		return false
@@ -344,7 +504,7 @@ func (c *Client) IsAvailableContext(ctx context.Context) bool {
 	// One deadline covers lock contention, every attempt, and every backoff.
 	// Caller cancellation exits without changing either the cache or the last
 	// completed diagnostic.
-	probeCtx, cancelProbe := context.WithTimeout(ctx, availabilityProbeBudget)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, availabilityProbeBudget())
 	defer cancelProbe()
 
 	// Acquire the health-check lock without losing caller cancellation while a
@@ -380,7 +540,7 @@ func (c *Client) IsAvailableContext(ctx context.Context) bool {
 	available := false
 probeLoop:
 	for attempt := 1; attempt <= availabilityProbeAttempts; attempt++ {
-		err = c.ping(probeCtx)
+		err = c.probeAvailability(probeCtx)
 		if ctx.Err() != nil {
 			return false
 		}
@@ -519,6 +679,130 @@ func HasArchiveForProject(projectKey string) bool {
 	return false
 }
 
+// livenessURL derives the server's cheap liveness endpoint from the MCP base
+// URL: the MCP transport is mounted at a path (".../mcp/") while liveness is
+// served from the origin root ("/health").
+func (c *Client) livenessURL() (string, error) {
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("agent mail base URL %q has no origin", c.baseURL)
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/" + HealthCheckPath}).String(), nil
+}
+
+// QuickAvailable reports availability from a SINGLE cheap liveness probe,
+// with the bearer attached.
+//
+// It exists because IsAvailableContext is built to gate mutating verbs: it
+// retries availabilityProbeAttempts times with backoff inside a ~1.25s budget,
+// so when the server is simply not running it spends that whole budget before
+// answering. That is the right trade for "may I send this message", and the
+// wrong one for filling an inventory row — `ntm doctor` and the tools registry
+// probe Agent Mail on every snapshot, and a refused connection must cost a
+// millisecond, not a second.
+//
+// decided reports whether the liveness endpoint could answer the question at
+// all. When it is false the endpoint is missing or auth-walled and the caller
+// may escalate to IsAvailableContext, which sends the MCP ping instead.
+func (c *Client) QuickAvailable(ctx context.Context) (available, decided bool) {
+	err := c.LivenessCheck(ctx)
+	switch {
+	case err == nil:
+		return true, true
+	case errors.Is(err, errLivenessUnsupported):
+		// The server is talking but this route cannot decide; escalating is
+		// the caller's choice.
+		return false, false
+	default:
+		// Transport failure or an explicit non-2xx: the server is down or
+		// broken, and we know it now without retrying.
+		return false, true
+	}
+}
+
+// LivenessCheck performs a cheap liveness probe (GET /health) against the
+// Agent Mail server. It exists because the MCP `health_check` tool is a full
+// diagnostic — on a large mailbox it inventories the git archive against
+// SQLite and takes seconds — which made it useless as a startup-budget gate
+// for mutating verbs like `ntm lock` (issue #295).
+//
+// It returns nil when the server answers 2xx, errLivenessUnsupported when the
+// server answers but the endpoint cannot decide availability (missing or
+// auth-walled), and a transport/status error otherwise.
+func (c *Client) LivenessCheck(ctx context.Context) error {
+	if c.disabled {
+		return NewAPIError("liveness", 0, ErrDisabled)
+	}
+	target, err := c.livenessURL()
+	if err != nil {
+		return errLivenessUnsupported
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return NewAPIError("liveness", 0, err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return NewAPIError("liveness", 0, ErrTimeout)
+		}
+		return NewAPIError("liveness", 0, ErrServerUnavailable)
+	}
+	defer resp.Body.Close()
+	// Drain a bounded prefix so the connection can be reused. A truncated body
+	// is a transport failure, not a verdict, so it retries like any other.
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10)); err != nil {
+		return responseBodyReadError(ctx, "liveness", err)
+	}
+
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return nil
+	case resp.StatusCode == http.StatusRequestTimeout,
+		resp.StatusCode == http.StatusTooEarly,
+		resp.StatusCode == http.StatusTooManyRequests:
+		// Genuinely transient: let the shared retry classifier see them.
+		return NewAPIError("liveness", resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
+	case resp.StatusCode >= 400 && resp.StatusCode < 500,
+		resp.StatusCode == http.StatusNotImplemented:
+		// The server is talking, but this endpoint cannot answer the question:
+		// it does not exist here, rejects GET, or is auth-walled. Availability
+		// falls back to the MCP dispatch path rather than being decided by a
+		// route we do not own.
+		return errLivenessUnsupported
+	default:
+		return NewAPIError("liveness", resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
+	}
+}
+
+// probeAvailability performs a single availability attempt: a cheap liveness
+// GET first, falling back to the MCP ping only when the server has no usable
+// liveness endpoint. Availability must not depend on the cost of the heaviest
+// diagnostic tool (issue #295): health_check took 11-13 s on a busy server, so
+// a server without a usable /health looked down to every caller (bd-izmjq).
+func (c *Client) probeAvailability(ctx context.Context) error {
+	err := c.LivenessCheck(ctx)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, errLivenessUnsupported) {
+		return err
+	}
+	if ctx.Err() != nil {
+		return NewAPIError("ping", 0, ErrTimeout)
+	}
+	return c.ping(ctx)
+}
+
 // HealthCheck runs the server's health_check tool and returns its report. The
 // tool performs full diagnostics, so use IsAvailableContext for reachability.
 func (c *Client) HealthCheck(ctx context.Context) (*HealthStatus, error) {
@@ -601,9 +885,9 @@ func extractMCPContent(result json.RawMessage) (json.RawMessage, error) {
 	// Check for tool-level error
 	if envelope.IsError {
 		if len(envelope.Content) > 0 && envelope.Content[0].Text != "" {
-			return nil, classifyToolErrorText(envelope.Content[0].Text)
+			return nil, &ToolRejectionError{Err: classifyToolErrorText(envelope.Content[0].Text)}
 		}
-		return nil, fmt.Errorf("tool returned error")
+		return nil, &ToolRejectionError{Err: errors.New("tool returned error")}
 	}
 
 	// Prefer structuredContent (already parsed JSON)
@@ -631,7 +915,7 @@ type ToolCallParams struct {
 
 // callTool makes a JSON-RPC call to the Agent Mail server.
 func (c *Client) callTool(ctx context.Context, toolName string, args map[string]interface{}) (json.RawMessage, error) {
-	result, err := c.rpc(ctx, toolName, "tools/call", ToolCallParams{
+	rpcResp, err := c.postJSONRPC(ctx, toolName, "tools/call", ToolCallParams{
 		Name:      toolName,
 		Arguments: args,
 	})
@@ -640,7 +924,7 @@ func (c *Client) callTool(ctx context.Context, toolName string, args map[string]
 	}
 
 	// Extract actual content from MCP envelope
-	content, err := extractMCPContent(result)
+	content, err := extractMCPContent(rpcResp.Result)
 	if err != nil {
 		return nil, redactTokenArgs(NewAPIError(toolName, 0, err), args)
 	}
@@ -652,76 +936,245 @@ func (c *Client) callTool(ctx context.Context, toolName string, args map[string]
 // database. A server that answers with "method not found" is up but predates
 // ping, so it counts as reachable too.
 func (c *Client) ping(ctx context.Context) error {
-	_, err := c.rpc(ctx, "ping", "ping", map[string]interface{}{})
+	_, err := c.postJSONRPC(ctx, "ping", "ping", map[string]interface{}{})
 	if errors.Is(err, ErrNotImplemented) {
 		return nil
 	}
 	return err
 }
 
-// rpc posts one JSON-RPC request to the MCP endpoint and returns its raw
-// result. operation names the call in returned errors.
-func (c *Client) rpc(ctx context.Context, operation, method string, params interface{}) (json.RawMessage, error) {
+// mcpSessionProtocolVersion is the MCP revision ntm offers when a server
+// demands a session handshake. 2025-03-26 is the first revision with
+// Streamable HTTP sessions and does not yet require the MCP-Protocol-Version
+// header on every later request.
+const mcpSessionProtocolVersion = "2025-03-26"
+
+// mcpSessionHeader carries the server-issued MCP session id.
+const mcpSessionHeader = "Mcp-Session-Id"
+
+// maxErrorDetailLen bounds how much of a non-200 response body is quoted
+// back in an error message.
+const maxErrorDetailLen = 200
+
+// postJSONRPC sends one JSON-RPC request to the MCP endpoint and returns the
+// decoded response, mapping transport, HTTP, and JSON-RPC failures to
+// APIErrors labeled with operation.
+//
+// ntm normally skips the MCP initialize handshake: the Rust Agent Mail server
+// and the Python server's /api endpoint answer one-shot requests. The Python
+// server's /mcp endpoint (ntm's default path) is stateful, though, and answers
+// a sessionless request with HTTP 400 "Missing session ID" — which is how
+// every spawn against it failed Agent Mail registration (GH #333). When a
+// server rejects the request for want of a session, ntm performs the
+// handshake once, keeps the issued session id for later calls, and retries.
+//
+// A client built with WithDisabled refuses every request with ErrDisabled
+// without contacting the server.
+func (c *Client) postJSONRPC(ctx context.Context, operation, method string, params interface{}) (*JSONRPCResponse, error) {
 	if c.disabled {
 		return nil, NewAPIError(operation, 0, ErrDisabled)
 	}
-	rpcReq := JSONRPCRequest{
+	body, err := json.Marshal(JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      c.requestID.Add(1),
 		Method:  method,
 		Params:  params,
-	}
-
-	body, err := json.Marshal(rpcReq)
+	})
 	if err != nil {
 		return nil, NewAPIError(operation, 0, err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL, bytes.NewReader(body))
+	for attempt := 0; ; attempt++ {
+		sessionID := c.mcpSessionID()
+		resp, respBody, err := c.postMCP(ctx, operation, body, sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if attempt == 0 && mcpSessionRejected(resp.StatusCode, respBody) {
+			if err := c.establishMCPSession(ctx, operation, sessionID); err != nil {
+				// Keep the server's own rejection as the primary error: the
+				// handshake was only an inference from its wording.
+				_, rejection := decodeJSONRPCResponse(operation, resp, respBody)
+				return nil, fmt.Errorf("%w (MCP session handshake failed: %v)", rejection, err)
+			}
+			continue
+		}
+		return decodeJSONRPCResponse(operation, resp, respBody)
+	}
+}
+
+// postMCP performs one POST of an already-encoded JSON-RPC body to the MCP
+// endpoint and returns the response with its (bounded) body read.
+func (c *Client) postMCP(ctx context.Context, operation string, body []byte, sessionID string) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, NewAPIError(operation, 0, err)
+		return nil, nil, NewAPIError(operation, 0, err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	if c.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
 	}
+	if sessionID != "" {
+		req.Header.Set(mcpSessionHeader, sessionID)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, NewAPIError(operation, 0, ErrTimeout)
+			return nil, nil, NewAPIError(operation, 0, ErrTimeout)
 		}
-		return nil, NewAPIError(operation, 0, ErrServerUnavailable)
+		return nil, nil, NewAPIError(operation, 0, ErrServerUnavailable)
 	}
 	defer resp.Body.Close()
 
 	// Read response body (limit to 10MB to prevent DoS/OOM)
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
-		return nil, responseBodyReadError(ctx, operation, err)
+		return nil, nil, responseBodyReadError(ctx, operation, err)
 	}
+	return resp, respBody, nil
+}
 
-	// Check HTTP status
+// decodeJSONRPCResponse maps an MCP endpoint response to its JSON-RPC
+// envelope, turning HTTP and JSON-RPC failures into APIErrors.
+func decodeJSONRPCResponse(operation string, resp *http.Response, respBody []byte) (*JSONRPCResponse, error) {
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, NewAPIError(operation, resp.StatusCode, fmt.Errorf("%w: invalid or missing bearer token", ErrUnauthorized))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, NewAPIError(operation, resp.StatusCode, fmt.Errorf("unexpected status: %s", resp.Status))
+		statusErr := fmt.Errorf("unexpected status: %s", resp.Status)
+		if detail := httpErrorDetail(respBody); detail != "" {
+			statusErr = fmt.Errorf("unexpected status: %s: %s", resp.Status, detail)
+		}
+		return nil, NewAPIError(operation, resp.StatusCode, statusErr)
 	}
 
-	// Parse JSON-RPC response
 	var rpcResp JSONRPCResponse
 	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
 		return nil, NewAPIError(operation, 0, err)
 	}
-
-	// Check for JSON-RPC error
 	if rpcResp.Error != nil {
 		return nil, NewAPIError(operation, 0, mapJSONRPCError(rpcResp.Error))
 	}
+	return &rpcResp, nil
+}
 
-	return rpcResp.Result, nil
+// httpErrorDetail extracts the server's own explanation from a non-200 body:
+// JSON-RPC and REST error messages, the legacy REST detail, or plain text.
+// When error and detail explain different parts of a failure, retain both.
+// A bare "unexpected status: 400 Bad Request" gave an operator nothing to
+// act on (GH #333, #355).
+func httpErrorDetail(respBody []byte) string {
+	var envelope struct {
+		Error  json.RawMessage `json:"error"`
+		Detail json.RawMessage `json:"detail"`
+	}
+	detail := string(respBody)
+	if err := json.Unmarshal(respBody, &envelope); err == nil {
+		var message string
+		if err := json.Unmarshal(envelope.Error, &message); err != nil {
+			var object struct {
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(envelope.Error, &object); err == nil {
+				message = object.Message
+			}
+		}
+		message = strings.Join(strings.Fields(message), " ")
+		var serverDetail string
+		_ = json.Unmarshal(envelope.Detail, &serverDetail)
+		serverDetail = strings.Join(strings.Fields(serverDetail), " ")
+		switch {
+		case message != "" && serverDetail != "" && message != serverDetail:
+			detail = message + ": " + serverDetail
+		case message != "":
+			detail = message
+		case serverDetail != "":
+			detail = serverDetail
+		}
+	}
+	detail = strings.Join(strings.Fields(detail), " ")
+	if runes := []rune(detail); len(runes) > maxErrorDetailLen {
+		detail = string(runes[:maxErrorDetailLen]) + "…"
+	}
+	return detail
+}
+
+// mcpSessionRejected reports whether a response rejects the request because
+// it carried no (or no longer a valid) MCP session: HTTP 400 or 404 whose body
+// names the session. Stateful Streamable HTTP servers answer a sessionless
+// request with 400 ("Missing session ID") and an unknown or expired one with
+// 400 or 404, depending on the implementation.
+func mcpSessionRejected(status int, respBody []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusNotFound {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(respBody)), "session")
+}
+
+// mcpSessionID returns the MCP session id this client holds, if any.
+func (c *Client) mcpSessionID() string {
+	c.mcpSessionMu.Lock()
+	defer c.mcpSessionMu.Unlock()
+	return c.mcpSession
+}
+
+// establishMCPSession performs the MCP initialize handshake and stores the
+// session id the server issues. stale is the session id the rejected request
+// carried: when another goroutine has already replaced it, that new session
+// is reused instead of opening a second one.
+func (c *Client) establishMCPSession(ctx context.Context, operation, stale string) error {
+	c.mcpSessionMu.Lock()
+	defer c.mcpSessionMu.Unlock()
+	if c.mcpSession != stale {
+		return nil
+	}
+
+	initBody, err := json.Marshal(JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      c.requestID.Add(1),
+		Method:  "initialize",
+		Params: map[string]interface{}{
+			"protocolVersion": mcpSessionProtocolVersion,
+			"capabilities":    map[string]interface{}{},
+			"clientInfo":      map[string]string{"name": "ntm", "version": "1"},
+		},
+	})
+	if err != nil {
+		return NewAPIError(operation, 0, err)
+	}
+	resp, respBody, err := c.postMCP(ctx, operation, initBody, "")
+	if err != nil {
+		return err
+	}
+	if _, err := decodeJSONRPCResponse(operation, resp, respBody); err != nil {
+		return fmt.Errorf("mcp session initialize: %w", err)
+	}
+	sessionID := strings.TrimSpace(resp.Header.Get(mcpSessionHeader))
+	if sessionID == "" {
+		return NewAPIError(operation, 0, errors.New("server requires an MCP session but its initialize response carried no Mcp-Session-Id"))
+	}
+
+	// The initialized notification completes the handshake. It has no id, so
+	// the server acknowledges it without a JSON-RPC body (202 Accepted).
+	notifyBody, err := json.Marshal(map[string]string{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	})
+	if err != nil {
+		return NewAPIError(operation, 0, err)
+	}
+	resp, _, err = c.postMCP(ctx, operation, notifyBody, sessionID)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return NewAPIError(operation, resp.StatusCode, fmt.Errorf("mcp session initialized notification: unexpected status: %s", resp.Status))
+	}
+
+	c.mcpSession = sessionID
+	return nil
 }
 
 // callToolWithTimeout calls a tool with a specific timeout.
@@ -732,9 +1185,10 @@ func (c *Client) callToolWithTimeout(ctx context.Context, toolName string, args 
 }
 
 // callToolWithBusyRetry wraps callTool with retry logic for ErrTransientBusy errors.
-// It retries up to maxRetries times with exponential backoff (500ms, 1s, 2s).
+// It retries up to maxRetries times with exponential backoff starting at the
+// configured [retry.agent_mail] initial delay (default 500ms: 500ms, 1s, 2s).
 func (c *Client) callToolWithBusyRetry(ctx context.Context, toolName string, args map[string]interface{}, perCallTimeout time.Duration, maxRetries int) (json.RawMessage, error) {
-	backoff := 500 * time.Millisecond
+	_, backoff := busyRetryPolicy()
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		callCtx, cancel := context.WithTimeout(ctx, perCallTimeout)
@@ -762,9 +1216,13 @@ func (c *Client) callToolWithBusyRetry(ctx context.Context, toolName string, arg
 
 // ReadResource reads a resource from the Agent Mail server.
 func (c *Client) ReadResource(ctx context.Context, uri string) (json.RawMessage, error) {
-	return c.rpc(ctx, "resources/read", "resources/read", map[string]string{
+	rpcResp, err := c.postJSONRPC(ctx, "resources/read", "resources/read", map[string]string{
 		"uri": uri,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return rpcResp.Result, nil
 }
 
 // InboxPeekConcurrency bounds how many inboxes one client's PeekInboxes calls
@@ -903,19 +1361,25 @@ func (c *Client) readInboxPeek(ctx context.Context, read *inboxPeekRead, opts Fe
 }
 
 // httpBaseURL returns the HTTP REST API base URL derived from the MCP base URL.
-// The MCP endpoint is typically at /mcp/ while the HTTP endpoints are at the root.
+// MCP uses /mcp/ or the stateless /api/ endpoint, alongside the HTTP endpoints.
+// Retain any reverse-proxy prefix when removing the final endpoint segment.
 // Example: "http://127.0.0.1:8765/mcp/" -> "http://127.0.0.1:8765"
 func (c *Client) httpBaseURL() string {
-	base := c.baseURL
-	// Remove trailing /mcp/ or /mcp if present
-	if strings.HasSuffix(base, "/mcp/") {
-		return strings.TrimSuffix(base, "/mcp/")
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		// Preserve malformed input so request construction reports the URL error.
+		return strings.TrimSuffix(c.baseURL, "/")
 	}
-	if strings.HasSuffix(base, "/mcp") {
-		return strings.TrimSuffix(base, "/mcp")
+	base.Path = strings.TrimSuffix(base.Path, "/")
+	base.RawPath = strings.TrimSuffix(base.RawPath, "/")
+	for _, endpoint := range []string{"/mcp", "/api"} {
+		if strings.HasSuffix(base.EscapedPath(), endpoint) {
+			base.Path = strings.TrimSuffix(base.Path, endpoint)
+			base.RawPath = strings.TrimSuffix(base.RawPath, endpoint)
+			break
+		}
 	}
-	// Remove trailing slash
-	return strings.TrimSuffix(base, "/")
+	return base.String()
 }
 
 // ProjectSlugFromPath derives a project slug from an absolute path.

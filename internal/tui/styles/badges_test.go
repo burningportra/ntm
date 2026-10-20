@@ -1,120 +1,11 @@
 package styles
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
 )
-
-func TestStatusBadge(t *testing.T) {
-	statuses := []string{
-		"success", "ok", "done",
-		"running", "active",
-		"idle", "waiting",
-		"warning", "warn",
-		"error", "failed",
-		"pending",
-		"disabled",
-		"blocked",
-		"unknown",
-	}
-
-	for _, status := range statuses {
-		t.Run(status, func(t *testing.T) {
-			result := StatusBadge(status)
-			if result == "" {
-				t.Errorf("StatusBadge(%q) returned empty string", status)
-			}
-		})
-	}
-}
-
-func TestStatusBadgeIcon(t *testing.T) {
-	statuses := []string{
-		"success", "running", "idle", "warning", "error", "pending", "blocked", "unknown",
-	}
-
-	for _, status := range statuses {
-		t.Run(status, func(t *testing.T) {
-			result := StatusBadgeIcon(status)
-			if result == "" {
-				t.Errorf("StatusBadgeIcon(%q) returned empty string", status)
-			}
-		})
-	}
-}
-
-func TestPriorityBadge(t *testing.T) {
-	for priority := 0; priority <= 5; priority++ {
-		name := fmt.Sprintf("P%d", priority)
-		p := priority // capture for closure
-		t.Run(name, func(t *testing.T) {
-			result := PriorityBadge(p)
-			if result == "" {
-				t.Errorf("PriorityBadge(%d) returned empty string", p)
-			}
-			// Should contain P followed by number
-			expected := fmt.Sprintf("P%d", p)
-			if !strings.Contains(result, expected) {
-				t.Errorf("PriorityBadge(%d) should contain %q", p, expected)
-			}
-		})
-	}
-}
-
-func TestCountBadge(t *testing.T) {
-	tests := []struct {
-		count int
-	}{
-		{0},
-		{1},
-		{99},
-		{999},
-	}
-
-	for _, tt := range tests {
-		result := CountBadge(tt.count, "#89b4fa", "#1e1e2e")
-		if result == "" {
-			t.Errorf("CountBadge(%d) returned empty string", tt.count)
-		}
-	}
-}
-
-func TestHealthBadge(t *testing.T) {
-	statuses := []string{
-		"ok", "healthy", "warning", "drift", "critical", "no_baseline", "unavailable", "unknown",
-	}
-
-	for _, status := range statuses {
-		t.Run(status, func(t *testing.T) {
-			result := HealthBadge(status)
-			if result == "" {
-				t.Errorf("HealthBadge(%q) returned empty string", status)
-			}
-		})
-	}
-}
-
-func TestIssueTypeBadge(t *testing.T) {
-	types := []string{
-		"epic", "feature", "task", "bug", "chore", "unknown",
-	}
-
-	for _, issueType := range types {
-		t.Run(issueType, func(t *testing.T) {
-			result := IssueTypeBadge(issueType)
-			if result == "" {
-				t.Errorf("IssueTypeBadge(%q) returned empty string", issueType)
-			}
-			// Should contain the type name
-			if !strings.Contains(result, issueType) {
-				t.Errorf("IssueTypeBadge(%q) should contain the type name", issueType)
-			}
-		})
-	}
-}
 
 func TestModelBadge(t *testing.T) {
 	models := []struct {
@@ -176,22 +67,6 @@ func TestMemoryUsageBadge(t *testing.T) {
 	}
 }
 
-func TestAlertSeverityBadge(t *testing.T) {
-	severities := []string{"critical", "high", "medium", "low", "info", "other", "p0", "sev2"}
-	for _, sev := range severities {
-		t.Run(sev, func(t *testing.T) {
-			result := AlertSeverityBadge(sev)
-			if result == "" {
-				t.Errorf("AlertSeverityBadge(%q) returned empty string", sev)
-			}
-			label := severityLabel(sev)
-			if label != "" && !strings.Contains(strings.ToLower(result), label) && sev != "other" {
-				t.Errorf("AlertSeverityBadge(%q) should include label %q", sev, label)
-			}
-		})
-	}
-}
-
 func severityLabel(sev string) string {
 	switch strings.ToLower(sev) {
 	case "critical", "crit", "p0", "sev0":
@@ -218,39 +93,10 @@ func TestBadgeOptions(t *testing.T) {
 	}
 
 	for i, opt := range opts {
-		result := StatusBadge("running", opt)
+		result := TextBadge("claude", "#89b4fa", "#1e1e2e", opt)
 		if result == "" {
-			t.Errorf("StatusBadge with opts[%d] returned empty string", i)
+			t.Errorf("TextBadge with opts[%d] returned empty string", i)
 		}
-	}
-}
-
-func TestBadgeGroup(t *testing.T) {
-	b1 := RankBadge(1)
-	b2 := StatusBadge("running")
-	b3 := PriorityBadge(1)
-
-	result := BadgeGroup(b1, b2, b3)
-	if result == "" {
-		t.Error("BadgeGroup returned empty string")
-	}
-	// Should contain all three badges separated by space
-	if !strings.Contains(result, " ") {
-		t.Error("BadgeGroup should separate badges with spaces")
-	}
-}
-
-func TestBadgeBar(t *testing.T) {
-	b1 := RankBadge(1)
-	b2 := StatusBadge("running")
-
-	result := BadgeBar(b1, b2)
-	if result == "" {
-		t.Error("BadgeBar returned empty string")
-	}
-	// Should contain double space separator
-	if !strings.Contains(result, "  ") {
-		t.Error("BadgeBar should separate badges with double spaces")
 	}
 }
 
@@ -261,46 +107,6 @@ func TestTextBadge(t *testing.T) {
 	}
 	if !strings.Contains(result, "custom") {
 		t.Error("TextBadge should contain the text")
-	}
-}
-
-func TestMiniBar(t *testing.T) {
-	p := DefaultMiniBarPalette()
-	bar := MiniBar(0.75, 6, p)
-	if bar == "" {
-		t.Fatal("MiniBar returned empty string")
-	}
-	if w := lipgloss.Width(bar); w != 6 {
-		t.Fatalf("MiniBar width = %d, want 6", w)
-	}
-
-	// Four-tier threshold: ensure mid-high band uses provided MidHigh
-	custom := p
-	custom.MidHigh = lipgloss.Color("#ffff00")
-	MiniBar(0.7, 4, custom) // should not panic; color check is visual-only here
-
-	// Clamp extremes
-	if w := lipgloss.Width(MiniBar(1.5, 4)); w != 4 {
-		t.Fatalf("MiniBar should clamp values above 1; width=%d", w)
-	}
-	if w := lipgloss.Width(MiniBar(-1, 3)); w != 3 {
-		t.Fatalf("MiniBar should clamp values below 0; width=%d", w)
-	}
-}
-
-func TestRankBadge(t *testing.T) {
-	tests := []int{1, 2, 3, 4}
-	for _, rank := range tests {
-		rank := rank
-		t.Run(fmt.Sprintf("rank_%d", rank), func(t *testing.T) {
-			out := RankBadge(rank)
-			if out == "" {
-				t.Fatalf("RankBadge(%d) returned empty string", rank)
-			}
-			if !strings.Contains(out, fmt.Sprintf("#%d", rank)) {
-				t.Fatalf("RankBadge(%d) missing label", rank)
-			}
-		})
 	}
 }
 

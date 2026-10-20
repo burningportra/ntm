@@ -2,6 +2,8 @@
 /ntm
 *.exe
 dist/
+# ...except the committed web-UI embed source (go:embed all:dist in internal/webui)
+!internal/webui/dist/
 
 # Test coverage
 coverage.out
@@ -13,9 +15,13 @@ coverage.html
 web/node_modules/
 web/.next/
 web/coverage/
+# next build (output: 'export') scratch output; the committed copy lives in internal/webui/dist
+web/out/
 vscode/node_modules/
 vscode/out/
-vscode/package-lock.json
+# vscode/package-lock.json is COMMITTED (F2, bd-ws5-ship-or-cut-jv0rc.2):
+# the ci.yml vscode-extension job and scripts/build_vsix.sh run `npm ci`,
+# which requires the lockfile. (vscode/dist/ is covered by the dist/ rule.)
 *.swp
 *.swo
 *~
@@ -136,3 +142,5 @@ storage.sqlite3-wal.corrupt-*
 **/zz_live_debug_test.go
 # br doctor per-run artifacts
 .doctor/
+.beads/.br-*.lock
+.beads/.br_recovery/

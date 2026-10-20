@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os/exec"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -185,20 +183,6 @@ func (a *CAAMAdapter) isResponsive(ctx context.Context) bool {
 	return stdout.Len() > 0 || stderr.Len() > 0
 }
 
-// HasCapability checks if caam has a specific capability
-func (a *CAAMAdapter) HasCapability(ctx context.Context, cap Capability) bool {
-	caps, err := a.Capabilities(ctx)
-	if err != nil {
-		return false
-	}
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
-}
-
 // Info returns complete caam tool information
 func (a *CAAMAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
@@ -216,6 +200,15 @@ type CAAMAccount struct {
 	RateLimited   bool      `json:"rate_limited,omitempty"`
 	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
 	CostCents     int       `json:"cost_cents,omitempty"`
+}
+
+// CAAMProfileUnusable reports whether caam says a profile cannot start work
+// now. caam has no "cooldown" health status: an active rate-limit cooldown is
+// cooldown.active, and it (like a required re-login) sets
+// health.launch_usable false, the field caam documents for routing. A
+// critical composite verdict also counts.
+func CAAMProfileUnusable(status string, launchUsable *bool, cooldownActive bool) bool {
+	return cooldownActive || status == "critical" || (launchUsable != nil && !*launchUsable)
 }
 
 // CAAMCostSession is CAAM's per-profile cost record. Costs are estimates
@@ -392,8 +385,13 @@ func (a *CAAMAdapter) fetchStatus(ctx context.Context) (*CAAMStatus, error) {
 					Active bool   `json:"active"`
 					System bool   `json:"system"`
 					Health struct {
-						Status string `json:"status"`
+						Status       string `json:"status"`
+						LaunchUsable *bool  `json:"launch_usable"`
 					} `json:"health"`
+					Cooldown *struct {
+						Active bool   `json:"active"`
+						Until  string `json:"until"`
+					} `json:"cooldown"`
 				} `json:"profiles"`
 			} `json:"providers"`
 		} `json:"data"`
@@ -413,13 +411,20 @@ func (a *CAAMAdapter) fetchStatus(ctx context.Context) (*CAAMStatus, error) {
 			if profile.System {
 				continue
 			}
-			accounts = append(accounts, CAAMAccount{
-				ID:          profile.Name,
-				Provider:    caamProviderForNTM(provider.ID),
-				Name:        profile.Name,
-				Active:      profile.Active,
-				RateLimited: profile.Health.Status == "cooldown" || profile.Health.Status == "critical",
-			})
+			account := CAAMAccount{
+				ID:       profile.Name,
+				Provider: caamProviderForNTM(provider.ID),
+				Name:     profile.Name,
+				Active:   profile.Active,
+			}
+			cooldownActive := profile.Cooldown != nil && profile.Cooldown.Active
+			account.RateLimited = CAAMProfileUnusable(profile.Health.Status, profile.Health.LaunchUsable, cooldownActive)
+			if cooldownActive {
+				if until, err := time.Parse(time.RFC3339, profile.Cooldown.Until); err == nil {
+					account.CooldownUntil = until
+				}
+			}
+			accounts = append(accounts, account)
 		}
 	}
 
@@ -633,6 +638,18 @@ func (a *CAAMAdapter) SwitchAccount(ctx context.Context, provider, accountID str
 	if strings.TrimSpace(provider) == "" || strings.TrimSpace(accountID) == "" {
 		return fmt.Errorf("provider and account ID are required")
 	}
+	// The account ID is passed as a caam positional operand. IDs come from
+	// `caam list --json` output or operator-provided flags; refuse flag-shaped
+	// names (leading '-') and control bytes so a hostile listing can never
+	// inject caam options into the activate argv.
+	if strings.HasPrefix(strings.TrimSpace(accountID), "-") {
+		return fmt.Errorf("account ID %q begins with '-'; refusing flag-shaped operand", accountID)
+	}
+	for _, r := range accountID {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("account ID contains control character 0x%02x", r)
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
 	defer cancel()
@@ -643,17 +660,20 @@ func (a *CAAMAdapter) SwitchAccount(ctx context.Context, provider, accountID str
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return fmt.Errorf("failed to switch account: %w: %s", err, strings.TrimSpace(stderr.String()))
+	runErr := cmd.Run()
+	if runErr != nil && ctx.Err() == context.DeadlineExceeded {
+		return ErrTimeout
 	}
+	// caam reports a failed activate as {"success":false,"error":...} on
+	// stdout and exits 1, so read the JSON before falling back to stderr.
 	var response struct {
 		Success bool   `json:"success"`
 		Error   string `json:"error"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &response); err != nil {
+		if runErr != nil {
+			return fmt.Errorf("failed to switch account: %w: %s", runErr, strings.TrimSpace(stderr.String()))
+		}
 		return fmt.Errorf("%w: parse caam activate response: %v", ErrSchemaValidation, err)
 	}
 	if !response.Success {
@@ -661,6 +681,9 @@ func (a *CAAMAdapter) SwitchAccount(ctx context.Context, provider, accountID str
 			return fmt.Errorf("caam activate failed: %s", response.Error)
 		}
 		return fmt.Errorf("%w: caam activate returned success=false", ErrSchemaValidation)
+	}
+	if runErr != nil {
+		return fmt.Errorf("failed to switch account: %w: %s", runErr, strings.TrimSpace(stderr.String()))
 	}
 
 	// Invalidate cache after switch
@@ -794,288 +817,4 @@ func (a *CAAMAdapter) HasMultipleAccounts(ctx context.Context) bool {
 		return false
 	}
 	return status.AccountsCount > 1
-}
-
-// RateLimitDetector monitors agent output for rate limit signals and triggers CAAM account switching.
-// It uses pattern matching to detect rate limit messages from different AI providers.
-type RateLimitDetector struct {
-	adapter        *CAAMAdapter
-	patterns       map[string][]*rateLimitPattern // provider -> patterns
-	onLimitDetect  RateLimitCallback              // Called when rate limit is detected
-	mu             sync.RWMutex
-	lastDetection  map[string]time.Time // provider -> last detection time
-	cooldownPeriod time.Duration        // Minimum time between detections per provider
-}
-
-// rateLimitPattern holds a compiled regex pattern and its metadata
-type rateLimitPattern struct {
-	pattern *regexp.Regexp
-	name    string // Human-readable name for logging
-}
-
-// RateLimitCallback is called when a rate limit is detected
-type RateLimitCallback func(provider string, paneID string, patterns []string)
-
-// RateLimitEvent contains information about a detected rate limit
-type RateLimitEvent struct {
-	Provider      string    `json:"provider"`       // claude, openai, gemini
-	PaneID        string    `json:"pane_id"`        // Pane where limit was detected
-	DetectedAt    time.Time `json:"detected_at"`    // When limit was detected
-	Patterns      []string  `json:"patterns"`       // Which patterns matched
-	WaitSeconds   int       `json:"wait_seconds"`   // Suggested wait time (if detected)
-	AccountBefore string    `json:"account_before"` // Account before switch (if any)
-	AccountAfter  string    `json:"account_after"`  // Account after switch (if any)
-	SwitchSuccess bool      `json:"switch_success"` // Whether account switch succeeded
-}
-
-// NewRateLimitDetector creates a new rate limit detector with default patterns
-func NewRateLimitDetector(adapter *CAAMAdapter) *RateLimitDetector {
-	d := &RateLimitDetector{
-		adapter:        adapter,
-		patterns:       make(map[string][]*rateLimitPattern),
-		lastDetection:  make(map[string]time.Time),
-		cooldownPeriod: 30 * time.Second, // Minimum 30 seconds between detections
-	}
-
-	// Initialize patterns for each provider
-	d.initClaudePatterns()
-	d.initOpenAIPatterns()
-	d.initGeminiPatterns()
-
-	return d
-}
-
-// initClaudePatterns sets up rate limit patterns for Claude
-func (d *RateLimitDetector) initClaudePatterns() {
-	patterns := []string{
-		`(?i)you['']?ve\s+hit\s+your\s+limit`,
-		`(?i)please\s+wait`,
-		`(?i)try\s+again\s+later`,
-		`(?i)too\s+many\s+requests`,
-		`(?i)usage\s+limit`,
-		`(?i)request\s+limit`,
-		`(?i)limit.*exceeded`,
-		`(?i)api\s+limit`,
-		`(?i)anthropic.*limit`,
-		`(?i)claude.*limit`,
-	}
-	d.patterns["claude"] = compilePatterns(patterns)
-}
-
-// initOpenAIPatterns sets up rate limit patterns for OpenAI/Codex
-func (d *RateLimitDetector) initOpenAIPatterns() {
-	patterns := []string{
-		`(?i)you['']?ve\s+reached\s+your\s+usage\s+limit`,
-		`(?i)rate[\s_-]*limit`,
-		`(?i)quota\s+exceeded`,
-		`(?i)capacity\s+reached`,
-		`(?i)maximum\s+requests`,
-		`(?i)429`,
-		`(?i)tokens?\s+per\s+min`,
-		`(?i)requests?\s+per\s+min`,
-		`(?i)openai.*limit`,
-		`(?i)gpt.*limit`,
-		`(?i)codex.*limit`,
-	}
-	d.patterns["openai"] = compilePatterns(patterns)
-}
-
-// initGeminiPatterns sets up rate limit patterns for Gemini
-func (d *RateLimitDetector) initGeminiPatterns() {
-	patterns := []string{
-		`(?i)resource[\s_-]*exhausted`,
-		`(?i)RESOURCE_EXHAUSTED`,
-		`(?i)limit\s+reached`,
-		`(?i)gemini.*limit`,
-		`(?i)google.*limit`,
-		`(?i)bard.*limit`,
-	}
-	d.patterns["gemini"] = compilePatterns(patterns)
-}
-
-// compilePatterns compiles string patterns into regex
-func compilePatterns(patterns []string) []*rateLimitPattern {
-	result := make([]*rateLimitPattern, 0, len(patterns))
-	for _, p := range patterns {
-		compiled, err := regexp.Compile(p)
-		if err != nil {
-			slog.Warn("caam: invalid rate-limit pattern", "pattern", p, "error", err)
-			continue
-		}
-		result = append(result, &rateLimitPattern{
-			pattern: compiled,
-			name:    p,
-		})
-	}
-	return result
-}
-
-// SetCallback sets the callback function for rate limit detection
-func (d *RateLimitDetector) SetCallback(cb RateLimitCallback) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.onLimitDetect = cb
-}
-
-// SetCooldownPeriod sets the minimum time between detections per provider
-func (d *RateLimitDetector) SetCooldownPeriod(period time.Duration) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.cooldownPeriod = period
-}
-
-// Check analyzes output for rate limit signals and triggers callback if found.
-// It returns the detected event if a rate limit was found, nil otherwise.
-// Providers are checked in order: claude, openai, gemini (deterministic).
-func (d *RateLimitDetector) Check(output string, paneID string) *RateLimitEvent {
-	// Check providers in deterministic order
-	providerOrder := []string{"claude", "openai", "gemini"}
-	for _, provider := range providerOrder {
-		patterns := d.patterns[provider]
-		if patterns == nil {
-			continue
-		}
-		matched := d.matchPatterns(output, patterns)
-		if len(matched) > 0 {
-			// Check cooldown
-			d.mu.RLock()
-			lastTime := d.lastDetection[provider]
-			cooldown := d.cooldownPeriod
-			d.mu.RUnlock()
-
-			if time.Since(lastTime) < cooldown {
-				continue // Still in cooldown
-			}
-
-			// Update last detection time
-			d.mu.Lock()
-			d.lastDetection[provider] = time.Now()
-			callback := d.onLimitDetect
-			d.mu.Unlock()
-
-			event := &RateLimitEvent{
-				Provider:   provider,
-				PaneID:     paneID,
-				DetectedAt: time.Now(),
-				Patterns:   matched,
-			}
-
-			// Parse wait time if present
-			event.WaitSeconds = parseWaitTimeFromOutput(output)
-
-			// Invoke callback if set
-			if callback != nil {
-				callback(provider, paneID, matched)
-			}
-
-			return event
-		}
-	}
-	return nil
-}
-
-// matchPatterns returns names of all patterns that matched in the output
-func (d *RateLimitDetector) matchPatterns(output string, patterns []*rateLimitPattern) []string {
-	var matched []string
-	for _, p := range patterns {
-		if p.pattern.MatchString(output) {
-			matched = append(matched, p.name)
-		}
-	}
-	return matched
-}
-
-// waitTimePatterns compiled once at package level (called from hot path).
-var waitTimePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)try\s+again\s+in\s+(\d+)\s*s`),
-	regexp.MustCompile(`(?i)wait\s+(\d+)\s*(?:second|sec|s)`),
-	regexp.MustCompile(`(?i)retry\s+(?:after|in)\s+(\d+)\s*(?:s|sec)`),
-	regexp.MustCompile(`(?i)(\d+)\s*(?:second|sec)s?\s+(?:cooldown|delay|wait)`),
-	regexp.MustCompile(`(?i)rate.?limit.*?(\d+)\s*s`),
-}
-
-// parseWaitTimeFromOutput extracts wait time from rate limit messages
-func parseWaitTimeFromOutput(output string) int {
-	for _, pattern := range waitTimePatterns {
-		if matches := pattern.FindStringSubmatch(output); len(matches) > 1 {
-			var seconds int
-			if _, err := fmt.Sscanf(matches[1], "%d", &seconds); err == nil && seconds > 0 {
-				return seconds
-			}
-		}
-	}
-	return 0
-}
-
-// TriggerAccountSwitch attempts to switch CAAM accounts when rate limit is detected.
-// Uses the new SwitchToNextAccount method which calls `caam switch <provider> --next --json`.
-// Returns the event with switch results populated.
-func (d *RateLimitDetector) TriggerAccountSwitch(ctx context.Context, event *RateLimitEvent) *RateLimitEvent {
-	if d.adapter == nil {
-		return event
-	}
-
-	// Check if CAAM is available and has multiple accounts
-	if !d.adapter.IsAvailable(ctx) {
-		return event
-	}
-	if !d.adapter.HasMultipleAccounts(ctx) {
-		return event
-	}
-
-	// Use the provider from the event, fallback to attempting detection
-	provider := event.Provider
-	if provider == "" || provider == "unknown" {
-		return event // Can't switch without knowing the provider
-	}
-
-	// Use the new SwitchToNextAccount method
-	result, err := d.adapter.SwitchToNextAccount(ctx, provider)
-	if err != nil {
-		// Switch failed - populate event with error info
-		event.SwitchSuccess = false
-		if result != nil {
-			event.AccountBefore = result.PreviousAccount
-		}
-		return event
-	}
-
-	// Populate event with switch results
-	event.AccountBefore = result.PreviousAccount
-	event.AccountAfter = result.NewAccount
-	event.SwitchSuccess = result.Success
-
-	return event
-}
-
-// DetectProvider attempts to determine the AI provider from pane output
-func DetectProvider(output string) string {
-	outputLower := strings.ToLower(output)
-
-	// Claude indicators
-	if strings.Contains(outputLower, "claude") ||
-		strings.Contains(outputLower, "anthropic") ||
-		strings.Contains(outputLower, "sonnet") ||
-		strings.Contains(outputLower, "opus") ||
-		strings.Contains(outputLower, "haiku") {
-		return "claude"
-	}
-
-	// OpenAI/Codex indicators
-	if strings.Contains(outputLower, "openai") ||
-		strings.Contains(outputLower, "codex") ||
-		strings.Contains(outputLower, "gpt-") ||
-		strings.Contains(outputLower, "gpt4") ||
-		strings.Contains(outputLower, "gpt5") {
-		return "openai"
-	}
-
-	// Gemini indicators
-	if strings.Contains(outputLower, "gemini") ||
-		strings.Contains(outputLower, "google") ||
-		strings.Contains(outputLower, "bard") {
-		return "gemini"
-	}
-
-	return "unknown"
 }

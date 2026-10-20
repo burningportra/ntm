@@ -219,13 +219,6 @@ func BinaryPath() string {
 	return tmuxBinaryPath
 }
 
-func resolveTmuxBinaryPath() string {
-	if override := strings.TrimSpace(os.Getenv("NTM_TMUX_BINARY")); override != "" {
-		return override
-	}
-	return resolveInstalledTmuxBinaryPath()
-}
-
 func resolveInstalledTmuxBinaryPath() string {
 	if path := findInstalledTmuxBinaryPath(); path != "" {
 		return path
@@ -529,15 +522,16 @@ func (c *Client) IsInstalled() bool {
 // started with `respawn-pane -k <agent command>` came back as the agent, and a
 // caller typing the relaunch command typed it into the agent (bd-dehqt).
 func (c *Client) RespawnPaneShellContext(ctx context.Context, target string) error {
-	defaultShell, err := c.RunContext(ctx, "display-message", "-p", "-t", target, "#{default-shell}")
+	exact := ExactTarget(target)
+	defaultShell, err := c.RunContext(ctx, "display-message", "-p", "-t", exact, "#{default-shell}")
 	if err != nil {
 		return fmt.Errorf("read default-shell for pane %s: %w", target, err)
 	}
-	defaultCommand, err := c.RunContext(ctx, "display-message", "-p", "-t", target, "#{default-command}")
+	defaultCommand, err := c.RunContext(ctx, "display-message", "-p", "-t", exact, "#{default-command}")
 	if err != nil {
 		return fmt.Errorf("read default-command for pane %s: %w", target, err)
 	}
-	args := append([]string{"respawn-pane", "-k", "-t", target}, newPaneShellCommand(defaultShell, defaultCommand)...)
+	args := append([]string{"respawn-pane", "-k", "-t", exact}, newPaneShellCommand(defaultShell, defaultCommand)...)
 	return c.RunSilentContext(ctx, args...)
 }
 

@@ -22,8 +22,14 @@ type Checkpoint struct {
 	Description string `json:"description,omitempty"`
 	// SessionName is the tmux session this checkpoint belongs to
 	SessionName string `json:"session_name"`
-	// WorkingDir is the working directory at checkpoint time
+	// WorkingDir is the working directory at checkpoint time. Empty when the
+	// session's active pane path could not be resolved; WorkingDirError then
+	// says why.
 	WorkingDir string `json:"working_dir"`
+	// WorkingDirError explains an empty WorkingDir (tmux query failure or an
+	// empty pane path). Omitted when WorkingDir resolved. Checkpoints written
+	// before this field existed omit it as well.
+	WorkingDirError string `json:"working_dir_error,omitempty"`
 	// CreatedAt is when the checkpoint was created
 	CreatedAt time.Time `json:"created_at"`
 	// Session contains the captured session state
@@ -32,6 +38,10 @@ type Checkpoint struct {
 	Git GitState `json:"git,omitempty"`
 	// PaneCount is the number of panes captured
 	PaneCount int `json:"pane_count"`
+
+	// ArtifactIntegrity fingerprints all referenced payloads. Nil means an older
+	// checkpoint with no recorded checksums, not a verified empty manifest.
+	ArtifactIntegrity *ArtifactIntegrity `json:"artifact_integrity,omitempty"`
 
 	// Assignments contains bead-to-agent assignment state at checkpoint time (bd-32ck)
 	// This field is optional for backward compatibility with older checkpoints.
@@ -140,6 +150,11 @@ type PaneState struct {
 	AgentType string `json:"agent_type"`
 	// Command is the running command
 	Command string `json:"command,omitempty"`
+	// LaunchSpec preserves the rendered agent launch command and its settings.
+	// Command alone is tmux's foreground executable and may only name an
+	// interpreter. Older checkpoints without launch metadata use the legacy
+	// command reconstruction path.
+	LaunchSpec *tmux.AgentLaunchSpec `json:"launch_spec,omitempty"`
 	// Width is the pane width in columns
 	Width int `json:"width"`
 	// Height is the pane height in rows
@@ -154,6 +169,17 @@ type PaneState struct {
 
 // GitState captures the git repository state at checkpoint time.
 type GitState struct {
+	// Captured is true when the state below was read from a git repository
+	// at checkpoint time. It is false when capture was skipped or failed
+	// (SkipReason says why) and absent in checkpoints written before the
+	// field existed; use HasState to interpret those.
+	Captured bool `json:"captured"`
+	// SkipReason is set when Captured is false and explains why the zero
+	// values below must not be read as a clean repository: one of the
+	// GitSkip* constants.
+	SkipReason string `json:"skip_reason,omitempty"`
+	// SkipDetail carries the underlying error text for SkipReason, when any.
+	SkipDetail string `json:"skip_detail,omitempty"`
 	// Branch is the current branch name
 	Branch string `json:"branch"`
 	// Commit is the current HEAD commit SHA
@@ -170,6 +196,57 @@ type GitState struct {
 	UnstagedCount int `json:"unstaged_count"`
 	// UntrackedCount is the number of untracked files
 	UntrackedCount int `json:"untracked_count"`
+	// UntrackedCaptured counts untracked files preserved in PatchFile by an
+	// explicit capture request. Zero does not imply there were no untracked
+	// files; compare UntrackedCount. Ignored files are never included.
+	UntrackedCaptured int `json:"untracked_captured,omitempty"`
+}
+
+// Git capture skip reasons recorded in GitState.SkipReason.
+const (
+	// GitSkipDisabled: git capture was turned off for this checkpoint.
+	GitSkipDisabled = "capture_disabled"
+	// GitSkipWorkingDirUnavailable: the session's working directory could not
+	// be resolved from tmux, so there was nowhere to run git.
+	GitSkipWorkingDirUnavailable = "working_dir_unavailable"
+	// GitSkipNotRepository: the working directory is not inside a git repository.
+	GitSkipNotRepository = "not_git_repository"
+	// GitSkipCaptureFailed: git commands failed; SkipDetail has the error.
+	GitSkipCaptureFailed = "capture_failed"
+)
+
+// HasState reports whether the GitState carries real repository state.
+// Checkpoints written before Captured existed are recognised by a non-empty
+// branch or commit.
+func (g GitState) HasState() bool {
+	return g.Captured || g.Branch != "" || g.Commit != ""
+}
+
+// Unavailable reports whether git state is explicitly known to be missing,
+// as opposed to captured or simply undeclared by an older checkpoint.
+func (g GitState) Unavailable() bool {
+	return !g.HasState() && g.SkipReason != ""
+}
+
+// DescribeGitUnavailable explains why a checkpoint carries no git state, or
+// returns "" when it does (or when an older checkpoint left it undeclared).
+// A missing working directory is reported ahead of the derived git skip.
+func DescribeGitUnavailable(cp *Checkpoint) string {
+	if cp == nil || !cp.Git.Unavailable() {
+		return ""
+	}
+	if cp.Git.SkipReason == GitSkipWorkingDirUnavailable && cp.WorkingDirError != "" {
+		return GitSkipWorkingDirUnavailable + ": " + cp.WorkingDirError
+	}
+	return describeGitSkip(cp.Git)
+}
+
+// describeGitSkip renders SkipReason (and SkipDetail, if any) for humans.
+func describeGitSkip(g GitState) string {
+	if g.SkipDetail == "" {
+		return g.SkipReason
+	}
+	return g.SkipReason + " (" + g.SkipDetail + ")"
 }
 
 // Summary returns a brief summary of the checkpoint.
@@ -221,20 +298,6 @@ func sortWindowLayouts(layouts []WindowLayoutState) {
 	})
 }
 
-func windowLayoutsEqual(a, b []WindowLayoutState) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	left := cloneWindowLayouts(a)
-	right := cloneWindowLayouts(b)
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func legacyLayoutFromWindowLayouts(layouts []WindowLayoutState) string {
 	if len(layouts) != 1 {
 		return ""
@@ -266,6 +329,7 @@ type CheckpointOption func(*checkpointOptions)
 type checkpointOptions struct {
 	description         string
 	captureGit          bool
+	captureUntracked    bool
 	scrollbackLines     int
 	scrollbackCompress  bool
 	scrollbackMaxSizeMB int
@@ -287,39 +351,20 @@ func WithGitCapture(capture bool) CheckpointOption {
 	}
 }
 
+// WithUntrackedCapture includes non-ignored untracked files in the Git patch.
+// It is disabled by default and requires Git capture to be enabled. When
+// requested, failure to capture Git data is an error even if a useful partial
+// session checkpoint was saved; Create then returns that checkpoint and error.
+func WithUntrackedCapture(capture bool) CheckpointOption {
+	return func(o *checkpointOptions) {
+		o.captureUntracked = capture
+	}
+}
+
 // WithScrollbackLines sets the number of scrollback lines to capture.
 func WithScrollbackLines(lines int) CheckpointOption {
 	return func(o *checkpointOptions) {
 		o.scrollbackLines = lines
-	}
-}
-
-// WithScrollbackCompress enables/disables gzip compression for scrollback.
-func WithScrollbackCompress(compress bool) CheckpointOption {
-	return func(o *checkpointOptions) {
-		o.scrollbackCompress = compress
-	}
-}
-
-// WithScrollbackMaxSizeMB sets the maximum compressed scrollback size in MB.
-// Scrollback larger than this will be skipped. 0 = no limit.
-func WithScrollbackMaxSizeMB(sizeMB int) CheckpointOption {
-	return func(o *checkpointOptions) {
-		o.scrollbackMaxSizeMB = sizeMB
-	}
-}
-
-// WithAssignments enables/disables capturing bead-to-agent assignments (bd-32ck).
-func WithAssignments(capture bool) CheckpointOption {
-	return func(o *checkpointOptions) {
-		o.captureAssignments = capture
-	}
-}
-
-// WithBVSnapshot enables/disables capturing BV triage summary (bd-32ck).
-func WithBVSnapshot(capture bool) CheckpointOption {
-	return func(o *checkpointOptions) {
-		o.captureBVSnapshot = capture
 	}
 }
 

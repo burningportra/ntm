@@ -216,29 +216,6 @@ func TestGetTriageQuickRef(t *testing.T) {
 	}
 }
 
-func TestGetTriageTopPicks(t *testing.T) {
-	if !IsInstalled() {
-		t.Skip("bv not installed")
-	}
-
-	// Use cached triage to avoid slow bv command
-	triage, _ := getCachedTriage(t)
-
-	picks := triage.Triage.QuickWins
-	if len(picks) > 3 {
-		picks = picks[:3]
-	}
-
-	for i, pick := range picks {
-		if pick.ID == "" {
-			t.Errorf("Pick %d has empty ID", i)
-		}
-		if pick.Score < 0 {
-			t.Errorf("Pick %d has negative score: %f", i, pick.Score)
-		}
-	}
-}
-
 func TestGetNextRecommendation(t *testing.T) {
 	if !IsInstalled() {
 		t.Skip("bv not installed")
@@ -267,41 +244,6 @@ func TestGetNextRecommendation(t *testing.T) {
 	}
 
 	t.Logf("Top recommendation: %s - %s (score: %.2f)", rec.ID, rec.Title, rec.Score)
-}
-
-func TestSetTriageCacheTTL(t *testing.T) {
-	originalTTL := triageCacheTTL
-
-	// Set a short TTL
-	SetTriageCacheTTL(100 * time.Millisecond)
-
-	if triageCacheTTL != 100*time.Millisecond {
-		t.Errorf("Expected TTL to be 100ms, got %v", triageCacheTTL)
-	}
-
-	// Restore original TTL
-	SetTriageCacheTTL(originalTTL)
-}
-
-func TestGetTriageNoCache(t *testing.T) {
-	if !IsInstalled() {
-		t.Skip("bv not installed")
-	}
-
-	// Use test cache to ensure we have data, rather than making slow bv call
-	triage, _ := getCachedTriage(t)
-
-	if triage == nil {
-		t.Fatal("GetTriage returned nil")
-	}
-
-	// Verify the cached data is valid (testing the structure, not the no-cache mechanism)
-	if triage.DataHash == "" {
-		t.Error("DataHash should not be empty")
-	}
-
-	// Note: We don't test the actual GetTriageNoCache behavior here to avoid
-	// making slow bv calls. The caching logic is tested in TestTriageCache.
 }
 
 // TestReadyBeadLabelsMergesOpenListForEpics is the #224 regression: `br ready`
@@ -970,5 +912,84 @@ func TestGetActionableRecommendationsFailsClosedWithoutIssueType(t *testing.T) {
 		t.Fatal("expected fail-closed error when issue type is absent from br ready and br list")
 	} else if !strings.Contains(err.Error(), "issue type") {
 		t.Fatalf("error %q should name the missing issue type", err.Error())
+	}
+}
+
+// installStalePlanRowTestTools fakes bv (one open tracked plan item, optionally
+// also recommended by triage) and br (empty open surfaces; br list --all
+// answers with the given lifecycle row JSON).
+func installStalePlanRowTestTools(t *testing.T, triageOutput, allListOutput string) {
+	t.Helper()
+	binDir := t.TempDir()
+	bvScript := `#!/bin/sh
+case "$1" in
+  --robot-triage) printf '%s\n' '` + triageOutput + `' ;;
+  --robot-plan) printf '%s\n' '{"plan":{"tracks":[{"track_id":"t1","items":[{"id":"tracked","title":"tracked","status":"open","priority":1}]}]}}' ;;
+  *) printf 'unexpected bv args: %s\n' "$*" >&2; exit 64 ;;
+esac
+`
+	brScript := `#!/bin/sh
+case "$*" in
+  *" --all "*) printf '%s\n' '` + allListOutput + `' ;;
+  *" ready "*|*" --status open "*) printf '%s\n' '[]' ;;
+  *) printf 'unexpected br args: %s\n' "$*" >&2; exit 64 ;;
+esac
+`
+	for name, script := range map[string]string{"bv": bvScript, "br": brScript} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o700); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", binDir)
+	InvalidateTriageCache()
+	t.Cleanup(InvalidateTriageCache)
+}
+
+// TestGetActionableRecommendationsSkipsPlanRowsClosedSinceSnapshot: a plan row
+// that vanished from both open label surfaces because Beads moved it to a
+// non-open lifecycle state is satisfied/ineligible, not an error — assignment
+// must proceed (with the row dropped) instead of killing the watch loop.
+func TestGetActionableRecommendationsSkipsPlanRowsClosedSinceSnapshot(t *testing.T) {
+	for _, status := range []string{"closed", "blocked", "in_progress", "deferred"} {
+		t.Run(status, func(t *testing.T) {
+			installStalePlanRowTestTools(t,
+				`{"triage":{"recommendations":[{"id":"tracked","title":"tracked","status":"open","priority":1}]}}`,
+				`[{"id":"tracked","status":"`+status+`"}]`)
+
+			recs, err := GetActionableRecommendationsContext(t.Context(), t.TempDir(), 0)
+			if err != nil {
+				t.Fatalf("lifecycle %s: unexpected error: %v", status, err)
+			}
+			if len(recs) != 0 {
+				t.Fatalf("lifecycle %s: recommendations = %+v, want stale row dropped", status, recs)
+			}
+		})
+	}
+}
+
+// TestGetActionableRecommendationsFailsClosedWhenRowStillOpenButUnlisted: when
+// br list --all says the row is still open, its absence from both open
+// surfaces is a source inconsistency, and the call must keep failing closed.
+func TestGetActionableRecommendationsFailsClosedWhenRowStillOpenButUnlisted(t *testing.T) {
+	installStalePlanRowTestTools(t,
+		`{"triage":{"recommendations":[]}}`,
+		`[{"id":"tracked","status":"open"}]`)
+
+	recs, err := GetActionableRecommendationsContext(t.Context(), t.TempDir(), 0)
+	if recs != nil || !errors.Is(err, ErrActionableLabelsUnverified) || !strings.Contains(err.Error(), "still open in br list --all") {
+		t.Fatalf("recommendations=%v error=%v, want fail-closed still-open error", recs, err)
+	}
+}
+
+// TestGetActionableRecommendationsFailsClosedWhenRowAbsentEverywhere: a plan
+// row missing even from the complete tracker surface stays a hard error.
+func TestGetActionableRecommendationsFailsClosedWhenRowAbsentEverywhere(t *testing.T) {
+	installStalePlanRowTestTools(t,
+		`{"triage":{"recommendations":[]}}`,
+		`[]`)
+
+	recs, err := GetActionableRecommendationsContext(t.Context(), t.TempDir(), 0)
+	if recs != nil || !errors.Is(err, ErrActionableLabelsUnverified) || !strings.Contains(err.Error(), "br list --all") {
+		t.Fatalf("recommendations=%v error=%v, want fail-closed absent-everywhere error", recs, err)
 	}
 }

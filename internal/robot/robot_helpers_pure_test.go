@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -822,68 +823,6 @@ func TestAppendUnique(t *testing.T) {
 }
 
 // =============================================================================
-// isUnknownJSONFlag tests
-// =============================================================================
-
-func TestIsUnknownJSONFlag(t *testing.T) {
-	tests := []struct {
-		name   string
-		stderr string
-		want   bool
-	}{
-		{"empty string", "", false},
-		{"no json mention", "something went wrong", false},
-		{"json but no flag error", "json output enabled", false},
-		{"unknown flag with json", "unknown flag: --json", true},
-		{"flag provided but not defined with json", "flag provided but not defined: -json", true},
-		{"case insensitive json", "Unknown flag: --JSON", true},
-		{"case insensitive flag", "UNKNOWN FLAG: --json", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isUnknownJSONFlag(tt.stderr)
-			if got != tt.want {
-				t.Errorf("isUnknownJSONFlag(%q) = %v, want %v", tt.stderr, got, tt.want)
-			}
-		})
-	}
-}
-
-// =============================================================================
-// removeFlag tests
-// =============================================================================
-
-func TestRemoveFlag(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-		flag string
-		want []string
-	}{
-		{"remove existing", []string{"--json", "--verbose"}, "--json", []string{"--verbose"}},
-		{"remove absent", []string{"--verbose"}, "--json", []string{"--verbose"}},
-		{"remove from empty", nil, "--json", []string{}},
-		{"remove multiple occurrences", []string{"--json", "a", "--json"}, "--json", []string{"a"}},
-		{"remove only exact match", []string{"--json-output", "--json"}, "--json", []string{"--json-output"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := removeFlag(tt.args, tt.flag)
-			if len(got) != len(tt.want) {
-				t.Fatalf("len = %d, want %d; got=%v", len(got), len(tt.want), got)
-			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Errorf("result[%d] = %q, want %q", i, got[i], tt.want[i])
-				}
-			}
-		})
-	}
-}
-
-// =============================================================================
 // resolveEnsembleBudget tests (partial - only empty preset path)
 // =============================================================================
 
@@ -1350,6 +1289,7 @@ func TestPrintDashboardMarkdown_RendersModernAgentCounts(t *testing.T) {
 					{Pane: "0.5", Type: "user"},
 					{Pane: "0.6", Type: "mystery"},
 					{Pane: "0.7", Type: "muse-code"},
+					{Pane: "0.8", Type: "omp"},
 				},
 			},
 		},
@@ -1360,16 +1300,40 @@ func TestPrintDashboardMarkdown_RendersModernAgentCounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("printDashboardMarkdown() error = %v", err)
 	}
+	// The session table has one column per agent.AgentTypes() entry, in that
+	// order, so the expected header and row are built from it rather than
+	// pinning where each type sits.
+	sessionCounts := map[agent.AgentType]int{
+		agent.AgentTypeCursor:   1,
+		agent.AgentTypeWindsurf: 1,
+		agent.AgentTypeAider:    1,
+		agent.AgentTypeOllama:   1,
+		agent.AgentTypeMuse:     1,
+		agent.AgentTypeOmp:      1,
+	}
+	header := "| Session | Attached | Panes | User |"
+	separator := "|---|---|---:|---:|"
+	row := "| proj-modern | no | 8 | 1 |"
+	for _, agentType := range agent.AgentTypes() {
+		header += " " + dashboardAgentTypeLabel(agentType) + " |"
+		separator += "---:|"
+		row += fmt.Sprintf(" %d |", sessionCounts[agentType])
+	}
+	header += " Other |"
+	separator += "---:|"
+	row += " 1 |"
+
 	for _, want := range []string{
 		"| Cursor | 1 |",
 		"| Windsurf | 1 |",
 		"| Aider | 1 |",
 		"| Ollama | 1 |",
 		"| Muse | 1 |",
+		"| Oh My Pi | 1 |",
 		"| Other Agents | 1 |",
-		"| Session | Attached | Panes | User | Claude | Codex | Gemini | Pi | Kimi | Muse | Antigravity | Grok | Cursor | Windsurf | Aider | Opencode | Ollama | Other |",
-		"|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-		"| proj-modern | no | 7 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 | 1 | 1 | 0 | 1 | 1 |",
+		header,
+		separator,
+		row,
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("dashboard markdown missing %q:\n%s", want, rendered)

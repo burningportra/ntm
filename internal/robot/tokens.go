@@ -287,7 +287,7 @@ func aggregateTokenStats(eventList []events.Event, days int, since, groupBy stri
 				agentSpawns[ResolveAgentType(agentType)] += count
 			}
 
-		case events.EventAgentSpawn:
+		case events.EventAgentSpawn, events.EventAgentAdd:
 			// Track model info
 			agentType, _ := event.Data["agent_type"].(string)
 			model, _ := event.Data["model"].(string)

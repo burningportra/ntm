@@ -71,7 +71,7 @@ func TestE2E_UBSAssignmentRouting(t *testing.T) {
 		},
 	}
 
-	if err := scanner.NotifyScanResults(ctx, result, projectKey); err != nil {
+	if err := scanner.NotifyScanResults(ctx, client, result, projectKey); err != nil {
 		t.Fatalf("[E2E-UBS-ROUTE] notify failed: %v", err)
 	}
 

@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +39,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/prompt"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	sessionPkg "github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/state"
@@ -68,7 +68,10 @@ type SendResult struct {
 	Failed               int                                 `json:"failed"`
 	RoutedTo             *SendRoutingResult                  `json:"routed_to,omitempty"`
 	DispatchPacing       *coordinator.DispatchPacingDecision `json:"dispatch_pacing,omitempty"`
-	Error                string                              `json:"error,omitempty"`
+	// CASSInjection reports send-time CASS context injection (--with-cass),
+	// using the same envelope block contract as --robot-send.
+	CASSInjection *robot.CASSInjectionInfo `json:"cass_injection,omitempty"`
+	Error         string                   `json:"error,omitempty"`
 }
 
 const (
@@ -173,6 +176,8 @@ type SendRoutingResult struct {
 	Strategy  string  `json:"strategy"`
 	Reason    string  `json:"reason"`
 	Score     float64 `json:"score"`
+	// ReservationWarning: files in the message that other agents reserve.
+	ReservationWarning *robot.ReservationWarning `json:"reservation_warning,omitempty"`
 }
 
 // SessionInterruptInput is the kernel input for sessions.interrupt.
@@ -320,7 +325,7 @@ type SendOptions struct {
 	// typed into the operator's shell was one of the most-documented swarm
 	// footguns (every broadcast recipe carried --skip-first to dodge it).
 	IncludeUser bool
-	// ClearInput performs the per-agent composer clear (Escape ritual + C-u)
+	// ClearInput performs the per-agent composer clear (agent-specific keys)
 	// with emptiness verification before typing each prompt (ntm-5p0b).
 	ClearInput     bool
 	SkipFirst      bool
@@ -346,6 +351,12 @@ type SendOptions struct {
 	CassCheck      bool
 	CassSimilarity float64
 	CassCheckDays  int
+
+	// CASS context injection (C10, bd-ws2-wire-or-delete-ykmcz.11).
+	// WithCASS/--with-cass turns injection on for this send; NoCASS/--no-cass
+	// forces it off, overriding [cass.context] enabled=true.
+	WithCASS bool
+	NoCASS   bool
 	// LoopMode permits periodic orchestration nudges without using timestamp
 	// suffixes to evade the advisory CASS duplicate-work prompt.
 	LoopMode bool
@@ -373,6 +384,19 @@ type SendOptions struct {
 	// Runtime: composing commands use collect mode to own terminal output.
 	executionPolicy sendExecutionPolicy
 	executionResult *sendExecutionResult
+	// Composing runtimes can bind a prepared message to their durable pane
+	// identity and reject prompt-echo ambiguity after all enrichment. The
+	// canonical service invokes this immediately before any delivery.
+	beforeDispatch func(context.Context, dispatchsvc.Request, []dispatchsvc.Delivery) error
+
+	// promptForTarget renders the prompt body for one selected pane, given its
+	// 0-based position in send order and the number of targets. Template sends
+	// set it so per-pane context ({{agent_num}}, {{agent_type}}, {{send_num}},
+	// ...) is filled for every target. Prompt then carries the target-
+	// independent rendering seen only by stages that run before targets are
+	// resolved (redaction preflight, routing, duplicate check, pre-send hooks);
+	// delivery, dry-run, DCG and history use the per-target renderings.
+	promptForTarget func(pane tmux.Pane, index, total int) (string, error)
 }
 
 // SendTarget represents a send target with optional variant filter.
@@ -506,6 +530,22 @@ func sendErrorIsNil(err error) bool {
 	return err == nil
 }
 
+// sendRoutingExclusions lists the panes smart routing must not pick: those a
+// broadcast with the same --tag and agent-type/variant targets would skip.
+func sendRoutingExclusions(panes []tmux.Pane, targets SendTargets, tags []string) []string {
+	var excluded []string
+	for _, p := range panes {
+		if len(tags) > 0 && !HasAnyTag(p.Tags, tags) {
+			excluded = append(excluded, p.ID)
+			continue
+		}
+		if len(targets) > 0 && !targets.MatchesPane(p) {
+			excluded = append(excluded, p.ID)
+		}
+	}
+	return excluded
+}
+
 func matchesLegacySendTypeFilter(pane tmux.Pane, targetCC, targetCod, targetGmi bool) bool {
 	return matchesLegacySendTypeFilterWithTargets(pane, targetCC, targetCod, targetGmi, false, false)
 }
@@ -543,19 +583,11 @@ func matchesLegacySendTypeFilterWithOc(pane tmux.Pane, targetCC, targetCod, targ
 
 func isInterruptibleAgentPane(pane tmux.Pane) bool {
 	switch tmux.AgentType(pane.Type).Canonical() {
-	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentMuse, tmux.AgentAntigravity, tmux.AgentGrok, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
+	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentMuse, tmux.AgentAntigravity, tmux.AgentGrok, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOmp, tmux.AgentOllama:
 		return true
 	default:
 		return false
 	}
-}
-
-func intsToStrings(ints []int) []string {
-	out := make([]string, 0, len(ints))
-	for _, v := range ints {
-		out = append(out, fmt.Sprintf("%d", v))
-	}
-	return out
 }
 
 // shuffledPermutation returns a Fisher-Yates permutation of [0..n) using a deterministic PRNG.
@@ -641,10 +673,13 @@ func newSendCmd() *cobra.Command {
 	var contextFiles []string
 	var templateName string
 	var templateVars []string
+	var templateBead string
 	var tags []string
 	var dryRun bool
 	var cassCheck bool
 	var noCassCheck bool
+	var withCASS bool
+	var noCASS bool
 	var loopMode bool
 	var forceNonInteractive bool
 	var cassSimilarity float64
@@ -695,6 +730,12 @@ func newSendCmd() *cobra.Command {
 		Template Usage:
 		Use --template (-t) to use a named prompt template with variable substitution.
 		Templates support {{variable}} placeholders and {{#var}}...{{/var}} conditionals.
+		The template is rendered separately for every target pane, filling
+		{{agent_num}} (N in cc_N), {{agent_type}}, {{agent_variant}}, {{agent_pane}},
+		{{send_num}}/{{send_index}} and {{send_total}} for that pane.
+		Use --bead <id> to fill {{bead_id}}, {{bead_title}}, {{bead_description}},
+		{{bead_priority}}, {{bead_status}} and {{bead_type}} from 'br show'.
+		A {{variable}} nothing fills is an error; it is never sent as literal text.
 		See 'ntm template list' for available templates.
 
 		File Context Injection:
@@ -715,9 +756,13 @@ func newSendCmd() *cobra.Command {
 		When set, JSON output includes "non_interactive_forced": true.
 
 		Smart Routing:
-		Use --smart to automatically select the best agent based on routing strategies.
-		Use --route to specify the strategy (default: least-loaded).
-		Strategies: least-loaded, round-robin, affinity, sticky, random.
+		Use --smart to send to the single best agent instead of every matching pane.
+		Use --route=STRATEGY to choose the strategy; --route implies --smart (default strategy: least-loaded).
+		Strategies: least-loaded, first-available, round-robin, round-robin-available, random, sticky, explicit, affinity.
+		affinity prefers the agent holding Agent Mail reservations on files the prompt names (needs
+		[agent_mail] enabled=true) and falls back to least-loaded when no agent holds any.
+		An explicit --pane/--panes wins over routing; --all, --skip-first, --project, --batch, and
+		--distribute cannot be combined with --smart/--route.
 
 		Examples:
 		  ntm send myproject "fix the linting errors"           # All agents
@@ -741,8 +786,11 @@ func newSendCmd() *cobra.Command {
 		  ntm send myproject -c a.go -c b.go "Compare these"    # Multiple files
 		  ntm send myproject -t code_review --file src/main.go  # Template with file
 		  ntm send myproject -t fix --var issue="null pointer" --file src/app.go  # Template with vars
+		  ntm send myproject --cc -t marching_orders --bead bd-123  # Per-pane orders for a bead
 		  ntm send myproject --smart "fix auth bug"             # Auto-select best agent
-		  ntm send myproject --smart --route=affinity "auth"    # Use affinity strategy`,
+		  ntm send myproject --cc --route=least-loaded "fix"    # One Claude agent (--route implies --smart)
+		  ntm send myproject --route=sticky "auth"              # Prefer same agent for related tasks
+		  ntm send myproject --route=affinity "fix src/auth.go" # Prefer the agent holding src/auth.go`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			failureSession := ""
@@ -769,12 +817,39 @@ func newSendCmd() *cobra.Command {
 			if skipFirst && (paneSelector != "" || panesSpecified) {
 				return earlyError(fmt.Errorf("cannot combine --skip-first with explicit --pane/--panes selectors"))
 			}
+			// An explicit --route is itself a request for smart routing. The
+			// strategy used to be read only under --smart (default false), so
+			// `--route=X` alone was silently ignored and the prompt went to
+			// every matching pane.
+			smartFlag := "--smart"
+			if cmd.Flags().Changed("route") {
+				smartFlag = "--route"
+				routeStrategy = strings.TrimSpace(routeStrategy)
+				if err := validateSendRouteStrategy(routeStrategy); err != nil {
+					return earlyError(err)
+				}
+				// The explicit strategy routes to a named pane; without one the
+				// router silently fell back to least-loaded.
+				if routeStrategy == string(robot.StrategyExplicit) && paneSelector == "" && !panesSpecified {
+					return earlyError(fmt.Errorf("--route=explicit needs --pane to name the target pane"))
+				}
+				smartRoute = true
+			}
 			if skipFirst && smartRoute {
-				return earlyError(fmt.Errorf("cannot combine --skip-first with --smart"))
+				return earlyError(fmt.Errorf("cannot combine --skip-first with %s", smartFlag))
+			}
+			if targetAll && smartRoute {
+				return earlyError(fmt.Errorf("cannot combine --all with %s: --all broadcasts to every agent pane while smart routing selects one", smartFlag))
+			}
+			if err := validateSendTemplateFlags(cmd, templateName, &templateBead, projectFilter != "", codexGoal, distribute, batchFile != ""); err != nil {
+				return earlyError(err)
 			}
 
 			// Handle --project mode: broadcast to all matching sessions (bd-3cu02.14)
 			if projectFilter != "" {
+				if smartRoute {
+					return earlyError(fmt.Errorf("cannot combine --project with %s: --project broadcasts to every matching session", smartFlag))
+				}
 				if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 					// Check if first arg looks like a session name (no spaces, no special chars)
 					// If it could be a session name, error out
@@ -822,6 +897,9 @@ func newSendCmd() *cobra.Command {
 				if skipFirst {
 					return earlyError(fmt.Errorf("cannot combine --distribute with --skip-first"))
 				}
+				if smartRoute {
+					return earlyError(fmt.Errorf("cannot combine --distribute with %s; choose the distribution strategy with --dist-strategy", smartFlag))
+				}
 				if dryRun && distributeAuto {
 					return earlyError(fmt.Errorf("cannot use --dry-run with --dist-auto"))
 				}
@@ -832,6 +910,9 @@ func newSendCmd() *cobra.Command {
 			if batchFile != "" {
 				if paneSelector != "" || panesSpecified {
 					return earlyError(fmt.Errorf("cannot combine --batch with --pane or --panes; use --agent for a specific batch target"))
+				}
+				if smartRoute {
+					return earlyError(fmt.Errorf("cannot combine --batch with %s; batch targets agents round-robin, or use --agent or --broadcast", smartFlag))
 				}
 				var delay time.Duration
 				if batchDelay != "" {
@@ -851,9 +932,9 @@ func newSendCmd() *cobra.Command {
 					ClearInput:          clearInput,
 					SkipFirst:           skipFirst,
 					Tags:                tags,
-					SmartRoute:          smartRoute,
-					RouteStrategy:       routeStrategy,
 					CassCheck:           cassCheck && !noCassCheck,
+					WithCASS:            withCASS,
+					NoCASS:              noCASS,
 					LoopMode:            loopMode,
 					CassSimilarity:      cassSimilarity,
 					CassCheckDays:       cassCheckDays,
@@ -890,6 +971,8 @@ func newSendCmd() *cobra.Command {
 				SmartRoute:          smartRoute,
 				RouteStrategy:       routeStrategy,
 				CassCheck:           cassCheck && !noCassCheck,
+				WithCASS:            withCASS,
+				NoCASS:              noCASS,
 				LoopMode:            loopMode,
 				CassSimilarity:      cassSimilarity,
 				CassCheckDays:       cassCheckDays,
@@ -905,7 +988,7 @@ func newSendCmd() *cobra.Command {
 			if templateName != "" {
 				opts.TemplateName = templateName
 				opts.PromptSource = fmt.Sprintf("template:%s", templateName)
-				return earlyError(runSendWithTemplate(templateVars, promptFile, contextFiles, opts))
+				return earlyError(runSendWithTemplate(templateVars, promptFile, contextFiles, templateBead, opts))
 			}
 
 			promptText, promptSource, err := getPromptContent(args[1:], promptFile, prefix, suffix)
@@ -952,11 +1035,19 @@ func newSendCmd() *cobra.Command {
 	cmd.Flags().Lookup("muse").NoOptDefVal = "true"
 	cmd.Flags().Var(newSendTargetValue(AgentTypeAntigravity, &targets), "agy", "send to Antigravity (agy) agents (optional :variant filter)")
 	cmd.Flags().Lookup("agy").NoOptDefVal = "true"
-	cmd.Flags().Var(newSendTargetValue(AgentTypeOpencode, &targets), "oc", "send to Opencode (oc) agents (optional :variant filter)")
+	cmd.Flags().Var(newSendTargetValue(AgentTypeGrok, &targets), "grok", "send to Grok Build agents (optional :variant filter)")
+	cmd.Flags().Lookup("grok").NoOptDefVal = "true"
+	cmd.Flags().Var(newSendTargetValue(AgentTypeOpencode, &targets), "oc", "send to OpenCode agents (optional :variant filter)")
 	cmd.Flags().Lookup("oc").NoOptDefVal = "true"
+	cmd.Flags().Var(newSendTargetValue(AgentTypeOmp, &targets), "omp", "send to Oh My Pi (omp) agents (optional :variant filter)")
+	cmd.Flags().Lookup("omp").NoOptDefVal = "true"
+	// Agent plugins get the same selectors spawn/add expose (ntm#260).
+	for _, p := range registerAgentPluginTypes(pluginAgentsDirForArgs(os.Args[1:])) {
+		registerPluginSendFlags(cmd, p, &targets)
+	}
 	cmd.Flags().BoolVar(&targetAll, "all", false, "send to all agent panes, overriding type/tag filters (the user pane is excluded unless --include-user)")
 	cmd.Flags().BoolVar(&includeUser, "include-user", false, "opt the user/control pane into a --all broadcast (deliberate shell input only)")
-	cmd.Flags().BoolVar(&clearInput, "clear-input", false, "clear residual composer text (per-agent Escape ritual + C-u, verified) before typing each prompt; recommended after interrupts on codex panes")
+	cmd.Flags().BoolVar(&clearInput, "clear-input", false, "clear residual composer text (agent-specific keys, verified) before typing each prompt; recommended after interrupts on codex panes")
 	cmd.Flags().BoolVarP(&skipFirst, "skip-first", "s", false, "skip the first pane in deterministic topology order")
 	cmd.Flags().StringVarP(&paneSelector, "pane", "p", "", "send to one pane (N, W.P, or %N)")
 	cmd.Flags().StringVarP(&panesArg, "panes", "", "", "send to panes (comma-separated N, W.P, or %N selectors)")
@@ -966,21 +1057,24 @@ func newSendCmd() *cobra.Command {
 	cmd.Flags().StringArrayVarP(&contextFiles, "context", "c", nil, "file to include as context (repeatable, supports path:start-end)")
 	cmd.Flags().StringVarP(&templateName, "template", "t", "", "use a named prompt template (see 'ntm template list')")
 	cmd.Flags().StringArrayVar(&templateVars, "var", nil, "template variable in key=value format (repeatable)")
+	cmd.Flags().StringVar(&templateBead, "bead", "", "fill the template's bead_* variables from this bead via 'br show' (requires --template)")
 	cmd.Flags().StringSliceVar(&tags, "tag", nil, "filter by tag (OR logic)")
 
 	// Smart routing flags
-	cmd.Flags().BoolVar(&smartRoute, "smart", false, "Use smart routing to select best agent")
-	cmd.Flags().StringVar(&routeStrategy, "route", "", "Routing strategy: least-loaded, round-robin, affinity, sticky, random")
+	cmd.Flags().BoolVar(&smartRoute, "smart", false, "Send to the single best agent (smart routing) instead of every matching pane")
+	cmd.Flags().StringVar(&routeStrategy, "route", "", "Smart-routing strategy (implies --smart): least-loaded, first-available, round-robin, round-robin-available, random, sticky, explicit, affinity")
 
 	// Distribute mode flags - auto-distribute work from bv triage to agents
 	cmd.Flags().BoolVar(&distribute, "distribute", false, "Auto-distribute prioritized work from bv triage to idle agents")
-	cmd.Flags().StringVar(&distributeStrategy, "dist-strategy", "balanced", "Distribution strategy: balanced, speed, quality, dependency")
+	cmd.Flags().StringVar(&distributeStrategy, "dist-strategy", "simple", "Distribution strategy: simple (sequential pairing), balanced, speed, quality, dependency (graph-aware planner)")
 	cmd.Flags().IntVar(&distributeLimit, "dist-limit", 0, "Max tasks to distribute (0 = one per idle agent)")
 	cmd.Flags().BoolVar(&distributeAuto, "dist-auto", false, "Execute distribution without confirmation")
 
 	// CASS check flags
 	cmd.Flags().BoolVar(&cassCheck, "cass-check", true, "Check for duplicate work in CASS")
 	cmd.Flags().BoolVar(&noCassCheck, "no-cass-check", false, "Skip CASS duplicate check")
+	cmd.Flags().BoolVar(&withCASS, "with-cass", false, "Inject relevant CASS session context above the prompt before sending; degrades gracefully when cass is unavailable. Config: [cass.context] enabled/max_sessions/lookback_days/max_tokens/min_relevance/skip_if_context_above/prefer_same_project")
+	cmd.Flags().BoolVar(&noCASS, "no-cass", false, "Disable CASS context injection for this send, overriding [cass.context] enabled=true")
 	cmd.Flags().BoolVar(&loopMode, "loop-mode", false, "Allow repeated orchestration nudges without a CASS duplicate prompt")
 	cmd.Flags().BoolVar(&forceNonInteractive, "force-non-interactive", false,
 		"Bypass safe confirmation gates (currently the CASS duplicate prompt) for "+
@@ -1283,7 +1377,7 @@ func readPromptFileOrStdin(path string) ([]byte, error) {
 	if path == "-" {
 		// Read one byte past the limit so oversize input is a loud error
 		// instead of a silent mid-prompt truncation (mirrors
-		// loadRobotSendMessage's overflow detection).
+		// loadRobotMessageInput's overflow detection).
 		const limit = 10 * 1024 * 1024
 		data, err := io.ReadAll(io.LimitReader(os.Stdin, limit+1))
 		if err != nil {
@@ -1413,8 +1507,49 @@ func buildPrompt(content, prefix, suffix string) string {
 	return strings.Join(parts, "\n")
 }
 
+// validateSendTemplateFlags rejects --bead without --template, and --template
+// in send modes that never render it (they would silently drop the template
+// and any bead context). It trims the bead ID in place.
+func validateSendTemplateFlags(cmd *cobra.Command, templateName string, beadID *string, project, codexGoal, distribute, batch bool) error {
+	*beadID = strings.TrimSpace(*beadID)
+	if cmd.Flags().Changed("bead") && *beadID == "" {
+		return markCLIInvalidInput(errors.New("--bead requires a bead ID"))
+	}
+	if *beadID != "" && templateName == "" {
+		return markCLIInvalidInput(errors.New("--bead only fills template variables; use it with --template"))
+	}
+	if templateName == "" {
+		return nil
+	}
+	for _, mode := range []struct {
+		set  bool
+		flag string
+	}{
+		{project, "--project"},
+		{codexGoal, "--codex-goal"},
+		{distribute, "--distribute"},
+		{batch, "--batch"},
+	} {
+		if mode.set {
+			return markCLIInvalidInput(fmt.Errorf("cannot combine --template with %s", mode.flag))
+		}
+	}
+	return nil
+}
+
 // runSendWithTemplate handles template-based prompt generation and sending.
-func runSendWithTemplate(templateVars []string, promptFile string, contextFiles []string, opts SendOptions) error {
+//
+// Session-level context (--var, --file, {{session}}, --bead) is known up
+// front, but per-pane context ({{agent_num}}, {{agent_type}}, {{send_num}},
+// ...) only exists once runSendInternal resolves the targets. The template is
+// therefore validated and rendered once here without pane context, and
+// rendered again for every selected pane through promptForTarget, so each
+// agent receives its own identity instead of a literal "{{agent_num}}".
+func runSendWithTemplate(templateVars []string, promptFile string, contextFiles []string, beadID string, opts SendOptions) error {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
+
 	// Load the template
 	loader := templates.NewLoader()
 	tmpl, err := loader.Load(opts.TemplateName)
@@ -1427,13 +1562,13 @@ func runSendWithTemplate(templateVars []string, promptFile string, contextFiles 
 	for _, v := range templateVars {
 		parts := strings.SplitN(v, "=", 2)
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid --var format '%s' (expected key=value)", v)
+			return markCLIInvalidInput(fmt.Errorf("invalid --var format '%s' (expected key=value)", v))
 		}
 		vars[parts[0]] = parts[1]
 	}
 
 	// Build execution context
-	ctx := templates.ExecutionContext{
+	execCtx := templates.ExecutionContext{
 		Variables: vars,
 		Session:   opts.Session,
 	}
@@ -1445,34 +1580,123 @@ func runSendWithTemplate(templateVars []string, promptFile string, contextFiles 
 		if err != nil {
 			return fmt.Errorf("reading file '%s': %w", promptFile, err)
 		}
-		ctx.FileContent = string(content)
+		execCtx.FileContent = string(content)
 	}
 
-	// Execute the template
-	promptText, err := tmpl.Execute(ctx)
-	if err != nil {
-		return fmt.Errorf("executing template: %w", err)
-	}
-
-	// Inject additional file context if specified (via --context)
-	if len(contextFiles) > 0 {
-		var specs []prompt.FileSpec
-		for _, cf := range contextFiles {
-			spec, err := prompt.ParseFileSpec(cf)
-			if err != nil {
-				return fmt.Errorf("invalid --context spec '%s': %w", cf, err)
-			}
-			specs = append(specs, spec)
-		}
-
-		promptText, err = prompt.InjectFiles(specs, promptText)
+	if beadID != "" {
+		session, bead, err := lookupSendTemplateBead(opts.Context, opts.Session, beadID)
 		if err != nil {
 			return err
 		}
+		opts.Session = session
+		execCtx.Session = session
+		execCtx = execCtx.WithBead(bead.ID, bead.Title, fmt.Sprintf("P%d", bead.Priority), bead.Description, bead.Status, bead.IssueType)
 	}
 
-	opts.Prompt = promptText
+	// Render everything known before targeting. This fails on any
+	// {{variable}} that no --var, --file, --bead or builtin fills.
+	sharedText, err := tmpl.ExecuteShared(execCtx)
+	if err != nil {
+		return markCLIInvalidInput(explainSendTemplateError(err))
+	}
+
+	// Additional file context (--context) is read once so every pane gets
+	// the same snapshot.
+	var specs []prompt.FileSpec
+	for _, cf := range contextFiles {
+		spec, err := prompt.ParseFileSpec(cf)
+		if err != nil {
+			return fmt.Errorf("invalid --context spec '%s': %w", cf, err)
+		}
+		specs = append(specs, spec)
+	}
+	fileContext, err := prompt.FileContextBlock(specs)
+	if err != nil {
+		return err
+	}
+
+	opts.Prompt = fileContext + sharedText
+	opts.promptForTarget = func(pane tmux.Pane, index, total int) (string, error) {
+		// agent_type uses the long robot-output names (claude, codex, ...).
+		paneCtx := execCtx.
+			WithAgent(pane.NTMIndex, robot.ResolveAgentType(string(pane.Type)), pane.Variant, pane.ID).
+			WithSendBatch(index, total)
+		body, err := tmpl.Execute(paneCtx)
+		if err != nil {
+			return "", markCLIInvalidInput(explainSendTemplatePaneError(pane, err))
+		}
+		return fileContext + body, nil
+	}
 	return runSendWithTargets(opts)
+}
+
+// lookupSendTemplateBead reads --bead from the target session's project with
+// the same `br show --json` contract assignment uses, failing closed rather
+// than consulting whatever project the caller's working directory belongs to.
+// It returns the resolved session name alongside the bead.
+func lookupSendTemplateBead(ctx context.Context, session, beadID string) (string, *bv.BeadAssignmentDetails, error) {
+	resolved, _, err := resolveSendSessionForCommandContext(ctx, session)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve session for --bead %s: %w", beadID, err)
+	}
+	projectDir, err := resolveExplicitProjectDirForSessionContext(ctx, resolved)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve project for session %s to read --bead %s: %w", resolved, beadID, err)
+	}
+	details, err := bv.GetBeadAssignmentDetailsContext(ctx, projectDir, beadID)
+	if err != nil {
+		return "", nil, fmt.Errorf("read --bead %s in %s: %w", beadID, projectDir, err)
+	}
+	return resolved, details, nil
+}
+
+// explainSendTemplateError adds the flag that fills each kind of unresolved
+// session-level variable.
+func explainSendTemplateError(err error) error {
+	var unresolved *templates.UnresolvedVariablesError
+	if !errors.As(err, &unresolved) {
+		return fmt.Errorf("executing template: %w", err)
+	}
+	needsBead, needsVar := false, false
+	for _, name := range unresolved.Names {
+		if strings.HasPrefix(name, "bead_") {
+			needsBead = true
+		} else {
+			needsVar = true
+		}
+	}
+	var hints []string
+	if needsBead {
+		hints = append(hints, "pass --bead <id> to fill bead_* variables")
+	}
+	if needsVar {
+		hints = append(hints, "pass --var name=value")
+	}
+	return fmt.Errorf("%w (%s)", err, strings.Join(hints, "; "))
+}
+
+// explainSendTemplatePaneError names the pane whose per-pane context could not
+// fill the template and why.
+func explainSendTemplatePaneError(pane tmux.Pane, err error) error {
+	var unresolved *templates.UnresolvedVariablesError
+	if !errors.As(err, &unresolved) {
+		return err
+	}
+	var reasons []string
+	for _, name := range unresolved.Names {
+		switch name {
+		case "agent_num":
+			reasons = append(reasons, fmt.Sprintf("pane title %q carries no ntm agent number", pane.Title))
+		case "agent_variant":
+			reasons = append(reasons, "pane has no variant; wrap it in {{#agent_variant}}...{{/agent_variant}}")
+		case "agent_pane":
+			reasons = append(reasons, "pane has no tmux pane ID")
+		}
+	}
+	if len(reasons) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w (%s)", err, strings.Join(reasons, "; "))
 }
 
 // runSendWithTargets sends prompts using the new SendTargets filtering
@@ -1481,6 +1705,23 @@ func runSendWithTargets(opts SendOptions) error {
 		opts.Context = context.Background()
 	}
 	return runSendInternal(opts)
+}
+
+// validateSendRouteStrategy rejects an empty or unknown smart-routing
+// strategy, naming the valid ones.
+func validateSendRouteStrategy(name string) error {
+	names := robot.GetStrategyNames()
+	valid := make([]string, len(names))
+	for i, n := range names {
+		valid[i] = string(n)
+	}
+	if name == "" {
+		return fmt.Errorf("--route requires a strategy (valid: %s)", strings.Join(valid, ", "))
+	}
+	if !robot.IsValidStrategy(robot.StrategyName(name)) {
+		return fmt.Errorf("invalid routing strategy: %s (valid: %s)", name, strings.Join(valid, ", "))
+	}
+	return nil
 }
 
 func finishSendResult(opts SendOptions, result SendResult, cause error) error {
@@ -1609,6 +1850,9 @@ func runSendInternal(opts SendOptions) (err error) {
 		histAgentTypes []string
 		histErr        error
 		histSuccess    bool
+		// histGroups holds each distinct outbound prompt and its panes once
+		// targets resolve; before that the shared prompt is recorded.
+		histGroups []sendPromptGroup
 	)
 
 	// Redaction preflight for outbound prompts
@@ -1679,6 +1923,8 @@ func runSendInternal(opts SendOptions) (err error) {
 				code = "SENSITIVE_DATA_BLOCKED"
 			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				code = robot.ErrCodeTimeout
+			} else if errors.Is(err, errCLIInvalidInput) {
+				code = robot.ErrCodeInvalidFlag
 			}
 			result := SendResult{
 				Success:              false,
@@ -1761,38 +2007,49 @@ func runSendInternal(opts SendOptions) (err error) {
 	// Start time tracking for history
 	start := time.Now()
 
-	// Defer history logic
+	// Defer history logic. One entry per distinct outbound prompt: a plain
+	// send records one; a per-pane template render records what each group
+	// of panes actually received.
 	defer func() {
 		if dryRun {
 			return
 		}
-		entry := history.NewEntry(session, histTargets, prompt, history.SourceCLI)
-		entry.SetAgentTypes(histAgentTypes)
-		entry.Template = templateName
-		entry.DurationMs = int(time.Since(start) / time.Millisecond)
-		if histSuccess {
-			entry.SetSuccess()
-		} else {
-			entry.SetError(histErr)
+		groups := histGroups
+		if len(groups) == 0 {
+			groups = []sendPromptGroup{{prompt: prompt, targets: histTargets, agentTypes: histAgentTypes, delivered: delivered}}
 		}
-		_ = history.Append(entry)
+		for _, group := range groups {
+			entry := history.NewEntry(session, group.targets, group.prompt, history.SourceCLI)
+			entry.SetAgentTypes(group.agentTypes)
+			entry.Template = templateName
+			entry.DurationMs = int(time.Since(start) / time.Millisecond)
+			if histSuccess {
+				entry.SetSuccess()
+			} else {
+				entry.SetError(histErr)
+			}
+			_ = history.Append(entry)
 
-		// Session prompt history is replayable restart state, so only record
-		// prompts that reached at least one pane. Global history above retains
-		// failed attempts with their error metadata.
-		promptEntry := sessionPkg.PromptEntry{
-			Session:  session,
-			Content:  prompt,
-			Targets:  histTargets,
-			Source:   "cli",
-			Template: templateName,
+			// Session prompt history is replayable restart state, so only record
+			// prompts that reached at least one pane. Global history above retains
+			// failed attempts with their error metadata.
+			promptEntry := sessionPkg.PromptEntry{
+				Session:  session,
+				Content:  group.prompt,
+				Targets:  group.targets,
+				Source:   "cli",
+				Template: templateName,
+			}
+			_ = saveDeliveredPrompt(group.delivered, promptEntry)
 		}
-		_ = saveDeliveredPrompt(delivered, promptEntry)
 	}()
 
-	// Smart routing: select best agent automatically.
+	// Smart routing: select best agent automatically. A routing strategy is
+	// itself a request for smart routing — reading it only under SmartRoute
+	// let a bare strategy broadcast to every matching pane.
+	smartRoute := opts.SmartRoute || strings.TrimSpace(opts.RouteStrategy) != ""
 	// Explicit pane selection (--pane/--panes) wins over automatic routing.
-	if opts.SmartRoute && (opts.PanesSpecified || paneSelector != "") {
+	if smartRoute && (opts.PanesSpecified || paneSelector != "") {
 		if !jsonOutput && !silent {
 			if opts.PanesSpecified {
 				fmt.Println("Note: --panes specified, skipping smart routing")
@@ -1800,21 +2057,15 @@ func runSendInternal(opts SendOptions) (err error) {
 				fmt.Println("Note: --pane specified, skipping smart routing")
 			}
 		}
-		opts.SmartRoute = false
+		smartRoute = false
 	}
-	if opts.SmartRoute {
+	if smartRoute {
 		strategy := robot.StrategyLeastLoaded
-		if opts.RouteStrategy != "" {
-			strategy = robot.StrategyName(opts.RouteStrategy)
-			if !robot.IsValidStrategy(strategy) {
-				validNames := robot.GetStrategyNames()
-				validStrs := make([]string, len(validNames))
-				for i, n := range validNames {
-					validStrs[i] = string(n)
-				}
-				return outputError(fmt.Errorf("invalid routing strategy: %s (valid: %s)",
-					opts.RouteStrategy, strings.Join(validStrs, ", ")))
+		if name := strings.TrimSpace(opts.RouteStrategy); name != "" {
+			if err := validateSendRouteStrategy(name); err != nil {
+				return outputError(err)
 			}
+			strategy = robot.StrategyName(name)
 		}
 
 		routeOpts := robot.RouteOptions{
@@ -1822,10 +2073,23 @@ func runSendInternal(opts SendOptions) (err error) {
 			Strategy: strategy,
 			Prompt:   prompt,
 			Config:   loadSelectedConfigOrDefault(),
+			// A dry-run previews the route; it must not advance the persisted
+			// sticky/round-robin state or repeated previews burn rotation slots.
+			NoPersist: dryRun,
 		}
 
-		// Filter by agent type if specified (only when exactly one type is set)
-		routeOpts.AgentType = sendRouteAgentType(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse)
+		// Route among exactly the panes the same filters would broadcast to.
+		// Mapping only a single --cc/--cod/--gmi/--agy onto the router's
+		// type filter ignored variants (--cc=opus), tags, several types and
+		// every other agent type (--grok, --omp, --oc, plugins), so routing
+		// could pick an agent outside the requested set.
+		if len(targets) > 0 || len(tags) > 0 {
+			allPanes, err := tmux.GetPanesContext(ctx, session)
+			if err != nil {
+				return outputError(fmt.Errorf("smart routing: listing panes: %w", err))
+			}
+			routeOpts.ExcludePaneIDs = sendRoutingExclusions(allPanes, targets, tags)
+		}
 
 		recommendation, err := robot.GetRouteRecommendation(routeOpts)
 		if err != nil {
@@ -1839,17 +2103,22 @@ func runSendInternal(opts SendOptions) (err error) {
 		paneIndex = recommendation.PaneIndex
 		paneSelector = recommendation.PaneID
 		opts.routingResult = &SendRoutingResult{
-			PaneIndex: recommendation.PaneIndex,
-			PaneID:    recommendation.PaneID,
-			AgentType: recommendation.AgentType,
-			Strategy:  string(strategy),
-			Reason:    recommendation.Reason,
-			Score:     recommendation.Score,
+			PaneIndex:          recommendation.PaneIndex,
+			PaneID:             recommendation.PaneID,
+			AgentType:          recommendation.AgentType,
+			Strategy:           string(strategy),
+			Reason:             recommendation.Reason,
+			Score:              recommendation.Score,
+			ReservationWarning: recommendation.ReservationWarning,
 		}
 
 		if !jsonOutput && !silent {
 			fmt.Printf("Smart routing: selected %s (pane %d) - %s\n",
 				recommendation.AgentType, recommendation.PaneIndex, recommendation.Reason)
+			if w := recommendation.ReservationWarning; w != nil {
+				fmt.Fprintf(os.Stderr, "Smart routing: warning: %s: %s reserved by %s\n",
+					w.Message, strings.Join(w.Paths, ", "), strings.Join(w.Holders, ", "))
+			}
 		}
 	}
 
@@ -1960,7 +2229,9 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	// Auto-checkpoint before broadcast sends
-	isBroadcast := !opts.PanesSpecified && paneSelector == "" && (targetAll || (!targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse && len(tags) == 0))
+	// len(targets) covers every type selector (--grok, --omp, plugins), not
+	// just the ones with a legacy bool, so a typed send is never a broadcast.
+	isBroadcast := !opts.PanesSpecified && paneSelector == "" && (targetAll || (len(targets) == 0 && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse && len(tags) == 0))
 	// Checkpoint capture emits human-facing advisory logs from lower layers, so
 	// keep it on the interactive path and preserve a clean machine-output channel.
 	if !dryRun && !jsonOutput && !silent && isBroadcast && cfg != nil && cfg.Checkpoints.Enabled && cfg.Checkpoints.BeforeBroadcast {
@@ -2000,7 +2271,7 @@ func runSendInternal(opts SendOptions) (err error) {
 
 	// Broad sends apply type/tag filters after deterministic topology ordering.
 	if selectedPanes == nil {
-		noFilter := !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse && !targetAll && len(tags) == 0
+		noFilter := len(targets) == 0 && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse && !targetAll && len(tags) == 0
 		hasVariantFilter := len(targets) > 0
 
 		for i, p := range panes {
@@ -2073,13 +2344,79 @@ func runSendInternal(opts SendOptions) (err error) {
 	histAgentTypes = targetAgentTypes
 	dispatchPacing := buildDispatchPacingDecision(opts, session, selectedPanes, multiWindow)
 
+	// Template sends render once per selected pane, in send order, before
+	// anything is delivered: a pane the template cannot be filled for fails
+	// the whole send with no pane touched. targetPrompts is nil for plain
+	// sends, which deliver the shared prompt everywhere.
+	targetPrompts, err := renderSendTargetPrompts(opts, selectedPanes, multiWindow)
+	if err != nil {
+		return outputError(err)
+	}
+
 	if opts.Randomize && len(targetPanes) > 1 && !jsonOutput && !silent {
 		fmt.Fprintf(os.Stderr, "Randomized send order (seed=%d): %v\n", seedUsed, targetPanes)
 	}
 
+	// Send-time CASS context injection (--with-cass / --no-cass, C10
+	// bd-ws2-wire-or-delete-ykmcz.11). Best-effort enrichment: cass being
+	// missing or wedged records a skip and the send proceeds unmodified.
+	var cassInjectionInfo *robot.CASSInjectionInfo
+	if cassEnabled, cassQuery, cassFilter, cassInject := sendCASSInjectionConfigs(opts.WithCASS, opts.NoCASS, cfg); cassEnabled {
+		// One prompt goes to every selected pane, so a mixed --cc/--cod send
+		// must not format for whichever pane happens to be first: use the
+		// agent-specific format only when all targets run the same agent
+		// type, else the neutral markdown format.
+		if len(selectedPanes) > 0 {
+			agentType := selectedPanes[0].Type.String()
+			uniform := true
+			for _, p := range selectedPanes[1:] {
+				if p.Type.String() != agentType {
+					uniform = false
+					break
+				}
+			}
+			if uniform {
+				cassInject.Format = cass.FormatForAgent(agentType)
+			} else {
+				cassInject.Format = cass.FormatMarkdown
+			}
+		}
+		injectRes, queryRes, filterRes := cass.InjectContextFromQuery(prompt, cassQuery, cassFilter, cassInject)
+		cassInjectionInfo = sendCASSInjectionInfo(injectRes, queryRes.Query, filterRes.Hits)
+		if injectRes.Success && injectRes.ModifiedPrompt != "" {
+			prompt = injectRes.ModifiedPrompt
+			opts.Prompt = prompt
+			// The context found for the shared prompt is injected into every
+			// per-pane rendering the same way.
+			for i := range targetPrompts {
+				if perTarget := cass.InjectContext(targetPrompts[i], filterRes.Hits, cassInject); perTarget.Success && perTarget.ModifiedPrompt != "" {
+					targetPrompts[i] = perTarget.ModifiedPrompt
+				}
+			}
+		}
+		if !jsonOutput && !silent {
+			switch {
+			case cassInjectionInfo.ItemsInjected > 0:
+				fmt.Printf("CASS context injected: %d item(s), ~%d tokens\n",
+					cassInjectionInfo.ItemsInjected, cassInjectionInfo.TokensAdded)
+			case cassInjectionInfo.SkippedReason != "":
+				fmt.Fprintf(os.Stderr, "CASS context injection skipped: %s\n", cassInjectionInfo.SkippedReason)
+			}
+		}
+	}
+
+	// From here on every stage sees exactly what each pane will receive.
+	histGroups = groupSendPrompts(prompt, targetPrompts, selectedPanes, multiWindow)
+	previewPrompt := prompt
+	if len(targetPrompts) > 0 {
+		previewPrompt = targetPrompts[0]
+	}
+
 	// Apply DCG safety check for non-Claude agents
-	if err := maybeBlockSendWithDCG(prompt, session, selectedPanes); err != nil {
-		return outputError(err)
+	for _, group := range histGroups {
+		if err := maybeBlockSendWithDCG(ctx, group.prompt, session, group.panes); err != nil {
+			return outputError(err)
+		}
 	}
 
 	if len(selectedPanes) == 0 {
@@ -2087,7 +2424,7 @@ func runSendInternal(opts SendOptions) (err error) {
 		result := SendResult{
 			Success:              false,
 			Session:              session,
-			PromptPreview:        truncatePrompt(prompt, 50),
+			PromptPreview:        truncatePrompt(previewPrompt, 50),
 			NonInteractiveForced: opts.ForceNonInteractive,
 			Redaction:            redactionSummary,
 			Warnings:             redactionWarnings,
@@ -2107,7 +2444,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	dispatchRedactCfg := activeShellDispatchRedactionConfig()
-	dispatchService, err := newShellDispatchService(session, selectedPanes, dispatchRedactCfg)
+	dispatchService, err := newShellDispatchServiceWithGate(session, selectedPanes, sendTargetMessages(selectedPanes, targetPrompts), dispatchRedactCfg, opts.beforeDispatch)
 	if err != nil {
 		return outputError(err)
 	}
@@ -2130,6 +2467,10 @@ func runSendInternal(opts SendOptions) (err error) {
 			return outputError(dispatchErr)
 		}
 		entries := buildSendDryRunEntries(selectedPanes, prompt, promptSource, multiWindow)
+		for i := range targetPrompts {
+			entries[i].Prompt = targetPrompts[i]
+			entries[i].PromptPreview = truncateForPreview(targetPrompts[i], 80)
+		}
 		return finishSendDryRunResult(opts, SendDryRunResult{
 			Success:              true,
 			DryRun:               true,
@@ -2147,6 +2488,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 	delivered = dispatchResult.Delivered
 	failed = dispatchResult.Failed
+	countSendGroupDeliveries(histGroups, dispatchResult.Receipts)
 	var firstDeliveryErr error
 	var firstFailedPane string
 	for _, receipt := range dispatchResult.Receipts {
@@ -2176,7 +2518,7 @@ func runSendInternal(opts SendOptions) (err error) {
 			result := SendResult{
 				Success:              false,
 				Session:              session,
-				PromptPreview:        truncatePrompt(prompt, 50),
+				PromptPreview:        truncatePrompt(previewPrompt, 50),
 				NonInteractiveForced: opts.ForceNonInteractive,
 				Redaction:            redactionSummary,
 				Warnings:             redactionWarnings,
@@ -2187,6 +2529,7 @@ func runSendInternal(opts SendOptions) (err error) {
 				Failed:               failed,
 				RoutedTo:             opts.routingResult,
 				DispatchPacing:       dispatchPacing,
+				CASSInjection:        cassInjectionInfo,
 				ErrorCode:            errorCode,
 				Error:                firstDeliveryErr.Error(),
 			}
@@ -2199,7 +2542,7 @@ func runSendInternal(opts SendOptions) (err error) {
 		result := SendResult{
 			Success:              true,
 			Session:              session,
-			PromptPreview:        truncatePrompt(prompt, 50),
+			PromptPreview:        truncatePrompt(previewPrompt, 50),
 			NonInteractiveForced: opts.ForceNonInteractive,
 			Redaction:            redactionSummary,
 			Warnings:             redactionWarnings,
@@ -2210,6 +2553,7 @@ func runSendInternal(opts SendOptions) (err error) {
 			Failed:               failed,
 			RoutedTo:             opts.routingResult,
 			DispatchPacing:       dispatchPacing,
+			CASSInjection:        cassInjectionInfo,
 		}
 		if jsonOutput || opts.executionPolicy == sendExecutionCollect {
 			return finishSendResult(opts, result, nil)
@@ -2259,7 +2603,7 @@ func runSendInternal(opts SendOptions) (err error) {
 	result := SendResult{
 		Success:              failed == 0 && firstDeliveryErr == nil,
 		Session:              session,
-		PromptPreview:        truncatePrompt(prompt, 50),
+		PromptPreview:        truncatePrompt(previewPrompt, 50),
 		NonInteractiveForced: opts.ForceNonInteractive,
 		Redaction:            redactionSummary,
 		Warnings:             redactionWarnings,
@@ -2270,6 +2614,7 @@ func runSendInternal(opts SendOptions) (err error) {
 		Failed:               failed,
 		RoutedTo:             opts.routingResult,
 		DispatchPacing:       dispatchPacing,
+		CASSInjection:        cassInjectionInfo,
 	}
 	if !result.Success {
 		result.ErrorCode = sendErrorCodeFailed
@@ -2306,6 +2651,101 @@ func runSendInternal(opts SendOptions) (err error) {
 	}
 
 	return nil
+}
+
+// renderSendTargetPrompts renders opts.promptForTarget for every selected pane
+// (0-based send position, target count) and composes each rendering the way
+// runSendInternal composes the shared prompt: base prompt first, then redact
+// mode rewriting, so dry-run output and history never hold a secret the shared
+// preflight would have redacted. Block mode needs no per-pane pass: the shared
+// rendering carries every session-level value and was already refused, and
+// the dispatch redactor still enforces policy on each final message. It
+// returns nil when the send has no per-target renderer.
+func renderSendTargetPrompts(opts SendOptions, panes []tmux.Pane, multiWindow bool) ([]string, error) {
+	if opts.promptForTarget == nil {
+		return nil, nil
+	}
+	redactCfg := activeShellDispatchRedactionConfig()
+	prompts := make([]string, len(panes))
+	for i, pane := range panes {
+		body, err := opts.promptForTarget(pane, i, len(panes))
+		if err != nil {
+			return nil, fmt.Errorf("rendering prompt for pane %s: %w", tmux.PaneTargetKey(pane, multiWindow), err)
+		}
+		composed := applyBasePrompt(opts.BasePrompt, body)
+		if redactCfg.Mode == redaction.ModeRedact {
+			composed = redaction.ScanAndRedact(composed, redactCfg).Output
+		}
+		prompts[i] = composed
+	}
+	return prompts, nil
+}
+
+// sendPromptGroup is one distinct outbound prompt and the selected panes that
+// receive it, in send order.
+type sendPromptGroup struct {
+	prompt     string
+	panes      []tmux.Pane
+	targets    []string
+	agentTypes []string
+	delivered  int
+}
+
+// groupSendPrompts partitions the selected panes by the exact prompt each one
+// receives: a plain send (perTarget nil) is a single group, while a per-pane
+// template render yields one group per distinct rendering.
+func groupSendPrompts(shared string, perTarget []string, panes []tmux.Pane, multiWindow bool) []sendPromptGroup {
+	var groups []sendPromptGroup
+	byPrompt := make(map[string]int)
+	for i, pane := range panes {
+		text := shared
+		if perTarget != nil {
+			text = perTarget[i]
+		}
+		index, ok := byPrompt[text]
+		if !ok {
+			index = len(groups)
+			byPrompt[text] = index
+			groups = append(groups, sendPromptGroup{prompt: text})
+		}
+		group := &groups[index]
+		group.panes = append(group.panes, pane)
+		group.targets = append(group.targets, tmux.PaneTargetKey(pane, multiWindow))
+		group.agentTypes = append(group.agentTypes, pane.Type.String())
+	}
+	return groups
+}
+
+// countSendGroupDeliveries records how many of each group's panes the
+// dispatch receipts report as delivered.
+func countSendGroupDeliveries(groups []sendPromptGroup, receipts []dispatchsvc.Receipt) {
+	delivered := make(map[string]bool, len(receipts))
+	for _, receipt := range receipts {
+		if receipt.Status == dispatchsvc.ReceiptDelivered {
+			delivered[receipt.Target.Ref.StableKey()] = true
+		}
+	}
+	for i := range groups {
+		groups[i].delivered = 0
+		for _, pane := range groups[i].panes {
+			if delivered[pane.Ref().StableKey()] {
+				groups[i].delivered++
+			}
+		}
+	}
+}
+
+// sendTargetMessages keys per-pane prompts by stable pane identity for the
+// dispatch message builder; nil means every target receives the base message.
+func sendTargetMessages(panes []tmux.Pane, prompts []string) map[string]string {
+	if prompts == nil {
+		return nil
+	}
+	messages := make(map[string]string, len(panes))
+	for i, pane := range panes {
+		messages[pane.Ref().StableKey()] = prompts[i]
+	}
+	return messages
 }
 
 func saveDeliveredPrompt(delivered int, entry sessionPkg.PromptEntry) error {
@@ -2460,7 +2900,16 @@ func runInterrupt(session string, tags []string) error {
 		if err != nil {
 			return emitJSONFailureEnvelopeWithCause(output.NewError(err.Error()), err)
 		}
-		return output.PrintJSON(result)
+		if printErr := output.PrintJSON(result); printErr != nil {
+			return printErr
+		}
+		// PARTIAL semantics: a success:false envelope (partial or total
+		// interrupt failure) must exit non-zero so shell callers can gate
+		// on $? (bd-ws7-docs-ux-truth-tqh3l.6).
+		if resp, ok := result.(*output.InterruptResponse); ok && !resp.Success {
+			return jsonFailureExit()
+		}
+		return nil
 	}
 
 	if err := tmux.EnsureInstalled(); err != nil {
@@ -2485,7 +2934,11 @@ func runInterrupt(session string, tags []string) error {
 		return err
 	}
 
-	ctrlC, escape := 0, 0
+	// Best-effort sweep: a tmux error on one pane must not leave the
+	// remaining panes un-interrupted (bd-ws7-docs-ux-truth-tqh3l.6).
+	count := 0
+	escapeCount := 0
+	var failures []string
 	for _, p := range panes {
 		// Only interrupt agent panes
 		if isInterruptibleAgentPane(p) {
@@ -2496,32 +2949,29 @@ func runInterrupt(session string, tags []string) error {
 				}
 			}
 
-			key := interruptKeyForPane(p)
-			if err := tmux.SendKeyName(p.ID, key); err != nil {
-				return fmt.Errorf("interrupting pane %d: %w", p.Index, err)
+			// Each TUI's own interrupt key: Escape for omp and Muse Code,
+			// Ctrl+C elsewhere.
+			if err := tmux.SendInterruptForAgent(p.ID, p.Type); err != nil {
+				failures = append(failures, fmt.Sprintf("pane %d: %v", p.Index, err))
+				continue
 			}
-			if key == "Escape" {
-				escape++
-			} else {
-				ctrlC++
+			count++
+			if tmux.InterruptKeyForAgent(p.Type) == "Escape" {
+				escapeCount++
 			}
 		}
 	}
 
-	if ctrlC > 0 || escape == 0 {
-		fmt.Printf("Sent Ctrl+C to %d agent pane(s)\n", ctrlC)
+	if escapeCount == 0 {
+		fmt.Printf("Sent Ctrl+C to %d agent pane(s)\n", count)
+	} else {
+		fmt.Printf("Sent interrupt to %d agent pane(s) (Ctrl+C: %d, Escape: %d)\n", count, count-escapeCount, escapeCount)
 	}
-	if escape > 0 {
-		fmt.Printf("Sent Escape to %d Muse pane(s)\n", escape)
+	if len(failures) > 0 {
+		return fmt.Errorf("interrupt partially failed (%d interrupted, %d failed): %s",
+			count, len(failures), strings.Join(failures, "; "))
 	}
 	return nil
-}
-
-// interruptKeyForPane returns the tmux key name that stops a pane's running
-// turn (tmux.InterruptKey): Escape for Muse Code, Ctrl+C for every other
-// agent.
-func interruptKeyForPane(pane tmux.Pane) string {
-	return tmux.InterruptKey(pane.Type)
 }
 
 // buildInterruptResponse constructs the response for session interrupt.
@@ -2545,8 +2995,15 @@ func buildInterruptResponse(ctx context.Context, session string, tags []string) 
 		return nil, err
 	}
 
-	var targetedPanes []int
+	// Best-effort sweep with per-pane results: a tmux error on one pane no
+	// longer aborts the remaining panes, and the envelope reports exactly
+	// which panes were interrupted and which failed
+	// (bd-ws7-docs-ux-truth-tqh3l.6).
+	multiWindow := tmux.PanesSpanMultipleWindows(panes)
+	targetedPanes := make([]int, 0, len(panes))
+	paneResults := make([]output.InterruptPaneResult, 0, len(panes))
 	interrupted := 0
+	failed := 0
 	skipped := 0
 
 	for _, p := range panes {
@@ -2561,20 +3018,44 @@ func buildInterruptResponse(ctx context.Context, session string, tags []string) 
 			}
 
 			targetedPanes = append(targetedPanes, p.Index)
-			if err := tmux.SendKeyName(p.ID, interruptKeyForPane(p)); err != nil {
-				return nil, fmt.Errorf("interrupting pane %d: %w", p.Index, err)
+			result := output.InterruptPaneResult{
+				Pane:      tmux.PaneTargetKey(p, multiWindow),
+				Index:     p.Index,
+				PaneID:    p.ID,
+				AgentType: tmux.AgentType(p.Type).Canonical().String(),
 			}
-			interrupted++
+			if err := tmux.SendInterruptForAgent(p.ID, p.Type); err != nil {
+				result.Status = "failed"
+				result.Error = err.Error()
+				failed++
+			} else {
+				result.Status = "interrupted"
+				interrupted++
+			}
+			paneResults = append(paneResults, result)
 		}
 	}
 
-	return &output.InterruptResponse{
+	resp := &output.InterruptResponse{
 		TimestampedResponse: output.NewTimestamped(),
+		Success:             failed == 0,
 		Session:             session,
 		Interrupted:         interrupted,
+		Failed:              failed,
 		Skipped:             skipped,
 		TargetedPanes:       targetedPanes,
-	}, nil
+		Panes:               paneResults,
+	}
+	if failed > 0 {
+		if interrupted > 0 {
+			resp.ErrorCode = "PARTIAL_INTERRUPT"
+			resp.Error = fmt.Sprintf("interrupt partially failed: %d pane(s) interrupted, %d failed", interrupted, failed)
+		} else {
+			resp.ErrorCode = "INTERRUPT_FAILED"
+			resp.Error = fmt.Sprintf("interrupt failed on all %d targeted pane(s)", failed)
+		}
+	}
+	return resp, nil
 }
 
 func newKillCmd() *cobra.Command {
@@ -2682,6 +3163,12 @@ func runKillPane(ctx context.Context, w io.Writer, session, selector string, for
 	return nil
 }
 
+var (
+	stopKillSessionMonitor     = resilience.StopSessionMonitor
+	collectKillPaneDescendants = collectPaneDescendants
+	reapKillOrphans            = reapOrphanProcesses
+)
+
 func runKill(ctx context.Context, w io.Writer, session string, force bool, tags []string, noHooks bool, summarize bool) (err error) {
 	// Use kernel for JSON output mode
 	if IsJSONOutput() {
@@ -2710,225 +3197,40 @@ func runKill(ctx context.Context, w io.Writer, session string, force bool, tags 
 		return fmt.Errorf("session is required")
 	}
 	session = res.Session
-	sessionInferred := res.Inferred
 
 	if !tmux.SessionExists(session) {
 		return fmt.Errorf("session '%s' not found", session)
 	}
 
-	dir := getSessionWorkingDir(ctx, session, sessionInferred)
-	auditStart := time.Now()
-	auditAborted := false
-	auditKilled := false
-	auditNoTargets := false
-	auditScope := "session"
-	auditKilledPanes := 0
-	if len(tags) > 0 {
-		auditScope = "tags"
+	req := killRequest{
+		session:   session,
+		inferred:  res.Inferred,
+		force:     force,
+		tags:      tags,
+		noHooks:   noHooks,
+		summarize: summarize,
+		notify:    func(format string, args ...any) { fmt.Printf(format, args...) },
 	}
-	_ = audit.LogEvent(session, audit.EventTypeCommand, audit.ActorUser, "session.kill", map[string]interface{}{
-		"phase":          "start",
-		"session":        session,
-		"force":          force,
-		"tags":           tags,
-		"summarize":      summarize,
-		"scope":          auditScope,
-		"working_dir":    dir,
-		"correlation_id": auditCorrelationID,
-	}, nil)
-	defer func() {
-		success := err == nil && !auditAborted
-		payload := map[string]interface{}{
-			"phase":          "finish",
-			"session":        session,
-			"force":          force,
-			"tags":           tags,
-			"summarize":      summarize,
-			"scope":          auditScope,
-			"killed":         auditKilled,
-			"killed_panes":   auditKilledPanes,
-			"no_targets":     auditNoTargets,
-			"aborted":        auditAborted,
-			"success":        success,
-			"duration_ms":    time.Since(auditStart).Milliseconds(),
-			"working_dir":    dir,
-			"correlation_id": auditCorrelationID,
-		}
-		if err != nil {
-			payload["error"] = err.Error()
-		}
-		_ = audit.LogEvent(session, audit.EventTypeCommand, audit.ActorUser, "session.kill", payload, nil)
-	}()
-
-	// Initialize hook executor
-	var hookExec *hooks.Executor
-	if !noHooks {
-		var err error
-		hookExec, err = hooks.NewExecutorFromConfig()
-		if err != nil {
-			if !jsonOutput {
-				fmt.Printf("⚠ Could not load hooks config: %v\n", err)
-			}
-			hookExec = hooks.NewExecutor(nil)
-		}
-	}
-
-	// Build hook context
-	hookCtx := hooks.ExecutionContext{
-		SessionName: session,
-		ProjectDir:  dir,
-		AdditionalEnv: map[string]string{
-			"NTM_FORCE_KILL": boolToStr(force),
-			"NTM_KILL_TAGS":  strings.Join(tags, ","),
-		},
-	}
-
-	// Run pre-kill hooks
-	if hookExec != nil && hookExec.HasHooksForEvent(hooks.EventPreKill) {
-		if !jsonOutput {
-			fmt.Println("Running pre-kill hooks...")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		results, err := hookExec.RunHooksForEvent(ctx, hooks.EventPreKill, hookCtx)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("pre-kill hook failed: %w", err)
-		}
-		if hooks.AnyFailed(results) {
-			return fmt.Errorf("pre-kill hook failed: %w", hooks.AllErrors(results))
-		}
-	}
-
-	// Generate summary before killing if requested
-	if summarize {
-		fmt.Println("Generating session summary...")
-		summaryResult, err := generateKillSummary(ctx, session, sessionInferred)
-		if err != nil {
-			fmt.Printf("⚠ Summary generation failed: %v\n", err)
-		} else {
-			fmt.Println("\n" + summaryResult.Text + "\n")
-		}
-	}
-
-	// If tags are provided, kill specific panes
-	if len(tags) > 0 {
-		panes, err := tmux.GetPanes(session)
-		if err != nil {
-			return err
-		}
-
-		var toKill []tmux.Pane
-		for _, p := range panes {
-			if HasAnyTag(p.Tags, tags) {
-				toKill = append(toKill, p)
-			}
-		}
-
-		if len(toKill) == 0 {
-			fmt.Println("No panes found matching tags.")
-			auditNoTargets = true
-			return nil
-		}
-
-		if !force {
-			title := fmt.Sprintf("Kill %d pane(s)?", len(toKill))
-			desc := fmt.Sprintf("This will terminate panes matching tags %v in session '%s'.", tags, session)
-			if !confirmHuhDestructive(title, desc) {
-				auditAborted = true
-				fmt.Println("Aborted.")
-				return nil
-			}
-		}
-
-		for _, p := range toKill {
-			if err := tmux.KillPane(p.ID); err != nil {
-				return fmt.Errorf("killing pane %s: %w", p.ID, err)
-			}
-		}
-		addTimelineStopMarkers(session, toKill)
-		auditKilled = true
-		auditKilledPanes = len(toKill)
-		fmt.Printf("Killed %d pane(s)\n", len(toKill))
-		return nil
-	}
-
 	if !force {
-		panes, err := tmux.GetPanes(session)
-		if err != nil {
-			return err
-		}
-
-		title := fmt.Sprintf("Kill session '%s'?", session)
-		desc := fmt.Sprintf("This will terminate %d running agent(s).", len(panes))
-		if !confirmHuhDestructive(title, desc) {
-			auditAborted = true
-			fmt.Println("Aborted.")
-			return nil
-		}
+		req.confirm = confirmHuhDestructive
 	}
-
-	panesForStop, err := tmux.GetPanes(session)
-	if err == nil {
-		addTimelineStopMarkers(session, panesForStop)
+	outcome, err := executeKill(ctx, req)
+	if outcome.summaryErr != nil {
+		fmt.Printf("⚠ Summary generation failed: %v\n", outcome.summaryErr)
+	} else if outcome.summary != nil {
+		fmt.Println("\n" + outcome.summary.Text + "\n")
 	}
-
-	// Finalize timeline persistence before killing the session
-	if err := state.EndSessionTimeline(session); err != nil {
-		// Log but don't fail - timeline finalization is not critical
-		if !jsonOutput {
-			fmt.Printf("⚠ Timeline finalization failed: %v\n", err)
-		}
-	}
-
-	// Collect the agent process subtree of every pane BEFORE killing the
-	// session. Agents (often node/bun launched with --dangerously-skip-
-	// permissions) run as descendants of the pane shell PID; on a tmux
-	// kill-session SIGHUP they can survive, reparent to init, and leak —
-	// holding agent-mail registrations and file locks. We snapshot the subtree
-	// now while the shells are still alive, then reap any survivors after the
-	// session is gone.
-	var panePIDs []int
-	for _, p := range panesForStop {
-		panePIDs = append(panePIDs, p.PID)
-	}
-	orphanCandidates := collectPaneDescendants(panePIDs)
-
-	// Kill the monitor process before destroying the session
-	if output, err := exec.Command("pkill", "-f", monitorProcessPattern(session)).CombinedOutput(); err != nil {
-		// Monitor may not be running — that's fine
-		_ = output
-	}
-
-	if err := tmux.KillSession(session); err != nil {
+	if err != nil {
 		return err
 	}
-	auditKilled = true
-
-	// Reap any agent process subtrees that survived kill-session.
-	reapOrphanProcesses(orphanCandidates)
-
-	fmt.Printf("Killed session '%s'\n", session)
-
-	// Post-kill hooks?
-	// The session is gone, but we can still run hooks in context of what was killed.
-	if hookExec != nil && hookExec.HasHooksForEvent(hooks.EventPostKill) {
-		if !jsonOutput {
-			fmt.Println("Running post-kill hooks...")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		results, err := hookExec.RunHooksForEvent(ctx, hooks.EventPostKill, hookCtx)
-		cancel()
-		if err != nil {
-			if !jsonOutput {
-				fmt.Printf("⚠ Post-kill hook error: %v\n", err)
-			}
-		} else if hooks.AnyFailed(results) {
-			if !jsonOutput {
-				fmt.Printf("⚠ Post-kill hook failed: %v\n", hooks.AllErrors(results))
-			}
-		}
+	switch {
+	case outcome.aborted:
+		fmt.Println("Aborted.")
+	case outcome.noTargets:
+		fmt.Println("No panes found matching tags.")
+	default:
+		fmt.Println(outcome.message)
 	}
-
 	return nil
 }
 
@@ -3086,7 +3388,7 @@ func runKillProject(ctx context.Context, w io.Writer, project string, force bool
 // buildKillResponse constructs the response for session kill.
 // Used by both kernel handler and direct CLI calls.
 // In JSON/robot mode, force is effectively always true (no interactive confirmation).
-func buildKillResponse(ctx context.Context, session string, force bool, tags []string, noHooks bool, summarize bool) (resp *output.KillResponse, err error) {
+func buildKillResponse(ctx context.Context, session string, force bool, tags []string, noHooks bool, summarize bool) (*output.KillResponse, error) {
 	if err := tmux.EnsureInstalled(); err != nil {
 		return nil, err
 	}
@@ -3100,15 +3402,60 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 		return nil, fmt.Errorf("session '%s' not found", session)
 	}
 
-	dir := getSessionWorkingDir(ctx, session, false)
+	outcome, err := executeKill(ctx, killRequest{session: session, force: force, tags: tags, noHooks: noHooks, summarize: summarize})
+	if err != nil {
+		return nil, err
+	}
+	return &output.KillResponse{
+		TimestampedResponse: output.NewTimestamped(),
+		Session:             session,
+		Killed:              outcome.killed,
+		Message:             outcome.message,
+		Summary:             outcome.summary,
+	}, nil
+}
+
+// killRequest is one kill of a resolved session, or of its panes matching
+// tags. The terminal and JSON surfaces resolve the session their own way and
+// then share executeKill, so both write the same audit record, run the same
+// hooks, reap the same orphaned agent processes and emit the same webhook
+// events. Each used to carry its own copy: the terminal kill emitted no events
+// and the JSON kill reaped no orphans (bd-zp9su).
+type killRequest struct {
+	session   string
+	inferred  bool
+	force     bool
+	tags      []string
+	noHooks   bool
+	summarize bool
+	// confirm asks before destroying anything; nil never asks.
+	confirm func(title, desc string) bool
+	// notify prints progress for a person; nil is silent.
+	notify func(format string, args ...any)
+}
+
+type killOutcome struct {
+	killed      bool
+	aborted     bool
+	noTargets   bool
+	killedPanes int
+	message     string
+	summary     *summary.SessionSummary
+	summaryErr  error
+}
+
+func executeKill(ctx context.Context, req killRequest) (outcome killOutcome, err error) {
+	session, force, tags, summarize := req.session, req.force, req.tags, req.summarize
+	notify := req.notify
+	if notify == nil {
+		notify = func(string, ...any) {}
+	}
+	dir := getSessionWorkingDir(ctx, session, req.inferred)
 	auditStart := time.Now()
 	auditScope := "session"
 	if len(tags) > 0 {
 		auditScope = "tags"
 	}
-	auditKilled := false
-	auditNoTargets := false
-	auditKilledPanes := 0
 	_ = audit.LogEvent(session, audit.EventTypeCommand, audit.ActorUser, "session.kill", map[string]interface{}{
 		"phase":          "start",
 		"session":        session,
@@ -3120,7 +3467,7 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 		"correlation_id": auditCorrelationID,
 	}, nil)
 	defer func() {
-		success := err == nil
+		success := err == nil && !outcome.aborted
 		payload := map[string]interface{}{
 			"phase":          "finish",
 			"session":        session,
@@ -3128,9 +3475,10 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 			"tags":           tags,
 			"summarize":      summarize,
 			"scope":          auditScope,
-			"killed":         auditKilled,
-			"killed_panes":   auditKilledPanes,
-			"no_targets":     auditNoTargets,
+			"killed":         outcome.killed,
+			"killed_panes":   outcome.killedPanes,
+			"no_targets":     outcome.noTargets,
+			"aborted":        outcome.aborted,
 			"success":        success,
 			"duration_ms":    time.Since(auditStart).Milliseconds(),
 			"working_dir":    dir,
@@ -3162,11 +3510,11 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 
 	// Initialize hook executor
 	var hookExec *hooks.Executor
-	if !noHooks {
+	if !req.noHooks {
 		var err error
 		hookExec, err = hooks.NewExecutorFromConfig()
 		if err != nil {
-			// In kernel mode, we don't have interactive output
+			notify("⚠ Could not load hooks config: %v\n", err)
 			hookExec = hooks.NewExecutor(nil)
 		}
 	}
@@ -3183,35 +3531,33 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 
 	// Run pre-kill hooks
 	if hookExec != nil && hookExec.HasHooksForEvent(hooks.EventPreKill) {
+		notify("Running pre-kill hooks...\n")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		results, err := hookExec.RunHooksForEvent(ctx, hooks.EventPreKill, hookCtx)
 		cancel()
 		if err != nil {
-			return nil, fmt.Errorf("pre-kill hook failed: %w", err)
+			return outcome, fmt.Errorf("pre-kill hook failed: %w", err)
 		}
 		if hooks.AnyFailed(results) {
-			return nil, fmt.Errorf("pre-kill hook failed: %w", hooks.AllErrors(results))
+			return outcome, fmt.Errorf("pre-kill hook failed: %w", hooks.AllErrors(results))
 		}
 	}
 
-	// Generate summary before killing if requested
-	var summaryResult *summary.SessionSummary
+	// Generate summary before killing if requested. A failure does not stop
+	// the kill; the error is reported with the outcome.
 	if summarize {
-		var err error
-		summaryResult, err = generateKillSummary(ctx, session, false)
-		if err != nil {
-			// Non-fatal - continue with kill but note the error
-			summaryResult = nil
+		notify("Generating session summary...\n")
+		outcome.summary, outcome.summaryErr = generateKillSummary(ctx, session, req.inferred)
+		if outcome.summaryErr != nil {
+			outcome.summary = nil
 		}
 	}
-
-	var message string
 
 	// If tags are provided, kill specific panes
 	if len(tags) > 0 {
 		panes, err := tmux.GetPanes(session)
 		if err != nil {
-			return nil, err
+			return outcome, err
 		}
 
 		var toKill []tmux.Pane
@@ -3222,19 +3568,23 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 		}
 
 		if len(toKill) == 0 {
-			auditNoTargets = true
-			resp = &output.KillResponse{
-				TimestampedResponse: output.NewTimestamped(),
-				Session:             session,
-				Killed:              false,
-				Message:             "No panes found matching tags",
+			outcome.noTargets = true
+			outcome.message = "No panes found matching tags"
+			return outcome, nil
+		}
+
+		if req.confirm != nil {
+			title := fmt.Sprintf("Kill %d pane(s)?", len(toKill))
+			desc := fmt.Sprintf("This will terminate panes matching tags %v in session '%s'.", tags, session)
+			if !req.confirm(title, desc) {
+				outcome.aborted = true
+				return outcome, nil
 			}
-			return resp, nil
 		}
 
 		for _, p := range toKill {
 			if err := tmux.KillPane(p.ID); err != nil {
-				return nil, fmt.Errorf("killing pane %s: %w", p.ID, err)
+				return outcome, fmt.Errorf("killing pane %s: %w", p.ID, err)
 			}
 			events.DefaultEmitter().Emit(events.NewWebhookEvent(
 				events.WebhookAgentStopped,
@@ -3251,35 +3601,92 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 			))
 		}
 		addTimelineStopMarkers(session, toKill)
-		auditKilled = true
-		auditKilledPanes = len(toKill)
-		message = fmt.Sprintf("Killed %d pane(s) matching tags", len(toKill))
+		outcome.killed = true
+		outcome.killedPanes = len(toKill)
+		outcome.message = fmt.Sprintf("Killed %d pane(s) matching tags", len(toKill))
 	} else {
+		if req.confirm != nil {
+			panes, err := tmux.GetPanes(session)
+			if err != nil {
+				return outcome, err
+			}
+			title := fmt.Sprintf("Kill session '%s'?", session)
+			desc := fmt.Sprintf("This will terminate %d running agent(s).", len(panes))
+			if !req.confirm(title, desc) {
+				outcome.aborted = true
+				return outcome, nil
+			}
+		}
+
+		// Join the owning resident before recording the process subtree or
+		// ending its timeline. Recovery must not create another agent during
+		// shutdown.
+		local := tmux.DefaultClient.Remote == ""
+		if local {
+			if err := stopKillSessionMonitor(ctx, session); err != nil {
+				return outcome, fmt.Errorf("stopping session monitor before kill: %w", err)
+			}
+		}
 		panesForStop, err := tmux.GetPanes(session)
 		if err == nil {
 			addTimelineStopMarkers(session, panesForStop)
 		}
 
-		// Finalize timeline persistence before killing the session
-		_ = state.EndSessionTimeline(session) // Ignore error - not critical
+		// Finalize timeline persistence before killing the session; a
+		// failure is reported but does not stop the kill.
+		if err := state.EndSessionTimeline(session); err != nil {
+			notify("⚠ Timeline finalization failed: %v\n", err)
+		}
 
-		// Kill the monitor process before destroying the session (same as runKill)
-		if output, err := exec.Command("pkill", "-f", monitorProcessPattern(session)).CombinedOutput(); err != nil {
-			_ = output // Monitor may not be running — that's fine
+		// Collect the agent process subtree of every pane BEFORE killing the
+		// session. Agents (often node/bun launched with --dangerously-skip-
+		// permissions) run as descendants of the pane shell PID; on a tmux
+		// kill-session SIGHUP they can survive, reparent to init, and leak —
+		// holding agent-mail registrations and file locks. We snapshot the
+		// subtree now while the shells are still alive, then reap any
+		// survivors after the session is gone. Remote pane PIDs belong to
+		// another host and cannot identify local processes for collection or
+		// signaling.
+		var orphanCandidates []int
+		if local {
+			var panePIDs []int
+			for _, p := range panesForStop {
+				panePIDs = append(panePIDs, p.PID)
+			}
+			orphanCandidates = collectKillPaneDescendants(panePIDs)
 		}
 
 		if err := tmux.KillSession(session); err != nil {
-			return nil, err
+			return outcome, err
 		}
-		auditKilled = true
-		message = fmt.Sprintf("Killed session '%s'", session)
+		outcome.killed = true
+
+		// Reap any agent process subtrees that survived kill-session.
+		if local {
+			reapKillOrphans(orphanCandidates)
+		}
+
+		// Best-effort: release Agent Mail reservations held by the session's
+		// registered pane agents and drop stale pane identities (bd-1bdvy).
+		// Never blocks or fails the kill when the mail server is down.
+		cleanupAgentMailOnKill(ctx, session, dir)
+
+		// Drop persisted routing state for the killed session so a recreated
+		// session with the same name does not inherit a stale last_agent /
+		// rotation cursor (bd-88um4). Best-effort: routing state is only a hint.
+		if st, err := state.Open(""); err == nil {
+			_ = st.DeleteRoutingState(session)
+			_ = st.Close()
+		}
+
+		outcome.message = fmt.Sprintf("Killed session '%s'", session)
 
 		events.DefaultEmitter().Emit(events.NewWebhookEvent(
 			events.WebhookSessionKilled,
 			session,
 			"",
 			"",
-			message,
+			outcome.message,
 			map[string]string{
 				"project_dir": dir,
 				"force":       boolToStr(force),
@@ -3291,7 +3698,7 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 			session,
 			"",
 			"",
-			message,
+			outcome.message,
 			map[string]string{
 				"project_dir": dir,
 				"force":       boolToStr(force),
@@ -3299,22 +3706,21 @@ func buildKillResponse(ctx context.Context, session string, force bool, tags []s
 		))
 	}
 
-	// Post-kill hooks
+	// Post-kill hooks run in the context of what was killed. Their errors are
+	// reported but do not fail the kill.
 	if hookExec != nil && hookExec.HasHooksForEvent(hooks.EventPostKill) {
+		notify("Running post-kill hooks...\n")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		_, _ = hookExec.RunHooksForEvent(ctx, hooks.EventPostKill, hookCtx)
+		results, err := hookExec.RunHooksForEvent(ctx, hooks.EventPostKill, hookCtx)
 		cancel()
-		// Post-kill hook errors are logged but don't fail the response
+		if err != nil {
+			notify("⚠ Post-kill hook error: %v\n", err)
+		} else if hooks.AnyFailed(results) {
+			notify("⚠ Post-kill hook failed: %v\n", hooks.AllErrors(results))
+		}
 	}
 
-	resp = &output.KillResponse{
-		TimestampedResponse: output.NewTimestamped(),
-		Session:             session,
-		Killed:              true,
-		Message:             message,
-		Summary:             summaryResult,
-	}
-	return resp, nil
+	return outcome, nil
 }
 
 // generateKillSummary generates a session summary for use before killing.
@@ -3377,7 +3783,6 @@ func truncatePrompt(s string, maxLen int) string {
 	return s[:prevI] + "..."
 }
 
-// buildTargetDescription creates a human-readable description of send targets
 func buildObservedTargetTypes(panes []tmux.Pane) string {
 	seen := make(map[string]struct{})
 	targets := make([]string, 0, len(panes))
@@ -3395,38 +3800,7 @@ func buildObservedTargetTypes(panes []tmux.Pane) string {
 	return strings.Join(targets, ",")
 }
 
-// sendRouteAgentType returns the robot routing filter for --smart sends. It
-// names an agent type only when exactly one type flag is set; mixed or absent
-// type flags leave routing unfiltered.
-func sendRouteAgentType(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse bool) string {
-	if targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
-		return "claude"
-	} else if targetCod && !targetCC && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
-		return "codex"
-	} else if targetGmi && !targetCC && !targetCod && !targetPi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
-		return "gemini"
-	} else if targetPi && !targetCC && !targetCod && !targetGmi && !targetKimi && !targetAgy && !targetOc && !targetMuse {
-		return "pi"
-	} else if targetKimi && !targetCC && !targetCod && !targetGmi && !targetPi && !targetAgy && !targetOc && !targetMuse {
-		return "kimi"
-	} else if targetAgy && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetOc && !targetMuse {
-		return "antigravity"
-	} else if targetOc && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetMuse {
-		return "opencode"
-	} else if targetMuse && !targetCC && !targetCod && !targetGmi && !targetPi && !targetKimi && !targetAgy && !targetOc {
-		return "muse"
-	}
-	return ""
-}
-
-func buildTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
-	return buildTargetDescriptionWithPi(targetCC, targetCod, targetGmi, false, targetAgy, targetAll, skipFirst, paneIndex, tags)
-}
-
-func buildTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst bool, paneIndex int, tags []string) string {
-	return buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, false, targetAgy, false, false, targetAll, skipFirst, paneIndex, tags)
-}
-
+// buildTargetDescriptionWithPiAndKimi creates a human-readable description of send targets
 func buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse, targetAll, skipFirst bool, paneIndex int, tags []string) string {
 	if paneIndex >= 0 {
 		return fmt.Sprintf("pane:%d", paneIndex)
@@ -3473,14 +3847,6 @@ func buildTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetP
 	return strings.Join(targets, ",")
 }
 
-func buildSendTargetDescription(targetCC, targetCod, targetGmi, targetAgy, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
-	return buildSendTargetDescriptionWithPi(targetCC, targetCod, targetGmi, false, targetAgy, targetAll, skipFirst, paneIndex, paneSelector, paneSelectors, panesSpecified, tags)
-}
-
-func buildSendTargetDescriptionWithPi(targetCC, targetCod, targetGmi, targetPi, targetAgy, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
-	return buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, false, targetAgy, false, false, targetAll, skipFirst, paneIndex, paneSelector, paneSelectors, panesSpecified, tags)
-}
-
 func buildSendTargetDescriptionWithPiAndKimi(targetCC, targetCod, targetGmi, targetPi, targetKimi, targetAgy, targetOc, targetMuse, targetAll, skipFirst bool, paneIndex int, paneSelector string, paneSelectors []string, panesSpecified bool, tags []string) string {
 	if paneSelector != "" {
 		return "pane:" + paneSelector
@@ -3517,7 +3883,14 @@ var dcgCommandPrefixes = map[string]struct{}{
 	"rch":       {},
 }
 
-func maybeBlockSendWithDCG(prompt, session string, panes []tmux.Pane) error {
+// init makes robot sends (--robot-send, REST sends) apply the same dcg guard
+// as `ntm send`; the guard lives here because it reads the cli config global
+// and metrics collector, and robot cannot import cli without a cycle.
+func init() {
+	robot.SetSendCommandGuard(maybeBlockSendWithDCG)
+}
+
+func maybeBlockSendWithDCG(ctx context.Context, prompt, session string, panes []tmux.Pane) error {
 	if cfg == nil || !cfg.Integrations.DCG.Enabled {
 		return nil
 	}
@@ -3532,11 +3905,16 @@ func maybeBlockSendWithDCG(prompt, session string, panes []tmux.Pane) error {
 		return nil
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	adapter := tools.NewDCGAdapter()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if !adapter.IsAvailable(ctx) {
-		return nil
+		// Missing dcg means no check; a probe cut short means unknown, and the
+		// send is refused rather than let through unchecked.
+		return ctx.Err()
 	}
 
 	for _, command := range commands {
@@ -3550,7 +3928,8 @@ func maybeBlockSendWithDCG(prompt, session string, panes []tmux.Pane) error {
 			if reason == "" {
 				reason = "blocked by dcg"
 			}
-			return fmt.Errorf("blocked by dcg: %s", reason)
+			recordBlockedCommandMetric(session, command, reason, panes)
+			return fmt.Errorf("%w: %s", robot.ErrSendCommandBlocked, reason)
 		}
 	}
 	return nil
@@ -3727,18 +4106,31 @@ func shellFinalMessageRedactor(redactCfg redaction.Config) dispatchsvc.FinalMess
 }
 
 func newShellDispatchService(session string, selected []tmux.Pane, redactCfg redaction.Config) (*dispatchsvc.Service, error) {
-	return newShellDispatchServiceWithGate(session, selected, redactCfg, nil)
+	return newShellDispatchServiceWithGate(session, selected, nil, redactCfg, nil)
 }
 
+// newShellDispatchServiceWithGate builds the shell send dispatch service.
+// targetMessages, keyed by pane stable key, replaces the request's base message
+// per target (per-pane template renders); nil sends the base message to every
+// target, and a non-nil map missing a planned target fails preflight.
 func newShellDispatchServiceWithGate(
 	session string,
 	selected []tmux.Pane,
+	targetMessages map[string]string,
 	redactCfg redaction.Config,
 	beforeDispatch func(context.Context, dispatchsvc.Request, []dispatchsvc.Delivery) error,
 ) (*dispatchsvc.Service, error) {
 	return dispatchsvc.NewService(dispatchsvc.Ports{
 		Builder: dispatchsvc.FinalMessageBuilderFunc(func(_ context.Context, input dispatchsvc.BuildInput) (string, error) {
-			return stampMarchingOrders(input.BaseMessage, session, input.Target.Pane.WindowIndex, input.Target.Pane.Index), nil
+			message := input.BaseMessage
+			if targetMessages != nil {
+				perTarget, ok := targetMessages[input.Target.Ref.StableKey()]
+				if !ok {
+					return "", fmt.Errorf("no rendered prompt for pane %s", input.Target.Address)
+				}
+				message = perTarget
+			}
+			return stampMarchingOrders(message, session, input.Target.Pane.WindowIndex, input.Target.Pane.Index), nil
 		}),
 		Redactor:  shellFinalMessageRedactor(redactCfg),
 		Orderer:   shellDispatchOrderer(selected),
@@ -3754,6 +4146,11 @@ func newShellDispatchServiceWithGate(
 			if err := (dispatchsvc.TMUXDeliverer{}).ClearComposerForDelivery(ctx, target.ID, delivery); err != nil {
 				return err
 			}
+			if delivery.Target.AgentType.Canonical() == tmux.AgentCodex {
+				if ready, reason := tmux.ComposerReadyForDelivery(ctx, target.ID, delivery.Target.AgentType, target.Width); !ready {
+					return dispatchsvc.GuaranteeNoDeliveryActuation(fmt.Errorf("pane %s not ready for delivery: %s", target.ID, reason))
+				}
+			}
 			switch delivery.Protocol {
 			case dispatchsvc.ProtocolSingleEnter:
 				return tmux.PasteKeysWithDelayContext(ctx, target.ID, delivery.Message, true, delivery.EnterDelay)
@@ -3761,7 +4158,7 @@ func newShellDispatchServiceWithGate(
 				if err := tmux.SendKeysForAgentDoubleEnterContext(ctx, target.ID, delivery.Message, target.Type); err != nil {
 					return err
 				}
-				return dispatchsvc.TMUXDeliverer{}.VerifyAgentSubmission(ctx, target.ID, delivery.Message, target.Type)
+				return dispatchsvc.VerifyAgentSubmission(ctx, target.ID, delivery.Message, target.Type, target.Width)
 			default:
 				return fmt.Errorf("unsupported shell send protocol %q", delivery.Protocol)
 			}
@@ -3775,38 +4172,6 @@ func newShellDispatchServiceWithGate(
 			},
 		},
 	})
-}
-
-func distributeDispatchGate(session string) func(context.Context, dispatchsvc.Request, []dispatchsvc.Delivery) error {
-	return func(ctx context.Context, _ dispatchsvc.Request, deliveries []dispatchsvc.Delivery) error {
-		observation, err := observeAssignSession(ctx, session)
-		if err != nil {
-			return fmt.Errorf("observe distribute targets: %w", err)
-		}
-		activePanes, err := loadActiveAssignmentPanes(session)
-		if err != nil {
-			return fmt.Errorf("load distribute assignment occupancy: %w", err)
-		}
-		now := time.Now()
-		for _, delivery := range deliveries {
-			paneID := strings.TrimSpace(delivery.Target.Ref.ID)
-			if paneID == "" {
-				return fmt.Errorf("distribute target %s has no stable pane ID", delivery.Target.Address)
-			}
-			paneObservation, err := currentAssignPaneObservation(observation, paneID, now)
-			if err != nil {
-				return fmt.Errorf("observe distribute target %s (%s): %w", delivery.Target.Address, paneID, err)
-			}
-			if !paneObservation.SafeToDispatch() {
-				return fmt.Errorf("distribute target %s (%s) is not freshly and confidently idle (state: %s)",
-					delivery.Target.Address, paneID, paneObservation.Current.Status.State)
-			}
-			if _, active := activePanes[paneID]; active {
-				return fmt.Errorf("distribute target %s (%s) already has a durable active assignment", delivery.Target.Address, paneID)
-			}
-		}
-		return nil
-	}
 }
 
 func activeShellDispatchRedactionConfig() redaction.Config {
@@ -4255,6 +4620,15 @@ func logDCGBlocked(command, session string, panes []tmux.Pane, blocked *tools.Bl
 		output = "blocked"
 	}
 
+	for _, paneLabel := range dcgBlockedPaneLabels(panes) {
+		_ = logger.LogBlocked(command, paneLabel, session, rule, output)
+	}
+}
+
+// dcgBlockedPaneLabels names the panes a dcg block applies to: the non-Claude
+// agents, which dcg guards from the send side.
+func dcgBlockedPaneLabels(panes []tmux.Pane) []string {
+	var labels []string
 	for _, p := range panes {
 		if !isNonClaudeAgent(p) {
 			continue
@@ -4267,12 +4641,25 @@ func logDCGBlocked(command, session string, panes []tmux.Pane, blocked *tools.Bl
 				paneLabel = fmt.Sprintf("pane_%d", p.Index)
 			}
 		}
-		_ = logger.LogBlocked(command, paneLabel, session, rule, output)
+		labels = append(labels, paneLabel)
 	}
+	return labels
 }
 
-func resolveSendSessionForCommand(session string) (string, bool, error) {
-	return resolveSendSessionForCommandContext(context.Background(), session)
+// recordBlockedCommandMetric counts a dcg-blocked send toward the session's
+// blocked_commands, which `ntm metrics` reports as destructive_cmd_incidents.
+// It was fed only by an event-bus type nothing published, so every session
+// showed zero blocked commands and a met Tier-0 target.
+func recordBlockedCommandMetric(session, command, reason string, panes []tmux.Pane) {
+	store, collector, err := getMetricsCollector(session)
+	if err != nil {
+		slog.Default().Debug("blocked-command metric unavailable", "session", session, "error", err)
+		return
+	}
+	if store != nil {
+		defer store.Close()
+	}
+	collector.RecordBlockedCommand(strings.Join(dcgBlockedPaneLabels(panes), ","), command, "dcg: "+reason)
 }
 
 func resolveSendSessionForCommandContext(ctx context.Context, session string) (string, bool, error) {
@@ -4691,10 +5078,6 @@ func revalidateDistributeRecommendation(ctx context.Context, projectDir string, 
 		rec.Title = title
 	}
 	return rec, nil
-}
-
-func validateDistributeBeadDetails(rec robot.DistributeRecommendation, details *bv.BeadAssignmentDetails, now time.Time) error {
-	return validateDistributeBeadDetailsWithGate(rec, details, now, bv.IsOperatorGatedLabel)
 }
 
 func validateDistributeBeadDetailsForProject(projectDir string, rec robot.DistributeRecommendation, details *bv.BeadAssignmentDetails, now time.Time) error {

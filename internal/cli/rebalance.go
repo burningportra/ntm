@@ -466,20 +466,31 @@ func normalizeAgentTypeLike(value string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if canonical := agentpkg.AgentType(trimmed).Canonical(); slices.Contains(agentpkg.AgentTypes(), canonical) {
+	if canonical := agentpkg.AgentType(trimmed).Canonical(); isSupportedWorkAgentType(canonical) {
 		return string(canonical)
 	}
 	if head, _, ok := strings.Cut(trimmed, "_"); ok {
-		if canonical := agentpkg.AgentType(head).Canonical(); slices.Contains(agentpkg.AgentTypes(), canonical) {
+		if canonical := agentpkg.AgentType(head).Canonical(); isSupportedWorkAgentType(canonical) {
 			return string(canonical)
 		}
 	}
 	return ""
 }
 
+// isSupportedWorkAgentType reports whether agentType is one of the launchable
+// agent types in agent.AgentTypes, so a new type reaches the rebalance and
+// review-queue filters without another hand list (bd-cizy1).
+func isSupportedWorkAgentType(agentType agentpkg.AgentType) bool {
+	return slices.Contains(agentpkg.AgentTypes(), agentType)
+}
+
 // agentTypeShortName is an agent type's name without its product suffix
-// ("Claude" for Claude Code, "Cursor" for Cursor Agent).
+// ("Claude" for Claude Code, "Cursor" for Cursor Agent). Oh My Pi has no
+// one-word name, so it goes by its command, "Omp".
 func agentTypeShortName(t agentpkg.AgentType) string {
+	if t == agentpkg.AgentTypeOmp {
+		return "Omp"
+	}
 	return strings.Fields(t.DisplayName())[0]
 }
 

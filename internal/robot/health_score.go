@@ -29,6 +29,11 @@ const (
 
 	// RecommendSwitchAccount indicates the provider account is near capacity.
 	RecommendSwitchAccount HealthRecommendation = "SWITCH_ACCOUNT"
+
+	// RecommendManualIntervention indicates a human must answer something
+	// in the pane (trust dialog, login gate) — a restart would NOT help:
+	// the gate reappears on relaunch and the session context is lost.
+	RecommendManualIntervention HealthRecommendation = "MANUAL_INTERVENTION"
 )
 
 // CalculateHealthScore computes a health score (0-100) from local state and provider usage.
@@ -132,7 +137,14 @@ func CollectIssues(localState *PaneWorkStatus, providerUsage *caut.ProviderPaylo
 	}
 
 	if localState.Recommendation == "ERROR_STATE" {
-		issues = append(issues, "Agent in error state - needs attention")
+		// Interactive gate screens (bd-jf22c) carry the specific gate text in
+		// RecommendationReason; surface it instead of the generic message so
+		// --robot-agent-health says WHAT is blocking the pane.
+		if localState.IndicatorBasis == "interactive_gate" && localState.RecommendationReason != "" {
+			issues = append(issues, localState.RecommendationReason)
+		} else {
+			issues = append(issues, "Agent in error state - needs attention")
+		}
 	}
 
 	if localState.IsContextLow {
@@ -184,6 +196,20 @@ func DeriveHealthRecommendation(localState *PaneWorkStatus, providerUsage *caut.
 			}
 		}
 		return RecommendWaitForReset, reason
+	}
+
+	// Interactive gate screen (bd-jf22c): the pane is parked on a modal
+	// trust / login / onboarding screen and will never accept work until a
+	// human answers it (or a restart re-authenticates it). Keep the specific
+	// gate text as the reason so operators know which screen to clear.
+	if localState.IndicatorBasis == "interactive_gate" {
+		reason := localState.RecommendationReason
+		if reason == "" {
+			reason = "Blocked on interactive gate screen; needs a keystroke before the pane can accept work"
+		}
+		// A restart cannot answer a dialog — the gate reappears on relaunch
+		// and the pane's context is destroyed for nothing. Route a human.
+		return RecommendManualIntervention, reason
 	}
 
 	// Check for error state

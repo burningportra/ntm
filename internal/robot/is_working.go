@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
-	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -111,10 +110,24 @@ type PaneWorkStatus struct {
 	PaneCurrentCommand string `json:"pane_current_command,omitempty"`
 	AgentCLIDead       bool   `json:"agent_cli_dead,omitempty"`
 
+	// UnsubmittedInput / QueuedMessages surface the composer state
+	// (bd-v8dqd): a pane can be idle, blocking the swarm, and holding
+	// prompts unread all at once, and no working/idle verdict shows it.
+	// UnsubmittedInput: real text is sitting in the input box unsubmitted.
+	// QueuedMessages: the TUI reports queued not-yet-processed messages.
+	UnsubmittedInput bool `json:"unsubmitted_input,omitempty"`
+	QueuedMessages   bool `json:"queued_messages,omitempty"`
+
 	// SemanticProgress is the OPTIONAL, additive ground-truth signal (#199),
 	// present only under --semantic and omitted entirely otherwise. It is
 	// advisory: it never changes IsWorking/IsIdle/Recommendation above.
 	SemanticProgress *SemanticProgress `json:"semantic_progress,omitempty"`
+
+	// paneType is the pane's tmux-recorded agent type (paneAgentType), or ""
+	// when the pane was not observed. Unlike AgentType it is never rewritten
+	// by output parsing, so it can tell a user shell from an agent whose
+	// type the parser could not confirm (ntm#335). Not serialized.
+	paneType string
 }
 
 // IsWorkingSummary provides aggregate statistics across all panes.
@@ -173,8 +186,8 @@ func getRecommendationReason(state *agent.AgentState) string {
 // idle signal and an error match elsewhere in the capture is historical rather
 // than the pane's current state. Rate-limit and context-low flags remain intact
 // and therefore retain their normal recommendation precedence.
-func applyLiveBusyOverride(content string, state *agent.AgentState) bool {
-	if state == nil || !isAIAgentLiveBusy(content, string(state.Type)) {
+func applyLiveBusyOverride(content string, state *agent.AgentState, paneWidth int) bool {
+	if state == nil || !isAIAgentLiveBusy(content, string(state.Type), paneWidth) {
 		return false
 	}
 	canonicalType := state.Type.Canonical()
@@ -530,6 +543,12 @@ func classifyPaneWork(parser agent.Parser, paneObservation statuspkg.PaneObserva
 	status.Recommendation = string(parsed.GetRecommendation())
 	status.RecommendationReason = getRecommendationReason(parsed)
 
+	// Composer visibility (bd-v8dqd): report unsubmitted input and
+	// queued messages so a pane that is idle-but-blocking is legible.
+	composer := tmux.InspectComposer(content, tmux.AgentType(parsed.Type))
+	status.UnsubmittedInput = composer.HoldsText
+	status.QueuedMessages = composer.QueuedMessages
+
 	// Live-window THINKING override (#133). The legacy parser can mark a
 	// pane idle when its prompt-pattern view does not see in-flight work
 	// driven by another orchestrator, but `--robot-activity` would still
@@ -553,7 +572,7 @@ func classifyPaneWork(parser agent.Parser, paneObservation statuspkg.PaneObserva
 	// window supersedes stale prompt/error matches, while rate-limit and
 	// context-low signals retain their normal precedence. ParseWithHint
 	// returns a fresh *AgentState, so this mutation is local to this pane.
-	liveBusy := applyLiveBusyOverride(content, parsed)
+	liveBusy := applyLiveBusyOverride(content, parsed, paneObservation.Metadata.Width)
 	if liveBusy {
 		status.IsWorking = true
 		status.IsIdle = false
@@ -570,6 +589,8 @@ func classifyPaneWork(parser agent.Parser, paneObservation statuspkg.PaneObserva
 	parsedStatus := status
 	applyCanonicalWorkSafety(&status, paneObservation, liveBusy)
 	status.IndicatorBasis = workIndicatorBasis(parsed, liveBusy, parsedStatus, status, paneObservation)
+	applyInteractiveGateOverride(&status, parsed.Type, content, paneObservation.Metadata.Width)
+	applyProviderErrorOverride(&status, parsed.Type, content)
 
 	// Ensure indicators are never nil
 	if status.Indicators.Work == nil {
@@ -596,17 +617,6 @@ func observedPaneWork(parser agent.Parser, paneObservation statuspkg.PaneObserva
 		return nil
 	}
 	return &status
-}
-
-// classifyCapturedPaneWork classifies output another collector already
-// captured. It feeds the capture through the observer's state machine without
-// another tmux call, then classifies it with observedPaneWork.
-func classifyCapturedPaneWork(observer *statuspkg.SessionObserver, parser agent.Parser, session string, pane tmux.PaneActivity, output, captureErr string) *PaneWorkStatus {
-	var err error
-	if captureErr != "" {
-		err = errors.New(captureErr)
-	}
-	return observedPaneWork(parser, observer.ObservePaneCapture(session, pane, output, err))
 }
 
 // runtimeAgentState maps a pane's work verdict onto the agent state vocabulary
@@ -674,23 +684,84 @@ func paneWorkStatusFromObservation(observation statuspkg.PaneObservation) PaneWo
 		ObservationError:      observation.Current.Error,
 		SafeToDispatch:        observation.SafeToDispatch(),
 	}
-	// Pane age comes from the shell PID's process start time: tmux has no
-	// per-pane creation-time format variable, and the shell PID is replaced
-	// on respawn — exactly the "current incarnation" semantics age-based
-	// replacement policies need (ntm-qvpm). Best-effort: a vanished PID
-	// simply omits the fields.
-	if pid := observation.Metadata.PID; pid > 0 {
-		if startedAt, err := process.StartTime(pid); err == nil {
-			result.PaneStartedAt = FormatTimestamp(startedAt)
-			if uptime := int64(time.Since(startedAt).Seconds()); uptime > 0 {
-				result.AgentUptimeSeconds = uptime
-			}
+	// Pane age is the current shell incarnation's (PaneStartedAt) — exactly
+	// the semantics age-based replacement policies need (ntm-qvpm).
+	// Best-effort: a vanished PID simply omits the fields.
+	if startedAt, ok := PaneStartedAt(observation.Metadata.PID); ok {
+		result.PaneStartedAt = FormatTimestamp(startedAt)
+		if uptime := int64(time.Since(startedAt).Seconds()); uptime > 0 {
+			result.AgentUptimeSeconds = uptime
 		}
+	}
+	if strings.TrimSpace(observation.Metadata.ID) != "" {
+		result.paneType = paneAgentType(observation.Metadata)
 	}
 	result.PanePID = observation.Metadata.PID
 	result.PaneCurrentCommand = observation.Metadata.Command
 	result.AgentCLIDead = observation.Metadata.AgentCLIDead()
 	return result
+}
+
+// applyInteractiveGateOverride flags a pane whose live tail shows a modal
+// interactive gate screen — a trust dialog, auth/login gate, or first-run
+// onboarding choice (bd-jf22c). Such a pane is alive and usually classifies
+// "idle", so --robot-is-working and the downstream --robot-agent-health
+// surface reported it healthy while it could never accept work (field cases:
+// Antigravity's folder-trust dialog; panes frozen on an authentication-error
+// frame after an OAuth token race).
+//
+// Guards against false positives: user/unknown panes are skipped (no agent
+// CLI renders gates there); a working pane keeps its verdict (the shared
+// detector additionally vetoes matches while Claude/Codex working chrome is
+// visible, so an agent merely QUOTING a gate phrase mid-turn is not flagged);
+// and a rate-limited pane keeps its higher-precedence WAIT verdict. Residual
+// risk — an idle agent whose final transcript lines quote a gate phrase —
+// is documented on agent.DetectInteractiveGate.
+//
+// Reports true when the override fired.
+func applyInteractiveGateOverride(workStatus *PaneWorkStatus, agentType agent.AgentType, content string, paneWidth int) bool {
+	if workStatus == nil || workStatus.IsWorking || workStatus.IsRateLimited {
+		return false
+	}
+	switch agentType.Canonical() {
+	case agent.AgentTypeUser, agent.AgentTypeUnknown:
+		return false
+	}
+	gate, ok := agent.DetectInteractiveGate(content, paneWidth)
+	if !ok {
+		return false
+	}
+	// Not idle-ready either: anything sent to this pane lands on the modal
+	// screen, so orchestrators must not feed it work. MANUAL_INTERVENTION
+	// (not ERROR_STATE): a restart cannot answer a dialog — the gate
+	// reappears on relaunch with the session context destroyed — so this
+	// verdict must not feed restart machinery.
+	workStatus.IsIdle = false
+	workStatus.Recommendation = "MANUAL_INTERVENTION"
+	workStatus.RecommendationReason = fmt.Sprintf("Blocked on interactive gate screen (%q); needs a keystroke before the pane can accept work", gate)
+	workStatus.IndicatorBasis = "interactive_gate"
+	return true
+}
+
+// applyProviderErrorOverride names a retryable provider failure. Oh My Pi ends
+// a failed turn with a dismissable error block above its quiet composer
+// ("server_error: ERROR" from a live OpenRouter failure); the pane accepts
+// input and any new message retries, so it is neither idle-after-completion
+// (orchestrators must not treat the task as done or feed unrelated work) nor
+// a dead pane that needs a restart. Reports true when the override fired.
+func applyProviderErrorOverride(workStatus *PaneWorkStatus, agentType agent.AgentType, content string) bool {
+	if workStatus == nil || workStatus.IsWorking || agentType.Canonical() != agent.AgentTypeOmp {
+		return false
+	}
+	summary, ok := agent.OmpProviderError(content)
+	if !ok {
+		return false
+	}
+	workStatus.IsIdle = false
+	workStatus.Recommendation = string(agent.RecommendErrorState)
+	workStatus.RecommendationReason = fmt.Sprintf("Provider error %q ended the turn; %s", summary, agent.OmpProviderErrorRecovery)
+	workStatus.IndicatorBasis = "provider_error"
+	return true
 }
 
 // applyCanonicalWorkSafety reconciles the parser verdict with the canonical
@@ -874,7 +945,8 @@ func selectIsWorkingPanes(session string, allPanes []tmux.Pane, requested []int)
 			}
 			continue
 		}
-		// Multiple panes: skip this window's lowest-index pane (control pane).
+		// Multiple panes: skip this window's lowest-index pane (control pane)
+		// unless ntm knows it runs an agent (see paneIsDefaultControlPane).
 		minIdx := wp[0].Index
 		for _, p := range wp[1:] {
 			if p.Index < minIdx {
@@ -882,12 +954,28 @@ func selectIsWorkingPanes(session string, allPanes []tmux.Pane, requested []int)
 			}
 		}
 		for _, p := range wp {
-			if p.Index != minIdx {
+			if p.Index != minIdx || !paneIsDefaultControlPane(p) {
 				out = append(out, build(p))
 			}
 		}
 	}
 	return out
+}
+
+// paneIsDefaultControlPane reports whether a lowest-index pane that the "all
+// agent panes" defaults would skip really is a control pane. A pane whose agent
+// type ntm knows — recorded by `ntm adopt` / spawn in @ntm_agent_type, carried
+// in an NTM title, or detected from its process — is an agent even at the
+// lowest index: adopted sessions and --no-user spawns have no user pane, and
+// with pane-base-index 1 their first agent is pane 1. Only user and
+// unclassifiable panes keep the historical control-pane skip.
+func paneIsDefaultControlPane(p tmux.Pane) bool {
+	switch paneAgentType(p) {
+	case "user", "unknown":
+		return true
+	default:
+		return false
+	}
 }
 
 // sessionSpansMultipleWindows reports whether the session's panes live in more
@@ -920,7 +1008,7 @@ func isWorkingPaneKey(sel selectedPane, multiWindow bool) string {
 // pane_current_path. Used only by the --semantic path to locate the repo for
 // token-attributed reads; returns "" on any failure (degrades to source none).
 func paneCurrentPathForTarget(ctx context.Context, target string) string {
-	output, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-t", target, "-p", "#{pane_current_path}")
+	output, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-t", tmux.ExactTarget(target), "-p", "#{pane_current_path}")
 	if err != nil {
 		return ""
 	}

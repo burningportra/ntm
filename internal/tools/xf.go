@@ -5,12 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
-
-	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 // XFAdapter provides integration with the XF (X Find) tool.
@@ -26,8 +23,6 @@ func NewXFAdapter() *XFAdapter {
 		BaseAdapter: NewBaseAdapter(ToolXF, "xf"),
 	}
 }
-
-const defaultXFArchivePath = "~/.xf/archive"
 
 // Detect checks if xf is installed
 func (a *XFAdapter) Detect() (string, bool) {
@@ -117,22 +112,14 @@ func (a *XFAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 
 	// Tool health = xf is installed and responds with a parseable version.
 	// Whether an archive is *indexed* is operational readiness, NOT tool health:
-	// a freshly-installed xf, or one whose archive lives at a non-default path
-	// (XF_DB / XF_INDEX), is perfectly healthy but has nothing at the canonical
-	// ~/.xf/archive location. Previously `ntm doctor` HARD-FAILED on a missing
-	// default archive AND probed an index via the removed `xf stats --output json`
-	// flag, so a healthy xf permanently reported "health check failed" (#202).
-	// Archive/index state is now surfaced as advisory context only.
+	// a freshly-installed xf is perfectly healthy with nothing indexed yet.
+	// Previously `ntm doctor` HARD-FAILED on a missing default archive, so a
+	// healthy xf permanently reported "health check failed" (#202). Index state
+	// is advisory context only, and comes from xf itself so XF_DB/XF_INDEX and
+	// xf's config are honored instead of guessed.
 	versionOK := VersionRegex.MatchString(ver.Raw)
-
-	// Archive presence is a cheap filesystem stat (no exec). Advisory only.
-	archivePath := util.ExpandPath(defaultXFArchivePath)
-	archiveOK, archiveErr := isDir(archivePath)
-
-	// indexValid/indexStatus/tweetCount/statsErr are not probed here anymore
-	// (they required the removed stats JSON flag); pass zero-values so the
-	// advisory message reflects "archive presence" without a stale exec.
-	msg := xfHealthMessage(ver, versionOK, archivePath, archiveOK, archiveErr, false, "", 0, nil)
+	stats, statsErr := a.archiveStats(ctx)
+	msg := xfHealthMessage(ver, versionOK, stats, statsErr)
 
 	return &HealthStatus{
 		Healthy:     versionOK,
@@ -142,20 +129,6 @@ func (a *XFAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 	}, nil
 }
 
-// HasCapability checks if xf has a specific capability
-func (a *XFAdapter) HasCapability(ctx context.Context, cap Capability) bool {
-	caps, err := a.Capabilities(ctx)
-	if err != nil {
-		return false
-	}
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
-}
-
 // Info returns complete xf tool information
 func (a *XFAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
@@ -163,68 +136,41 @@ func (a *XFAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 
 // XF-specific methods
 
-// XFStats represents archive statistics
-type XFStats struct {
-	TweetCount   int    `json:"tweet_count,omitempty"`
-	LikeCount    int    `json:"like_count,omitempty"`
-	DMCount      int    `json:"dm_count,omitempty"`
-	GrokCount    int    `json:"grok_count,omitempty"`
-	IndexStatus  string `json:"index_status,omitempty"`
-	LastIndexed  string `json:"last_indexed,omitempty"`
-	DatabasePath string `json:"database_path,omitempty"`
-}
-
-// XFSearchResult represents a search result
+// XFSearchResult is one record of `xf search --format json`, which prints a
+// bare array of these.
 type XFSearchResult struct {
-	ID        string  `json:"id"`
-	Content   string  `json:"content"`
-	CreatedAt string  `json:"created_at,omitempty"`
-	Type      string  `json:"type,omitempty"` // tweet, like, dm, grok
-	Score     float64 `json:"score,omitempty"`
+	ID         string  `json:"id"`
+	Text       string  `json:"text"`
+	CreatedAt  string  `json:"created_at,omitempty"`
+	ResultType string  `json:"result_type,omitempty"` // tweet, like, dm, grok, bookmark
+	Score      float64 `json:"score,omitempty"`
 }
 
-// GetStats returns archive statistics
-func (a *XFAdapter) GetStats(ctx context.Context) (*XFStats, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "stats", "--output", "json")
-	cmd.WaitDelay = time.Second
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		// Return empty stats if command fails (no archive indexed)
-		return &XFStats{}, nil
-	}
-
-	output := stdout.Bytes()
-	if !json.Valid(output) {
-		return &XFStats{}, nil
-	}
-
-	var stats XFStats
-	if err := json.Unmarshal(output, &stats); err != nil {
-		return nil, fmt.Errorf("failed to parse xf stats: %w", err)
-	}
-
-	return &stats, nil
+// XFSearchParams narrows an xf search; zero values keep xf's defaults.
+type XFSearchParams struct {
+	Limit int
+	Mode  string // lexical, semantic, hybrid, two-tier
+	Sort  string // relevance, date, date-desc, engagement
 }
 
 // Search performs a full-text search on the indexed archive
-func (a *XFAdapter) Search(ctx context.Context, query string, limit int) ([]XFSearchResult, error) {
+func (a *XFAdapter) Search(ctx context.Context, query string, params XFSearchParams) ([]XFSearchResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
 	defer cancel()
 
-	args := []string{"search", query, "--output", "json"}
-	if limit > 0 {
-		args = append(args, "--limit", fmt.Sprintf("%d", limit))
+	// --format is xf's global output selector; "--" keeps a query that starts
+	// with "-" from being parsed as a flag.
+	args := []string{"search", "--format", "json"}
+	if params.Limit > 0 {
+		args = append(args, "--limit", fmt.Sprintf("%d", params.Limit))
 	}
+	if params.Mode != "" {
+		args = append(args, "--mode", params.Mode)
+	}
+	if params.Sort != "" {
+		args = append(args, "--sort", params.Sort)
+	}
+	args = append(args, "--", query)
 
 	cmd := exec.CommandContext(ctx, a.BinaryName(), args...)
 	cmd.WaitDelay = time.Second
@@ -240,14 +186,19 @@ func (a *XFAdapter) Search(ctx context.Context, query string, limit int) ([]XFSe
 		return nil, fmt.Errorf("xf search failed: %w: %s", err, stderr.String())
 	}
 
-	output := stdout.Bytes()
-	if !json.Valid(output) {
+	// With no matches xf prints nothing on stdout (its "[]" goes through a
+	// message channel that is silent off a terminal). Any other output that is
+	// not a JSON array is a contract break, not an empty result.
+	output := bytes.TrimSpace(stdout.Bytes())
+	if len(output) == 0 {
 		return []XFSearchResult{}, nil
 	}
-
 	var results []XFSearchResult
 	if err := json.Unmarshal(output, &results); err != nil {
 		return nil, fmt.Errorf("failed to parse xf search results: %w", err)
+	}
+	if results == nil {
+		results = []XFSearchResult{}
 	}
 
 	return results, nil
@@ -275,98 +226,61 @@ func (a *XFAdapter) Doctor(ctx context.Context) (string, error) {
 	return stdout.String(), nil
 }
 
-func xfIndexValid(stats XFStats) bool {
-	// Conservative: require at least one strong signal of an index.
-	if stats.TweetCount > 0 || stats.LikeCount > 0 || stats.DMCount > 0 || stats.GrokCount > 0 {
-		return true
-	}
-	if stats.DatabasePath != "" {
-		return true
-	}
-	return xfIndexStatusHealthy(stats.IndexStatus)
+// xfArchiveStats is the subset of `xf stats --format json` that health reports.
+type xfArchiveStats struct {
+	TweetsCount  int    `json:"tweets_count"`
+	IndexBuiltAt string `json:"index_built_at"`
 }
 
-func xfIndexStatusHealthy(status string) bool {
-	s := strings.ToLower(strings.TrimSpace(status))
-	if s == "" {
-		return false
+// archiveStats asks xf whether an archive is indexed. xf exits non-zero with
+// "No archive indexed yet" when there is nothing to search.
+func (a *XFAdapter) archiveStats(ctx context.Context) (*xfArchiveStats, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, a.BinaryName(), "stats", "--format", "json")
+	cmd.WaitDelay = time.Second
+	stdout := NewLimitedBuffer(1024 * 1024)
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, ErrTimeout
+		}
+		reason, _, _ := strings.Cut(strings.TrimSpace(stderr.String()), "\n")
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(reason))
 	}
 
-	// Explicitly unhealthy signals.
-	switch {
-	case strings.Contains(s, "missing"),
-		strings.Contains(s, "not indexed"),
-		strings.Contains(s, "invalid"),
-		strings.Contains(s, "corrupt"),
-		strings.Contains(s, "error"),
-		strings.Contains(s, "failed"):
-		return false
+	var stats xfArchiveStats
+	if err := json.Unmarshal(stdout.Bytes(), &stats); err != nil {
+		return nil, fmt.Errorf("failed to parse xf stats: %w", err)
 	}
-
-	// Explicit healthy signals.
-	switch {
-	case strings.Contains(s, "ok"),
-		strings.Contains(s, "ready"),
-		strings.Contains(s, "indexed"),
-		strings.Contains(s, "healthy"),
-		strings.Contains(s, "up-to-date"):
-		return true
-	}
-
-	// Unknown status: keep conservative.
-	return false
+	return &stats, nil
 }
 
-func isDir(path string) (bool, error) {
-	if path == "" {
-		return false, fmt.Errorf("empty path")
+func xfHealthMessage(ver Version, versionOK bool, stats *xfArchiveStats, statsErr error) string {
+	// `xf --version` prints "xf X.Y.Z" followed by build lines.
+	name, _, _ := strings.Cut(strings.TrimSpace(ver.Raw), "\n")
+	if name = strings.TrimSpace(name); name == "" {
+		name = ver.String()
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return false, err
+	if !strings.HasPrefix(name, "xf") {
+		name = "xf " + name
 	}
-	return info.IsDir(), nil
-}
+	parts := []string{name, fmt.Sprintf("version_ok=%t", versionOK)}
 
-func xfHealthMessage(
-	ver Version,
-	versionOK bool,
-	archivePath string,
-	archiveOK bool,
-	archiveErr error,
-	indexValid bool,
-	indexStatus string,
-	tweetCount int,
-	statsErr error,
-) string {
-	parts := []string{"xf"}
-	if ver.Raw != "" {
-		parts = append(parts, strings.TrimSpace(ver.Raw))
-	} else {
-		parts = append(parts, ver.String())
-	}
-	parts = append(parts, fmt.Sprintf("version_ok=%t", versionOK))
-
-	parts = append(parts, fmt.Sprintf("archive=%s", archivePath))
-	if !archiveOK {
-		if archiveErr != nil {
-			parts = append(parts, fmt.Sprintf("archive_ok=false(%s)", archiveErr.Error()))
-		} else {
-			parts = append(parts, "archive_ok=false")
+	if statsErr != nil || stats == nil {
+		parts = append(parts, "index_valid=false")
+		if statsErr != nil {
+			parts = append(parts, fmt.Sprintf("stats_err=%q", statsErr.Error()))
 		}
 	} else {
-		parts = append(parts, "archive_ok=true")
-	}
-
-	parts = append(parts, fmt.Sprintf("index_valid=%t", indexValid))
-	if strings.TrimSpace(indexStatus) != "" {
-		parts = append(parts, fmt.Sprintf("index_status=%q", strings.TrimSpace(indexStatus)))
-	}
-	if tweetCount > 0 {
-		parts = append(parts, fmt.Sprintf("tweet_count=%d", tweetCount))
-	}
-	if statsErr != nil {
-		parts = append(parts, fmt.Sprintf("stats_err=%q", statsErr.Error()))
+		parts = append(parts, "index_valid=true", fmt.Sprintf("tweet_count=%d", stats.TweetsCount))
+		if stats.IndexBuiltAt != "" {
+			parts = append(parts, fmt.Sprintf("index_built_at=%s", stats.IndexBuiltAt))
+		}
 	}
 
 	return strings.Join(parts, " ")

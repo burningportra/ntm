@@ -25,8 +25,14 @@ func normalizeSingularBeadPayload(payload interface{}) interface{} {
 	return beads[0]
 }
 
-// beadIDPattern matches a beads issue ID such as "bd-2euwg" or "ntm-y9cd".
-var beadIDPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9]+$`)
+// beadIDPattern matches a beads issue ID: a prefix that starts with a letter
+// and may itself contain hyphens ("bd-2euwg", "ntm-y9cd", "my-proj-a1b2"),
+// optionally followed by dotted child segments for hierarchical issues
+// ("bd-1aae9.1", "bd-1aae9.1.2"). Rejecting children made every sub-issue's
+// detail, update, claim and dependency endpoints answer 400. The leading
+// letter and the closed character set still keep an ID from ever parsing as a
+// br flag or smuggling an "=value" or path.
+var beadIDPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)+(?:\.[A-Za-z0-9]+)*$`)
 
 // validateBeadIDParam checks that a bead ID from a URL parameter is a real ID
 // before it becomes an argv element for br. br is executed without a shell, but
@@ -41,7 +47,7 @@ func validateBeadIDParam(w http.ResponseWriter, beadID, reqID string) bool {
 	}
 	if !beadIDPattern.MatchString(beadID) {
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
-			"invalid bead ID: expected a prefixed identifier such as bd-2euwg", nil, reqID)
+			"invalid bead ID: expected a prefixed identifier such as bd-2euwg or bd-2euwg.1", nil, reqID)
 		return false
 	}
 	return true
@@ -66,8 +72,21 @@ const (
 	ErrCodeBeadNotFound       = "BEAD_NOT_FOUND"
 	ErrCodeBeadAlreadyClaimed = "BEAD_ALREADY_CLAIMED"
 	ErrCodeBVUnavailable      = "BV_UNAVAILABLE"
+	ErrCodeBeadsNotInit       = "BEADS_NOT_INITIALIZED"
 	beadsUnavailableMessage   = "br (beads_rust) is not installed"
+	beadsNotInitMessage       = "no beads workspace in this project: run 'br init' to start tracking work"
 )
+
+// writeBeadsCommandError reports a failed br/bv call. A project with no beads
+// workspace has no beads resource (404 BEADS_NOT_INITIALIZED), which is
+// neither a missing br (503 BEADS_UNAVAILABLE) nor a server fault (500).
+func writeBeadsCommandError(w http.ResponseWriter, err error, reqID string) {
+	if bv.IsNotInitialized(err) {
+		writeErrorResponse(w, http.StatusNotFound, ErrCodeBeadsNotInit, beadsNotInitMessage, nil, reqID)
+		return
+	}
+	writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+}
 
 // Beads request/response types
 
@@ -168,7 +187,7 @@ func (s *Server) handleListBeads(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--status", status)
 	}
 	if label != "" {
-		args = append(args, "--labels", label)
+		args = append(args, "--label", label)
 	}
 	if assignee != "" {
 		args = append(args, "--assignee", assignee)
@@ -176,7 +195,7 @@ func (s *Server) handleListBeads(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), args...)
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -245,7 +264,7 @@ func (s *Server) handleCreateBead(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), args...)
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -351,7 +370,7 @@ func (s *Server) handleUpdateBead(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), args...)
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -402,8 +421,26 @@ func (s *Server) handleCloseBead(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if async {
-		job := s.jobStore.Create("bead_close")
-		go s.executeBeadCloseJob(job.ID, beadID)
+		job, err := s.submitJob(r.Context(), CreateJobRequest{
+			Type:   jobTypeBeadClose,
+			Params: map[string]interface{}{"bead_id": beadID},
+		})
+		if err != nil {
+			code, status := ErrCodeServiceUnavail, http.StatusServiceUnavailable
+			if errors.Is(err, errInvalidJobRequest) {
+				code, status = ErrCodeBadRequest, http.StatusBadRequest
+			}
+			if errors.Is(err, errJobQueueFull) {
+				w.Header().Set("Retry-After", "1")
+			}
+			details := map[string]interface{}{"bead_id": beadID, "execution": s.jobExecutor.snapshot()}
+			if job != nil {
+				details["job"] = job
+			}
+			writeErrorResponse(w, status, code, err.Error(), details, reqID)
+			return
+		}
+		w.Header().Set("Location", "/api/v1/jobs/"+job.ID)
 		writeSuccessResponse(w, http.StatusAccepted, map[string]interface{}{
 			"job":     job,
 			"bead_id": beadID,
@@ -411,68 +448,21 @@ func (s *Server) handleCloseBead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	output, err := bv.RunBd(s.projectDirSnapshot(), "close", beadID, "--json")
+	result, err := runBeadClose(r.Context(), s.projectDirSnapshot(), beadID, bv.RunBdContext)
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), result, reqID)
 		return
 	}
-
-	var bead interface{}
-	if err := json.Unmarshal([]byte(output), &bead); err != nil {
-		writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-			"closed": true,
-			"output": output,
-		}, reqID)
-		return
-	}
-	bead = normalizeSingularBeadPayload(bead)
 
 	// Publish WebSocket event
-	if s.wsHub != nil {
+	if s.wsHub != nil && result["already_closed"] != true {
 		s.wsHub.Publish("beads:*", "bead.closed", map[string]interface{}{
 			"id":   beadID,
-			"bead": bead,
+			"bead": result["bead"],
 		})
 	}
 
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"bead":   bead,
-		"closed": true,
-	}, reqID)
-}
-
-// executeBeadCloseJob closes a bead outside the request lifecycle. RunBd already
-// serializes access to a workspace and retries transient Beads database errors,
-// so an overloaded tracker cannot strand a caller in a shell retry loop.
-func (s *Server) executeBeadCloseJob(jobID, beadID string) {
-	s.jobStore.Update(jobID, JobStatusRunning, 0, nil, "")
-
-	bead, alreadyClosed, err := s.closeBeadForAsyncJob(beadID)
-	if err != nil {
-		s.jobStore.Update(jobID, JobStatusFailed, 0, map[string]interface{}{
-			"bead_id": beadID,
-		}, err.Error())
-		s.publishAsyncBeadCloseAttention(jobID, beadID, false, err)
-		return
-	}
-
-	result := map[string]interface{}{
-		"bead_id": beadID,
-		"closed":  true,
-	}
-	if bead != nil {
-		result["bead"] = bead
-	}
-	if alreadyClosed {
-		result["already_closed"] = true
-	} else if s.wsHub != nil {
-		s.wsHub.Publish("beads:*", "bead.closed", map[string]interface{}{
-			"id":   beadID,
-			"bead": bead,
-		})
-	}
-	s.jobStore.Update(jobID, JobStatusCompleted, 100, result, "")
-	s.publishAsyncBeadCloseAttention(jobID, beadID, alreadyClosed, nil)
+	writeSuccessResponse(w, http.StatusOK, result, reqID)
 }
 
 func (s *Server) publishAsyncBeadCloseAttention(jobID, beadID string, alreadyClosed bool, closeErr error) {
@@ -503,52 +493,6 @@ func (s *Server) publishAsyncBeadCloseAttention(jobID, beadID string, alreadyClo
 		"closed asynchronously",
 		details,
 	))
-}
-
-// closeBeadForAsyncJob treats an already-closed bead as the successful terminal
-// result of the same logical close request. This makes a retry after a completed
-// close safe even when the client did not receive the original response.
-func (s *Server) closeBeadForAsyncJob(beadID string) (interface{}, bool, error) {
-	dir := s.projectDirSnapshot()
-	if bead, closed, err := asyncJobBeadStatus(dir, beadID); err == nil && closed {
-		return bead, true, nil
-	}
-
-	output, err := bv.RunBd(dir, "close", beadID, "--json")
-	if err != nil {
-		if bead, closed, statusErr := asyncJobBeadStatus(dir, beadID); statusErr == nil && closed {
-			return bead, true, nil
-		}
-		return nil, false, err
-	}
-
-	var bead interface{}
-	if err := json.Unmarshal([]byte(output), &bead); err != nil {
-		return map[string]interface{}{
-			"id":     beadID,
-			"output": output,
-		}, false, nil
-	}
-	return normalizeSingularBeadPayload(bead), false, nil
-}
-
-func asyncJobBeadStatus(dir, beadID string) (interface{}, bool, error) {
-	output, err := bv.RunBd(dir, "show", beadID, "--json")
-	if err != nil {
-		return nil, false, err
-	}
-
-	var bead interface{}
-	if err := json.Unmarshal([]byte(output), &bead); err != nil {
-		return nil, false, err
-	}
-	bead = normalizeSingularBeadPayload(bead)
-	values, ok := bead.(map[string]interface{})
-	if !ok {
-		return bead, false, nil
-	}
-	status, _ := values["status"].(string)
-	return bead, strings.EqualFold(strings.TrimSpace(status), "closed"), nil
 }
 
 // handleClaimBead handles POST /api/v1/beads/{id}/claim
@@ -592,7 +536,7 @@ func (s *Server) handleClaimBead(w http.ResponseWriter, r *http.Request) {
 			writeErrorResponse(w, http.StatusConflict, ErrCodeBeadAlreadyClaimed, err.Error(), nil, reqID)
 			return
 		}
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -628,7 +572,7 @@ func (s *Server) handleBeadsStats(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), "stats", "--json")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -655,7 +599,7 @@ func (s *Server) handleBeadsReady(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), "ready", "--json")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -683,7 +627,7 @@ func (s *Server) handleBeadsBlocked(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), "blocked", "--json")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -711,7 +655,7 @@ func (s *Server) handleBeadsInProgress(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), "list", "--status", "in_progress", "--json")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -745,7 +689,7 @@ func (s *Server) handleListBeadDeps(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), "dep", "list", beadID, "--json")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -797,7 +741,7 @@ func (s *Server) handleAddBeadDep(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), "dep", "add", beadID, req.BlockedBy, "--json")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -836,7 +780,7 @@ func (s *Server) handleRemoveBeadDep(w http.ResponseWriter, r *http.Request) {
 
 	output, err := bv.RunBd(s.projectDirSnapshot(), "dep", "remove", beadID, depID, "--json")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -883,7 +827,7 @@ func (s *Server) handleBeadsTriage(w http.ResponseWriter, r *http.Request) {
 	client := bv.NewBVClientWithOptions(s.projectDirSnapshot(), 0, 0)
 	recs, err := client.GetRecommendations(bv.RecommendationOpts{Limit: limit})
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -905,7 +849,7 @@ func (s *Server) handleBeadsInsights(w http.ResponseWriter, r *http.Request) {
 
 	insights, err := bv.GetInsights(s.projectDirSnapshot())
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -926,7 +870,7 @@ func (s *Server) handleBeadsPlan(w http.ResponseWriter, r *http.Request) {
 
 	plan, err := bv.GetPlan(s.projectDirSnapshot())
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -947,7 +891,7 @@ func (s *Server) handleBeadsPriority(w http.ResponseWriter, r *http.Request) {
 
 	priority, err := bv.GetPriority(s.projectDirSnapshot())
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -968,7 +912,7 @@ func (s *Server) handleBeadsRecipes(w http.ResponseWriter, r *http.Request) {
 
 	recipes, err := bv.GetRecipes(s.projectDirSnapshot())
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 
@@ -993,7 +937,7 @@ func (s *Server) handleBeadsSync(w http.ResponseWriter, r *http.Request) {
 	// site in the tree pins the same flags (internal/bv/bv.go, internal/hooks).
 	output, err := bv.RunBd(s.projectDirSnapshot(), "sync", "--flush-only", "--json", "--no-auto-import")
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeBeadsCommandError(w, err, reqID)
 		return
 	}
 

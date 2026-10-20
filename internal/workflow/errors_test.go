@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -20,12 +21,12 @@ func (a *recordingActions) add(s string) {
 	a.calls = append(a.calls, s)
 }
 
-// recorded returns a copy of the calls so far. A timeout monitor records from
-// its own goroutine, so tests must not read calls directly.
-func (a *recordingActions) recorded() []string {
+// snapshot reads calls under the same lock add uses: the TimeoutMonitor
+// invokes actions on its own goroutine.
+func (a *recordingActions) snapshot() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return slices.Clone(a.calls)
+	return append([]string(nil), a.calls...)
 }
 func (a *recordingActions) RestartAgent(context.Context, string) error { a.add("restart"); return nil }
 func (a *recordingActions) Pause(context.Context, string) error        { a.add("pause"); return nil }
@@ -39,15 +40,53 @@ func (a *recordingActions) Notify(context.Context, *WorkflowError, string) error
 
 func TestErrorHandlerActionsAndRetries(t *testing.T) {
 	actions := &recordingActions{}
-	h := NewErrorHandler(ErrorHandlingConfig{OnAgentCrash: ErrorActionRestartAgent, OnAgentError: ErrorActionPause, OnTriggerFailed: ErrorActionSkipStage, OnTimeout: ErrorActionRetry, MaxRetriesPerStage: 1}, actions)
-	for _, err := range []*WorkflowError{{Type: ErrorAgentCrash}, {Type: ErrorAgentError}, {Type: ErrorTriggerFailed}, {Type: ErrorTimeout, Stage: "build"}, {Type: ErrorTimeout, Stage: "build"}} {
+	h := NewErrorHandler(ErrorHandlingConfig{OnAgentCrash: ErrorActionRestartAgent, OnAgentError: ErrorActionPause, OnTriggerFailed: ErrorActionSkipStage, OnTimeout: ErrorActionRetry, MaxRetriesPerStage: 1, MaxRestartsPerAgent: 1}, actions)
+	for _, err := range []*WorkflowError{{Type: ErrorAgentCrash, AgentID: "%1"}, {Type: ErrorAgentError, AgentID: "%1"}, {Type: ErrorTriggerFailed}, {Type: ErrorTimeout, Stage: "build"}, {Type: ErrorTimeout, Stage: "build"}} {
 		if got := h.Handle(context.Background(), err); got != nil {
 			t.Fatal(got)
 		}
 	}
 	want := []string{"restart", "pause", "skip", "retry", "abort"}
-	if got := actions.recorded(); !slices.Equal(got, want) {
-		t.Fatalf("calls = %v, want %v", got, want)
+	calls := actions.snapshot()
+	if len(calls) != len(want) {
+		t.Fatalf("calls=%v", calls)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls=%v", calls)
+		}
+	}
+}
+
+// restart_agent is bounded per agent: a crash loop restarts each agent at
+// most MaxRestartsPerAgent times, then aborts. Budgets are independent per
+// agent, and an error without a faulted agent cannot restart anything.
+func TestErrorHandlerRestartBudgetIsPerAgent(t *testing.T) {
+	actions := &recordingActions{}
+	h := NewErrorHandler(ErrorHandlingConfig{OnAgentCrash: ErrorActionRestartAgent, OnAgentError: ErrorActionRestartAgent, MaxRestartsPerAgent: 2}, actions)
+	for _, err := range []*WorkflowError{
+		{Type: ErrorAgentCrash, AgentID: "%1"},
+		{Type: ErrorAgentError, AgentID: "%1"}, // same agent, different fault kind: shared budget
+		{Type: ErrorAgentCrash, AgentID: "%2"},
+		{Type: ErrorAgentCrash, AgentID: "%1"}, // third fault of %1: budget exhausted
+	} {
+		if got := h.Handle(context.Background(), err); got != nil {
+			t.Fatal(got)
+		}
+	}
+	want := []string{"restart", "restart", "restart", "abort"}
+	if calls := actions.snapshot(); strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls=%v, want %v", calls, want)
+	}
+	if err := h.Handle(context.Background(), &WorkflowError{Type: ErrorAgentCrash}); err == nil || !strings.Contains(err.Error(), "names none") {
+		t.Fatalf("restart without a faulted agent = %v, want refusal", err)
+	}
+	none := NewErrorHandler(ErrorHandlingConfig{OnAgentCrash: ErrorActionRestartAgent}, actions)
+	if err := none.Handle(context.Background(), &WorkflowError{Type: ErrorAgentCrash, AgentID: "%3"}); err != nil {
+		t.Fatal(err)
+	}
+	if calls := actions.snapshot(); calls[len(calls)-1] != "abort" {
+		t.Fatalf("zero restart budget must abort, calls=%v", calls)
 	}
 }
 
@@ -70,36 +109,17 @@ func TestTimeoutMonitorFiresOnlyForCurrentStage(t *testing.T) {
 				m := NewTimeoutMonitor(time.Minute, h, func() string { return tc.current })
 				m.Start(context.Background(), "build")
 				if tc.stop {
-					m.Stop()
+					m.StopAndWait()
 				}
 				// The bubble's clock moves only once every goroutine in it is
 				// blocked, so this passes the timeout without waiting for real,
 				// and Wait returns once the monitor goroutine has finished.
 				time.Sleep(2 * time.Minute)
 				synctest.Wait()
-				if got := actions.recorded(); !slices.Equal(got, tc.want) {
+				if got := actions.snapshot(); !slices.Equal(got, tc.want) {
 					t.Fatalf("calls = %v, want %v", got, tc.want)
 				}
 			})
 		})
 	}
-}
-
-// Stage changes restart the monitor while shutdown stops it, and those can
-// come from different goroutines. Run with -race.
-func TestTimeoutMonitorStartAndStopFromDifferentGoroutines(t *testing.T) {
-	h := NewErrorHandler(ErrorHandlingConfig{OnTimeout: ErrorActionNotify}, &recordingActions{})
-	m := NewTimeoutMonitor(time.Hour, h, func() string { return "build" })
-	t.Cleanup(m.Stop)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		m.Start(context.Background(), "build")
-	}()
-	go func() {
-		defer wg.Done()
-		m.Stop()
-	}()
-	wg.Wait()
 }

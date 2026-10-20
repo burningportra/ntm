@@ -53,6 +53,7 @@ const (
 	AgentWindsurf    = agent.AgentTypeWindsurf
 	AgentAider       = agent.AgentTypeAider
 	AgentOpencode    = agent.AgentTypeOpencode
+	AgentOmp         = agent.AgentTypeOmp
 	AgentOllama      = agent.AgentTypeOllama
 	AgentUser        = agent.AgentTypeUser
 	AgentUnknown     = agent.AgentTypeUnknown
@@ -76,6 +77,59 @@ type Pane struct {
 	Height      int
 	Active      bool
 	PID         int // Shell PID
+	// Dead is tmux's #{pane_dead}: the pane's process has exited and the pane
+	// is retained only because remain-on-exit kept its scrollback. A dead pane
+	// has no current path, no foreground process and cannot accept input, so
+	// callers that reason about live work must skip it (ntm#311).
+	Dead bool
+
+	// Service is the durable service tag carried by a non-agent service pane
+	// (PaneOptionACFSService / PaneOptionNTMService). A service such as `cm` or
+	// `cass` runs in a tmux pane alongside agent panes but is not an agent;
+	// ntm must not count it in agent health. Empty for agent and user panes.
+	Service string
+	// ServiceManager names whoever tagged the pane ("acfs" or "ntm").
+	ServiceManager string
+}
+
+// Pane options that mark a pane as a long-lived, non-agent service pane.
+// ACFS sets @acfs_service to the service name when it starts a service pane;
+// @ntm_service is the vendor-neutral spelling any other supervisor can use.
+// The tag is a pane option, not a title: unlike the title it cannot be
+// overwritten by the program running in the pane, so it stays a durable
+// identity for the life of the pane (ntm#305).
+const (
+	PaneOptionACFSService = "@acfs_service"
+	PaneOptionNTMService  = "@ntm_service"
+)
+
+// maxServiceTagLen bounds a pane-option value that ntm echoes into robot
+// output. Service names are short; anything longer is a mistagged pane.
+const maxServiceTagLen = 64
+
+// ParsePaneServiceOption normalizes a raw service pane-option value. It
+// returns "" for an absent, blank, over-long, or control-character-bearing
+// value so a malformed tag can never smuggle formatting into robot output.
+func ParsePaneServiceOption(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > maxServiceTagLen {
+		return ""
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return raw
+}
+
+// IsServicePane reports whether this pane is a tagged non-agent service pane
+// and must therefore be excluded from agent counts, agent-state summaries and
+// agent-health rollups. An explicit ntm adoption (@ntm_agent_type) wins over
+// the service tag — see parsePaneFromParts — so an operator who deliberately
+// adopts a pane as an agent still gets an agent.
+func (p Pane) IsServicePane() bool {
+	return p.Service != ""
 }
 
 // PaneRef is the stable physical identity and topology address of a pane.
@@ -407,16 +461,6 @@ func parseAgentFromTitle(title string) (AgentType, int, string, []string) {
 	return AgentUser, 0, "", nil
 }
 
-// tagsFromTitle extracts only tags from a pane title.
-// This is a convenience wrapper around parseAgentFromTitle.
-func tagsFromTitle(title string) []string {
-	matches := paneNameRegex.FindStringSubmatch(title)
-	if len(matches) < 5 {
-		return nil
-	}
-	return parseTags(matches[4])
-}
-
 // parseTags parses a comma-separated tag string into a slice.
 // Returns nil for empty input.
 func parseTags(tagStr string) []string {
@@ -464,6 +508,27 @@ func detectAgentFromCommand(command string) AgentType {
 	// a launcher path such as /tmp/claude-501/bin/muse is not taken for Claude.
 	if isMuseExecutable(cmd) {
 		return AgentMuse
+	}
+
+	// Antigravity (agy) — checked before Gemini so an agy launch command whose
+	// pinned model name contains "Gemini" ("Gemini 4 Argon (High)") is never
+	// misread as a gemini pane. Like grok, "agy" is a short generic token, so
+	// it must be the command's executable basename, never a coincidental
+	// argument. Real launch shapes: `agy`, `agy-locked` (the un-aliased
+	// wrapper binary spawn actually execs — see config.agyBinary), and the
+	// spelled-out `antigravity` binary.
+	if commandExecutableIs(cmd, "agy") ||
+		commandExecutableIs(cmd, "agy-locked") ||
+		commandExecutableIs(cmd, "antigravity") {
+		return AgentAntigravity
+	}
+
+	// Oh My Pi ships as a single compiled `omp` binary, so tmux reports it as
+	// the pane's current command. "omp" is a short token that also shows up in
+	// unrelated names (libomp, OpenMP flags, `rg omp`), so like grok and agy it
+	// only classifies as the command's exact executable basename.
+	if commandExecutableIs(cmd, "omp") {
+		return AgentOmp
 	}
 
 	// Helper to check if a command matches an agent
@@ -520,6 +585,12 @@ func detectAgentFromCommand(command string) AgentType {
 		return AgentOllama
 	}
 
+	// OpenCode (https://opencode.ai) ships as a single `opencode` binary, so
+	// tmux reports it directly as the pane's current command (ntm#266).
+	if isAgent("opencode") {
+		return AgentOpencode
+	}
+
 	return AgentUser
 }
 
@@ -569,12 +640,27 @@ func detectAgentFromArgv(argv []string) AgentType {
 		return AgentMuse
 	}
 
+	// Antigravity: same executable-only rule as grok. "agy" is a short
+	// generic token that shows up in unrelated argv elements (`rg agy`), so
+	// it may only classify via argv[0]; the fallback loops below therefore
+	// exclude AgentAntigravity the same way they exclude AgentGrok.
+	if commandExecutableIs(argv[0], "agy") ||
+		commandExecutableIs(argv[0], "agy-locked") ||
+		commandExecutableIs(argv[0], "antigravity") {
+		return AgentAntigravity
+	}
+
+	// omp: executable-only, same rule as grok/agy.
+	if commandExecutableIs(argv[0], "omp") {
+		return AgentOmp
+	}
+
 	joined := strings.Join(argv, " ")
-	if t := detectAgentFromCommand(joined); t != AgentUser && t != AgentGrok && t != AgentMuse {
+	if t := detectAgentFromCommand(joined); t != AgentUser && t != AgentGrok && t != AgentMuse && t != AgentAntigravity && t != AgentOmp {
 		return t
 	}
 	for _, arg := range argv {
-		if t := detectAgentFromCommand(arg); t != AgentUser && t != AgentGrok && t != AgentMuse {
+		if t := detectAgentFromCommand(arg); t != AgentUser && t != AgentGrok && t != AgentMuse && t != AgentAntigravity && t != AgentOmp {
 			return t
 		}
 	}
@@ -608,6 +694,22 @@ var bareShellCommands = map[string]struct{}{
 	"zsh": {}, "bash": {}, "sh": {}, "fish": {}, "dash": {}, "ksh": {}, "tcsh": {},
 }
 
+// RunsBareShell reports whether the pane's foreground process is a bare login
+// shell — the only state in which typing a launch command into the pane is
+// guaranteed to reach a shell rather than a running program. Conservative by
+// construction: wrappers and unknown binaries all report false.
+func (p Pane) RunsBareShell() bool {
+	base := strings.ToLower(strings.TrimSpace(p.Command))
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	if i := strings.IndexAny(base, " \t"); i >= 0 {
+		base = base[:i]
+	}
+	_, isShell := bareShellCommands[base]
+	return isShell
+}
+
 // AgentCLIDead reports whether an agent-typed pane's CLI has exited back to a
 // bare shell — the pane looks like an agent (title) but its foreground
 // process is the login shell, so anything typed into it lands in zsh, not an
@@ -618,15 +720,92 @@ func (p Pane) AgentCLIDead() bool {
 	if !agentType.IsValid() || agentType == AgentUser || agentType == AgentUnknown {
 		return false
 	}
-	base := strings.ToLower(strings.TrimSpace(p.Command))
-	if i := strings.LastIndex(base, "/"); i >= 0 {
-		base = base[i+1:]
+	return strings.TrimSpace(p.Command) != "" && p.IdleShell()
+}
+
+// IdleShell reports whether the pane is an idle interactive shell with
+// nothing running under it — the only state in which keystrokes reach a
+// shell prompt. tmux's pane_current_command names the foreground
+// process-group leader, which is also the shell for a non-exec'ing wrapper
+// script, a `sh -c …` agent or a command list (`a && b`), so when the pane's
+// root pid is known the process tree and the root's argv decide: a shell
+// started with a script path or -c is running something, and a shell with a
+// live descendant is busy. Without a pid the command name alone decides.
+func (p Pane) IdleShell() bool {
+	command := strings.TrimSpace(p.Command)
+	if command == "" || !PaneCommandIsShell(command) {
+		return false
 	}
-	if i := strings.IndexAny(base, " \t"); i >= 0 {
-		base = base[:i]
+	if p.PID <= 0 {
+		return true
 	}
-	_, isShell := bareShellCommands[base]
-	return isShell
+	if !shellArgvLooksInteractive(process.GetCmdline(p.PID)) {
+		return false
+	}
+	if p.ForegroundJobRunning() {
+		return false
+	}
+	return !shellHasLiveDescendant(p.PID, 4)
+}
+
+// ForegroundJobRunning reports whether a job other than the pane's root shell
+// owns the pane's terminal: the shell launched something with job control and
+// that process group is now in the foreground. This is the precise "the agent
+// has taken over the pane" signal; the foreground command name alone cannot
+// tell an agent started via `sh -c …` from the idle shell. False when the
+// pid is unknown or /proc is unavailable.
+func (p Pane) ForegroundJobRunning() bool {
+	if p.PID <= 0 {
+		return false
+	}
+	tpgid, pgrp, ok := process.TerminalForeground(p.PID)
+	return ok && tpgid > 0 && tpgid != pgrp
+}
+
+// paneProcessStarted reports whether an observation shows a launched process
+// owning the pane: a non-shell foreground command, or (when the pid is known)
+// a job in the foreground even if it is itself a shell (`sh -c …` agents,
+// non-exec'ing wrapper scripts).
+func paneProcessStarted(pane Pane) bool {
+	command := strings.TrimSpace(pane.Command)
+	if command == "" || PaneCommandIsStarting(command) {
+		return false
+	}
+	if !PaneCommandIsShell(command) {
+		return true
+	}
+	return pane.ForegroundJobRunning()
+}
+
+// shellArgvLooksInteractive reports whether a shell's argv is that of an
+// interactive shell (a bare name, possibly a login "-zsh", with flags only)
+// rather than a shell executing a script path or a -c command string.
+func shellArgvLooksInteractive(argv []string) bool {
+	if len(argv) == 0 {
+		return true // unreadable (no /proc, process gone): the command decides
+	}
+	for _, arg := range argv[1:] {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			continue
+		}
+		if arg == "-c" || !strings.HasPrefix(arg, "-") {
+			return false
+		}
+	}
+	return true
+}
+
+// shellHasLiveDescendant reports whether any process runs under pid. Any
+// descendant counts: even a nested shell under the interactive one means the
+// pane is not idle. (maxDepth is kept for symmetry with
+// detectAgentFromProcessTree; a direct child is enough to decide.)
+func shellHasLiveDescendant(pid, maxDepth int) bool {
+	if pid <= 0 {
+		return false
+	}
+	_ = maxDepth
+	return len(process.GetChildPIDs(pid, 8)) > 0
 }
 
 func isAgentWrapperCommand(command string) bool {
@@ -725,7 +904,7 @@ func (c *Client) SessionExists(name string) bool {
 
 // SessionExistsContext checks whether a session exists with caller cancellation.
 func (c *Client) SessionExistsContext(ctx context.Context, name string) (bool, error) {
-	return classifySessionExistsResult(c.RunSilentContext(ctx, "has-session", "-t", name))
+	return classifySessionExistsResult(c.RunSilentContext(ctx, "has-session", "-t", TargetSession(name)))
 }
 
 func classifySessionExistsResult(err error) (bool, error) {
@@ -747,7 +926,9 @@ func isExpectedSessionAbsence(err error) bool {
 	if strings.Contains(message, "can't find session") ||
 		strings.Contains(message, "no such session") ||
 		strings.Contains(message, "session not found") ||
-		strings.Contains(message, "no server running") {
+		strings.Contains(message, "no server running") ||
+		// tmux 3.6, exit-empty off: the server is up but holds no sessions.
+		strings.Contains(message, "no current target") {
 		return true
 	}
 	return strings.Contains(message, "error connecting to") &&
@@ -762,6 +943,30 @@ func SessionExists(name string) bool {
 // SessionExistsContext checks whether a session exists with caller cancellation (default client).
 func SessionExistsContext(ctx context.Context, name string) (bool, error) {
 	return DefaultClient.SessionExistsContext(ctx, name)
+}
+
+// SessionCreatedAt returns when tmux created the session (#{session_created},
+// whole seconds).
+func (c *Client) SessionCreatedAt(name string) (time.Time, error) {
+	// Pane-qualified exact target: the bare `=name` form yields empty output
+	// from `display-message -p` on tmux 3.4/3.6a (ntm#310).
+	out, err := c.Run("display-message", "-p", "-t", SessionPaneTarget(name), "#{session_created}")
+	if err != nil {
+		return time.Time{}, err
+	}
+	secs, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse session_created %q: %w", strings.TrimSpace(out), err)
+	}
+	if secs <= 0 {
+		return time.Time{}, fmt.Errorf("tmux reported no creation time for session %q", name)
+	}
+	return time.Unix(secs, 0), nil
+}
+
+// SessionCreatedAt returns when tmux created the session (default client).
+func SessionCreatedAt(name string) (time.Time, error) {
+	return DefaultClient.SessionCreatedAt(name)
 }
 
 // ListSessions returns all tmux sessions
@@ -875,6 +1080,15 @@ func GetSession(name string) (*Session, error) {
 // previous output in panes created via the palette or spawn commands.
 const DefaultHistoryLimit = 50000
 
+// DefaultSessionWidth and DefaultSessionHeight give detached agent sessions
+// room for readable dialogs and output before any client attaches. Explicit
+// new-session dimensions preserve tmux's window-size policy, so attached
+// clients can still resize windows normally.
+const (
+	DefaultSessionWidth  = 320
+	DefaultSessionHeight = 100
+)
+
 // CreateSession creates a new tmux session with a generous scrollback buffer.
 // The history-limit is set to DefaultHistoryLimit (50000 lines) to ensure pane
 // scrollback is accessible. Use CreateSessionWithHistoryLimit for a custom value.
@@ -903,7 +1117,8 @@ func (c *Client) CreateSessionWithHistoryLimitContext(ctx context.Context, name,
 	if err := ValidateSessionName(name); err != nil {
 		return fmt.Errorf("invalid session name: %w", err)
 	}
-	if err := c.RunSilentContext(ctx, "new-session", "-d", "-s", name, "-c", directory); err != nil {
+	if err := c.RunSilentContext(ctx, "new-session", "-d", "-s", name, "-c", directory,
+		"-x", strconv.Itoa(DefaultSessionWidth), "-y", strconv.Itoa(DefaultSessionHeight)); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -912,7 +1127,7 @@ func (c *Client) CreateSessionWithHistoryLimitContext(ctx context.Context, name,
 	if historyLimit > 0 {
 		// Set history-limit on the session so all panes (including those created
 		// later via split-window) inherit the larger scrollback buffer.
-		if err := c.RunSilentContext(ctx, "set-option", "-t", name, "history-limit", fmt.Sprintf("%d", historyLimit)); err != nil {
+		if err := c.RunSilentContext(ctx, "set-option", "-t", SessionOptionTarget(name), "history-limit", fmt.Sprintf("%d", historyLimit)); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return fmt.Errorf("tmux session %q was created before cancellation: %w", name, ctxErr)
 			}
@@ -945,6 +1160,59 @@ func CreateSessionWithHistoryLimitContext(ctx context.Context, name, directory s
 	return DefaultClient.CreateSessionWithHistoryLimitContext(ctx, name, directory, historyLimit)
 }
 
+// SessionOptionPrivacy records `ntm spawn --privacy` / `--allow-persist` on
+// the session itself, so every ntm process that persists session data
+// (prompt history, event logs, checkpoints) honors it for exactly as long as
+// the session exists. Value: comma-separated "privacy", "allow-persist".
+const SessionOptionPrivacy = "@ntm_privacy"
+
+// SetSessionPrivacyContext records a session's privacy settings.
+func (c *Client) SetSessionPrivacyContext(ctx context.Context, session string, privacyMode, allowPersist bool) error {
+	var parts []string
+	if privacyMode {
+		parts = append(parts, "privacy")
+	}
+	if allowPersist {
+		parts = append(parts, "allow-persist")
+	}
+	if len(parts) == 0 {
+		return c.RunSilentContext(ctx, "set-option", "-u", "-t", SessionOptionTarget(session), SessionOptionPrivacy)
+	}
+	return c.RunSilentContext(ctx, "set-option", "-t", SessionOptionTarget(session), SessionOptionPrivacy, strings.Join(parts, ","))
+}
+
+// SetSessionPrivacyContext records a session's privacy settings (default client).
+func SetSessionPrivacyContext(ctx context.Context, session string, privacyMode, allowPersist bool) error {
+	return DefaultClient.SetSessionPrivacyContext(ctx, session, privacyMode, allowPersist)
+}
+
+// SessionPrivacyContext reads the settings SetSessionPrivacyContext recorded.
+// recorded is false when the session has none (or no longer exists); err is
+// set only when tmux could not be asked.
+func (c *Client) SessionPrivacyContext(ctx context.Context, session string) (privacyMode, allowPersist, recorded bool, err error) {
+	if exists, existsErr := c.SessionExistsContext(ctx, session); existsErr != nil || !exists {
+		return false, false, false, existsErr
+	}
+	out, err := c.RunContext(ctx, "show-options", "-q", "-v", "-t", SessionOptionTarget(session), SessionOptionPrivacy)
+	if err != nil {
+		return false, false, false, err
+	}
+	for _, part := range strings.Split(strings.TrimSpace(out), ",") {
+		switch strings.TrimSpace(part) {
+		case "privacy":
+			privacyMode, recorded = true, true
+		case "allow-persist":
+			allowPersist, recorded = true, true
+		}
+	}
+	return privacyMode, allowPersist, recorded, nil
+}
+
+// SessionPrivacyContext reads a session's recorded privacy settings (default client).
+func SessionPrivacyContext(ctx context.Context, session string) (privacyMode, allowPersist, recorded bool, err error) {
+	return DefaultClient.SessionPrivacyContext(ctx, session)
+}
+
 // GetPanes returns all panes in a session
 func (c *Client) GetPanes(session string) ([]Pane, error) {
 	return c.GetPanesContext(context.Background(), session)
@@ -953,8 +1221,8 @@ func (c *Client) GetPanes(session string) ([]Pane, error) {
 // GetPanesContext returns all panes in a session with cancellation support.
 func (c *Client) GetPanesContext(ctx context.Context, session string) ([]Pane, error) {
 	sep := FieldSeparator
-	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}", sep)
-	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", session, "-F", format)
+	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_agent_type}%[1]s#{"+PaneOptionACFSService+"}%[1]s#{"+PaneOptionNTMService+"}%[1]s#{pane_dead}", sep)
+	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", TargetSession(session), "-F", format)
 	if err != nil {
 		return nil, err
 	}
@@ -991,6 +1259,24 @@ const (
 	paneProcessStableObservations  = 2
 )
 
+// A pane that tmux has just created is not immediately an idle shell: it
+// reports the tmux binary itself until the child execs the shell (~300 ms on
+// Linux), and then the shell's rc files run short-lived children (grep, sed,
+// …) for a moment more. The launch preflight therefore gives a pane a bounded
+// settle window to show an idle shell before judging it occupied; a pane that
+// still runs a non-shell process at the end of that window is refused.
+var (
+	paneLaunchSettleTimeout = 3 * time.Second
+	paneLaunchSettlePoll    = 50 * time.Millisecond
+)
+
+// PaneCommandIsStarting reports whether tmux still observes its own binary as
+// the pane's foreground process, i.e. the pane child has not exec'd the shell
+// yet. Neither idle nor occupied: the caller should re-observe shortly.
+func PaneCommandIsStarting(command string) bool {
+	return strings.ToLower(filepath.Base(strings.TrimSpace(command))) == "tmux"
+}
+
 // PaneCommandIsShell reports whether tmux still observes an interactive shell
 // rather than the process sent to the pane.
 func PaneCommandIsShell(command string) bool {
@@ -1005,12 +1291,25 @@ func PaneCommandIsShell(command string) bool {
 	}
 }
 
+// ErrPaneOccupied is wrapped by ValidatePaneLaunchBaseline when a launch
+// target is already running a non-shell process.
+var ErrPaneOccupied = errors.New("pane is occupied by a non-shell process")
+
 // ValidatePaneLaunchBaseline rejects a pane that was already occupied before
-// an agent launch. Without this preflight, a stable pre-existing process could
-// be mistaken for the process that the launch command was meant to start.
+// an agent launch. The decision is made from tmux's own `pane_current_command`
+// (the foreground process on the pane's tty), not from titles or output
+// heuristics: a pane whose foreground process is an interactive shell is idle,
+// anything else (an agent CLI, `cat`, `vim`, a build) would receive the launch
+// line as keystrokes — `tmux send-keys` succeeds either way, so without this
+// preflight the launch command would be typed into the running process and
+// spawn would report success. A pane with an empty observation (process died
+// instantly under remain-on-exit) is left to the post-launch stability wait.
 func ValidatePaneLaunchBaseline(pane Pane) error {
 	command := strings.TrimSpace(pane.Command)
-	if command == "" || PaneCommandIsShell(command) {
+	if command == "" || PaneCommandIsStarting(command) || pane.IdleShell() {
+		// Empty or still-starting observations are not evidence of an occupant;
+		// the live pre-launch re-read (which waits for an idle shell) and the
+		// post-launch stability wait cover them.
 		return nil
 	}
 
@@ -1018,11 +1317,113 @@ func ValidatePaneLaunchBaseline(pane Pane) error {
 	if paneID == "" {
 		paneID = pane.Ref().Physical()
 	}
+	what := "is already a non-shell process"
+	if PaneCommandIsShell(command) {
+		what = "is a shell that is running something (a script or a child process)"
+	}
 	return fmt.Errorf(
-		"pane %s pre-launch current command %q is already a non-shell process; use an idle shell pane",
+		"pane %s pre-launch current command %q %s (%w); "+
+			"refusing to type the launch command into it — free the pane (exit that process) "+
+			"or add the agent in a fresh pane instead of reusing this one",
 		paneID,
 		command,
+		what,
+		ErrPaneOccupied,
 	)
+}
+
+// ValidatePaneLaunchBaselineLiveContext re-reads the exact pane from tmux
+// immediately before a launch and applies ValidatePaneLaunchBaseline to the
+// fresh observation. It closes the gap between a batch preflight and the
+// send-keys call: identity registration and command preparation can take long
+// enough for something else to occupy the pane. A pane that can no longer be
+// found, or a tmux read failure, is a refusal — the launch is never retargeted.
+func ValidatePaneLaunchBaselineLiveContext(ctx context.Context, session, paneID string) error {
+	return validatePaneLaunchBaselineLiveContext(ctx, session, paneID, GetPanesContext)
+}
+
+func validatePaneLaunchBaselineLiveContext(ctx context.Context, session, paneID string, listPanes paneProcessLister) error {
+	if ctx == nil {
+		return errors.New("pane launch preflight requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	session = strings.TrimSpace(session)
+	paneID = strings.TrimSpace(paneID)
+	if session == "" || paneID == "" {
+		return errors.New("pane launch preflight requires a session and an exact pane ID")
+	}
+	if listPanes == nil {
+		return errors.New("pane launch preflight requires a pane lister")
+	}
+	deadline := time.Now().Add(paneLaunchSettleTimeout)
+	for {
+		panes, err := listPanes(ctx, session)
+		if err != nil {
+			return fmt.Errorf("re-reading pane %s before launch: %w", paneID, err)
+		}
+		var found *Pane
+		for i := range panes {
+			if strings.TrimSpace(panes[i].ID) == paneID {
+				found = &panes[i]
+				break
+			}
+		}
+		if found == nil {
+			return fmt.Errorf("pane %s disappeared from session %s before launch", paneID, session)
+		}
+		command := strings.TrimSpace(found.Command)
+		if command == "" || found.IdleShell() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if PaneCommandIsStarting(command) {
+				return fmt.Errorf(
+					"pane %s pre-launch current command %q did not become a shell within %s (%w); "+
+						"a nested tmux client would receive the launch line as keystrokes",
+					paneID, command, paneLaunchSettleTimeout, ErrPaneOccupied,
+				)
+			}
+			return ValidatePaneLaunchBaseline(*found)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(paneLaunchSettlePoll):
+		}
+	}
+}
+
+// ValidatePaneLaunchBaselineSettledContext is the batch-preflight form of the
+// live check: it gives the pane the same settle window (so a pane created
+// moments ago is not refused for its shell's startup children) and then
+// applies ValidatePaneLaunchBaseline to what tmux reports.
+func ValidatePaneLaunchBaselineSettledContext(ctx context.Context, session string, pane Pane) error {
+	return DefaultClient.ValidatePaneLaunchBaselineSettledContext(ctx, session, pane)
+}
+
+// ValidatePaneLaunchBaselineSettledContext uses this client's tmux server for
+// every observation, including remote swarm launches.
+func (c *Client) ValidatePaneLaunchBaselineSettledContext(ctx context.Context, session string, pane Pane) error {
+	command := strings.TrimSpace(pane.Command)
+	if command == "" || pane.IdleShell() {
+		return nil
+	}
+	paneID := strings.TrimSpace(pane.ID)
+	if paneID == "" {
+		return ValidatePaneLaunchBaseline(pane)
+	}
+	err := validatePaneLaunchBaselineLiveContext(ctx, session, paneID, c.GetPanesContext)
+	if err == nil || errors.Is(err, ErrPaneOccupied) {
+		return err
+	}
+	// The pane could not be re-observed (no such session, tmux read failure):
+	// fail closed on the snapshot the caller planned with.
+	if snapshotErr := ValidatePaneLaunchBaseline(pane); snapshotErr != nil {
+		return fmt.Errorf("%w (re-observation failed: %v)", snapshotErr, err)
+	}
+	return err
 }
 
 type paneProcessLister func(context.Context, string) ([]Pane, error)
@@ -1103,7 +1504,7 @@ func waitForPaneProcessStartContext(
 				// returned success and callers reported the agent as
 				// launched. The empty-command failure detail below was
 				// likewise unreachable.
-				if lastCommand == "" || PaneCommandIsShell(strings.ToLower(filepath.Base(lastCommand))) {
+				if !paneProcessStarted(pane) {
 					stableCommand = ""
 					stableObservations = 0
 					break
@@ -1174,7 +1575,7 @@ func waitForPaneProcessStartContext(
 func (c *Client) GetAllPanesContext(ctx context.Context) (map[string][]Pane, error) {
 	sep := FieldSeparator
 	// Add session_name at the beginning
-	format := fmt.Sprintf("#{session_name}%[1]s#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}", sep)
+	format := fmt.Sprintf("#{session_name}%[1]s#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_agent_type}%[1]s#{"+PaneOptionACFSService+"}%[1]s#{"+PaneOptionNTMService+"}%[1]s#{pane_dead}", sep)
 	output, err := c.RunContext(ctx, "list-panes", "-a", "-F", format)
 	if err != nil {
 		// No server/no sessions is not an error; treat as empty result.
@@ -1196,14 +1597,17 @@ func (c *Client) GetAllPanesContext(ctx context.Context) (map[string][]Pane, err
 		}
 
 		parts := strings.Split(line, sep)
-		if len(parts) != 10 {
-			return nil, fmt.Errorf("parse pane %d: expected 10 fields, got %d", lineNumber+1, len(parts))
+		// 11 fields is the pre-#305 layout (no service tags), 13 the pre-#311
+		// layout (no pane_dead); 14 is current. All are accepted so a format
+		// change never turns into a hard parse failure across an upgrade.
+		if len(parts) < 11 || len(parts) > 14 {
+			return nil, fmt.Errorf("parse pane %d: expected 11 to 14 fields, got %d", lineNumber+1, len(parts))
 		}
 
 		sessionName := parts[0]
-		// parts[1:] contains: id, index, title, command, width, height, active, pid, window_index
+		// parts[1:] contains: id, index, title, command, width, height, active, pid, window_index, @ntm_agent_type, @acfs_service, @ntm_service, pane_dead
 		// parts[1:8] = id(0), index(1), title(2), command(3), width(4), height(5), active(6)
-		// parts[8:] = pid(0), window_index(1)
+		// parts[8:] = pid(0), window_index(1), @ntm_agent_type(2), @acfs_service(3), @ntm_service(4), pane_dead(5)
 		p, err := parsePaneFromParts(parts[1:8], parts[8:])
 		if err != nil {
 			return nil, fmt.Errorf("parse pane %d: %w", lineNumber+1, err)
@@ -1234,7 +1638,7 @@ func (c *Client) GetFirstWindow(session string) (int, error) {
 // GetFirstWindowContext returns the first window index for a session with
 // cancellation support.
 func (c *Client) GetFirstWindowContext(ctx context.Context, session string) (int, error) {
-	output, err := c.RunContext(ctx, "list-windows", "-t", session, "-F", "#{window_index}")
+	output, err := c.RunContext(ctx, "list-windows", "-t", TargetSession(session), "-F", "#{window_index}")
 	if err != nil {
 		return 0, err
 	}
@@ -1258,31 +1662,6 @@ func GetFirstWindowContext(ctx context.Context, session string) (int, error) {
 	return DefaultClient.GetFirstWindowContext(ctx, session)
 }
 
-// GetDefaultPaneIndex returns the default pane index (respects pane-base-index)
-func (c *Client) GetDefaultPaneIndex(session string) (int, error) {
-	firstWin, err := c.GetFirstWindow(session)
-	if err != nil {
-		return 0, err
-	}
-
-	output, err := c.Run("list-panes", "-t", fmt.Sprintf("%s:%d", session, firstWin), "-F", "#{pane_index}")
-	if err != nil {
-		return 0, err
-	}
-
-	lines := strings.Split(output, "\n")
-	if len(lines) == 0 {
-		return 0, errors.New("no panes found")
-	}
-
-	return strconv.Atoi(lines[0])
-}
-
-// GetDefaultPaneIndex returns the default pane index (default client)
-func GetDefaultPaneIndex(session string) (int, error) {
-	return DefaultClient.GetDefaultPaneIndex(session)
-}
-
 // SplitWindow creates a new pane in the session
 func (c *Client) SplitWindow(session string, directory string) (string, error) {
 	return c.SplitWindowContext(context.Background(), session, directory)
@@ -1302,7 +1681,7 @@ func (c *Client) SplitWindowContext(ctx context.Context, session string, directo
 	target := fmt.Sprintf("%s:%d", session, firstWin)
 
 	// Split and get the new pane ID
-	paneID, err := c.RunContext(ctx, "split-window", "-t", target, "-c", directory, "-P", "-F", "#{pane_id}")
+	paneID, err := c.RunContext(ctx, "split-window", "-t", ExactTarget(target), "-c", directory, "-P", "-F", "#{pane_id}")
 	if err != nil {
 		return "", err
 	}
@@ -1311,7 +1690,7 @@ func (c *Client) SplitWindowContext(ctx context.Context, session string, directo
 	}
 
 	// Apply tiled layout
-	if err := c.RunSilentContext(ctx, "select-layout", "-t", target, "tiled"); err != nil {
+	if err := c.RunSilentContext(ctx, "select-layout", "-t", ExactTarget(target), "tiled"); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return paneID, fmt.Errorf("tmux pane %q was created before cancellation: %w", paneID, ctxErr)
 		}
@@ -1352,7 +1731,7 @@ func (c *Client) SetPaneTitleContext(ctx context.Context, paneID, title string) 
 			return fmt.Errorf("pane title contains disallowed control character 0x%02x", r)
 		}
 	}
-	selectErr := c.RunSilentContext(ctx, "select-pane", "-t", paneID, "-T", title)
+	selectErr := c.RunSilentContext(ctx, "select-pane", "-t", ExactTarget(paneID), "-T", title)
 	if selectErr != nil && ClassifyCommandError(selectErr).Kind == CommandErrorPaneNotFound {
 		// On busy tmux servers, newly-created panes can transiently fail to resolve by ID.
 		// Retry briefly to reduce flakiness (especially under `go test`).
@@ -1361,7 +1740,7 @@ func (c *Client) SetPaneTitleContext(ctx context.Context, paneID, title string) 
 			if err := waitForSendDelay(ctx, 50*time.Millisecond); err != nil {
 				return err
 			}
-			selectErr = c.RunSilentContext(ctx, "select-pane", "-t", paneID, "-T", title)
+			selectErr = c.RunSilentContext(ctx, "select-pane", "-t", ExactTarget(paneID), "-T", title)
 			if selectErr != nil && ClassifyCommandError(selectErr).Kind != CommandErrorPaneNotFound {
 				break
 			}
@@ -1378,7 +1757,7 @@ func (c *Client) SetPaneTitleContext(ctx context.Context, paneID, title string) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_ = c.RunSilentContext(ctx, "set-option", "-p", "-t", paneID, "allow-set-title", "off")
+	_ = c.RunSilentContext(ctx, "set-option", "-p", "-t", ExactTarget(paneID), "allow-set-title", "off")
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1395,172 +1774,43 @@ func SetPaneTitleContext(ctx context.Context, paneID, title string) error {
 	return DefaultClient.SetPaneTitleContext(ctx, paneID, title)
 }
 
+// SetPaneAgentIdentityContext records both pieces of pane identity that ntm
+// owns: the human-readable title and the durable agent-type pane option. The
+// option is authoritative when wrappers or TUIs replace the visible command or
+// title, so lifecycle paths that already know the agent type must use this
+// helper before launching the agent.
+func (c *Client) SetPaneAgentIdentityContext(ctx context.Context, paneID, title string, agentType AgentType) error {
+	if ParsePaneAgentTypeOption(string(agentType)) == AgentUnknown {
+		return fmt.Errorf("agent type %q is not a known agent type", agentType)
+	}
+	if title != "" {
+		if err := c.SetPaneTitleContext(ctx, paneID, title); err != nil {
+			return err
+		}
+	}
+	return c.SetPaneAgentTypeContext(ctx, paneID, agentType)
+}
+
+// SetPaneAgentIdentityContext records pane title and durable agent type using
+// the default client.
+func SetPaneAgentIdentityContext(ctx context.Context, paneID, title string, agentType AgentType) error {
+	return DefaultClient.SetPaneAgentIdentityContext(ctx, paneID, title, agentType)
+}
+
+// SetPaneAgentIdentity records pane title and durable agent type using the
+// default client.
+func SetPaneAgentIdentity(paneID, title string, agentType AgentType) error {
+	return DefaultClient.SetPaneAgentIdentityContext(context.Background(), paneID, title, agentType)
+}
+
 // GetPaneTitle returns the title of a pane
 func (c *Client) GetPaneTitle(paneID string) (string, error) {
-	return c.Run("display-message", "-p", "-t", paneID, "#{pane_title}")
+	return c.Run("display-message", "-p", "-t", ExactTarget(paneID), "#{pane_title}")
 }
 
 // GetPaneTitle returns the title of a pane (default client)
 func GetPaneTitle(paneID string) (string, error) {
 	return DefaultClient.GetPaneTitle(paneID)
-}
-
-// GetPaneTags returns the tags for a pane parsed from its title.
-// Returns nil if no tags are found.
-func (c *Client) GetPaneTags(paneID string) ([]string, error) {
-	title, err := c.GetPaneTitle(paneID)
-	if err != nil {
-		return nil, err
-	}
-	return tagsFromTitle(title), nil
-}
-
-// GetPaneTags returns the tags for a pane (default client)
-func GetPaneTags(paneID string) ([]string, error) {
-	return DefaultClient.GetPaneTags(paneID)
-}
-
-// SetPaneTags sets the tags for a pane by updating its title.
-// Tags are appended to the title in the format [tag1,tag2,...].
-// This replaces any existing tags on the pane.
-func (c *Client) SetPaneTags(paneID string, tags []string) error {
-	// Validate tags
-	for _, tag := range tags {
-		if strings.ContainsAny(tag, "[]") {
-			return fmt.Errorf("tag %q contains invalid characters '[' or ']'", tag)
-		}
-	}
-
-	title, err := c.GetPaneTitle(paneID)
-	if err != nil {
-		return err
-	}
-
-	// Strip existing tags from title
-	baseTitle := stripTags(title)
-	newTitle := baseTitle + FormatTags(tags)
-
-	return c.SetPaneTitle(paneID, newTitle)
-}
-
-// SetPaneTags sets the tags for a pane (default client)
-func SetPaneTags(paneID string, tags []string) error {
-	return DefaultClient.SetPaneTags(paneID, tags)
-}
-
-// AddPaneTags adds tags to a pane without removing existing ones.
-// Duplicate tags are not added.
-func (c *Client) AddPaneTags(paneID string, newTags []string) error {
-	existing, err := c.GetPaneTags(paneID)
-	if err != nil {
-		return err
-	}
-
-	// Build set of existing tags
-	tagSet := make(map[string]bool)
-	for _, t := range existing {
-		tagSet[t] = true
-	}
-
-	// Add new tags
-	for _, t := range newTags {
-		if !tagSet[t] {
-			existing = append(existing, t)
-			tagSet[t] = true
-		}
-	}
-
-	return c.SetPaneTags(paneID, existing)
-}
-
-// AddPaneTags adds tags to a pane (default client)
-func AddPaneTags(paneID string, newTags []string) error {
-	return DefaultClient.AddPaneTags(paneID, newTags)
-}
-
-// RemovePaneTags removes specific tags from a pane.
-func (c *Client) RemovePaneTags(paneID string, tagsToRemove []string) error {
-	existing, err := c.GetPaneTags(paneID)
-	if err != nil {
-		return err
-	}
-
-	// Build set of tags to remove
-	removeSet := make(map[string]bool)
-	for _, t := range tagsToRemove {
-		removeSet[t] = true
-	}
-
-	// Filter out removed tags
-	var filtered []string
-	for _, t := range existing {
-		if !removeSet[t] {
-			filtered = append(filtered, t)
-		}
-	}
-
-	return c.SetPaneTags(paneID, filtered)
-}
-
-// RemovePaneTags removes specific tags from a pane (default client)
-func RemovePaneTags(paneID string, tagsToRemove []string) error {
-	return DefaultClient.RemovePaneTags(paneID, tagsToRemove)
-}
-
-// HasPaneTag returns true if the pane has the specified tag.
-func (c *Client) HasPaneTag(paneID, tag string) (bool, error) {
-	tags, err := c.GetPaneTags(paneID)
-	if err != nil {
-		return false, err
-	}
-	for _, t := range tags {
-		if t == tag {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// HasPaneTag returns true if the pane has the specified tag (default client)
-func HasPaneTag(paneID, tag string) (bool, error) {
-	return DefaultClient.HasPaneTag(paneID, tag)
-}
-
-// HasAnyPaneTag returns true if the pane has any of the specified tags (OR logic).
-func (c *Client) HasAnyPaneTag(paneID string, tags []string) (bool, error) {
-	paneTags, err := c.GetPaneTags(paneID)
-	if err != nil {
-		return false, err
-	}
-	tagSet := make(map[string]bool)
-	for _, t := range paneTags {
-		tagSet[t] = true
-	}
-	for _, t := range tags {
-		if tagSet[t] {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// HasAnyPaneTag returns true if the pane has any of the specified tags (default client)
-func HasAnyPaneTag(paneID string, tags []string) (bool, error) {
-	return DefaultClient.HasAnyPaneTag(paneID, tags)
-}
-
-// stripTags removes the [tags] suffix from a pane title.
-func stripTags(title string) string {
-	// Find last '[' that's followed by any characters and ']' at end
-	idx := strings.LastIndex(title, "[")
-	if idx == -1 {
-		return title
-	}
-	// Check if it ends with ']'
-	if strings.HasSuffix(title, "]") && idx < len(title)-1 {
-		return title[:idx]
-	}
-	return title
 }
 
 // PaneTitleSuffix returns the portion of an NTM pane title after the final
@@ -1648,12 +1898,6 @@ func (c *Client) SendKeysContext(ctx context.Context, target, keys string, enter
 	return c.SendKeysWithDelayContext(ctx, target, keys, enter, DefaultEnterDelay)
 }
 
-// SendKeysWithDelay sends keys to a pane with a configurable delay before Enter.
-// Use ShellEnterDelay for shell panes (bash, zsh) or DefaultEnterDelay for agent TUIs.
-func (c *Client) SendKeysWithDelay(target, keys string, enter bool, enterDelay time.Duration) error {
-	return c.SendKeysWithDelayContext(context.Background(), target, keys, enter, enterDelay)
-}
-
 // escapeTrailingSemicolon protects a payload whose last byte is an unescaped
 // semicolon from tmux's command parser.
 //
@@ -1691,7 +1935,7 @@ func (c *Client) SendKeysWithDelayContext(ctx context.Context, target, keys stri
 	const chunkSize = 4096
 
 	if len(keys) <= chunkSize {
-		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "-l", "--", escapeTrailingSemicolon(keys)); err != nil {
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "-l", "--", escapeTrailingSemicolon(keys)); err != nil {
 			return err
 		}
 	} else {
@@ -1712,7 +1956,7 @@ func (c *Client) SendKeysWithDelayContext(ctx context.Context, target, keys stri
 			}
 
 			chunk := keys[start:end]
-			if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "-l", "--", escapeTrailingSemicolon(chunk)); err != nil {
+			if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "-l", "--", escapeTrailingSemicolon(chunk)); err != nil {
 				return err
 			}
 			start = end
@@ -1728,7 +1972,7 @@ func (c *Client) SendKeysWithDelayContext(ctx context.Context, target, keys stri
 		}
 		// Use "Enter" instead of "C-m" (Ctrl+M) because some TUIs (e.g., Codex)
 		// distinguish between the Enter key and the carriage return control character.
-		return c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter")
+		return c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter")
 	}
 	return nil
 }
@@ -1818,18 +2062,9 @@ func SendKeysContext(ctx context.Context, target, keys string, enter bool) error
 	return DefaultClient.SendKeysContext(ctx, target, keys, enter)
 }
 
-// SendKeysWithDelay sends keys to a pane with a configurable Enter delay (default client)
-func SendKeysWithDelay(target, keys string, enter bool, enterDelay time.Duration) error {
-	return DefaultClient.SendKeysWithDelay(target, keys, enter, enterDelay)
-}
-
-// SendKeysWithDelayContext sends keys with a cancellable Enter delay (default client).
-func SendKeysWithDelayContext(ctx context.Context, target, keys string, enter bool, enterDelay time.Duration) error {
-	return DefaultClient.SendKeysWithDelayContext(ctx, target, keys, enter, enterDelay)
-}
-
-// PasteKeys pastes content to a pane using tmux's paste mechanism.
-// This is an alias for SendKeys for now, but may be optimized for large content later.
+// PasteKeys pastes content to a pane. It delegates to SendKeys, whose literal
+// (-l) chunked delivery already handles multi-line content safely; a tmux
+// paste-buffer implementation would be an optimization, not a behavior change.
 func (c *Client) PasteKeys(target, content string, enter bool) error {
 	return c.PasteKeysContext(context.Background(), target, content, enter)
 }
@@ -1852,11 +2087,6 @@ func (c *Client) PasteKeysWithDelayContext(ctx context.Context, target, content 
 // PasteKeys pastes content to a pane (default client)
 func PasteKeys(target, content string, enter bool) error {
 	return DefaultClient.PasteKeys(target, content, enter)
-}
-
-// PasteKeysContext pastes content with caller cancellation (default client).
-func PasteKeysContext(ctx context.Context, target, content string, enter bool) error {
-	return DefaultClient.PasteKeysContext(ctx, target, content, enter)
 }
 
 // PasteKeysWithDelay pastes content to a pane with a configurable delay (default client)
@@ -1889,11 +2119,6 @@ func (c *Client) SendBufferContext(ctx context.Context, target, content string, 
 	return c.SendBufferWithDelayContext(ctx, target, content, enter, DefaultEnterDelay)
 }
 
-// SendBufferWithDelay sends content using the buffer mechanism with a configurable Enter delay.
-func (c *Client) SendBufferWithDelay(target, content string, enter bool, enterDelay time.Duration) error {
-	return c.SendBufferWithDelayContext(context.Background(), target, content, enter, enterDelay)
-}
-
 // SendBufferWithDelayContext sends content using the buffer mechanism with
 // cancellation covering load, paste, delay, and Enter.
 func (c *Client) SendBufferWithDelayContext(ctx context.Context, target, content string, enter bool, enterDelay time.Duration) error {
@@ -1903,10 +2128,7 @@ func (c *Client) SendBufferWithDelayContext(ctx context.Context, target, content
 	if enterDelay < 0 {
 		return errors.New("tmux Enter delay cannot be negative")
 	}
-	// Use a unique buffer name to avoid conflicts with concurrent operations.
-	// Combine timestamp with an atomic counter to prevent collisions when
-	// multiple goroutines call this within the same nanosecond.
-	bufferName := fmt.Sprintf("ntm-%d-%d", time.Now().UnixNano(), bufferSeq.Add(1))
+	bufferName := newSendBufferName()
 
 	// Load content into a tmux buffer
 	// We use 'load-buffer' with stdin to handle arbitrary content including special characters
@@ -1926,7 +2148,7 @@ func (c *Client) SendBufferWithDelayContext(ctx context.Context, target, content
 
 	// Paste the buffer into the target pane
 	// -p = paste from buffer, -d = delete buffer after pasting, -b = buffer name
-	if err := c.RunSilentContext(ctx, "paste-buffer", "-p", "-d", "-b", bufferName, "-t", target); err != nil {
+	if err := c.RunSilentContext(ctx, "paste-buffer", "-p", "-d", "-b", bufferName, "-t", ExactTarget(target)); err != nil {
 		// Cleanup uses its own short context because the delivery context may be
 		// canceled. It can only delete the private buffer; it never submits Enter.
 		c.cleanupBuffer(bufferName)
@@ -1937,9 +2159,21 @@ func (c *Client) SendBufferWithDelayContext(ctx context.Context, target, content
 		if err := waitForSendDelay(ctx, enterDelay); err != nil {
 			return err
 		}
-		return c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter")
+		return c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter")
 	}
 	return nil
+}
+
+// newSendBufferName returns a tmux buffer name that is unique per send.
+// The PID makes the name unique across concurrent ntm processes sharing one
+// tmux server (each process starts its bufferSeq at 1, so two processes'
+// first sends landing in the same nanosecond could otherwise collide and
+// paste-buffer -d one another's buffers); the timestamp plus the atomic
+// counter make it unique across goroutines within a process. Every send —
+// including a caller-level retry of a failed send — allocates a fresh name,
+// so no retry can race a prior attempt's delete-after-paste.
+func newSendBufferName() string {
+	return fmt.Sprintf("ntm-%d-%d-%d", os.Getpid(), time.Now().UnixNano(), bufferSeq.Add(1))
 }
 
 func (c *Client) cleanupBuffer(bufferName string) {
@@ -1997,21 +2231,6 @@ func SendBuffer(target, content string, enter bool) error {
 	return DefaultClient.SendBuffer(target, content, enter)
 }
 
-// SendBufferContext sends buffer content with caller cancellation (default client).
-func SendBufferContext(ctx context.Context, target, content string, enter bool) error {
-	return DefaultClient.SendBufferContext(ctx, target, content, enter)
-}
-
-// SendBufferWithDelay sends content using the buffer mechanism with delay (default client)
-func SendBufferWithDelay(target, content string, enter bool, enterDelay time.Duration) error {
-	return DefaultClient.SendBufferWithDelay(target, content, enter, enterDelay)
-}
-
-// SendBufferWithDelayContext sends buffer content with a cancellable delay (default client).
-func SendBufferWithDelayContext(ctx context.Context, target, content string, enter bool, enterDelay time.Duration) error {
-	return DefaultClient.SendBufferWithDelayContext(ctx, target, content, enter, enterDelay)
-}
-
 // SendKeysForAgent sends keys to a pane using the appropriate method for the agent type.
 // It uses buffer-based paste for agents/content combinations that misbehave with raw
 // send-keys (for example multiline Claude/Gemini prompts or large/multiline Codex prompts).
@@ -2024,11 +2243,6 @@ func (c *Client) SendKeysForAgent(target, keys string, enter bool, agentType Age
 // with caller cancellation.
 func (c *Client) SendKeysForAgentContext(ctx context.Context, target, keys string, enter bool, agentType AgentType) error {
 	return c.SendKeysForAgentWithDelayContext(ctx, target, keys, enter, DefaultEnterDelay, agentType)
-}
-
-// SendKeysForAgentWithDelay sends keys using the appropriate method with a configurable delay.
-func (c *Client) SendKeysForAgentWithDelay(target, keys string, enter bool, enterDelay time.Duration, agentType AgentType) error {
-	return c.SendKeysForAgentWithDelayContext(context.Background(), target, keys, enter, enterDelay, agentType)
 }
 
 // SendKeysForAgentWithDelayContext sends keys using the appropriate mechanism
@@ -2115,6 +2329,21 @@ func needsBufferSend(agentType AgentType, content string) bool {
 		// Use buffer for Codex when content contains newlines or is large (>512 chars)
 		// This avoids the "[Pasted Content N chars]" truncation and auto-execute issues
 		return strings.Contains(content, "\n") || len(content) > 512
+	case AgentOmp:
+		// omp honours bracketed paste: a pasted newline stays in the draft
+		// (large pastes collapse into a "#N" token) and only the protocol's
+		// Enter submits — verified live. Typed newlines would not survive
+		// send-keys -l, so multi-line prompts go through the buffer.
+		return strings.Contains(content, "\n")
+	case AgentOpencode:
+		// OpenCode's TUI does not reliably take typed bursts: send-keys -l of
+		// even 200-400 bytes is intermittently dropped or left unpainted, and
+		// multi-KB prompts are lost wholesale while the send reports success
+		// (GH #333, verified live against OpenCode 1.18.32). Bracketed paste
+		// lands at every size and renders at once — short pastes literally,
+		// large ones as a "[Pasted ~N lines]" token — and a pasted "/command"
+		// still opens OpenCode's command menu, so every payload is pasted.
+		return content != ""
 	default:
 		return false
 	}
@@ -2128,16 +2357,6 @@ func SendKeysForAgent(target, keys string, enter bool, agentType AgentType) erro
 // SendKeysForAgentContext sends keys with caller cancellation (default client).
 func SendKeysForAgentContext(ctx context.Context, target, keys string, enter bool, agentType AgentType) error {
 	return DefaultClient.SendKeysForAgentContext(ctx, target, keys, enter, agentType)
-}
-
-// SendKeysForAgentWithDelay sends keys using the appropriate method with delay (default client)
-func SendKeysForAgentWithDelay(target, keys string, enter bool, enterDelay time.Duration, agentType AgentType) error {
-	return DefaultClient.SendKeysForAgentWithDelay(target, keys, enter, enterDelay, agentType)
-}
-
-// SendKeysForAgentWithDelayContext sends keys with a cancellable delay (default client).
-func SendKeysForAgentWithDelayContext(ctx context.Context, target, keys string, enter bool, enterDelay time.Duration, agentType AgentType) error {
-	return DefaultClient.SendKeysForAgentWithDelayContext(ctx, target, keys, enter, enterDelay, agentType)
 }
 
 const (
@@ -2171,15 +2390,20 @@ func (c *Client) SendKeysForAgentDoubleEnterContext(ctx context.Context, target,
 	if err := waitForSendDelay(ctx, DoubleEnterFirstDelay); err != nil {
 		return err
 	}
+	if canonicalAgentType(agentType) == AgentOpencode && strings.TrimSpace(keys) != "" {
+		if err := c.requireOpencodePayloadStaged(ctx, target); err != nil {
+			return err
+		}
+	}
 	// First Enter
-	if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+	if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter"); err != nil {
 		return err
 	}
 	if err := waitForSendDelay(ctx, DoubleEnterSecondDelay); err != nil {
 		return err
 	}
 	// Second Enter
-	if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+	if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter"); err != nil {
 		return err
 	}
 	return nil
@@ -2203,13 +2427,11 @@ const (
 // "[Pasted ..." stand-in there. Idle suggestion hints also render after "›",
 // so composer text alone is not evidence — the line must carry the payload
 // snippet or a paste marker.
-// Composer-clear choreography (ntm-5p0b). AP-16 doctrine — "always Escape
-// Escape Escape C-u before sending fresh prompts into any codex pane that had
-// a prior interrupt" — was operator muscle memory driven with raw tmux
-// send-keys. The sequence is per-agent because the same keys mean different
-// things per TUI: codex tolerates the triple-Escape ritual; Claude Code maps
-// double-Escape to history jump-back, so it gets a single Escape; unknown
-// TUIs get only the line-kill.
+// Composer-clear choreography (ntm-5p0b) is per-agent because the same keys
+// mean different things per TUI. Escape pairs open transcript browsing in
+// current Codex (GH#345), so its draft is cleared with editing keys and a
+// history modal is dismissed separately with verified readback. Claude Code
+// gets a single Escape to avoid its history jump; unknown TUIs get line-kill.
 const (
 	composerClearKeyGap     = 120 * time.Millisecond
 	composerClearVerifyWait = 300 * time.Millisecond
@@ -2220,7 +2442,10 @@ const (
 func ComposerClearKeys(agentType AgentType) []string {
 	switch agentType.Canonical() {
 	case AgentCodex:
-		return []string{"Escape", "Escape", "Escape", "C-u"}
+		// Escape pairs open transcript browsing in current Codex (GH#345).
+		// Edit the draft without entering history; modal dismissal is verified
+		// separately by ClearComposerContext.
+		return []string{"C-e", "C-u"}
 	case AgentClaude:
 		return []string{"Escape", "C-u"}
 	case AgentMuse:
@@ -2228,29 +2453,59 @@ func ComposerClearKeys(agentType AgentType) []string {
 		// line-kill is safe here. ClearComposerContext follows up with C-c
 		// when a multi-line draft outlives it on an idle pane.
 		return []string{"C-u"}
+	case AgentOmp:
+		// One Ctrl+C drains an omp draft of any shape (Ctrl+U only kills the
+		// current row). ClearComposerContext sends it only at a positively
+		// non-empty draft, spaced beyond omp's double-press quit window.
+		return []string{"C-c"}
 	default:
 		return []string{"C-u"}
 	}
 }
 
-// composerMarkerForAgent returns the live-composer marker glyph used to
-// verify emptiness, or "" when the TUI has no known marker.
-func composerMarkerForAgent(agentType AgentType) string {
+// composerMarkersForAgent returns the live-composer marker glyphs used to
+// verify emptiness, or nil when the TUI has no known marker. Codex has TWO
+// markers: "›" (U+203A) at every reasoning effort except ultra, and "»"
+// (U+00BB) at effort ultra — codex's EffortTier::prompt_glyph swaps the
+// composer glyph with the effort (GH#273), so a gate that only knows "›"
+// refuses every delivery to an ultra pane.
+func composerMarkersForAgent(agentType AgentType) []string {
 	switch agentType.Canonical() {
 	case AgentCodex:
-		return "›"
+		return []string{"›", "»"}
 	case AgentClaude, AgentMuse:
-		return "❯"
+		return []string{"❯"}
+	case AgentGrok:
+		// Grok Build renders a bordered composer ("│ ❯ <text>  │"); the same
+		// heavy chevron is the live-composer marker. Lines are trimmed of the
+		// trailing box border before emptiness checks (see composerBlockEmpty).
+		return []string{"❯"}
 	default:
-		return ""
+		return nil
 	}
 }
 
-// composerPlaceholder returns a matcher for the hint text an agent's TUI
-// renders in an EMPTY composer (dim, but indistinguishable from real text in
-// a plain capture), or nil when the TUI shows none. Text it accepts counts as
-// empty.
-func composerPlaceholder(agentType AgentType) func(text string) bool {
+// indexAnyMarker returns the byte index and glyph of the leftmost occurrence
+// of any of the markers in line, or (-1, "") when none appears.
+func indexAnyMarker(line string, markers []string) (int, string) {
+	best, bestMarker := -1, ""
+	for _, m := range markers {
+		if m == "" {
+			continue
+		}
+		if j := strings.Index(line, m); j >= 0 && (best < 0 || j < best) {
+			best, bestMarker = j, m
+		}
+	}
+	return best, bestMarker
+}
+
+// composerPlaceholderPrefixes returns a matcher for the hint text an agent's
+// TUI renders in an EMPTY composer (dim, but indistinguishable from real text
+// in a plain capture), or nil when the TUI shows none. Text it accepts counts
+// as empty. Claude and Codex hints are fixed prefixes; Muse's tips are cut
+// short by a narrow pane, so a prefix list cannot read them.
+func composerPlaceholderPrefixes(agentType AgentType) func(text string) bool {
 	switch agentType.Canonical() {
 	case AgentClaude:
 		return placeholderPrefix(`Try "`)
@@ -2270,77 +2525,554 @@ func placeholderPrefix(prefix string) func(string) bool {
 	return func(text string) bool { return strings.HasPrefix(text, prefix) }
 }
 
-// composerLineEmpty reports whether the bottom-most marker line in the
-// capture carries no composer text. found=false means no marker line was
-// visible at all (verification impossible). Hint text the TUI renders in an
-// empty composer (isPlaceholder, which may be nil) counts as empty.
-func composerLineEmpty(capture, marker string, isPlaceholder func(string) bool) (found, empty bool) {
+// composerBlockMaxRows bounds how far below the marker line the composer
+// block scan looks for wrapped continuation rows. Claude Code's composer is a
+// bordered box that grows downward as the entry wraps; a bound keeps a
+// transcript that happens to sit inside a box from being read as input.
+const composerBlockMaxRows = 24
+
+// boxRuleRunes are the glyphs that make up a box rule/corner row. A row built
+// only from these is chrome, not composer text.
+const boxRuleRunes = "─━╌┄┈╰╯└┘╭╮┌┐┏┓┗┛"
+
+// composerBlockEmpty reports whether the LIVE composer block — the bottom-most
+// marker line together with its wrapped continuation rows — carries any text.
+//
+// Only the marker row used to be checked. A Claude Code entry long
+// enough to wrap renders its tail on the rows *below* the marker inside the
+// same bordered box, so a clear that emptied only the marker row verified as
+// "empty" while the logical entry was still there — and, symmetrically, a
+// stranded wrapped prompt could not be proven cleared (ntm#300).
+//
+// Continuation rows are recognized only inside a bordered composer: the marker
+// row must carry a vertical border to its left, and a continuation row must
+// carry one too. Unboxed TUIs fall back to the single-row check unchanged, so
+// this can never invent composer text where the old check saw none. Hint text
+// the TUI renders in an empty composer (isPlaceholder, which may be nil)
+// counts as empty.
+func composerBlockEmpty(capture string, markers []string, isPlaceholder func(string) bool) (found, empty bool, text string) {
 	lines := strings.Split(capture, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		idx := strings.Index(lines[i], marker)
+		idx, marker := indexAnyMarker(lines[i], markers)
+		if idx < 0 {
+			continue
+		}
+		head := strings.TrimSpace(lines[i][idx+len(marker):])
+		head = strings.TrimSpace(strings.TrimRight(head, "│┃"))
+
+		parts := []string{}
+		if head != "" {
+			parts = append(parts, head)
+		}
+		if strings.ContainsAny(lines[i][:idx], "│┃") {
+			for j := i + 1; j < len(lines) && j-i <= composerBlockMaxRows; j++ {
+				row := lines[j]
+				if !strings.ContainsAny(row, "│┃") {
+					break
+				}
+				inner := strings.TrimSpace(strings.Trim(row, " \t│┃"))
+				if inner == "" {
+					continue
+				}
+				if strings.TrimLeft(inner, boxRuleRunes) == "" {
+					break
+				}
+				parts = append(parts, inner)
+			}
+		}
+
+		text = strings.Join(parts, " ")
+		if text == "" {
+			return true, true, ""
+		}
+		if isPlaceholder != nil && isPlaceholder(text) {
+			return true, true, text
+		}
+		return true, false, text
+	}
+	return false, false, ""
+}
+
+// ComposerState is the message-independent view of an agent pane's input
+// box, derived from a pane capture (bd-v8dqd). It lets observability
+// surfaces report "this pane holds an unsubmitted prompt" or "this pane has
+// queued messages" without knowing what was sent — the blind spot behind
+// panes that are simultaneously idle, blocking a swarm, and holding orders
+// unread.
+type ComposerState struct {
+	// MarkerVisible: the agent's composer marker (❯ for Claude, › for
+	// codex) appears in the capture. False for agent types without a known
+	// marker, or when the pane shows a splash/dialog instead of the input
+	// box.
+	MarkerVisible bool `json:"marker_visible"`
+	// HoldsText: the bottom-most marker line carries real text (TUI hint
+	// text counts as empty) — a prompt is sitting unsubmitted in the box.
+	HoldsText bool `json:"holds_text"`
+	// QueuedMessages: the TUI reports queued unsubmitted messages (Claude's
+	// "Press up to edit queued messages" footer).
+	QueuedMessages bool `json:"queued_messages"`
+}
+
+// queuedMessagesMarkers are TUI phrases (lowercase) that appear on the
+// LIVE footer when the agent is holding queued, not-yet-processed messages.
+// Only screen-verbatim phrases belong here: matching a generic substring
+// like "queued messages" would latch the flag whenever the agent's recent
+// output merely mentions the phrase (editing this file, discussing the
+// feature), and orchestrators withhold work from panes that appear to hold
+// queued input.
+var queuedMessagesMarkers = []string{
+	"press up to edit queued messages",
+}
+
+// queuedMarkerTailLines bounds the queued-footer scan to the rows where the
+// live footer actually renders. Callers pass scrollback-inclusive captures
+// (50-500 lines), so an unanchored scan would resurrect a footer that
+// scrolled away hours ago.
+const queuedMarkerTailLines = 10
+
+// InspectComposer derives the message-independent composer state from a
+// pane capture. The composer is bottom-pinned in both Claude Code and
+// codex, so the bottom-most marker line is the live input box even in a
+// capture that includes scrollback.
+func InspectComposer(capture string, agentType AgentType) ComposerState {
+	var state ComposerState
+	tailLines := strings.Split(capture, "\n")
+	if len(tailLines) > queuedMarkerTailLines {
+		tailLines = tailLines[len(tailLines)-queuedMarkerTailLines:]
+	}
+	lower := strings.ToLower(strings.Join(tailLines, "\n"))
+	for _, marker := range queuedMessagesMarkers {
+		if strings.Contains(lower, marker) {
+			state.QueuedMessages = true
+			break
+		}
+	}
+	if agentType.Canonical() == AgentOmp {
+		// omp has no marker glyph: its composer is the bottom-pinned status-
+		// line box, whose bottom border is the draft's input row. omp steers
+		// a message sent mid-turn straight into the running turn, so it never
+		// holds queued messages outside the composer.
+		composer := agent.ParseOmpComposer(capture)
+		state.QueuedMessages = false
+		state.MarkerVisible = composer.Found
+		state.HoldsText = composer.Found && composer.Draft != ""
+		return state
+	}
+	if agentType.Canonical() == AgentCodex && codexTranscriptBrowsing(capture) {
+		return state
+	}
+	markers := composerMarkersForAgent(agentType)
+	if len(markers) == 0 {
+		return state
+	}
+	// Block-aware: a Claude entry long enough to wrap puts its tail on the
+	// rows below the marker, and an unsubmitted wrapped prompt must still
+	// report HoldsText (ntm#300).
+	found, empty, _ := composerBlockEmpty(capture, markers, composerPlaceholderPrefixes(agentType))
+	state.MarkerVisible = found
+	state.HoldsText = found && !empty
+	return state
+}
+
+// ComposerReadyForDelivery reports whether an agent pane is in a state that
+// can accept a typed prompt (bd-dp9oy). Sends fired while a Claude/codex
+// TUI is still initializing — or while it is showing a trust dialog or menu
+// instead of its input box — are silently swallowed: the keystrokes land
+// nowhere recoverable and the send still reports success. Refusing up front
+// turns that silent drop into a typed failure the caller can retry.
+//
+// The check is deliberately conservative: it only reports not-ready when a
+// capture POSITIVELY shows neither the composer marker nor working-state
+// chrome for an agent type whose marker we know. Unknown agent types, empty
+// captures, and capture errors all return ready=true (fail open) so a
+// detection gap can never block deliveries that used to work.
+//
+// paneWidth is the real tmux pane width used by the width-adaptive working
+// detectors (bd-eeifh); pass 0 when unknown.
+func (c *Client) ComposerReadyForDelivery(ctx context.Context, target string, agentType AgentType, paneWidth int) (ready bool, reason string) {
+	canonical := agentType.Canonical()
+	if canonical == AgentOmp {
+		return c.ompComposerReadyForDelivery(ctx, target)
+	}
+	markers := composerMarkersForAgent(canonical)
+	if len(markers) == 0 {
+		return true, ""
+	}
+	capture, err := c.CapturePaneVisibleContext(ctx, target)
+	if err != nil || strings.TrimSpace(capture) == "" {
+		return true, ""
+	}
+	if canonical == AgentCodex && codexTranscriptBrowsing(capture) {
+		return false, ErrCodexTranscriptBrowsing.Error()
+	}
+	if composerVisibleForDelivery(capture, markers) {
+		return true, ""
+	}
+	switch canonical {
+	case AgentClaude:
+		if agent.ClaudeActivelyWorking(capture, paneWidth) {
+			return true, ""
+		}
+	case AgentCodex:
+		if codexLooksWorking(capture) {
+			return true, ""
+		}
+	case AgentGrok:
+		if grokLooksWorking(capture) {
+			return true, ""
+		}
+	case AgentMuse:
+		if agent.MuseActivelyWorking(capture) {
+			return true, ""
+		}
+	}
+	return false, fmt.Sprintf("%s composer not visible: pane appears to be initializing or showing a dialog; a typed prompt would be swallowed", canonical)
+}
+
+// ompComposerReadyForDelivery is the omp arm of ComposerReadyForDelivery.
+// omp draws nothing for about a second after launch and then renders its
+// composer box in the same frame as the banner, so unlike the marker-based
+// arms a BLANK capture is positively "still booting" and refuses. A box with
+// rows under it is an open completion list: Enter there selects an entry, so
+// the pane must be cleared first. A capture error still fails open.
+func (c *Client) ompComposerReadyForDelivery(ctx context.Context, target string) (bool, string) {
+	capture, err := c.CapturePaneVisibleContext(ctx, target)
+	if err != nil {
+		return true, ""
+	}
+	if strings.TrimSpace(capture) == "" {
+		return false, "omp composer not drawn yet: pane is still booting; a typed prompt would be swallowed"
+	}
+	composer := agent.ParseOmpComposer(capture)
+	switch {
+	case composer.Found && composer.RowsBelow == 0:
+		return true, ""
+	case composer.Found:
+		return false, "omp composer has a completion list open below it; Enter would select an entry instead of submitting (clear the draft first)"
+	default:
+		return false, "omp composer not visible: pane appears to be initializing or showing a selector/dialog; a typed prompt would be swallowed"
+	}
+}
+
+// ComposerReadyForDelivery checks delivery readiness (default client).
+func ComposerReadyForDelivery(ctx context.Context, target string, agentType AgentType, paneWidth int) (bool, string) {
+	return DefaultClient.ComposerReadyForDelivery(ctx, target, agentType, paneWidth)
+}
+
+// dialogOptionLineRe matches the text of a numbered dialog option row after
+// the marker glyph has been stripped ("1. Update now (runs `bun install -g
+// @openai/codex`)"). Codex renders its update dialog's selected option with
+// the same "›" cursor glyph as the composer prompt, so a whole-screen
+// substring match accepted the dialog as a ready composer and a robot send's
+// Enter selected "Update now" — an unintended self-update (GH#273 root cause
+// 3; same class as the Claude-menu half of GH#241).
+var dialogOptionLineRe = regexp.MustCompile(`^\d{1,2}[.)]\s`)
+
+// dialogChromeScanLines bounds how far below the marker line the delivery
+// gate looks for dialog chrome like "Press enter to continue". Dialogs render
+// that hint directly under their option list, so a short window is enough and
+// keeps transcript text far above the composer from vetoing a live pane.
+const dialogChromeScanLines = 6
+
+// ErrCodexTranscriptBrowsing means the keyboard belongs to transcript history,
+// where Enter rewinds the conversation instead of submitting a fresh prompt.
+var ErrCodexTranscriptBrowsing = errors.New("codex is browsing transcript: Enter would rewind the conversation; return with Escape or use --clear-input before resending")
+
+// Codex shortens this footer as the pane narrows, down to just "Browsing".
+// These are the alternatives from its prompt_navigation_footer renderer.
+var codexTranscriptFooterRe = regexp.MustCompile(`(?i)^Browsing(?: transcript)?(?: · (?:↑↓/jk scroll|←→/hl prompts|\S+(?: \S+)? details|↵ rewind|esc(?: back)?|↑↓/jk ←→/hl))*$`)
+
+func codexTranscriptBrowsing(capture string) bool {
+	lines := strings.Split(strings.TrimSpace(capture), "\n")
+	start := max(0, len(lines)-queuedMarkerTailLines)
+	for i := start; i < len(lines); i++ {
+		footer := strings.Join(strings.Fields(strings.Join(lines[i:], " ")), " ")
+		if codexTranscriptFooterRe.MatchString(footer) {
+			return true
+		}
+	}
+	return false
+}
+
+// composerVisibleForDelivery reports whether the capture POSITIVELY shows a
+// live composer rather than dialog chrome reusing the marker glyph. Only the
+// BOTTOM-MOST marker line counts — the composer is bottom-pinned in every
+// supported TUI, and transcript echoes render the marker higher up. A marker
+// line whose text is a numbered dialog option, or whose frame shows "Press
+// enter to continue" at or just below the marker, is a selection cursor, not
+// an input box (GH#273 root cause 3).
+func composerVisibleForDelivery(capture string, markers []string) bool {
+	for _, marker := range markers {
+		if (marker == "›" || marker == "»") && codexTranscriptBrowsing(capture) {
+			return false
+		}
+	}
+	lines := strings.Split(capture, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		idx, marker := indexAnyMarker(lines[i], markers)
 		if idx < 0 {
 			continue
 		}
 		text := strings.TrimSpace(lines[i][idx+len(marker):])
-		if text == "" || (isPlaceholder != nil && isPlaceholder(text)) {
-			return true, true
+		if dialogOptionLineRe.MatchString(text) {
+			return false
 		}
-		return true, false
-	}
-	return false, false
-}
-
-// ClearComposerContext performs the per-agent pre-send composer clear and
-// verifies the composer is empty where the TUI exposes a marker. Returns
-// cleared=false only when verification POSITIVELY shows leftover text;
-// verified=false means the sequence was sent but emptiness could not be
-// confirmed (no marker visible / unknown TUI).
-func (c *Client) ClearComposerContext(ctx context.Context, target string, agentType AgentType) (cleared, verified bool, err error) {
-	for i, key := range ComposerClearKeys(agentType) {
-		if i > 0 {
-			if err := waitForSendDelay(ctx, composerClearKeyGap); err != nil {
-				return false, false, err
+		for j := i; j < len(lines) && j <= i+dialogChromeScanLines; j++ {
+			if strings.Contains(strings.ToLower(lines[j]), "press enter to continue") {
+				return false
 			}
 		}
-		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, key); err != nil {
-			return false, false, fmt.Errorf("send composer clear key %q: %w", key, err)
+		return true
+	}
+	return false
+}
+
+// ComposerClearBlocker names the state that kept a composer from being
+// cleared. It is a typed reason so callers can distinguish "the agent is
+// holding queued messages" from "a modal owns the keyboard" from "there is
+// simply text we could not drain" (ntm#300).
+type ComposerClearBlocker string
+
+const (
+	// ComposerBlockerNone means nothing blocked the clear.
+	ComposerBlockerNone ComposerClearBlocker = ""
+	// ComposerBlockerInput: ordinary unsubmitted text survived every
+	// escalation round.
+	ComposerBlockerInput ComposerClearBlocker = "input"
+	// ComposerBlockerQueued: the TUI still reports queued messages held
+	// outside the composer, so a fresh prompt would not be the next thing
+	// the agent processes.
+	ComposerBlockerQueued ComposerClearBlocker = "queued"
+	// ComposerBlockerModal: a dialog or picker owns the keyboard; sending
+	// line-kill keys there would select menu entries instead of clearing.
+	ComposerBlockerModal ComposerClearBlocker = "modal"
+)
+
+// ComposerClearResult reports the outcome of a composer clear.
+type ComposerClearResult struct {
+	// Cleared is false only when verification POSITIVELY shows leftover
+	// state.
+	Cleared bool
+	// Verified is false when emptiness could not be confirmed (no marker
+	// visible / unknown TUI).
+	Verified bool
+	// Blocker names what stopped the clear when Cleared is false.
+	Blocker ComposerClearBlocker
+	// Rounds counts the escalation rounds actually run.
+	Rounds int
+	// Residual is the composer text still visible when Cleared is false,
+	// for operator diagnostics.
+	Residual string
+}
+
+// composerClearEscalationKeys is the round-2+ sequence. A single C-u kills to
+// the start of the current line, which does not drain a Claude Code entry that
+// has wrapped across several visual rows — the failure behind ntm#300. Moving
+// to the end of the entry first and repeating the kill drains it row by row.
+var composerClearEscalationKeys = []string{"C-e", "C-u"}
+
+// composerClearMaxRounds bounds the escalation. Each round costs one key
+// burst plus one capture, so the loop stays well inside a send's budget.
+const composerClearMaxRounds = 4
+
+// composerClearMaxBackspaces caps the final measured drain so a
+// mis-measurement can never turn into an unbounded key storm.
+const composerClearMaxBackspaces = 4096
+
+// ClearComposerContext performs the per-agent pre-send composer clear and
+// verifies the composer is empty where the TUI exposes a marker.
+//
+// The clear escalates: the per-agent ritual first, then end-of-entry +
+// line-kill rounds, then a measured backspace drain sized from the residual
+// text the capture still shows. Each round is verified against the whole
+// composer BLOCK (marker row plus wrapped continuation rows), because a
+// wrapped entry is exactly the case the single-round, single-row version
+// could neither clear nor prove cleared (ntm#300).
+//
+// A pane whose queued-message footer is up gets its queued entry recalled
+// with Up before the ritual, so --clear-input covers queued composer state
+// too. A pane parked on a dialog is refused with ComposerBlockerModal rather
+// than hammered with line-kill keys, which would pick menu entries.
+func (c *Client) ClearComposerContext(ctx context.Context, target string, agentType AgentType) (ComposerClearResult, error) {
+	canonical := agentType.Canonical()
+	if canonical == AgentOmp {
+		return c.clearOmpComposerContext(ctx, target)
+	}
+	markers := composerMarkersForAgent(agentType)
+
+	sendKeys := func(keys []string) error {
+		for i, key := range keys {
+			if i > 0 {
+				if err := waitForSendDelay(ctx, composerClearKeyGap); err != nil {
+					return err
+				}
+			}
+			if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), key); err != nil {
+				return fmt.Errorf("send composer clear key %q: %w", key, err)
+			}
 		}
+		return nil
 	}
-	marker := composerMarkerForAgent(agentType)
-	if marker == "" {
-		return true, false, nil
+
+	// Unknown TUI: fire the line-kill and report an unverifiable clear, the
+	// same best-effort contract as before.
+	if len(markers) == 0 {
+		if err := sendKeys(ComposerClearKeys(agentType)); err != nil {
+			return ComposerClearResult{}, err
+		}
+		return ComposerClearResult{Cleared: true, Rounds: 1}, nil
 	}
-	if err := waitForSendDelay(ctx, composerClearVerifyWait); err != nil {
-		return false, false, err
-	}
-	capture, err := c.CapturePaneVisibleContext(ctx, target)
-	if err != nil {
-		return false, false, fmt.Errorf("capture pane for composer clear verification: %w", err)
-	}
-	found, empty := composerLineEmpty(capture, marker, composerPlaceholder(agentType))
-	if !found {
-		return true, false, nil
-	}
-	if !empty && agentType.Canonical() == AgentMuse && museCtrlCClearsDraft(capture) {
-		// Muse's C-u kills only the cursor line, so the earlier lines of a
-		// multi-line draft survive it. Ctrl+C clears the whole draft of an
-		// idle Muse pane ("Draft cleared · press ↑ to restore").
-		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "C-c"); err != nil {
-			return false, true, fmt.Errorf("send Ctrl+C to clear the rest of the Muse draft: %w", err)
+
+	result := ComposerClearResult{}
+	transcriptDismissed := false
+	for round := 1; round <= composerClearMaxRounds; round++ {
+		capture, err := c.CapturePaneVisibleContext(ctx, target)
+		if err != nil {
+			return result, fmt.Errorf("capture pane for composer clear verification: %w", err)
+		}
+		if canonical == AgentCodex && codexTranscriptBrowsing(capture) {
+			result.Verified = true
+			result.Blocker = ComposerBlockerModal
+			result.Residual = "Codex transcript browsing (Enter rewinds the conversation)"
+			if transcriptDismissed {
+				return result, nil
+			}
+			// One Escape returns from history. Re-capture before any editing;
+			// a second Escape could prime or reopen browsing again.
+			if err := sendKeys([]string{"Escape"}); err != nil {
+				return result, err
+			}
+			transcriptDismissed = true
+			result.Rounds = round
+			if err := waitForSendDelay(ctx, composerClearVerifyWait); err != nil {
+				return result, err
+			}
+			continue
+		}
+
+		// No marker at all (pane initializing, or an agent actively working
+		// with its composer off screen) is unverifiable. Codex receives no
+		// blind editing keys; other agents retain their best-effort clear.
+		markerVisible, empty, _ := composerBlockEmpty(capture, markers, composerPlaceholderPrefixes(agentType))
+		if !markerVisible {
+			if canonical == AgentCodex {
+				// After dismissing history, require positive recovery proof.
+				if transcriptDismissed {
+					return result, nil
+				}
+				return ComposerClearResult{Cleared: true, Rounds: result.Rounds}, nil
+			}
+			if err := sendKeys(ComposerClearKeys(agentType)); err != nil {
+				return result, err
+			}
+			result.Rounds = round
+			result.Cleared = true
+			return result, nil
+		}
+
+		// A marker that reads as dialog chrome is a selection cursor, not an
+		// input box. Never send line-kill keys there: they act as menu
+		// navigation, which is how a "recovery" can submit something.
+		if !composerVisibleForDelivery(capture, markers) {
+			result.Blocker = ComposerBlockerModal
+			result.Verified = true
+			result.Residual = ""
+			result.Rounds = round
+			return result, nil
+		}
+
+		queued := InspectComposer(capture, agentType).QueuedMessages
+		// Codex and Muse get no keys at an empty composer: Codex's would
+		// open history, and Muse's Ctrl+C there arms quit.
+		if (canonical == AgentCodex || canonical == AgentMuse) && empty && !queued {
+			return ComposerClearResult{Cleared: true, Verified: true, Rounds: result.Rounds}, nil
+		}
+		keys := ComposerClearKeys(agentType)
+		drain := 0
+		switch {
+		case canonical == AgentMuse && round > 1:
+			// Muse's C-u kills only the cursor line, so the earlier lines of
+			// a multi-line draft survive it. Ctrl+C clears the whole draft of
+			// an idle Muse pane ("Draft cleared · press ↑ to restore"), but
+			// mid-turn or under a dialog it does something else, so it is
+			// sent only when museCtrlCClearsDraft says so; otherwise the
+			// line-kill repeats. Muse gets no C-e or backspace drain, which
+			// were never checked against a live Muse.
+			if museCtrlCClearsDraft(capture) {
+				keys = []string{"C-c"}
+			}
+		case round == composerClearMaxRounds:
+			_, _, residual := composerBlockEmpty(capture, markers, composerPlaceholderPrefixes(agentType))
+			keys = []string{"C-e"}
+			drain = backspaceCount(residual)
+		case round > 1:
+			keys = composerClearEscalationKeys
+		}
+		if queued {
+			// Recall the queued entry into the composer so the same kill
+			// sequence drains it.
+			keys = append([]string{"Up"}, keys...)
+		}
+
+		result.Rounds = round
+		if err := sendKeys(keys); err != nil {
+			return result, err
+		}
+		if drain > 0 {
+			if err := waitForSendDelay(ctx, composerClearKeyGap); err != nil {
+				return result, err
+			}
+			// One tmux call with -N: a per-key gap would turn a long entry
+			// into a multi-second key storm.
+			if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "-N", strconv.Itoa(drain), "BSpace"); err != nil {
+				return result, fmt.Errorf("send composer backspace drain: %w", err)
+			}
 		}
 		if err := waitForSendDelay(ctx, composerClearVerifyWait); err != nil {
-			return false, true, err
+			return result, err
 		}
-		capture, err = c.CapturePaneVisibleContext(ctx, target)
+
+		after, err := c.CapturePaneVisibleContext(ctx, target)
 		if err != nil {
-			return false, false, fmt.Errorf("capture pane for composer clear verification: %w", err)
+			return result, fmt.Errorf("capture pane for composer clear verification: %w", err)
 		}
-		found, empty = composerLineEmpty(capture, marker, composerPlaceholder(agentType))
+		if canonical == AgentCodex && codexTranscriptBrowsing(after) {
+			result.Verified = true
+			result.Blocker = ComposerBlockerModal
+			result.Residual = "Codex transcript browsing (Enter rewinds the conversation)"
+			continue
+		}
+		found, empty, residual := composerBlockEmpty(after, markers, composerPlaceholderPrefixes(agentType))
+		stillQueued := InspectComposer(after, agentType).QueuedMessages
 		if !found {
-			return true, false, nil
+			// No marker visible: unverifiable, same as before.
+			result.Cleared = true
+			return result, nil
+		}
+		if empty && !stillQueued {
+			return ComposerClearResult{Cleared: true, Verified: true, Rounds: result.Rounds}, nil
+		}
+		result.Verified = true
+		result.Residual = residual
+		if empty && stillQueued {
+			result.Blocker = ComposerBlockerQueued
+		} else {
+			result.Blocker = ComposerBlockerInput
 		}
 	}
-	return empty, true, nil
+	return result, nil
+}
+
+// backspaceCount sizes the final measured drain: one BSpace per rune of
+// residual composer text, plus a small margin for glyphs the capture may have
+// collapsed. It is the last escalation step precisely because it depends on no
+// editor binding beyond Backspace.
+func backspaceCount(residual string) int {
+	n := len([]rune(residual)) + 8
+	if n > composerClearMaxBackspaces {
+		n = composerClearMaxBackspaces
+	}
+	return n
 }
 
 // museCtrlCClearsDraft reports whether Ctrl+C would only clear the draft
@@ -2368,7 +3100,7 @@ func museCtrlCClearsDraft(capture string) bool {
 }
 
 // ClearComposerContext clears the composer using the default client.
-func ClearComposerContext(ctx context.Context, target string, agentType AgentType) (bool, bool, error) {
+func ClearComposerContext(ctx context.Context, target string, agentType AgentType) (ComposerClearResult, error) {
 	return DefaultClient.ClearComposerContext(ctx, target, agentType)
 }
 
@@ -2384,19 +3116,21 @@ func codexComposerHoldsPayload(capture, message string) bool {
 			break
 		}
 	}
-	// Only the BOTTOM-MOST "›" line is the live composer. Codex also echoes
+	// Only the BOTTOM-MOST marker line is the live composer. Codex also echoes
 	// submitted user messages into the transcript with a "›" prefix, so any
 	// earlier match is history — treating it as composer content would make a
 	// successfully submitted prompt look permanently stuck and fail the
-	// delivery falsely.
+	// delivery falsely. Both codex glyphs count: "›" everywhere, "»" at
+	// reasoning effort ultra (GH#273).
+	markers := composerMarkersForAgent(AgentCodex)
 	lines := strings.Split(capture, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
-		marker := strings.Index(line, "›")
-		if marker < 0 {
+		idx, marker := indexAnyMarker(line, markers)
+		if idx < 0 {
 			continue
 		}
-		composerText := strings.TrimSpace(line[marker+len("›"):])
+		composerText := strings.TrimSpace(line[idx+len(marker):])
 		if composerText == "" {
 			return false
 		}
@@ -2413,6 +3147,230 @@ func codexLooksWorking(capture string) bool {
 	return strings.Contains(strings.ToLower(capture), "esc to interrupt")
 }
 
+// grokActivityLineRe matches Grok Build's live activity line — a braille
+// spinner frame plus one of the three observed phase verbs ("⠹ Waiting for
+// response… 0.7s" / "⠸ Thinking… 0.0s" / "⠙ Responding… 1.7s"). Rendered only
+// while a turn is in flight (verified live against grok 1.0.5, GH#251).
+var grokActivityLineRe = regexp.MustCompile(`(?m)^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*(?:Waiting for response|Thinking|Responding)…`)
+
+// grokLooksWorking reports whether the capture shows Grok Build's in-flight
+// chrome: the spinner activity line or the "Esc:cancel" footer hint, both of
+// which disappear at idle.
+func grokLooksWorking(capture string) bool {
+	return grokActivityLineRe.MatchString(capture) || strings.Contains(capture, "Esc:cancel")
+}
+
+// grokComposerHoldsPayload reports whether a Grok Build pane capture shows the
+// delivered message still sitting unsubmitted in the bordered composer. Grok
+// pins its "│ ❯ <text> │" composer to the bottom of the screen and echoes
+// submitted prompts into the transcript with a plain "❯" prefix, so only the
+// BOTTOM-MOST marker line is live-composer evidence; the trailing box border
+// is stripped before evaluation.
+func grokComposerHoldsPayload(capture, message string) bool {
+	snippet := ""
+	for _, line := range strings.Split(message, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			if len(line) > 32 {
+				line = line[:32]
+			}
+			snippet = line
+			break
+		}
+	}
+	lines := strings.Split(capture, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+		marker := strings.Index(line, "❯")
+		if marker < 0 {
+			continue
+		}
+		composerText := strings.TrimSpace(strings.TrimRight(strings.TrimSpace(line[marker+len("❯"):]), "│"))
+		if composerText == "" {
+			return false
+		}
+		if strings.Contains(composerText, "[Pasted") {
+			return true
+		}
+		return snippet != "" && strings.Contains(line, snippet)
+	}
+	return false
+}
+
+// VerifyGrokSubmissionContext confirms that a prompt delivered to a Grok Build
+// pane actually submitted (GH#251 phase 2). Mirrors the codex verifier: when
+// the payload is still visibly sitting in the composer after the double-Enter
+// protocol, the rescue is one extra Enter, then bounded polling. Returns
+// (confirmed, rescued); confirmed=false means the payload is still visibly
+// unsubmitted and callers must not report the send as delivered.
+//
+// paneWidth is accepted for signature parity with the other verifiers; grok's
+// working check is a full-capture match and does not depend on it.
+func (c *Client) VerifyGrokSubmissionContext(ctx context.Context, target, message string, paneWidth int) (bool, bool, error) {
+	if err := waitForSendDelay(ctx, codexVerifyInitialDelay); err != nil {
+		return false, false, err
+	}
+	capture, err := c.CapturePaneVisibleContext(ctx, target)
+	if err != nil {
+		return false, false, fmt.Errorf("capture grok pane for submission verification: %w", err)
+	}
+	if grokLooksWorking(capture) || !grokComposerHoldsPayload(capture, message) {
+		return true, false, nil
+	}
+
+	// The composer still holds the payload: finish the job with one bare
+	// Enter, then poll for the submission to take effect. An extra Enter into
+	// an already-submitted grok composer is a no-op (verified live).
+	if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter"); err != nil {
+		return false, true, fmt.Errorf("send rescue Enter to grok pane: %w", err)
+	}
+	for poll := 0; poll < codexVerifyMaxPolls; poll++ {
+		if err := waitForSendDelay(ctx, codexVerifyPollInterval); err != nil {
+			return false, true, err
+		}
+		capture, err = c.CapturePaneVisibleContext(ctx, target)
+		if err != nil {
+			return false, true, fmt.Errorf("capture grok pane after rescue Enter: %w", err)
+		}
+		if grokLooksWorking(capture) || !grokComposerHoldsPayload(capture, message) {
+			return true, true, nil
+		}
+	}
+	return false, true, nil
+}
+
+// VerifyGrokSubmissionContext verifies grok prompt submission (default client).
+func VerifyGrokSubmissionContext(ctx context.Context, target, message string, paneWidth int) (bool, bool, error) {
+	return DefaultClient.VerifyGrokSubmissionContext(ctx, target, message, paneWidth)
+}
+
+// ompComposerHoldsPayload reports whether an omp pane capture shows the
+// delivered message still sitting unsubmitted in the composer box. omp echoes
+// submitted prompts into the transcript as plain lines, so only the parsed
+// bottom-pinned composer draft is evidence. A collapsed bracketed-paste token
+// ("#1" with its preview box) is the payload by construction; otherwise the
+// first non-empty message line (whitespace-normalised, because the draft's
+// wrapped rows are re-joined line by line) must appear in the draft.
+func ompComposerHoldsPayload(capture, message string) bool {
+	composer := agent.ParseOmpComposer(capture)
+	if !composer.Found || composer.Draft == "" {
+		return false
+	}
+	if composer.PasteToken {
+		return true
+	}
+	snippet := ""
+	for _, line := range strings.Split(message, "\n") {
+		line = strings.Join(strings.Fields(line), " ")
+		if line != "" {
+			if runes := []rune(line); len(runes) > 32 {
+				line = string(runes[:32])
+			}
+			snippet = line
+			break
+		}
+	}
+	draft := strings.Join(strings.Fields(composer.Draft), " ")
+	return snippet != "" && strings.Contains(draft, snippet)
+}
+
+// ompClearVerifyWait spaces omp composer-clear rounds. Ctrl+C is omp's
+// draft-clear key, but two presses within ~0.5s on an EMPTY draft quit omp
+// (verified live against omp v18.2.3), so consecutive rounds stay well
+// outside that window and a press is only ever sent at a non-empty draft.
+const ompClearVerifyWait = 1200 * time.Millisecond
+
+// clearOmpComposerContext is the omp composer clear. A single Ctrl+C drains
+// the whole draft — multi-line drafts and paste tokens included, and while a
+// turn is in flight without interrupting it — whereas Ctrl+U only kills the
+// current row. Ctrl+C is sent only when the parsed composer positively holds
+// text, so the clear can never contribute to omp's double-press quit.
+func (c *Client) clearOmpComposerContext(ctx context.Context, target string) (ComposerClearResult, error) {
+	sent := 0
+	for {
+		capture, err := c.CapturePaneVisibleContext(ctx, target)
+		if err != nil {
+			return ComposerClearResult{Rounds: sent}, fmt.Errorf("capture pane for composer clear verification: %w", err)
+		}
+		composer := agent.ParseOmpComposer(capture)
+		if !composer.Found {
+			// No composer box (booting, or a selector owns the screen): the
+			// clear is unverifiable, and Ctrl+C there would cancel a
+			// selector, so nothing is sent — the same best-effort contract
+			// as an unknown TUI.
+			return ComposerClearResult{Cleared: true, Rounds: sent}, nil
+		}
+		if composer.Draft == "" {
+			return ComposerClearResult{Cleared: true, Verified: true, Rounds: sent}, nil
+		}
+		if sent == composerClearMaxRounds {
+			return ComposerClearResult{
+				Verified: true,
+				Blocker:  ComposerBlockerInput,
+				Rounds:   sent,
+				Residual: composer.Draft,
+			}, nil
+		}
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "C-c"); err != nil {
+			return ComposerClearResult{Rounds: sent}, fmt.Errorf("send composer clear key %q: %w", "C-c", err)
+		}
+		sent++
+		if err := waitForSendDelay(ctx, ompClearVerifyWait); err != nil {
+			return ComposerClearResult{Rounds: sent}, err
+		}
+	}
+}
+
+// VerifyOmpSubmissionContext confirms that a prompt delivered to an omp pane
+// actually submitted. omp submits on Enter, but an Enter pressed while the
+// "@file" or "/command" completion list is open selects the completion
+// instead (verified live), so a draft ending in a partial mention can survive
+// the protocol's Enters. When the payload is still visibly in the composer,
+// one more Enter finishes the job — an Enter into an empty or busy omp
+// composer is a verified no-op — followed by bounded polling. Returns
+// (confirmed, rescued) like the other verifiers.
+//
+// The postcondition is "the payload left the composer", NOT "the pane is
+// working": omp keeps its composer live mid-turn, and a message submitted
+// then moves into the "Steering · N" block above the activity line, so a busy
+// pane whose composer still holds the payload is exactly the stranded case.
+//
+// paneWidth is accepted for signature parity; omp's chrome is anchored to the
+// composer box rather than a width-dependent tail.
+func (c *Client) VerifyOmpSubmissionContext(ctx context.Context, target, message string, _ int) (bool, bool, error) {
+	if err := waitForSendDelay(ctx, codexVerifyInitialDelay); err != nil {
+		return false, false, err
+	}
+	capture, err := c.CapturePaneVisibleContext(ctx, target)
+	if err != nil {
+		return false, false, fmt.Errorf("capture omp pane for submission verification: %w", err)
+	}
+	if !ompComposerHoldsPayload(capture, message) {
+		return true, false, nil
+	}
+	if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter"); err != nil {
+		return false, true, fmt.Errorf("send rescue Enter to omp pane: %w", err)
+	}
+	for poll := 0; poll < codexVerifyMaxPolls; poll++ {
+		if err := waitForSendDelay(ctx, codexVerifyPollInterval); err != nil {
+			return false, true, err
+		}
+		capture, err = c.CapturePaneVisibleContext(ctx, target)
+		if err != nil {
+			return false, true, fmt.Errorf("capture omp pane after rescue Enter: %w", err)
+		}
+		if !ompComposerHoldsPayload(capture, message) {
+			return true, true, nil
+		}
+	}
+	return false, true, nil
+}
+
+// VerifyOmpSubmissionContext verifies omp prompt submission (default client).
+func VerifyOmpSubmissionContext(ctx context.Context, target, message string, paneWidth int) (bool, bool, error) {
+	return DefaultClient.VerifyOmpSubmissionContext(ctx, target, message, paneWidth)
+}
+
 // VerifyCodexSubmissionContext confirms that a prompt delivered to a codex
 // pane actually submitted, rescuing it with one extra Enter when the TUI
 // consumed the protocol's Enter as part of the bracketed paste (ntm-8ubn).
@@ -2420,7 +3378,11 @@ func codexLooksWorking(capture string) bool {
 // visibly sitting in the composer after the rescue attempt, so callers must
 // not report the send as delivered. A capture failure returns an error and
 // makes no claim either way.
-func (c *Client) VerifyCodexSubmissionContext(ctx context.Context, target, message string) (bool, bool, error) {
+//
+// paneWidth is accepted for signature parity with the Claude verifier so
+// callers can thread one real pane width (bd-eeifh); codex's working check
+// is a full-capture substring match and does not depend on it.
+func (c *Client) VerifyCodexSubmissionContext(ctx context.Context, target, message string, paneWidth int) (bool, bool, error) {
 	if err := waitForSendDelay(ctx, codexVerifyInitialDelay); err != nil {
 		return false, false, err
 	}
@@ -2431,13 +3393,16 @@ func (c *Client) VerifyCodexSubmissionContext(ctx context.Context, target, messa
 	if err != nil {
 		return false, false, fmt.Errorf("capture codex pane for submission verification: %w", err)
 	}
+	if codexTranscriptBrowsing(capture) {
+		return false, false, ErrCodexTranscriptBrowsing
+	}
 	if codexLooksWorking(capture) || !codexComposerHoldsPayload(capture, message) {
 		return true, false, nil
 	}
 
 	// The composer still holds the payload: finish the job with one bare
 	// Enter, then poll for the submission to take effect.
-	if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+	if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter"); err != nil {
 		return false, true, fmt.Errorf("send rescue Enter to codex pane: %w", err)
 	}
 	for poll := 0; poll < codexVerifyMaxPolls; poll++ {
@@ -2448,6 +3413,9 @@ func (c *Client) VerifyCodexSubmissionContext(ctx context.Context, target, messa
 		if err != nil {
 			return false, true, fmt.Errorf("capture codex pane after rescue Enter: %w", err)
 		}
+		if codexTranscriptBrowsing(capture) {
+			return false, true, ErrCodexTranscriptBrowsing
+		}
 		if codexLooksWorking(capture) || !codexComposerHoldsPayload(capture, message) {
 			return true, true, nil
 		}
@@ -2456,8 +3424,8 @@ func (c *Client) VerifyCodexSubmissionContext(ctx context.Context, target, messa
 }
 
 // VerifyCodexSubmissionContext verifies codex prompt submission (default client).
-func VerifyCodexSubmissionContext(ctx context.Context, target, message string) (bool, bool, error) {
-	return DefaultClient.VerifyCodexSubmissionContext(ctx, target, message)
+func VerifyCodexSubmissionContext(ctx context.Context, target, message string, paneWidth int) (bool, bool, error) {
+	return DefaultClient.VerifyCodexSubmissionContext(ctx, target, message, paneWidth)
 }
 
 // claudeComposerHoldsPayload reports whether a Claude Code pane capture shows
@@ -2506,7 +3474,10 @@ func claudeComposerHoldsPayload(capture, message string) bool {
 // text) followed by Enter, then bounded polling. Returns (confirmed, rescued);
 // confirmed=false means the payload is still visibly unsubmitted and callers
 // must not report the send as delivered.
-func (c *Client) VerifyClaudeSubmissionContext(ctx context.Context, target, message string) (bool, bool, error) {
+//
+// paneWidth is the real tmux pane width used by the width-adaptive Claude
+// working detector (bd-eeifh); pass 0 when unknown.
+func (c *Client) VerifyClaudeSubmissionContext(ctx context.Context, target, message string, paneWidth int) (bool, bool, error) {
 	if err := waitForSendDelay(ctx, codexVerifyInitialDelay); err != nil {
 		return false, false, err
 	}
@@ -2514,7 +3485,7 @@ func (c *Client) VerifyClaudeSubmissionContext(ctx context.Context, target, mess
 	if err != nil {
 		return false, false, fmt.Errorf("capture claude pane for submission verification: %w", err)
 	}
-	if agent.ClaudeActivelyWorking(capture) || !claudeComposerHoldsPayload(capture, message) {
+	if agent.ClaudeActivelyWorking(capture, paneWidth) || !claudeComposerHoldsPayload(capture, message) {
 		return true, false, nil
 	}
 
@@ -2530,19 +3501,19 @@ func (c *Client) VerifyClaudeSubmissionContext(ctx context.Context, target, mess
 	if err != nil {
 		return false, false, fmt.Errorf("re-capture claude pane before rescue: %w", err)
 	}
-	if agent.ClaudeActivelyWorking(capture) || !claudeComposerHoldsPayload(capture, message) {
+	if agent.ClaudeActivelyWorking(capture, paneWidth) || !claudeComposerHoldsPayload(capture, message) {
 		return true, false, nil
 	}
 
 	// Dismiss a possible picker, then finish the submission. A single Escape
 	// is deliberate: double-Escape opens Claude Code's message-history jump.
-	if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "Escape"); err != nil {
+	if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Escape"); err != nil {
 		return false, true, fmt.Errorf("send rescue Escape to claude pane: %w", err)
 	}
 	if err := waitForSendDelay(ctx, 300*time.Millisecond); err != nil {
 		return false, true, err
 	}
-	if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+	if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter"); err != nil {
 		return false, true, fmt.Errorf("send rescue Enter to claude pane: %w", err)
 	}
 	for poll := 0; poll < codexVerifyMaxPolls; poll++ {
@@ -2553,7 +3524,7 @@ func (c *Client) VerifyClaudeSubmissionContext(ctx context.Context, target, mess
 		if err != nil {
 			return false, true, fmt.Errorf("capture claude pane after rescue: %w", err)
 		}
-		if agent.ClaudeActivelyWorking(capture) || !claudeComposerHoldsPayload(capture, message) {
+		if agent.ClaudeActivelyWorking(capture, paneWidth) || !claudeComposerHoldsPayload(capture, message) {
 			return true, true, nil
 		}
 	}
@@ -2561,8 +3532,8 @@ func (c *Client) VerifyClaudeSubmissionContext(ctx context.Context, target, mess
 }
 
 // VerifyClaudeSubmissionContext verifies Claude prompt submission (default client).
-func VerifyClaudeSubmissionContext(ctx context.Context, target, message string) (bool, bool, error) {
-	return DefaultClient.VerifyClaudeSubmissionContext(ctx, target, message)
+func VerifyClaudeSubmissionContext(ctx context.Context, target, message string, paneWidth int) (bool, bool, error) {
+	return DefaultClient.VerifyClaudeSubmissionContext(ctx, target, message, paneWidth)
 }
 
 // SendKeyName sends a tmux KEY NAME (BSpace, Escape, Enter, C-u, Up, ...)
@@ -2582,7 +3553,7 @@ func (c *Client) SendKeyName(target, keyName string) error {
 // The "--" stops a key name that begins with a dash from being parsed by tmux
 // as a flag instead of a key.
 func (c *Client) SendKeyNameContext(ctx context.Context, target, keyName string) error {
-	return c.RunSilentContext(ctx, "send-keys", "-t", target, "--", keyName)
+	return c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "--", keyName)
 }
 
 // SendKeyName sends a tmux key name using the default client.
@@ -2590,31 +3561,14 @@ func SendKeyName(target, keyName string) error {
 	return DefaultClient.SendKeyName(target, keyName)
 }
 
-// SendKeyNameContext sends a tmux key name with cancellation (default client).
-func SendKeyNameContext(ctx context.Context, target, keyName string) error {
-	return DefaultClient.SendKeyNameContext(ctx, target, keyName)
-}
-
 // SendInterrupt sends Ctrl+C to a pane
 func (c *Client) SendInterrupt(target string) error {
-	return c.RunSilent("send-keys", "-t", target, "C-c")
+	return c.RunSilent("send-keys", "-t", ExactTarget(target), "C-c")
 }
 
 // SendInterrupt sends Ctrl+C to a pane (default client)
 func SendInterrupt(target string) error {
 	return DefaultClient.SendInterrupt(target)
-}
-
-// InterruptKey returns the tmux key name, for SendKeyName, that stops a
-// running turn in a pane of agentType. Muse Code gets Escape: its Ctrl+C only
-// clears the composer draft while the turn keeps running, and on an idle
-// composer it arms quit, so a second Ctrl+C exits Muse. Every other pane,
-// shells and unknown types included, gets Ctrl+C.
-func InterruptKey(agentType AgentType) string {
-	if agentType.Canonical() == AgentMuse {
-		return "Escape"
-	}
-	return "C-c"
 }
 
 // exitDoubleCtrlCGap is the pause between the two presses of a double Ctrl+C.
@@ -2632,6 +3586,7 @@ const exitDoubleCtrlCGap = 100 * time.Millisecond
 //   - Codex: /exit, typed only into a composer verified empty, otherwise a
 //     double Ctrl+C.
 //   - Gemini, Muse and Kimi: Escape, then three Ctrl+Cs.
+//   - Oh My Pi: Escape, Ctrl+C, then Ctrl+D (SendOmpExitContext).
 //   - Any other agent: the double Ctrl+C most agent CLIs quit on.
 //
 // No exit types a slash command onto a draft: typed after one, the command
@@ -2653,6 +3608,8 @@ func (c *Client) SendAgentExitKeys(ctx context.Context, target string, agentType
 		return c.sendCodexExitKeys(ctx, target)
 	case AgentGemini, AgentMuse, AgentKimi:
 		return "escape_then_triple_ctrl_c", c.sendEscapeThenTripleCtrlC(ctx, target)
+	case AgentOmp:
+		return "escape_clear_ctrl_d", c.SendOmpExitContext(ctx, target)
 	default:
 		return "double_ctrl_c_fallback", c.sendDoubleCtrlC(ctx, target)
 	}
@@ -2671,7 +3628,7 @@ func (c *Client) sendExitKeys(ctx context.Context, target string, keys []string,
 				return err
 			}
 		}
-		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, key); err != nil {
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), key); err != nil {
 			return fmt.Errorf("send exit key %d (%s): %w", i+1, key, err)
 		}
 	}
@@ -2685,8 +3642,8 @@ func (c *Client) sendDoubleCtrlC(ctx context.Context, target string) error {
 
 // sendCodexExitKeys quits Codex with /exit when it can prove the composer
 // holds nothing else, and with a double Ctrl+C when it cannot. It runs
-// Codex's composer clear (Escape x3, then C-u) and types /exit only when the
-// composer line reads empty; it presses Enter only when the composer then
+// Codex's verified composer clear (ClearComposerContext) and types /exit only
+// when the composer reads empty; it presses Enter only when the composer then
 // holds exactly "/exit". C-u kills only the cursor's line, so a multi-line
 // draft can survive it, and the line under the composer is where such a
 // draft continues. On either failure the double Ctrl+C quits without
@@ -2697,12 +3654,12 @@ func (c *Client) sendDoubleCtrlC(ctx context.Context, target string) error {
 // and Ctrl+C then Ctrl+C quit with that line still there.
 func (c *Client) sendCodexExitKeys(ctx context.Context, target string) (string, error) {
 	const method = "clear_then_exit_command"
-	cleared, verified, err := c.ClearComposerContext(ctx, target, AgentCodex)
+	result, err := c.ClearComposerContext(ctx, target, AgentCodex)
 	if err != nil {
 		return method, err
 	}
-	if cleared && verified {
-		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "-l", "/exit"); err != nil {
+	if result.Cleared && result.Verified {
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "-l", "/exit"); err != nil {
 			return method, fmt.Errorf("type /exit: %w", err)
 		}
 		if err := waitForSendDelay(ctx, composerClearVerifyWait); err != nil {
@@ -2713,7 +3670,7 @@ func (c *Client) sendCodexExitKeys(ctx context.Context, target string) (string, 
 			return method, fmt.Errorf("capture pane to verify /exit: %w", err)
 		}
 		if codexComposerHoldsOnly(capture, "/exit") {
-			if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+			if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), "Enter"); err != nil {
 				return method, fmt.Errorf("submit /exit: %w", err)
 			}
 			return method, nil
@@ -2723,17 +3680,19 @@ func (c *Client) sendCodexExitKeys(ctx context.Context, target string) (string, 
 }
 
 // codexComposerHoldsOnly reports whether a Codex capture's composer holds
-// exactly text: the bottom-most "›" line carries text, and the line below
-// it, where a multi-line draft would continue, is blank. The slash-command
-// popup renders above the composer, so it does not count.
+// exactly text: the bottom-most composer marker line ("›", or "»" at effort
+// ultra) carries text, and the line below it, where a multi-line draft would
+// continue, is blank. The slash-command popup renders above the composer, so
+// it does not count.
 func codexComposerHoldsOnly(capture, text string) bool {
+	markers := composerMarkersForAgent(AgentCodex)
 	lines := strings.Split(capture, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		idx := strings.Index(lines[i], "›")
+		idx, marker := indexAnyMarker(lines[i], markers)
 		if idx < 0 {
 			continue
 		}
-		if strings.TrimSpace(lines[i][idx+len("›"):]) != text {
+		if strings.TrimSpace(lines[i][idx+len(marker):]) != text {
 			return false
 		}
 		return i+1 == len(lines) || strings.TrimSpace(lines[i+1]) == ""
@@ -2774,20 +3733,85 @@ func (c *Client) sendEscapeThenTripleCtrlC(ctx context.Context, target string) e
 		[]time.Duration{100 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond})
 }
 
-// SendEOF sends Ctrl+D (EOF) to a pane
-func (c *Client) SendEOF(target string) error {
-	return c.RunSilent("send-keys", "-t", target, "C-d")
+// InterruptKeyForAgent returns the tmux key that interrupts an in-flight turn
+// for agentType. Oh My Pi binds interrupt to Escape: Ctrl+C there only clears
+// the draft (a running turn keeps going) and two Ctrl+C presses on an empty
+// draft quit omp — both verified live against omp v18.2.3. Muse Code gets
+// Escape for the same reason: its Ctrl+C only clears the composer draft while
+// the turn keeps running, and on an idle composer it arms quit, so a second
+// Ctrl+C exits Muse. Every other supported agent TUI, shells and unknown
+// types included, interrupts on Ctrl+C.
+func InterruptKeyForAgent(agentType AgentType) string {
+	switch agentType.Canonical() {
+	case AgentOmp, AgentMuse:
+		return "Escape"
+	default:
+		return "C-c"
+	}
 }
 
-// SendEOF sends Ctrl+D (EOF) to a pane (default client)
-func SendEOF(target string) error {
-	return DefaultClient.SendEOF(target)
+// InterruptKeyLabel is the human-readable name of InterruptKeyForAgent's key
+// for envelopes and messages.
+func InterruptKeyLabel(agentType AgentType) string {
+	if InterruptKeyForAgent(agentType) == "Escape" {
+		return "Escape"
+	}
+	return "Ctrl+C"
+}
+
+// SendInterruptForAgent interrupts an in-flight turn with the agent type's own
+// interrupt key (see InterruptKeyForAgent).
+func (c *Client) SendInterruptForAgent(target string, agentType AgentType) error {
+	return c.RunSilent("send-keys", "-t", ExactTarget(target), InterruptKeyForAgent(agentType))
+}
+
+// SendInterruptForAgent interrupts a pane with its agent type's interrupt key
+// (default client).
+func SendInterruptForAgent(target string, agentType AgentType) error {
+	return DefaultClient.SendInterruptForAgent(target, agentType)
+}
+
+// ompExitInterruptSettle is the pause after the exit choreography's Escape so
+// an interrupted turn has unwound before the draft is cleared.
+const ompExitInterruptSettle = 500 * time.Millisecond
+
+// SendOmpExitContext quits an omp process gracefully, verified live against
+// omp v18.2.3: Escape interrupts any in-flight turn (a single Escape at idle is
+// a no-op), one Ctrl+C clears any draft (a lone press never quits), and after
+// a pause well beyond omp's ~0.5s double-press window Ctrl+D quits from the now
+// empty composer. Ctrl+D on a non-empty draft would only delete a character,
+// which is why the clear comes first.
+func (c *Client) SendOmpExitContext(ctx context.Context, target string) error {
+	steps := []struct {
+		key   string
+		pause time.Duration
+	}{
+		{key: "Escape", pause: ompExitInterruptSettle},
+		{key: "C-c", pause: ompClearVerifyWait},
+		{key: "C-d"},
+	}
+	for _, step := range steps {
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", ExactTarget(target), step.key); err != nil {
+			return fmt.Errorf("send omp exit key %q: %w", step.key, err)
+		}
+		if step.pause > 0 {
+			if err := waitForSendDelay(ctx, step.pause); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// SendEOF sends Ctrl+D (EOF) to a pane
+func (c *Client) SendEOF(target string) error {
+	return c.RunSilent("send-keys", "-t", ExactTarget(target), "C-d")
 }
 
 // DisplayMessage shows a message in the tmux status line.
 // The "--" prevents msg from being interpreted as a tmux flag.
 func (c *Client) DisplayMessage(session, msg string, durationMs int) error {
-	return c.RunSilent("display-message", "-t", session, "-d", fmt.Sprintf("%d", durationMs), "--", msg)
+	return c.RunSilent("display-message", "-t", TargetSession(session), "-d", fmt.Sprintf("%d", durationMs), "--", msg)
 }
 
 // DisplayMessage shows a message in the tmux status line (default client)
@@ -2824,10 +3848,10 @@ func BuildPaneCommand(projectDir, agentCommand string) (string, error) {
 func (c *Client) AttachOrSwitch(session string) error {
 	if c.Remote == "" {
 		if InTmux() {
-			return c.RunSilent("switch-client", "-t", session)
+			return c.RunSilent("switch-client", "-t", TargetSession(session))
 		}
 		// Interactive attach needs stdin/stdout, so use exec directly for local
-		cmd := exec.Command(BinaryPath(), "attach", "-t", session)
+		cmd := exec.Command(BinaryPath(), "attach", "-t", TargetSession(session))
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -2836,7 +3860,7 @@ func (c *Client) AttachOrSwitch(session string) error {
 
 	// Remote attach
 	// ssh -t user@host tmux attach -t session
-	remoteCmd := buildRemoteShellCommand("tmux", "attach", "-t", session)
+	remoteCmd := buildRemoteShellCommand("tmux", "attach", "-t", TargetSession(session))
 	// Use "--" to prevent Remote from being parsed as an ssh option.
 	sshArgs := []string{"-t", "--", c.Remote, remoteCmd}
 	cmd := exec.Command("ssh", sshArgs...)
@@ -2853,7 +3877,7 @@ func AttachOrSwitch(session string) error {
 
 // KillSession kills a tmux session
 func (c *Client) KillSession(session string) error {
-	return c.RunSilent("kill-session", "-t", session)
+	return c.RunSilent("kill-session", "-t", TargetSession(session))
 }
 
 // KillSession kills a tmux session (default client)
@@ -2871,7 +3895,7 @@ func (c *Client) KillPaneContext(ctx context.Context, paneID string) error {
 	if ctx == nil {
 		return errors.New("tmux kill pane context is required")
 	}
-	return c.RunSilentContext(ctx, "kill-pane", "-t", paneID)
+	return c.RunSilentContext(ctx, "kill-pane", "-t", ExactTarget(paneID))
 }
 
 // KillPane kills a tmux pane (default client)
@@ -2895,7 +3919,7 @@ func (c *Client) ApplyTiledLayoutContext(ctx context.Context, session string) er
 	if ctx == nil {
 		return errors.New("tmux layout context is required")
 	}
-	output, err := c.RunContext(ctx, "list-windows", "-t", session, "-F", "#{window_index}")
+	output, err := c.RunContext(ctx, "list-windows", "-t", TargetSession(session), "-F", "#{window_index}")
 	if err != nil {
 		return err
 	}
@@ -2908,18 +3932,18 @@ func (c *Client) ApplyTiledLayoutContext(ctx context.Context, session string) er
 		target := fmt.Sprintf("%s:%s", session, winIdx)
 
 		// Unzoom if zoomed
-		zoomed, displayErr := c.RunContext(ctx, "display-message", "-t", target, "-p", "#{window_zoomed_flag}")
+		zoomed, displayErr := c.RunContext(ctx, "display-message", "-t", ExactTarget(target), "-p", "#{window_zoomed_flag}")
 		if displayErr != nil {
 			return fmt.Errorf("inspect window %s zoom state: %w", target, displayErr)
 		}
 		if zoomed == "1" {
-			if err := c.RunSilentContext(ctx, "resize-pane", "-t", target, "-Z"); err != nil {
+			if err := c.RunSilentContext(ctx, "resize-pane", "-t", ExactTarget(target), "-Z"); err != nil {
 				return fmt.Errorf("unzoom window %s: %w", target, err)
 			}
 		}
 
 		// Apply tiled layout
-		if err := c.RunSilentContext(ctx, "select-layout", "-t", target, "tiled"); err != nil {
+		if err := c.RunSilentContext(ctx, "select-layout", "-t", ExactTarget(target), "tiled"); err != nil {
 			return fmt.Errorf("apply tiled layout to window %s: %w", target, err)
 		}
 	}
@@ -2947,11 +3971,11 @@ func (c *Client) ZoomPane(session string, paneIndex int) error {
 
 	target := fmt.Sprintf("%s:%d.%d", session, firstWin, paneIndex)
 
-	if err := c.RunSilent("select-pane", "-t", target); err != nil {
+	if err := c.RunSilent("select-pane", "-t", ExactTarget(target)); err != nil {
 		return err
 	}
 
-	return c.RunSilent("resize-pane", "-t", target, "-Z")
+	return c.RunSilent("resize-pane", "-t", ExactTarget(target), "-Z")
 }
 
 // ZoomPane zooms a specific pane (default client)
@@ -2972,7 +3996,7 @@ func (c *Client) CapturePaneOutputContext(ctx context.Context, target string, li
 		lines = -lines
 	}
 	started := time.Now()
-	output, err := c.RunContext(ctx, "capture-pane", "-t", target, "-p", "-S", fmt.Sprintf("-%d", lines))
+	output, err := c.RunContext(ctx, "capture-pane", "-t", ExactTarget(target), "-p", "-S", fmt.Sprintf("-%d", lines))
 	c.recordCaptureBackpressure(target, lines, time.Since(started), err)
 	return output, err
 }
@@ -2998,7 +4022,7 @@ func (c *Client) CapturePaneVisible(target string) (string, error) {
 // caller cancellation.
 func (c *Client) CapturePaneVisibleContext(ctx context.Context, target string) (string, error) {
 	started := time.Now()
-	output, err := c.RunContext(ctx, "capture-pane", "-t", target, "-p", "-S", "0")
+	output, err := c.RunContext(ctx, "capture-pane", "-t", ExactTarget(target), "-p", "-S", "0")
 	c.recordCaptureBackpressure(target, 0, time.Since(started), err)
 	return output, err
 }
@@ -3039,8 +4063,8 @@ func (c *Client) GetCurrentSessionContext(ctx context.Context) (string, error) {
 			return "", nil
 		}
 	} else {
-		// Remote check logic might differ or be unsupported
-		// For now, assume unsupported or return empty
+		// A remote client is never "inside" the remote tmux server, so a
+		// current-session lookup is not applicable; report no session.
 		return "", nil
 	}
 	output, err := c.RunContext(ctx, "display-message", "-p", "#{session_name}")
@@ -3051,7 +4075,7 @@ func (c *Client) GetCurrentSessionContext(ctx context.Context) (string, error) {
 	if paneTarget == "" {
 		return "", err
 	}
-	output, err = c.RunContext(ctx, "display-message", "-p", "-t", paneTarget, "#{session_name}")
+	output, err = c.RunContext(ctx, "display-message", "-p", "-t", ExactTarget(paneTarget), "#{session_name}")
 	if err != nil {
 		return "", err
 	}
@@ -3098,7 +4122,7 @@ func ValidateSessionName(name string) error {
 // does not expose a pane-level activity timestamp; window_activity is the
 // narrowest supported signal and is conservative when a window has many panes.
 func (c *Client) GetPaneActivity(paneID string) (time.Time, error) {
-	output, err := c.Run("display-message", "-p", "-t", paneID, "#{window_activity}")
+	output, err := c.Run("display-message", "-p", "-t", ExactTarget(paneID), "#{window_activity}")
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -3124,8 +4148,8 @@ type PaneActivity struct {
 // GetPanesWithActivityContext returns all panes in a session with their activity times with cancellation support.
 func (c *Client) GetPanesWithActivityContext(ctx context.Context, session string) ([]PaneActivity, error) {
 	sep := FieldSeparator
-	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{window_activity}%[1]s#{pane_pid}%[1]s#{window_index}", sep)
-	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", session, "-F", format)
+	format := fmt.Sprintf("#{pane_id}%[1]s#{pane_index}%[1]s#{pane_title}%[1]s#{pane_current_command}%[1]s#{pane_width}%[1]s#{pane_height}%[1]s#{pane_active}%[1]s#{window_activity}%[1]s#{pane_pid}%[1]s#{window_index}%[1]s#{@ntm_agent_type}%[1]s#{"+PaneOptionACFSService+"}%[1]s#{"+PaneOptionNTMService+"}%[1]s#{pane_dead}", sep)
+	output, err := c.RunContext(ctx, "list-panes", "-s", "-t", TargetSession(session), "-F", format)
 	if err != nil {
 		return nil, err
 	}
@@ -3137,13 +4161,15 @@ func (c *Client) GetPanesWithActivityContext(ctx context.Context, session string
 		}
 
 		parts := strings.Split(line, sep)
-		if len(parts) != 10 {
-			return nil, fmt.Errorf("parse pane activity %d from session %q: expected 10 fields, got %d", lineNumber+1, session, len(parts))
+		// 11 fields is the pre-#305 layout (no service tags), 13 the pre-#311
+		// layout (no pane_dead); 14 is current.
+		if len(parts) < 11 || len(parts) > 14 {
+			return nil, fmt.Errorf("parse pane activity %d from session %q: expected 11 to 14 fields, got %d", lineNumber+1, session, len(parts))
 		}
 
-		// Format: id(0), index(1), title(2), command(3), width(4), height(5), active(6), last_activity(7), pid(8), window_index(9)
+		// Format: id(0), index(1), title(2), command(3), width(4), height(5), active(6), last_activity(7), pid(8), window_index(9), @ntm_agent_type(10), @acfs_service(11), @ntm_service(12), pane_dead(13)
 		// parts[:7] = id..active
-		// parts[8:] = pid, window_index
+		// parts[8:] = pid, window_index, @ntm_agent_type, @acfs_service, @ntm_service, pane_dead
 		p, err := parsePaneFromParts(parts[:7], parts[8:])
 		if err != nil {
 			return nil, fmt.Errorf("parse pane activity %d from session %q: %w", lineNumber+1, session, err)
@@ -3169,20 +4195,35 @@ func (c *Client) GetPanesWithActivityContext(ctx context.Context, session string
 // parsePaneLine parses a single line from list-panes format into a Pane.
 func parsePaneLine(line, sep string) (*Pane, error) {
 	parts := strings.Split(line, sep)
-	if len(parts) != 9 {
-		return nil, fmt.Errorf("expected 9 fields, got %d", len(parts))
+	// 10 fields is the pre-#305 layout (no service tags), 12 the pre-#311
+	// layout (no pane_dead); 13 is current.
+	if len(parts) < 10 || len(parts) > 13 {
+		return nil, fmt.Errorf("expected 10 to 13 fields, got %d", len(parts))
 	}
-	// For standard GetPanes: id, index, title, command, width, height, active, pid, window_index
+	// For standard GetPanes: id, index, title, command, width, height, active, pid, window_index, @ntm_agent_type, @acfs_service, @ntm_service, pane_dead
 	return parsePaneFromParts(parts[:7], parts[7:])
 }
 
 // parsePaneFromParts constructs a Pane from pre-split parts.
 // parts1: id, index, title, command, width, height, active
-// parts2: pid, window_index
+// parts2: pid, window_index, and optionally the pane's @ntm_agent_type,
+// @acfs_service and @ntm_service user options (each empty when unset, and the
+// trailing ones absent entirely on a pre-#305 format string) followed by
+// #{pane_dead} (absent on a pre-#311 format string).
 func parsePaneFromParts(parts1, parts2 []string) (*Pane, error) {
-	if len(parts1) != 7 || len(parts2) != 2 {
-		return nil, fmt.Errorf("expected 7 primary fields and 2 secondary fields, got %d and %d", len(parts1), len(parts2))
+	if len(parts1) != 7 || len(parts2) < 2 || len(parts2) > 6 {
+		return nil, fmt.Errorf("expected 7 primary fields and 2 to 6 secondary fields, got %d and %d", len(parts1), len(parts2))
 	}
+	optionalPart := func(i int) string {
+		if i < len(parts2) {
+			return parts2[i]
+		}
+		return ""
+	}
+	recordedType := optionalPart(2)
+	acfsService := ParsePaneServiceOption(optionalPart(3))
+	ntmService := ParsePaneServiceOption(optionalPart(4))
+	dead := strings.TrimSpace(optionalPart(5)) == "1"
 
 	index, err := strconv.Atoi(parts1[1])
 	if err != nil {
@@ -3216,19 +4257,46 @@ func parsePaneFromParts(parts1, parts2 []string) (*Pane, error) {
 		Height:      height,
 		Active:      active,
 		PID:         pid,
+		Dead:        dead,
+	}
+
+	// A service tag marks the pane as a non-agent service (ntm#305). ACFS's
+	// own tag wins over the vendor-neutral one when a pane carries both.
+	switch {
+	case acfsService != "":
+		pane.Service, pane.ServiceManager = acfsService, "acfs"
+	case ntmService != "":
+		pane.Service, pane.ServiceManager = ntmService, "ntm"
 	}
 
 	// Parse pane title using regex to extract type, index, variant, and tags
 	pane.Type, pane.NTMIndex, pane.Variant, pane.Tags = parseAgentFromTitle(pane.Title)
 
+	// A type recorded on the pane by ntm itself (adopt sets the
+	// @ntm_agent_type pane option) is authoritative: unlike the title it
+	// cannot be overwritten by the program running in the pane. OpenCode, for
+	// example, re-asserts its own "opencode | <dir>" title continuously, so an
+	// adopted pane's NTM title survives only seconds (ntm#266). The title is
+	// still consulted above for the NTM index, variant and tags.
+	if recorded := ParsePaneAgentTypeOption(recordedType); recorded != AgentUnknown {
+		pane.Type = recorded
+		// A deliberate ntm adoption outranks a service tag: whoever ran
+		// `ntm adopt` on this pane wants it treated as an agent (ntm#305).
+		pane.Service, pane.ServiceManager = "", ""
+		return pane, nil
+	}
+
 	// Fallback chain:
 	//  1. Title-based parse (NTM-formatted titles).
 	//  2. Immediate command name (`claude`, `codex`, etc.).
-	//  3. Process tree walk — required when the agent runs under a
+	//  3. A title the agent set for itself (e.g. OpenCode's "opencode | dir").
+	//  4. Process tree walk — required when the agent runs under a
 	//     wrapper that shows up in tmux's `pane_current_command` (e.g.
 	//     Bun-launched Codex shows `bun`, not `codex`). See acfs#267.
 	if pane.Type == AgentUser && pane.Command != "" {
 		if detected := detectAgentFromCommand(pane.Command); detected != AgentUser {
+			pane.Type = detected
+		} else if detected := detectAgentFromSelfTitle(pane.Title); detected != AgentUser {
 			pane.Type = detected
 		} else if isAgentWrapperCommand(pane.Command) && pane.PID > 0 {
 			if detected := detectAgentFromProcessTree(pane.PID, 4); detected != AgentUser {
@@ -3239,6 +4307,94 @@ func parsePaneFromParts(parts1, parts2 []string) (*Pane, error) {
 
 	return pane, nil
 }
+
+// PaneAgentTypeOption is the tmux pane user option in which ntm records the
+// agent type it assigned to a pane. Programs running in the pane can rewrite
+// the pane title (OSC 0/2 escapes, or tmux commands of their own) but never
+// this option, so it survives agents that manage their own titles (ntm#266).
+// Pane-scoped options need tmux 3.0+; on older servers the option is simply
+// absent and the title/command heuristics apply.
+const PaneAgentTypeOption = "@ntm_agent_type"
+
+// ParsePaneAgentTypeOption converts a raw @ntm_agent_type value into an agent
+// type. It returns AgentUnknown when the option is unset or names a type ntm
+// does not know (a built-in type or a registered plugin), so a stale or
+// hand-edited value can never masquerade as a real agent.
+func ParsePaneAgentTypeOption(raw string) AgentType {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return AgentUnknown
+	}
+	canonical := AgentType(raw).Canonical()
+	if canonical.IsValid() {
+		return canonical
+	}
+	if agent.IsPluginType(canonical) {
+		return canonical
+	}
+	return AgentUnknown
+}
+
+// SetPaneAgentType records agentType on the pane as the @ntm_agent_type user
+// option (see PaneAgentTypeOption). Unlike SetPaneTitle it never touches the
+// title, so it is safe to call for panes whose program owns its own title.
+func (c *Client) SetPaneAgentType(paneID string, agentType AgentType) error {
+	return c.SetPaneAgentTypeContext(context.Background(), paneID, agentType)
+}
+
+// SetPaneAgentTypeContext is SetPaneAgentType with caller cancellation.
+func (c *Client) SetPaneAgentTypeContext(ctx context.Context, paneID string, agentType AgentType) error {
+	if ctx == nil {
+		return errors.New("tmux pane agent type context is required")
+	}
+	if strings.TrimSpace(paneID) == "" {
+		return errors.New("pane ID is required")
+	}
+	recorded := ParsePaneAgentTypeOption(string(agentType))
+	if recorded == AgentUnknown {
+		return fmt.Errorf("agent type %q is not a known agent type", agentType)
+	}
+	return c.RunSilentContext(ctx, "set-option", "-p", "-t", ExactTarget(paneID), PaneAgentTypeOption, string(recorded))
+}
+
+// SetPaneAgentType records the agent type on a pane (default client).
+func SetPaneAgentType(paneID string, agentType AgentType) error {
+	return DefaultClient.SetPaneAgentType(paneID, agentType)
+}
+
+// SetPaneAgentTypeContext records the agent type on a pane with caller
+// cancellation (default client).
+func SetPaneAgentTypeContext(ctx context.Context, paneID string, agentType AgentType) error {
+	return DefaultClient.SetPaneAgentTypeContext(ctx, paneID, agentType)
+}
+
+// detectAgentFromSelfTitle recognises pane titles that an agent CLI sets for
+// itself, as opposed to the NTM "session__type_n" convention. Only shapes
+// that are unambiguous are listed: OpenCode renders "opencode | <workdir>"
+// (ntm#266). Free-form titles such as Claude Code's summary line are not
+// matched here; the command and process-tree checks cover those.
+func detectAgentFromSelfTitle(title string) AgentType {
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" {
+		return AgentUser
+	}
+	head := trimmed
+	if i := strings.Index(trimmed, "|"); i >= 0 {
+		head = trimmed[:i]
+	}
+	if strings.EqualFold(strings.TrimSpace(head), "opencode") {
+		return AgentOpencode
+	}
+	if ompSelfTitleRe.MatchString(trimmed) {
+		return AgentOmp
+	}
+	return AgentUser
+}
+
+// ompSelfTitleRe matches the terminal title omp sets for itself: "π" then a
+// state glyph — ">" at idle, a braille spinner frame mid-turn — then the
+// session title ("π > Fix the parser", "π ⠙ Fix the parser"; verified live).
+var ompSelfTitleRe = regexp.MustCompile(`^π [>⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] `)
 
 func parsePaneActivityTimestamp(raw string, now time.Time) (time.Time, error) {
 	raw = strings.TrimSpace(raw)
@@ -3270,56 +4426,4 @@ func GetPanesWithActivity(session string) ([]PaneActivity, error) {
 // GetPanesWithActivityContext returns all panes in a session with their activity times with cancellation support (default client).
 func GetPanesWithActivityContext(ctx context.Context, session string) ([]PaneActivity, error) {
 	return DefaultClient.GetPanesWithActivityContext(ctx, session)
-}
-
-// IsRecentlyActive checks if a pane has had activity within the threshold
-func (c *Client) IsRecentlyActive(paneID string, threshold time.Duration) (bool, error) {
-	lastActivity, err := c.GetPaneActivity(paneID)
-	if err != nil {
-		return false, err
-	}
-
-	return time.Since(lastActivity) <= threshold, nil
-}
-
-// IsRecentlyActive checks if a pane has had activity within the threshold (default client)
-func IsRecentlyActive(paneID string, threshold time.Duration) (bool, error) {
-	return DefaultClient.IsRecentlyActive(paneID, threshold)
-}
-
-// GetPaneLastActivityAge returns how long ago the pane was last active
-func (c *Client) GetPaneLastActivityAge(paneID string) (time.Duration, error) {
-	lastActivity, err := c.GetPaneActivity(paneID)
-	if err != nil {
-		return 0, err
-	}
-
-	return time.Since(lastActivity), nil
-}
-
-// GetPaneLastActivityAge returns how long ago the pane was last active (default client)
-func GetPaneLastActivityAge(paneID string) (time.Duration, error) {
-	return DefaultClient.GetPaneLastActivityAge(paneID)
-}
-
-// IsAttached checks if a session is currently attached
-func (c *Client) IsAttached(session string) bool {
-	// Validate session name to prevent tmux format string injection.
-	if err := ValidateSessionName(session); err != nil {
-		return false
-	}
-	output, err := c.Run("list-sessions", "-F", "#{session_name}:#{session_attached}", "-f", fmt.Sprintf("#{==:#{session_name},%s}", session))
-	if err != nil || output == "" {
-		return false
-	}
-	parts := strings.Split(output, ":")
-	if len(parts) < 2 {
-		return false
-	}
-	return parts[1] == "1"
-}
-
-// IsAttached checks if a session is currently attached (default client)
-func IsAttached(session string) bool {
-	return DefaultClient.IsAttached(session)
 }

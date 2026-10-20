@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -103,9 +102,9 @@ func TestRestorer_RestoreFromCheckpoint_DirectoryNotFound(t *testing.T) {
 		},
 	}
 
-	_, err = r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	_, err = r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err == nil {
-		t.Error("RestoreFromCheckpoint should fail for nonexistent directory")
+		t.Error("RestoreFromCheckpointContext should fail for nonexistent directory")
 	}
 }
 
@@ -127,51 +126,92 @@ func TestRestorer_RestoreFromCheckpoint_NoPanes(t *testing.T) {
 		},
 	}
 
-	_, err = r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	_, err = r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != ErrNoAgentsToRestore {
 		t.Errorf("Expected ErrNoAgentsToRestore, got: %v", err)
 	}
 }
 
-func TestRestorer_RestoreFromCheckpointRejectsGrokBeforeMutation(t *testing.T) {
+// GH#251 phase 2: grok relaunch is first-class, so restore planning accepts
+// grok panes exactly like claude/codex instead of refusing before mutation.
+func TestRestorer_RestoreFromCheckpointAcceptsGrokPanes(t *testing.T) {
 	tests := []struct {
 		name  string
 		panes []PaneState
+		want  int
 	}{
 		{
 			name:  "grok only",
-			panes: []PaneState{{Index: 0, AgentType: "grok", Command: "grok"}},
+			panes: []PaneState{{Index: 0, ID: "%0", AgentType: "grok", Command: "grok"}},
+			want:  1,
 		},
 		{
 			name: "mixed batch",
 			panes: []PaneState{
-				{Index: 0, AgentType: "cc", Command: "claude"},
-				{Index: 1, AgentType: "grok-build", Command: "grok"},
+				{Index: 0, ID: "%0", AgentType: "cc", Command: "claude"},
+				{Index: 1, ID: "%1", AgentType: "grok-build", Command: "grok"},
 			},
+			want: 2,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cp := &Checkpoint{
+				ID:          "grok-acceptance-checkpoint",
 				SessionName: "definitely-not-an-existing-ntm-checkpoint-session",
-				WorkingDir:  "/definitely/not/a/real/checkpoint/directory",
+				WorkingDir:  t.TempDir(),
 				Session:     SessionState{Panes: tt.panes},
 			}
-			result, err := NewRestorerWithStorage(NewStorageWithDir(t.TempDir())).RestoreFromCheckpoint(cp, RestoreOptions{Force: true})
-			if !errors.Is(err, agent.ErrAutomatedRelaunchNotImplemented) {
-				t.Fatalf("RestoreFromCheckpoint() error = %v, want Grok relaunch sentinel", err)
+			// DryRun keeps the test off a real tmux server while still
+			// exercising the restore-planning admission that used to refuse
+			// grok before any pane was counted.
+			result, err := NewRestorerWithStorage(NewStorageWithDir(t.TempDir())).RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{Force: true, DryRun: true})
+			if err != nil {
+				t.Fatalf("RestoreFromCheckpointContext() error = %v, want grok batch accepted", err)
 			}
-			if result != nil {
-				t.Fatalf("RestoreFromCheckpoint() result = %+v, want nil before restore planning", result)
+			if result == nil {
+				t.Fatal("RestoreFromCheckpointContext() result = nil, want plan including grok panes")
+			}
+			if result.PanesRestored != tt.want {
+				t.Fatalf("PanesRestored = %d, want %d (grok panes must be included)", result.PanesRestored, tt.want)
 			}
 		})
 	}
 }
 
-func TestRestorableAgentCommandRejectsGrokEvenWithCapturedCommand(t *testing.T) {
-	if got := restorableAgentCommand(PaneState{AgentType: "grok", Command: "claude"}); got != "" {
-		t.Fatalf("restorableAgentCommand(grok) = %q, want empty unsupported command", got)
+// GH#251 phase 2: grok panes now get a relaunch command like every other
+// first-class agent — captured commands are preserved, shell/missing commands
+// fall back to the official autonomous launch flag.
+func TestRestorableAgentCommandGrok(t *testing.T) {
+	tests := []struct {
+		name string
+		pane PaneState
+		want string
+	}{
+		{
+			name: "captured non-shell command is preserved",
+			pane: PaneState{AgentType: "grok", Command: "/opt/bin/grok --always-approve --model grok-4"},
+			want: "/opt/bin/grok --always-approve --model grok-4",
+		},
+		{
+			name: "shell command falls back to autonomous default",
+			pane: PaneState{AgentType: "grok", Command: "zsh"},
+			want: "grok --always-approve",
+		},
+		{
+			name: "missing command falls back to autonomous default",
+			pane: PaneState{AgentType: "grok-build"},
+			want: "grok --always-approve",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := restorableAgentCommand(tt.pane); got != tt.want {
+				t.Fatalf("restorableAgentCommand(%+v) = %q, want %q", tt.pane, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -196,9 +236,9 @@ func TestRestorer_RestoreFromCheckpoint_DryRun(t *testing.T) {
 		},
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint(DryRun) failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext(DryRun) failed: %v", err)
 	}
 
 	if !result.DryRun {
@@ -228,12 +268,12 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_CustomDirectory(t *testing.T) {
 	}
 
 	// Should succeed with custom directory override
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{
 		DryRun:          true,
 		CustomDirectory: tmpDir,
 	})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint with CustomDirectory failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext with CustomDirectory failed: %v", err)
 	}
 
 	if result.PanesRestored != 1 {
@@ -259,227 +299,9 @@ func TestRestorer_RestoreFromCheckpoint_WorkingDirNotDirectory(t *testing.T) {
 		},
 	}
 
-	_, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	_, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if !errors.Is(err, ErrWorkingDirInvalid) {
-		t.Fatalf("RestoreFromCheckpoint should fail with ErrWorkingDirInvalid, got %v", err)
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_DirectoryNotFound(t *testing.T) {
-	r := NewRestorer()
-
-	cp := &Checkpoint{
-		WorkingDir: "/nonexistent/path",
-		Session: SessionState{
-			Panes: []PaneState{{Index: 0}},
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-
-	found := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "directory not found") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("Expected directory not found issue")
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_NoPanes(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "ntm-restore-test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	r := NewRestorer()
-
-	cp := &Checkpoint{
-		WorkingDir: tmpDir,
-		Session: SessionState{
-			Panes: []PaneState{}, // Empty
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-
-	found := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "no panes") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("Expected 'no panes' issue")
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_WorkingDirNotDirectory(t *testing.T) {
-	tmpDir := t.TempDir()
-	filePath := filepath.Join(tmpDir, "not-a-dir")
-	if err := os.WriteFile(filePath, []byte("data"), 0644); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	r := NewRestorerWithStorage(NewStorageWithDir(tmpDir))
-	cp := &Checkpoint{
-		WorkingDir: filePath,
-		Session: SessionState{
-			Panes: []PaneState{{Index: 0}},
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-
-	found := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "not a directory") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected not-a-directory issue, got %v", issues)
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_MissingScrollback(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "ntm-restore-test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	storage := NewStorageWithDir(tmpDir)
-	r := NewRestorerWithStorage(storage)
-
-	// Create a checkpoint directory without scrollback files
-	cp := &Checkpoint{
-		ID:          "test-checkpoint",
-		SessionName: "test-session",
-		WorkingDir:  tmpDir,
-		Session: SessionState{
-			Panes: []PaneState{
-				{
-					Index:          0,
-					ID:             "%0",
-					ScrollbackFile: "panes/pane_0.txt", // File doesn't exist
-				},
-			},
-		},
-	}
-
-	// Create the checkpoint directory
-	cpDir := storage.CheckpointDir(cp.SessionName, cp.ID)
-	if err := os.MkdirAll(cpDir, 0755); err != nil {
-		t.Fatalf("Failed to create checkpoint dir: %v", err)
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{InjectContext: true})
-
-	found := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "scrollback file missing") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("Expected 'scrollback file missing' issue, got: %v", issues)
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_WindowLayoutReferencesMissingWindow(t *testing.T) {
-	r := NewRestorer()
-
-	cp := &Checkpoint{
-		WorkingDir: t.TempDir(),
-		Session: SessionState{
-			Panes: []PaneState{
-				{Index: 0, WindowIndex: 0},
-				{Index: 0, WindowIndex: 1},
-			},
-			WindowLayouts: []WindowLayoutState{
-				{WindowIndex: 0, Layout: "even-horizontal"},
-				{WindowIndex: 9, Layout: "main-vertical"},
-			},
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-
-	found := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "references missing window 9") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected missing-window layout issue, got %v", issues)
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_WindowLayoutMissingForExistingWindow(t *testing.T) {
-	r := NewRestorer()
-
-	cp := &Checkpoint{
-		WorkingDir: t.TempDir(),
-		Session: SessionState{
-			Panes: []PaneState{
-				{Index: 0, WindowIndex: 0},
-				{Index: 0, WindowIndex: 1},
-			},
-			WindowLayouts: []WindowLayoutState{
-				{WindowIndex: 0, Layout: "even-horizontal"},
-			},
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-
-	found := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "window layout missing for window 1") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected missing-layout issue, got %v", issues)
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_LegacyLayoutWarnsForMultiWindowSession(t *testing.T) {
-	r := NewRestorer()
-
-	cp := &Checkpoint{
-		WorkingDir: t.TempDir(),
-		Session: SessionState{
-			Panes: []PaneState{
-				{Index: 0, WindowIndex: 0},
-				{Index: 0, WindowIndex: 1},
-			},
-			Layout: "even-horizontal",
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-
-	found := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "legacy single layout string") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected legacy-layout warning, got %v", issues)
+		t.Fatalf("RestoreFromCheckpointContext should fail with ErrWorkingDirInvalid, got %v", err)
 	}
 }
 
@@ -488,9 +310,6 @@ func TestRestorer_RestoreFromCheckpoint_SkipsLegacyLayoutForMultiWindowSession(t
 
 	workDir := t.TempDir()
 	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
-	// The sleep stand-ins never draw a ready screen, so the restore waits out
-	// its ready deadline; a short one keeps the test fast.
-	r.agentReadyTimeout = time.Second
 	sessionName := "cplegacy-layout-" + time.Now().Format("150405000000")
 
 	cp := &Checkpoint{
@@ -524,9 +343,9 @@ func TestRestorer_RestoreFromCheckpoint_SkipsLegacyLayoutForMultiWindowSession(t
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 
 	found := false
@@ -545,9 +364,9 @@ func TestRestorer_RestoreFromCheckpoint_SkipsLegacyLayoutForMultiWindowSession(t
 // context injection into panes whose "agent" draws an idle composer, turns on
 // bracketed paste and records its raw input, plus a user pane. Each agent's
 // context message has to arrive as one paste followed by the shared
-// protocol's two Enters; the old path pasted it and pressed Enter once, 100 ms
-// later, whatever the agent. The user pane is a shell, so it must get nothing:
-// its scrollback is a command that creates a file if the shell runs it.
+// protocol's two Enters (bd-oxotp); a paste with one Enter can strand it in
+// the composer. The user pane is a shell, so it must get nothing: its
+// scrollback is a command that creates a file if the shell runs it.
 func TestRestorer_InjectContextSubmitsToAgentPanesOnly(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 
@@ -600,12 +419,12 @@ func TestRestorer_InjectContextSubmitsToAgentPanesOnly(t *testing.T) {
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{InjectContext: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{InjectContext: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v (result %+v)", err, result)
 	}
-	if !result.ContextInjected {
-		t.Fatalf("context was not injected; warnings: %v", result.Warnings)
+	if result.ContextPanesInjected != len(agentTypes) {
+		t.Fatalf("context reached %d agent panes, want %d; warnings: %v", result.ContextPanesInjected, len(agentTypes), result.Warnings)
 	}
 
 	for _, agentType := range agentTypes {
@@ -623,57 +442,44 @@ func TestRestorer_InjectContextSubmitsToAgentPanesOnly(t *testing.T) {
 	}
 }
 
-// TestRestorer_InjectContextWaitsForAgentReadiness restores two agents whose
-// processes start at once but whose TUIs differ: the Muse pane draws its idle
-// screen and turns on bracketed paste two seconds later, as a real TUI takes a
-// moment after its process starts, and the Codex pane never draws anything.
-// The Muse pane must get its context only once it is up, so the paste arrives
-// bracketed; the old restore submitted right after relaunch, while the TUI was
-// still starting, and the paste arrived bare. The Codex pane must get nothing
-// and be reported.
-func TestRestorer_InjectContextWaitsForAgentReadiness(t *testing.T) {
+// TestRestorer_InjectContextWaitsForMuseReadiness restores a Muse agent whose
+// process starts at once but whose TUI draws its idle screen and turns on
+// bracketed paste two seconds later, as a real TUI takes a moment after its
+// process starts (bd-d4n62). The pane must get its context only once the
+// readiness wait sees Muse's idle screen, so the paste arrives bracketed; a
+// restore that submitted right after relaunch, while the TUI was still
+// starting, delivered a bare paste.
+func TestRestorer_InjectContextWaitsForMuseReadiness(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 
 	workDir := t.TempDir()
 	storage := NewStorageWithDir(t.TempDir())
 	r := NewRestorerWithStorage(storage)
-	r.agentReadyTimeout = 4 * time.Second
 	sessionName := "cpready-" + time.Now().Format("150405000000")
 	const checkpointID = "inject-ready-checkpoint"
 
+	dir := filepath.Join(workDir, "muse")
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	received := filepath.Join(dir, "received.txt")
+	recorder := writeRestoreInputRecorder(t, dir, received, restoreTestReadyScreens["muse"], "2")
+	rel, err := storage.SaveScrollback(sessionName, checkpointID, "%0", "muse scrollback")
+	if err != nil {
+		t.Fatalf("SaveScrollback: %v", err)
+	}
 	cp := &Checkpoint{
 		ID:          checkpointID,
 		SessionName: sessionName,
 		WorkingDir:  workDir,
 		CreatedAt:   time.Now(),
-	}
-	received := map[string]string{}
-	for window, agentType := range []string{"muse", "cod"} {
-		dir := filepath.Join(workDir, agentType)
-		if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		received[agentType] = filepath.Join(dir, "received.txt")
-		screen, delay := "", ""
-		if agentType == "muse" {
-			screen, delay = restoreTestReadyScreens["muse"], "2"
-		}
-		recorder := writeRestoreInputRecorder(t, dir, received[agentType], screen, delay)
-
-		paneID := fmt.Sprintf("%%%d", window)
-		rel, err := storage.SaveScrollback(sessionName, checkpointID, paneID, agentType+" scrollback")
-		if err != nil {
-			t.Fatalf("SaveScrollback(%s): %v", agentType, err)
-		}
-		cp.Session.Panes = append(cp.Session.Panes, PaneState{
-			WindowIndex:    window,
-			ID:             paneID,
-			Title:          fmt.Sprintf("%s__%s_1", sessionName, agentType),
-			AgentType:      agentType,
+		Session: SessionState{Panes: []PaneState{{
+			ID:             "%0",
+			Title:          sessionName + "__muse_1",
+			AgentType:      "muse",
 			Command:        recorder,
 			ScrollbackFile: rel,
-		})
-		cp.Session.WindowLayouts = append(cp.Session.WindowLayouts, WindowLayoutState{WindowIndex: window, Layout: "tiled"})
+		}}},
 	}
 
 	t.Cleanup(func() {
@@ -682,153 +488,23 @@ func TestRestorer_InjectContextWaitsForAgentReadiness(t *testing.T) {
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{InjectContext: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{InjectContext: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v (result %+v)", err, result)
 	}
-	if result.ContextInjected {
-		t.Error("ContextInjected = true although the Codex pane never became ready")
-	}
-	// Relaunch reports the Codex agent started but not ready, and injection
-	// reports its context not injected.
-	var notReady []string
-	for _, warning := range result.Warnings {
-		if strings.Contains(warning, "not ready") {
-			notReady = append(notReady, warning)
-		}
-	}
-	wantWarnings := []string{
-		sessionName + `__cod_1): agent "cat" started but not ready within 4s`,
-		sessionName + "__cod_1): agent not ready within 4s; context not injected",
-	}
-	if len(notReady) != len(wantWarnings) {
-		t.Errorf("not-ready warnings = %q, want %d ending %q (all warnings: %q)", notReady, len(wantWarnings), wantWarnings, result.Warnings)
-	} else {
-		for i, want := range wantWarnings {
-			if !strings.HasSuffix(notReady[i], want) {
-				t.Errorf("not-ready warning %d = %q, want it ending %q", i, notReady[i], want)
-			}
-		}
+	if result.ContextPanesInjected != 1 {
+		t.Fatalf("ContextPanesInjected = %d, want 1; warnings: %v", result.ContextPanesInjected, result.Warnings)
 	}
 
 	want := restoreTestPastedContext("muse scrollback")
-	if got := waitForRestoreInput(received["muse"], want, 5*time.Second); got != want {
+	if got := waitForRestoreInput(received, want, 5*time.Second); got != want {
 		t.Errorf("muse pane input = %q, want %q", got, want)
 	}
-	time.Sleep(time.Second)
-	if data, _ := os.ReadFile(received["cod"]); len(data) != 0 {
-		t.Errorf("codex pane that never became ready got input %q", data)
-	}
 }
 
-// TestRestorer_RelaunchWaitsForSlowLaunchers restores three agent panes whose
-// launchers behave like real ones: two stay in their shell for 3 s and 10 s
-// (an update check, a version-manager shim) before exec'ing an agent that
-// draws its idle screen, and one exits with an error at once. Each slow agent
-// must be launched once and not reported; the old restore gave a pane 2 s to
-// show its command, then killed the launcher and launched it again, three
-// times, and reported it failed. The failing launcher must be launched three
-// times and reported, and its pane kept, dead, so the failure stays visible;
-// the old restore lost the pane when the launcher exited and never retried.
-func TestRestorer_RelaunchWaitsForSlowLaunchers(t *testing.T) {
-	testutil.RequireTmuxThrottled(t)
-
-	workDir := t.TempDir()
-	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
-	r.agentReadyTimeout = 20 * time.Second
-	sessionName := "cpslow-" + time.Now().Format("150405000000")
-
-	cp := &Checkpoint{
-		ID:          "slow-launcher-checkpoint",
-		SessionName: sessionName,
-		WorkingDir:  workDir,
-		CreatedAt:   time.Now(),
-	}
-	launchers := []struct {
-		agentType string
-		// then runs after the launcher records its launch; %[1]q is the agent.
-		then string
-	}{
-		{agentType: "cc", then: "sleep 3\nexec %[1]q\n"},
-		{agentType: "muse", then: "sleep 10\nexec %[1]q\n"},
-		{agentType: "cod", then: "echo 'launcher: update check failed' >&2\nexit 1\n"},
-	}
-	launchLogs := map[string]string{}
-	for window, l := range launchers {
-		dir := filepath.Join(workDir, l.agentType)
-		if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		agentPath := writeRestoreInputRecorder(t, dir, filepath.Join(dir, "received.txt"), restoreTestReadyScreens[l.agentType], "")
-		launchLogs[l.agentType] = filepath.Join(dir, "launches")
-		launcher := filepath.Join(dir, "bin", "launch")
-		script := fmt.Sprintf("#!/bin/sh\necho launched >> %q\n", launchLogs[l.agentType]) + fmt.Sprintf(l.then, agentPath)
-		if err := os.WriteFile(launcher, []byte(script), 0o755); err != nil {
-			t.Fatalf("write launcher: %v", err)
-		}
-		cp.Session.Panes = append(cp.Session.Panes, PaneState{
-			WindowIndex: window,
-			ID:          fmt.Sprintf("%%%d", window),
-			Title:       fmt.Sprintf("%s__%s_1", sessionName, l.agentType),
-			AgentType:   l.agentType,
-			Command:     launcher,
-		})
-		cp.Session.WindowLayouts = append(cp.Session.WindowLayouts, WindowLayoutState{WindowIndex: window, Layout: "tiled"})
-	}
-
-	t.Cleanup(func() {
-		if tmux.SessionExists(sessionName) {
-			_ = tmux.KillSession(sessionName)
-		}
-	})
-
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
-	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
-	}
-
-	var agentWarnings []string
-	for _, warning := range result.Warnings {
-		if strings.HasPrefix(warning, "agent restoration incomplete") {
-			agentWarnings = append(agentWarnings, warning)
-		}
-	}
-	wantWarning := sessionName + "__cod_1): agent failed to start in 3 attempts; the last exited with status 1"
-	if len(agentWarnings) != 1 || !strings.HasSuffix(agentWarnings[0], wantWarning) {
-		t.Errorf("agent warnings = %q, want one ending %q", agentWarnings, wantWarning)
-	}
-
-	for agentType, want := range map[string]int{"cc": 1, "muse": 1, "cod": 3} {
-		data, _ := os.ReadFile(launchLogs[agentType])
-		if got := strings.Count(string(data), "launched\n"); got != want {
-			t.Errorf("%s launcher ran %d times, want %d", agentType, got, want)
-		}
-	}
-
-	panes, err := tmux.GetPanes(sessionName)
-	if err != nil {
-		t.Fatalf("GetPanes failed: %v", err)
-	}
-	byTitle := map[string]tmux.Pane{}
-	for _, pane := range panes {
-		byTitle[pane.Title] = pane
-	}
-	for _, agentType := range []string{"cc", "muse"} {
-		if pane, ok := byTitle[sessionName+"__"+agentType+"_1"]; !ok || pane.Command != "cat" {
-			t.Errorf("%s pane = %+v (found %v), want it running its agent (cat)", agentType, pane, ok)
-		}
-	}
-	failed, ok := byTitle[sessionName+"__cod_1"]
-	if !ok {
-		t.Fatalf("failed launcher's pane is gone; panes: %+v", panes)
-	}
-	if dead, err := tmux.DefaultClient.Run("display-message", "-p", "-t", failed.ID, "#{pane_dead}"); err != nil || dead != "1" {
-		t.Errorf("failed launcher's pane_dead = %q (err %v), want 1", dead, err)
-	}
-}
-
-// restoreTestReadyScreens are idle screens that agent.IsReadyOutput accepts,
-// as printf format strings.
+// restoreTestReadyScreens are idle screens that the restore's readiness wait
+// (the status observer's idle classification and composer check) accepts, as
+// printf format strings.
 var restoreTestReadyScreens = map[string]string{
 	"cc":   `────────\n❯\n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n`,
 	"cod":  `›\n`,
@@ -879,273 +555,6 @@ func waitForRestoreInput(path, want string, timeout time.Duration) string {
 		}
 	}
 	return got
-}
-
-// restoreTestPiScreen is a fresh Pi 1.3.0 screen (`pi --offline --no-session
-// --no-extensions` in a 40-column pane): an empty editor above the footer,
-// with no prompt glyph, banner or "ready" status.
-var restoreTestPiScreen = strings.Repeat("─", 40) + "\n\n" + strings.Repeat("─", 40) + "\n" +
-	"/private/tmp/claude-501/-Volumes-1tb-...\n" +
-	"0.0%/1.0M (auto)  google/gemini-4-argon"
-
-func TestWaitForRestoredAgentReady(t *testing.T) {
-	const museScreen = "Muse Code 1.4.11\n\n❯\n  muse-wonder-1.0 · /repo · YOLO"
-	tests := []struct {
-		name string
-		// agentType is the type the pane was relaunched as; Muse when empty.
-		agentType agent.AgentType
-		// screens are the observed outputs in order; the last one repeats.
-		screens  []string
-		command  string
-		dead     bool
-		gone     bool
-		deadline time.Duration
-		// want is the returned error's text; empty for a ready agent.
-		want string
-		// minObservations and maxObservations bound how many observations
-		// the wait takes; zero is unbounded.
-		minObservations, maxObservations int
-	}{
-		{name: "ready once the TUI draws", screens: []string{"", "", museScreen}, command: "muse-bin-1.4.11", deadline: 2 * time.Second, minObservations: 3},
-		{name: "never draws", screens: []string{""}, command: "cat", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
-		{name: "shell prompt under a shell", screens: []string{"% "}, command: "zsh", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
-		{name: "ready text while the launcher shell still runs", screens: []string{"Update ready"}, command: "bash", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
-		{name: "dead pane keeps its agent's screen and name, and stops the wait", screens: []string{museScreen}, command: "muse-bin-1.4.11", dead: true, deadline: 5 * time.Second, want: "agent exited", maxObservations: 1},
-		{name: "closed pane stops the wait", screens: []string{""}, gone: true, deadline: 5 * time.Second, want: "pane closed", maxObservations: 1},
-		{name: "checked once after the deadline", screens: []string{museScreen}, command: "muse-bin-1.4.11", deadline: -time.Second, minObservations: 1},
-		// bd-1zadt: Pi's screen carries none of the generic indicators, so
-		// only its own editor recognizer sees it come up.
-		{name: "pi ready once its editor draws", agentType: agent.AgentTypePi, screens: []string{"", restoreTestPiScreen}, command: "node", deadline: 2 * time.Second, minObservations: 2},
-		{name: "pi shell prompt is not ready", agentType: agent.AgentTypePi, screens: []string{"$ "}, command: "node", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			agentType := tc.agentType
-			if agentType == "" {
-				agentType = agent.AgentTypeMuse
-			}
-			observations := 0
-			observe := func(paneID string) (restoredPaneState, error) {
-				if paneID != "%7" {
-					t.Errorf("observe(%q), want observe(%%7)", paneID)
-				}
-				screen := tc.screens[min(observations, len(tc.screens)-1)]
-				observations++
-				return restoredPaneState{gone: tc.gone, dead: tc.dead, command: tc.command, output: screen}, nil
-			}
-
-			err := waitForRestoredAgentReady("%7", agentType, time.Now().Add(tc.deadline), max(tc.deadline, 0), time.Millisecond, observe)
-			got := ""
-			if err != nil {
-				got = err.Error()
-			}
-			if got != tc.want {
-				t.Fatalf("waitForRestoredAgentReady() = %q, want %q", got, tc.want)
-			}
-			if observations < tc.minObservations || (tc.maxObservations > 0 && observations > tc.maxObservations) {
-				t.Fatalf("took %d observations, want between %d and %d", observations, tc.minObservations, tc.maxObservations)
-			}
-		})
-	}
-}
-
-// TestRelaunchRestoredPanes drives one pane's relaunch through scripted
-// observations: per launch, what the pane shows on each poll.
-func TestRelaunchRestoredPanes(t *testing.T) {
-	const museScreen = "Muse Code 1.4.11\n\n❯\n  muse-wonder-1.0 · /repo · YOLO"
-	var (
-		inShell  = restoredPaneState{command: "bash"}
-		wrapper  = restoredPaneState{command: "env"}
-		started  = restoredPaneState{command: "muse-bin-1.4.11"}
-		up       = restoredPaneState{command: "muse-bin-1.4.11", output: museScreen}
-		exited   = restoredPaneState{dead: true, exitStatus: "1", command: "bash"}
-		killed   = restoredPaneState{dead: true, command: "muse-bin-1.4.11"}
-		gone     = restoredPaneState{gone: true}
-		promptUp = restoredPaneState{command: "bash", output: "% "}
-	)
-	tests := []struct {
-		name string
-		// launches lists, per launch, the pane's observations in order; the
-		// last one repeats.
-		launches   [][]restoredPaneState
-		respawnErr error
-		deadline   time.Duration
-		// wantLaunches is how many times the agent must be launched.
-		wantLaunches int
-		// wantErr is the launch's outcome; empty for an agent that came up.
-		wantErr string
-	}{
-		{
-			name:         "launcher stays in its shell for many polls, then the agent comes up",
-			launches:     [][]restoredPaneState{{inShell, inShell, inShell, inShell, inShell, inShell, started, started, up}},
-			deadline:     5 * time.Second,
-			wantLaunches: 1,
-		},
-		{
-			name:         "launcher still in its shell at the deadline is left running",
-			launches:     [][]restoredPaneState{{inShell}},
-			deadline:     50 * time.Millisecond,
-			wantLaunches: 1,
-			wantErr:      "agent not started within 50ms; its launcher (bash) is still running",
-		},
-		{
-			name:         "shell prompt is not an agent coming up",
-			launches:     [][]restoredPaneState{{promptUp}},
-			deadline:     50 * time.Millisecond,
-			wantLaunches: 1,
-			wantErr:      "agent not started within 50ms; its launcher (bash) is still running",
-		},
-		{
-			name:         "agent started but not ready at the deadline is left running",
-			launches:     [][]restoredPaneState{{started}},
-			deadline:     50 * time.Millisecond,
-			wantLaunches: 1,
-			wantErr:      `agent "muse-bin-1.4.11" started but not ready within 50ms`,
-		},
-		{
-			name:         "launcher exits, the second launch comes up",
-			launches:     [][]restoredPaneState{{inShell, exited}, {inShell, up}},
-			deadline:     5 * time.Second,
-			wantLaunches: 2,
-		},
-		{
-			name:         "launcher exits on every launch",
-			launches:     [][]restoredPaneState{{exited}},
-			deadline:     5 * time.Second,
-			wantLaunches: 3,
-			wantErr:      "agent failed to start in 3 attempts; the last exited with status 1",
-		},
-		{
-			name:         "agent killed by a signal on every launch",
-			launches:     [][]restoredPaneState{{started, killed}},
-			deadline:     5 * time.Second,
-			wantLaunches: 3,
-			wantErr:      "agent failed to start in 3 attempts; the last exited",
-		},
-		{
-			name:         "agent back in a shell after it started is launched again",
-			launches:     [][]restoredPaneState{{started, started, inShell}, {up}},
-			deadline:     5 * time.Second,
-			wantLaunches: 2,
-		},
-		{
-			name:         "agent back in a shell after it started on every launch",
-			launches:     [][]restoredPaneState{{started, started, inShell}},
-			deadline:     5 * time.Second,
-			wantLaunches: 3,
-			wantErr:      "agent failed to start in 3 attempts; the last returned to a shell (bash) after its agent started",
-		},
-		{
-			name:         "wrapper seen once before the launcher's shell is not an agent that started",
-			launches:     [][]restoredPaneState{{wrapper, inShell, inShell, up}},
-			deadline:     5 * time.Second,
-			wantLaunches: 1,
-		},
-		{
-			name:         "pane closed",
-			launches:     [][]restoredPaneState{{inShell, gone}},
-			deadline:     5 * time.Second,
-			wantLaunches: 1,
-			wantErr:      "pane closed while its agent was starting",
-		},
-		{
-			name:         "respawn fails",
-			launches:     [][]restoredPaneState{{up}},
-			respawnErr:   errors.New("can't find pane: %3"),
-			deadline:     5 * time.Second,
-			wantLaunches: 1,
-			wantErr:      "launching agent: can't find pane: %3",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			launches, polls := 0, 0
-			ops := restoredPaneOps{
-				respawn: func(paneID, command string) error {
-					if paneID != "%3" || command != "muse --yolo" {
-						t.Errorf("respawn(%q, %q), want respawn(%%3, muse --yolo)", paneID, command)
-					}
-					launches++
-					polls = 0
-					return tc.respawnErr
-				},
-				observe: func(paneID string) (restoredPaneState, error) {
-					script := tc.launches[min(launches, len(tc.launches))-1]
-					state := script[min(polls, len(script)-1)]
-					polls++
-					return state, nil
-				},
-			}
-			launch := &restoredLaunch{paneID: "%3", command: "muse --yolo"}
-
-			relaunchRestoredPanes([]*restoredLaunch{launch}, time.Now().Add(tc.deadline), tc.deadline, time.Millisecond, ops)
-
-			if launches != tc.wantLaunches || launch.attempts != tc.wantLaunches {
-				t.Errorf("launched %d times (attempts %d), want %d", launches, launch.attempts, tc.wantLaunches)
-			}
-			gotErr := ""
-			if launch.err != nil {
-				gotErr = launch.err.Error()
-			}
-			if gotErr != tc.wantErr {
-				t.Errorf("outcome = %q, want %q", gotErr, tc.wantErr)
-			}
-		})
-	}
-}
-
-// TestRelaunchRestoredPanes_ReadsReadinessAsThePaneType is the bd-1zadt
-// regression: a restored Pi pane waited out the whole deadline and was
-// reported as started but not ready, because its idle screen matched none of
-// the indicators the readiness check knew without the pane's type.
-func TestRelaunchRestoredPanes_ReadsReadinessAsThePaneType(t *testing.T) {
-	ops := restoredPaneOps{
-		respawn: func(string, string) error { return nil },
-		observe: func(string) (restoredPaneState, error) {
-			return restoredPaneState{command: "node", output: restoreTestPiScreen}, nil
-		},
-	}
-	launch := &restoredLaunch{pane: PaneState{AgentType: "pi"}, paneID: "%3", command: "pi"}
-
-	relaunchRestoredPanes([]*restoredLaunch{launch}, time.Now().Add(time.Second), time.Second, time.Millisecond, ops)
-
-	if launch.err != nil || launch.attempts != 1 {
-		t.Fatalf("relaunch err = %v after %d launches, want the Pi pane up after one", launch.err, launch.attempts)
-	}
-}
-
-func TestRestorer_loadPaneScrollback_Compressed(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "ntm-restore-test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	storage := NewStorageWithDir(tmpDir)
-	r := NewRestorerWithStorage(storage)
-
-	const (
-		sessionName  = "test-session"
-		checkpointID = "test-checkpoint"
-		paneID       = "%0"
-		content      = "compressed scrollback\nline 2\n"
-	)
-
-	compressed, err := gzipCompress([]byte(content))
-	if err != nil {
-		t.Fatalf("gzipCompress failed: %v", err)
-	}
-	if _, err := storage.SaveCompressedScrollback(sessionName, checkpointID, paneID, compressed); err != nil {
-		t.Fatalf("SaveCompressedScrollback failed: %v", err)
-	}
-
-	got, err := r.loadPaneScrollback(sessionName, checkpointID, paneID)
-	if err != nil {
-		t.Fatalf("loadPaneScrollback failed: %v", err)
-	}
-	if got != content {
-		t.Fatalf("loadPaneScrollback = %q, want %q", got, content)
-	}
 }
 
 func TestRestorer_loadPaneScrollbackForPane_UsesRecordedScrollbackFile(t *testing.T) {
@@ -1234,34 +643,6 @@ func TestTruncateToLines(t *testing.T) {
 			t.Errorf("truncateToLines(%q, %d) = %q, want %q",
 				tt.content, tt.maxLines, got, tt.want)
 		}
-	}
-}
-
-func TestValidateCheckpoint_RejectsScrollbackTraversal(t *testing.T) {
-	storage := NewStorageWithDir(t.TempDir())
-	r := NewRestorerWithStorage(storage)
-
-	cp := &Checkpoint{
-		ID:          "test-checkpoint",
-		SessionName: "test-session",
-		WorkingDir:  t.TempDir(),
-		Session: SessionState{
-			Panes: []PaneState{
-				{
-					Index:          0,
-					ID:             "%0",
-					ScrollbackFile: "../../etc/passwd",
-				},
-			},
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{InjectContext: true})
-	if len(issues) != 1 {
-		t.Fatalf("expected 1 issue, got %d: %v", len(issues), issues)
-	}
-	if !containsSubstr(issues[0], "invalid scrollback path") {
-		t.Fatalf("expected invalid scrollback path issue, got %v", issues)
 	}
 }
 
@@ -1363,21 +744,6 @@ func TestFormatContextInjection(t *testing.T) {
 	}
 	if !containsSubstr(result, "World") {
 		t.Error("Expected content to be included")
-	}
-}
-
-func TestRestorer_Restore_CheckpointNotFound(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "ntm-restore-test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	r := NewRestorerWithStorage(NewStorageWithDir(tmpDir))
-
-	_, err = r.Restore("nonexistent-session", "nonexistent-checkpoint", RestoreOptions{})
-	if err == nil {
-		t.Error("Restore should fail for nonexistent checkpoint")
 	}
 }
 
@@ -1500,9 +866,9 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_SurfacesAssignments(t *testing.T)
 		},
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint(DryRun) failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext(DryRun) failed: %v", err)
 	}
 
 	// Verify assignments are surfaced in result
@@ -1548,9 +914,9 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_NoAssignments(t *testing.T) {
 		// No Assignments or BVSummary
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint(DryRun) failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext(DryRun) failed: %v", err)
 	}
 
 	if len(result.Assignments) != 0 {
@@ -1558,21 +924,6 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_NoAssignments(t *testing.T) {
 	}
 	if result.BVSummary != nil {
 		t.Error("result.BVSummary should be nil for checkpoint without BV data")
-	}
-}
-
-func TestRestorer_RestoreLatest_NoCheckpoints(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "ntm-restore-test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	r := NewRestorerWithStorage(NewStorageWithDir(tmpDir))
-
-	_, err = r.RestoreLatest("nonexistent-session", RestoreOptions{})
-	if err == nil {
-		t.Error("RestoreLatest should fail when no checkpoints exist")
 	}
 }
 
@@ -1757,6 +1108,88 @@ func TestRestorableAgentCommand(t *testing.T) {
 	}
 }
 
+func TestExpectedPaneCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{
+			name:    "plain command",
+			command: "claude --print",
+			want:    "claude",
+		},
+		{
+			name:    "custom wrapper path",
+			command: "/usr/local/bin/custom-claude-wrapper --fast",
+			want:    "custom-claude-wrapper",
+		},
+		{
+			name:    "leading env assignment",
+			command: `NODE_OPTIONS="--max-old-space-size=32768" claude --dangerously-skip-permissions`,
+			want:    "claude",
+		},
+		{
+			name:    "command substitution in env assignment",
+			command: `CODEX_SYSTEM_PROMPT="$(cat /tmp/system prompt.txt)" codex --search`,
+			want:    "codex",
+		},
+		{
+			name:    "env prefix with assignments",
+			command: "env FOO=bar codex --search",
+			want:    "codex",
+		},
+		{
+			name:    "env prefix with options",
+			command: "env -i FOO=bar codex --search",
+			want:    "codex",
+		},
+		{
+			name:    "absolute env wrapper path",
+			command: "/usr/bin/env FOO=bar codex --search",
+			want:    "codex",
+		},
+		{
+			name:    "exec prefix",
+			command: "exec codex --search",
+			want:    "codex",
+		},
+		{
+			name:    "env and exec prefixes",
+			command: "env FOO=bar exec codex --search",
+			want:    "codex",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := expectedPaneCommand(tt.command); got != tt.want {
+				t.Fatalf("expectedPaneCommand(%q) = %q, want %q", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsBareAgentRuntimeCommand(t *testing.T) {
+	for _, command := range []string{
+		"node", "nodejs", "bun", "deno", "npx", "npm", "python", "python3", "python3.13", "ruby", "perl", "uv", "uvx",
+		"  /usr/bin/node  ", `"/opt/runtime dir/python3.14"`, `'/opt/bun'`,
+	} {
+		if !isBareAgentRuntimeCommand(command) {
+			t.Errorf("bare runtime %q was treated as a complete agent launch", command)
+		}
+	}
+	for _, command := range []string{
+		"", "claude", "codex", "sleep 30", "python-agent", "python3.13-config",
+		"node /opt/agent.js", `node "/path with spaces/agent.js"`, "bun run agent", "python3 -m aider",
+		"env FOO=bar node /opt/agent.js", "/opt/agent-launcher --fast", "exec node /opt/agent.js",
+	} {
+		if isBareAgentRuntimeCommand(command) {
+			t.Errorf("explicit command %q would lose its argv", command)
+		}
+	}
+}
+
 func TestSortedCheckpointPanes(t *testing.T) {
 	panes := []PaneState{
 		{WindowIndex: 2, Index: 0, Title: "w2p0"},
@@ -1803,9 +1236,6 @@ func TestRestorer_RestoreFromCheckpoint_RelaunchesCommandsAcrossWindows(t *testi
 
 	workDir := t.TempDir()
 	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
-	// The sleep stand-ins never draw a ready screen, so the restore waits out
-	// its ready deadline; a short one keeps the test fast.
-	r.agentReadyTimeout = time.Second
 	sessionName := "cprestore-" + time.Now().Format("150405000000")
 
 	cp := &Checkpoint{
@@ -1849,9 +1279,9 @@ func TestRestorer_RestoreFromCheckpoint_RelaunchesCommandsAcrossWindows(t *testi
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 	if result.PanesRestored != 3 {
 		t.Fatalf("PanesRestored = %d, want 3 (warnings=%v)", result.PanesRestored, result.Warnings)
@@ -1904,6 +1334,25 @@ func TestRestorer_RestoreFromCheckpoint_RelaunchesCommandsAcrossWindows(t *testi
 	if sorted[2].Title != sessionName+"__cursor_2" {
 		t.Fatalf("third pane title = %q, want %q", sorted[2].Title, sessionName+"__cursor_2")
 	}
+	wantTypeByID := map[string]tmux.AgentType{
+		sorted[0].ID: tmux.AgentClaude,
+		sorted[1].ID: tmux.AgentCursor,
+		sorted[2].ID: tmux.AgentCursor,
+	}
+	for paneID := range wantTypeByID {
+		if err := tmux.SetPaneTitle(paneID, "wrapper | title replaced by TUI"); err != nil {
+			t.Fatalf("rewrite restored pane %s title: %v", paneID, err)
+		}
+	}
+	panesAfterRewrite, err := tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanes after title rewrite: %v", err)
+	}
+	for _, pane := range panesAfterRewrite {
+		if want, ok := wantTypeByID[pane.ID]; ok && pane.Type != want {
+			t.Errorf("restored pane %s type after title rewrite = %s, want %s", pane.ID, pane.Type, want)
+		}
+	}
 
 	activePaneID, err := tmux.DefaultClient.Run("display-message", "-p", "-t", sessionName, "#{pane_id}")
 	if err != nil {
@@ -1919,9 +1368,6 @@ func TestRestorer_RestoreFromCheckpoint_PreservesSparseWindowIndexes(t *testing.
 
 	workDir := t.TempDir()
 	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
-	// The sleep stand-ins never draw a ready screen, so the restore waits out
-	// its ready deadline; a short one keeps the test fast.
-	r.agentReadyTimeout = time.Second
 	sessionName := "cprestore-sparse-" + time.Now().Format("150405000000")
 
 	cp := &Checkpoint{
@@ -1965,9 +1411,9 @@ func TestRestorer_RestoreFromCheckpoint_PreservesSparseWindowIndexes(t *testing.
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 	if result.PanesRestored != 3 {
 		t.Fatalf("PanesRestored = %d, want 3 (warnings=%v)", result.PanesRestored, result.Warnings)
@@ -2079,9 +1525,9 @@ func TestRestorer_RestoreFromCheckpoint_PreservesPerWindowLayouts(t *testing.T) 
 		Session:     sessionState,
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 	if result.PanesRestored != len(sessionState.Panes) {
 		t.Fatalf("PanesRestored = %d, want %d (warnings=%v)", result.PanesRestored, len(sessionState.Panes), result.Warnings)

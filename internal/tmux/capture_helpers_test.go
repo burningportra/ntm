@@ -73,7 +73,7 @@ func TestCaptureForHealthCheck(t *testing.T) {
 	SendKeys(target, "echo HEALTH_TEST", true)
 	time.Sleep(200 * time.Millisecond)
 
-	output, err := CaptureForHealthCheck(target)
+	output, err := DefaultClient.CaptureForHealthCheck(target)
 	if err != nil {
 		t.Fatalf("CaptureForHealthCheck failed: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestCaptureForFullContext(t *testing.T) {
 	SendKeys(target, "echo CONTEXT_TEST", true)
 	time.Sleep(200 * time.Millisecond)
 
-	output, err := CaptureForFullContext(target)
+	output, err := DefaultClient.CaptureForFullContext(target)
 	if err != nil {
 		t.Fatalf("CaptureForFullContext failed: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestCaptureForCheckpoint(t *testing.T) {
 	SendKeys(target, "echo CHECKPOINT_TEST", true)
 	time.Sleep(200 * time.Millisecond)
 
-	output, err := CaptureForCheckpoint(target)
+	output, err := DefaultClient.CaptureForCheckpoint(target)
 	if err != nil {
 		t.Fatalf("CaptureForCheckpoint failed: %v", err)
 	}

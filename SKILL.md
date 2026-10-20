@@ -74,6 +74,14 @@ ntm spawn myproject --persona=architect --persona=implementer:2
 ntm spawn myproject --stagger-mode=smart --cc=6 --cod=4
 ```
 
+Stagger defaults can live in config so every spawn paces prompts (flags win):
+
+```toml
+[spawn]
+stagger_mode = "fixed"   # none | fixed | smart
+stagger_delay = "90s"    # 0-5m
+```
+
 ## Dispatch and Reusable Assets
 
 High-leverage NTM usage is not just `spawn` plus `send`. The real power shows up when
@@ -85,7 +93,7 @@ ntm send myproject --pane=2 "Own the auth migration."
 ntm send --project myproject "Sync to main and report conflicts."
 ntm send myproject -c internal/auth/service.go "Review this subsystem"
 ntm send myproject -t fix --var issue="nil pointer" --file internal/auth/service.go
-ntm send myproject --smart --route=affinity "Take the auth follow-up"
+ntm send myproject --route=affinity "Take the auth follow-up in internal/auth/service.go"
 ntm send myproject --distribute --dist-strategy=dependency
 
 ntm recipes list
@@ -142,9 +150,11 @@ ntm timeline list
 ntm timeline show <session-id>
 ntm history search "authentication error"
 ntm audit show myproject
-ntm changes conflicts myproject
+ntm conflicts myproject
 ntm resume myproject
 ```
+
+`ntm locks force-release` is approval-gated by default (`automation.force_release: approval`): the first run files a durable approval request, a second operator grants it with `ntm approve <id>` (self-approval is rejected), and re-running the command consumes the approval and executes once. A solo operator can set `ntm policy automation --force-release auto` to allow unattended force-release.
 
 Treat `ntm checkpoint save` as a routine cadence, not just a pre-disaster snapshot. Good points to checkpoint: once prompts are confirmed received after a spawn or restore, after an investigation isolates a root cause, before risky edits, after significant uncommitted work but before verification, after a green verification, and before a merge/cleanup/handoff. Cheap checkpoints make any later `ntm checkpoint restore` land on a known-good state.
 
@@ -170,7 +180,7 @@ NTM has built-in safety, policy, and approval surfaces. Use them instead of ad h
 ntm safety status
 ntm safety check -- git reset --hard
 ntm safety blocked --hours 24
-ntm safety install
+ntm safety install   # also registers the Claude hook in ~/.claude/settings.json
 
 ntm policy show --all
 ntm policy validate
@@ -203,6 +213,7 @@ ntm --robot-terse
 Common task-specific robot surfaces:
 
 ```bash
+ntm --robot-spawn=myproject --spawn-cc=3 --spawn-prompt="Read AGENTS.md and start on ready work" --spawn-stagger-mode=fixed --spawn-stagger-delay=90s
 ntm --robot-send=myproject --msg="Summarize blockers." --type=claude
 ntm --robot-ack=myproject --ack-timeout=30s
 ntm --robot-tail=myproject --lines=50
@@ -212,6 +223,12 @@ ntm --robot-beads-list --beads-status=open
 ntm --robot-bead-claim=br-123 --bead-assignee=agent1
 ntm --robot-bead-close=br-123 --bead-close-reason="Completed"
 ```
+
+`--spawn-prompt` (or `--spawn-prompt-file`) waits for readiness, then reaches
+each agent through robot send's dispatch path; the JSON reports the
+`stagger.schedule[]` (per-agent `delay_ms`/`scheduled_at`) and
+`prompt_deliveries[]` (per-agent `prompt_sent`/`delivered_at`). The same
+`--spawn-stagger-*` flags pace `--spawn-assign-work` prompts.
 
 Operator loop:
 

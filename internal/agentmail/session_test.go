@@ -1,9 +1,13 @@
 package agentmail
 
 import (
+	"context"
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,45 +101,6 @@ func TestLoadSaveSessionAgent(t *testing.T) {
 		t.Errorf("ProjectKey = %q, want %q", loaded.ProjectKey, saveInfo.ProjectKey)
 	}
 
-	// Delete agent info
-	if err := DeleteSessionAgent(sessionName, saveInfo.ProjectKey); err != nil {
-		t.Fatalf("DeleteSessionAgent failed: %v", err)
-	}
-
-	// Verify it's gone
-	info, err = LoadSessionAgent(sessionName, saveInfo.ProjectKey)
-	if err != nil {
-		t.Fatalf("LoadSessionAgent failed after delete: %v", err)
-	}
-	if info != nil {
-		t.Error("Expected nil info after delete")
-	}
-}
-
-func TestIsNameTakenError(t *testing.T) {
-	tests := []struct {
-		errStr   string
-		expected bool
-	}{
-		{"name already in use", true},
-		{"agent name taken", true},
-		{"agent already registered", true},
-		{"some other error", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.errStr, func(t *testing.T) {
-			var err error
-			if tt.errStr != "" {
-				err = NewAPIError("test", 0, &testError{msg: tt.errStr})
-			}
-			result := IsNameTakenError(err)
-			if result != tt.expected {
-				t.Errorf("IsNameTakenError(%q) = %v, want %v", tt.errStr, result, tt.expected)
-			}
-		})
-	}
 }
 
 // Helper functions for tests
@@ -151,14 +116,6 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
-}
-
-type testError struct {
-	msg string
-}
-
-func (e *testError) Error() string {
-	return e.msg
 }
 
 // Tests for SessionAgentRegistry
@@ -409,20 +366,6 @@ func TestSessionAgentRegistryPersistence(t *testing.T) {
 	if !ok || name != "GreenCastle" {
 		t.Errorf("agent mapping mismatch: got %q, %v", name, ok)
 	}
-
-	// Test delete
-	if err := DeleteSessionAgentRegistry(sessionName, projectKey); err != nil {
-		t.Fatalf("DeleteSessionAgentRegistry error: %v", err)
-	}
-
-	// Verify deleted
-	deleted, err := LoadSessionAgentRegistry(sessionName, projectKey)
-	if err != nil {
-		t.Fatalf("LoadSessionAgentRegistry after delete error: %v", err)
-	}
-	if deleted != nil {
-		t.Error("expected nil after delete")
-	}
 }
 
 func TestLoadSessionAgentRegistry_ProjectKeyValidation(t *testing.T) {
@@ -466,9 +409,9 @@ func TestLoadBestSessionAgentRegistry_PrefersUsableProject(t *testing.T) {
 	sessionName := "test-best-registry"
 	staleProject := filepath.Join(tmpDir, "stale-project")
 	actualProject := filepath.Join(tmpDir, "actual-project")
-	if err := os.MkdirAll(staleProject, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// Leave staleProject absent. Besides matching a genuinely stale registry,
+	// this keeps the fixture isolated when a remote test runner places
+	// t.TempDir beneath an unrelated repository with its own .beads/.git.
 	if err := os.MkdirAll(filepath.Join(actualProject, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -508,9 +451,9 @@ func TestLoadBestSessionAgent_PrefersUsableProject(t *testing.T) {
 	sessionName := "test-best-agent"
 	staleProject := filepath.Join(tmpDir, "stale-project")
 	actualProject := filepath.Join(tmpDir, "actual-project")
-	if err := os.MkdirAll(staleProject, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// The stale artifact points at a project that no longer exists. Keeping
+	// the path absent prevents enclosing project markers from influencing its
+	// score on runners whose temporary directory lives inside a checkout.
 	if err := os.MkdirAll(filepath.Join(actualProject, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -634,9 +577,6 @@ func TestSessionAgentStorageRejectsInvalidSessionNames(t *testing.T) {
 	if _, err := LoadSessionAgent("../escape", info.ProjectKey); err == nil {
 		t.Fatal("expected invalid session name error from LoadSessionAgent")
 	}
-	if err := DeleteSessionAgent("../escape", info.ProjectKey); err == nil {
-		t.Fatal("expected invalid session name error from DeleteSessionAgent")
-	}
 }
 
 func TestSessionAgentRegistryRejectsInvalidSessionNames(t *testing.T) {
@@ -648,9 +588,6 @@ func TestSessionAgentRegistryRejectsInvalidSessionNames(t *testing.T) {
 	}
 	if _, err := LoadSessionAgentRegistry("../escape", "/tmp/project"); err == nil {
 		t.Fatal("expected invalid session name error from LoadSessionAgentRegistry")
-	}
-	if err := DeleteSessionAgentRegistry("../escape", "/tmp/project"); err == nil {
-		t.Fatal("expected invalid session name error from DeleteSessionAgentRegistry")
 	}
 }
 
@@ -697,5 +634,223 @@ func TestLoadSessionAgentRegistryContinuesPastMismatchedCandidate(t *testing.T) 
 	}
 	if loaded.ProjectKey != projectKey {
 		t.Fatalf("expected project key %s, got %s", projectKey, loaded.ProjectKey)
+	}
+}
+
+// A fresh coordinator registration must persist the server-issued identity
+// AND its registration token, and prime the client's in-process token cache,
+// so every later ntm process re-claims the same adjective+noun identity
+// instead of sending as an unregistered literal (GH coordinator-identity fix;
+// PR #274/#275 context).
+func TestRegisterSessionAgent_PersistsIdentityAndToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, ".config"))
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"health_check": func(map[string]interface{}) (interface{}, *JSONRPCError) {
+			return map[string]interface{}{"status": "ok"}, nil
+		},
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			key, _ := args["human_key"].(string)
+			return Project{ID: 1, HumanKey: key}, nil
+		},
+		"register_agent": func(map[string]interface{}) (interface{}, *JSONRPCError) {
+			return Agent{ID: 2, Name: "GreenCastle", RegistrationToken: "tok-abc123"}, nil
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "coord-fresh", "/proj/coord-fresh")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "GreenCastle" || info.RegistrationToken != "tok-abc123" {
+		t.Fatalf("info = %+v, want GreenCastle with tok-abc123", info)
+	}
+
+	loaded, err := LoadSessionAgent("coord-fresh", "/proj/coord-fresh")
+	if err != nil || loaded == nil {
+		t.Fatalf("LoadSessionAgent = (%+v, %v)", loaded, err)
+	}
+	if loaded.RegistrationToken != "tok-abc123" {
+		t.Fatalf("persisted token = %q, want tok-abc123", loaded.RegistrationToken)
+	}
+	if tok := client.RegistrationToken("/proj/coord-fresh", "GreenCastle"); tok != "tok-abc123" {
+		t.Fatalf("client token cache = %q, want tok-abc123", tok)
+	}
+}
+
+// Re-registration for an already-persisted session identity must send the
+// persisted registration token so the server authenticates the re-claim
+// rather than rejecting the name as already taken.
+func TestRegisterSessionAgent_ReusesPersistedTokenOnReclaim(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, ".config"))
+
+	if err := SaveSessionAgent("coord-reuse", "/proj/coord-reuse", &SessionAgentInfo{
+		AgentName:         "GreenCastle",
+		ProjectKey:        "/proj/coord-reuse",
+		RegistrationToken: "tok-persisted",
+		RegisteredAt:      time.Now().Add(-time.Hour),
+		LastActiveAt:      time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("seed session agent: %v", err)
+	}
+
+	var gotToken string
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			return Project{ID: 2, HumanKey: args["human_key"].(string)}, nil
+		},
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			gotToken, _ = args["registration_token"].(string)
+			return Agent{ID: 2, Name: "GreenCastle", RegistrationToken: "tok-persisted"}, nil
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "coord-reuse", "/proj/coord-reuse")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "GreenCastle" {
+		t.Fatalf("info = %+v, want reused GreenCastle identity", info)
+	}
+	if gotToken != "tok-persisted" {
+		t.Fatalf("register_agent received token %q, want the persisted tok-persisted", gotToken)
+	}
+}
+
+// TestRegisterSessionAgentProbesWithEnsureProject verifies the availability
+// probe is the lightweight ensure_project call rather than the heavier
+// health_check diagnostic: a loaded-but-healthy server that would blow the
+// health_check budget must still yield a session identity.
+func TestRegisterSessionAgentProbesWithEnsureProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	var mu sync.Mutex
+	var called []string
+	record := func(name string) {
+		mu.Lock()
+		called = append(called, name)
+		mu.Unlock()
+	}
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			record("ensure_project")
+			return Project{ID: 7, HumanKey: args["human_key"].(string)}, nil
+		},
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			record("register_agent")
+			return Agent{ID: 8, Name: "WhiteHorse", Program: args["program"].(string), Model: args["model"].(string), RegistrationToken: "session-token"}, nil
+		},
+		// No health_check handler: mockMCPHandler fails the exchange for any
+		// unhandled tool, so a health_check probe would surface as an error.
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "session-probe-test", "/project/probe-test")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "WhiteHorse" || info.RegistrationToken != "session-token" {
+		t.Fatalf("session info = %+v", info)
+	}
+
+	mu.Lock()
+	tools := append([]string(nil), called...)
+	mu.Unlock()
+	if len(tools) < 2 || tools[0] != "ensure_project" {
+		t.Fatalf("ensure_project must be the first (probe) call, got %v", tools)
+	}
+	for _, tool := range tools {
+		if tool == "health_check" {
+			t.Fatalf("registration must not be gated on health_check, got %v", tools)
+		}
+	}
+
+	loaded, err := LoadSessionAgent("session-probe-test", "/project/probe-test")
+	if err != nil || loaded == nil || loaded.RegistrationToken != "session-token" {
+		t.Fatalf("persisted session info = %+v, error=%v", loaded, err)
+	}
+	if token := client.RegistrationToken("/project/probe-test", "WhiteHorse"); token != "session-token" {
+		t.Fatalf("client token cache = %q, want session-token", token)
+	}
+}
+
+// TestRegisterSessionAgentEnsuresProjectOnReRegister verifies the existing
+// registration fast path still runs ensure_project first: Agent Mail may have
+// rebuilt its database since the identity was persisted locally.
+func TestRegisterSessionAgentEnsuresProjectOnReRegister(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	if err := SaveSessionAgent("session-rebuild-test", "/project/rebuild-test", &SessionAgentInfo{
+		AgentName:  "WhiteHorse",
+		ProjectKey: "/project/rebuild-test",
+	}); err != nil {
+		t.Fatalf("seed session agent: %v", err)
+	}
+
+	var mu sync.Mutex
+	ensures := 0
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			mu.Lock()
+			ensures++
+			mu.Unlock()
+			return Project{ID: 7, HumanKey: args["human_key"].(string)}, nil
+		},
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			return Agent{ID: 8, Name: args["name"].(string)}, nil
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "session-rebuild-test", "/project/rebuild-test")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "WhiteHorse" {
+		t.Fatalf("session info = %+v", info)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if ensures != 1 {
+		t.Fatalf("ensure_project calls = %d, want 1", ensures)
+	}
+}
+
+// TestRegisterSessionAgentFailsClosedWhenProjectEnsureFails verifies the probe
+// failure is reported instead of the old silent (nil, nil) skip.
+func TestRegisterSessionAgentFailsClosedWhenProjectEnsureFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(map[string]interface{}) (interface{}, *JSONRPCError) {
+			return nil, &JSONRPCError{Code: -32000, Message: "database unavailable"}
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "session-down-test", "/project/down-test")
+	if err == nil || info != nil {
+		t.Fatalf("RegisterSessionAgent = (%+v, %v), want ensure-project error", info, err)
+	}
+	if !strings.Contains(err.Error(), "ensuring project") {
+		t.Fatalf("error should identify the failed probe, got %v", err)
 	}
 }

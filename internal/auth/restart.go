@@ -13,6 +13,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/rotation"
 	"github.com/Dicklesworthstone/ntm/internal/swarm"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -28,6 +29,7 @@ type Orchestrator struct {
 	sendInterrupt       func(string) error
 	buildPaneCommand    func(string, string) (string, error)
 	sanitizePaneCommand func(string) (string, error)
+	setLaunchSpec       func(context.Context, string, tmux.AgentLaunchSpec) error
 	promptBrowserAuth   func(string) error
 	sleep               func(time.Duration)
 }
@@ -49,6 +51,7 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		sendInterrupt:       tmux.SendInterrupt,
 		buildPaneCommand:    tmux.BuildPaneCommand,
 		sanitizePaneCommand: tmux.SanitizePaneCommand,
+		setLaunchSpec:       tmux.SetPaneLaunchSpecContext,
 		promptBrowserAuth: func(email string) error {
 			return promptBrowserAuth(os.Stdin, os.Stdout, email)
 		},
@@ -119,8 +122,9 @@ func (o *Orchestrator) TerminateSession(paneID string, provider string) error {
 	}
 	o.sleep(1 * time.Second)
 
-	// Check if still active (heuristic: check process or output)
-	// For now, assume we need a second Ctrl+C or explicit exit
+	// Send a second Ctrl+C unconditionally: agent CLIs commonly need two
+	// interrupts to exit, and the extra interrupt is harmless at a shell
+	// prompt (cheaper and more reliable than probing the pane process).
 	if err := o.sendInterrupt(paneID); err != nil {
 		return err
 	}
@@ -215,6 +219,8 @@ func (o *Orchestrator) StartNewAgentSession(ctx RestartContext) error {
 		agentCmdTemplate, agentType = o.cfg.Agents.Gemini, "gmi"
 	case tmux.AgentAntigravity:
 		agentCmdTemplate, agentType = o.cfg.Agents.Antigravity, "agy"
+	case tmux.AgentGrok:
+		agentCmdTemplate, agentType = o.cfg.Agents.Grok, "grok"
 	default:
 		// No usable agent type recorded — fall back to the auth provider name.
 		switch prov.Name() {
@@ -233,7 +239,7 @@ func (o *Orchestrator) StartNewAgentSession(ctx RestartContext) error {
 	resolvedModel := o.cfg.Models.GetModelName(agentType, ctx.ModelAlias)
 
 	// Generate command
-	agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, config.AgentTemplateVars{
+	vars := config.AgentTemplateVars{
 		Model:          resolvedModel,
 		ModelAlias:     ctx.ModelAlias,
 		ModelRequested: len(strings.TrimSpace(ctx.ModelAlias)) > 0,
@@ -241,9 +247,29 @@ func (o *Orchestrator) StartNewAgentSession(ctx RestartContext) error {
 		PaneIndex:      ctx.PaneIndex,
 		AgentType:      agentType,
 		ProjectDir:     ctx.ProjectDir,
-	})
+	}
+	if agentType == "cc" {
+		// The relaunched Claude agent keeps ntm's PreToolUse hooks.
+		vars.ClaudeSettings = policy.ClaudeAgentLaunchSettings(o.cfg).Settings
+	}
+	agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, vars)
 	if err != nil {
 		return fmt.Errorf("generating command: %w", err)
+	}
+	policy.LogClaudeHooksNotApplied("auth-restart", agentCmd, vars.ClaudeSettings)
+	// An auth restart deliberately changes the account in the current launch
+	// environment. Replace any earlier pane record with this actual command;
+	// retaining its old CAAM profile would undo that account switch on recovery.
+	launchSpec := tmux.AgentLaunchSpec{
+		Version: tmux.AgentLaunchSpecVersion, AgentType: tmux.AgentType(agentType),
+		Command: agentCmd, Model: resolvedModel, ModelAlias: ctx.ModelAlias,
+	}
+	if agentType == "cc" && o.cfg.Agents.ClaudeIsolateCredentials {
+		launchSpec.ClaudeIsolateCredentials = true
+		launchSpec.ClaudeTokenFile, err = swarm.ResolveClaudeSetupTokenFile(o.cfg.Agents.ClaudeTokenFile)
+		if err != nil {
+			return fmt.Errorf("capture auth restart token file reference: %w", err)
+		}
 	}
 
 	// Per-pane Claude credential isolation (GH#237). This path is the one that
@@ -270,6 +296,11 @@ func (o *Orchestrator) StartNewAgentSession(ctx RestartContext) error {
 	cmd, err := o.buildPaneCommand(ctx.ProjectDir, safeAgentCmd)
 	if err != nil {
 		return fmt.Errorf("building pane command: %w", err)
+	}
+	metadataCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := o.setLaunchSpec(metadataCtx, ctx.PaneID, launchSpec); err != nil {
+		return fmt.Errorf("record auth restart launch settings: %w", err)
 	}
 
 	// Launch agent command using the specialized robust sender

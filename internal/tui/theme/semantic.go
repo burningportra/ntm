@@ -54,7 +54,8 @@ type SemanticPalette struct {
 	AgentPi          lipgloss.Color // Pi (rosewater, the one accent no agent or status uses)
 	AgentKimi        lipgloss.Color // Kimi CLI (sapphire)
 	AgentGrok        lipgloss.Color // Grok Build (pink)
-	AgentMuse        lipgloss.Color // Muse Code (sky)
+	AgentMuse        lipgloss.Color // Muse Code (sky, shared with omp; the MUSE label tells them apart)
+	AgentOmp         lipgloss.Color // Oh My Pi / omp (sky)
 	AgentAntigravity lipgloss.Color // Antigravity / agy (lavender)
 	AgentCursor      lipgloss.Color // Cursor (teal)
 	AgentWindsurf    lipgloss.Color // Windsurf (flamingo)
@@ -132,6 +133,7 @@ func (t Theme) Semantic() SemanticPalette {
 		AgentKimi:        t.Sapphire,
 		AgentGrok:        t.Pink,
 		AgentMuse:        t.Sky,
+		AgentOmp:         t.Sky,
 		AgentAntigravity: t.Lavender,
 		AgentCursor:      t.Cursor,
 		AgentWindsurf:    t.Windsurf,
@@ -163,11 +165,6 @@ func (t Theme) Semantic() SemanticPalette {
 	}
 }
 
-// Semantic returns the semantic palette for the current theme.
-func Semantic() SemanticPalette {
-	return Current().Semantic()
-}
-
 // AgentColor returns the color for a given agent type string.
 func (p SemanticPalette) AgentColor(agentType string) lipgloss.Color {
 	switch agent.AgentType(agentType).Canonical() {
@@ -185,6 +182,8 @@ func (p SemanticPalette) AgentColor(agentType string) lipgloss.Color {
 		return p.AgentGrok
 	case agent.AgentTypeMuse:
 		return p.AgentMuse
+	case agent.AgentTypeOmp:
+		return p.AgentOmp
 	case agent.AgentTypeAntigravity:
 		return p.AgentAntigravity
 	case agent.AgentTypeCursor:
@@ -224,216 +223,4 @@ func (p SemanticPalette) StatusColor(status string) lipgloss.Color {
 	default:
 		return p.FgSecondary
 	}
-}
-
-// SemanticStyles provides pre-built styles using semantic colors.
-type SemanticStyles struct {
-	// Text styles
-	TextPrimary   lipgloss.Style
-	TextSecondary lipgloss.Style
-	TextMuted     lipgloss.Style
-	TextDisabled  lipgloss.Style
-
-	// Status text
-	TextSuccess lipgloss.Style
-	TextWarning lipgloss.Style
-	TextError   lipgloss.Style
-	TextInfo    lipgloss.Style
-
-	// Interactive elements
-	Link      lipgloss.Style
-	LinkHover lipgloss.Style
-	Code      lipgloss.Style
-	CodeBlock lipgloss.Style
-
-	// Containers
-	Surface    lipgloss.Style
-	Card       lipgloss.Style
-	CardRaised lipgloss.Style
-	Overlay    lipgloss.Style
-
-	// Badges
-	BadgeDefault lipgloss.Style
-	BadgeSuccess lipgloss.Style
-	BadgeWarning lipgloss.Style
-	BadgeError   lipgloss.Style
-	BadgeInfo    lipgloss.Style
-
-	// Agent badges
-	BadgeClaude   lipgloss.Style
-	BadgeCodex    lipgloss.Style
-	BadgeGemini   lipgloss.Style
-	BadgeGrok     lipgloss.Style
-	BadgeMuse     lipgloss.Style
-	BadgeCursor   lipgloss.Style
-	BadgeWindsurf lipgloss.Style
-	BadgeAider    lipgloss.Style
-	BadgeOllama   lipgloss.Style
-	BadgeUser     lipgloss.Style
-
-	// Input elements
-	Input        lipgloss.Style
-	InputFocused lipgloss.Style
-	InputError   lipgloss.Style
-
-	// Selection
-	Selected   lipgloss.Style
-	Unselected lipgloss.Style
-}
-
-// NewSemanticStyles creates semantic styles from a theme.
-func NewSemanticStyles(t Theme) SemanticStyles {
-	p := t.Semantic()
-
-	baseBadge := lipgloss.NewStyle().
-		Padding(0, 1).
-		Bold(true)
-
-	styles := SemanticStyles{
-		// Text
-		TextPrimary: lipgloss.NewStyle().
-			Foreground(p.FgPrimary),
-		TextSecondary: lipgloss.NewStyle().
-			Foreground(p.FgSecondary),
-		TextMuted: lipgloss.NewStyle().
-			Foreground(p.FgTertiary),
-		TextDisabled: lipgloss.NewStyle().
-			Foreground(p.FgDisabled),
-
-		// Status text
-		TextSuccess: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(p.StatusSuccess),
-		TextWarning: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(p.StatusWarning),
-		TextError: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(p.StatusError),
-		TextInfo: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(p.StatusInfo),
-
-		// Interactive
-		Link: lipgloss.NewStyle().
-			Foreground(p.Link).
-			Underline(true),
-		LinkHover: lipgloss.NewStyle().
-			Foreground(p.InteractiveHover).
-			Underline(true).
-			Bold(true),
-		Code: lipgloss.NewStyle().
-			Foreground(p.Code).
-			Background(p.CodeBlock).
-			Padding(0, 1),
-		CodeBlock: lipgloss.NewStyle().
-			Background(p.CodeBlock).
-			Padding(1, 2),
-
-		// Containers
-		Surface: lipgloss.NewStyle().
-			Background(p.BgSecondary),
-		Card: lipgloss.NewStyle().
-			Background(p.BgSecondary).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(p.BorderDefault).
-			Padding(1, 2),
-		CardRaised: lipgloss.NewStyle().
-			Background(p.BgTertiary).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(p.BorderDefault).
-			Padding(1, 2),
-		Overlay: lipgloss.NewStyle().
-			Background(p.Shadow),
-
-		// Badges (lipgloss styles are immutable, so method calls return new styles)
-		BadgeDefault: baseBadge.
-			Background(p.Badge).
-			Foreground(p.BadgeText),
-		BadgeSuccess: baseBadge.
-			Background(p.StatusSuccess).
-			Foreground(p.FgInverse),
-		BadgeWarning: baseBadge.
-			Background(p.StatusWarning).
-			Foreground(p.FgInverse),
-		BadgeError: baseBadge.
-			Background(p.StatusError).
-			Foreground(p.FgInverse),
-		BadgeInfo: baseBadge.
-			Background(p.StatusInfo).
-			Foreground(p.FgInverse),
-
-		// Agent badges
-		BadgeClaude: baseBadge.
-			Background(p.AgentClaude).
-			Foreground(p.FgInverse),
-		BadgeCodex: baseBadge.
-			Background(p.AgentCodex).
-			Foreground(p.FgInverse),
-		BadgeGemini: baseBadge.
-			Background(p.AgentGemini).
-			Foreground(p.FgInverse),
-		BadgeGrok: baseBadge.
-			Background(p.AgentGrok).
-			Foreground(p.FgInverse),
-		BadgeMuse: baseBadge.
-			Background(p.AgentMuse).
-			Foreground(p.FgInverse),
-		BadgeCursor: baseBadge.
-			Background(p.AgentCursor).
-			Foreground(p.FgInverse),
-		BadgeWindsurf: baseBadge.
-			Background(p.AgentWindsurf).
-			Foreground(p.FgInverse),
-		BadgeAider: baseBadge.
-			Background(p.AgentAider).
-			Foreground(p.FgInverse),
-		BadgeOllama: baseBadge.
-			Background(p.AgentOllama).
-			Foreground(p.FgInverse),
-		BadgeUser: baseBadge.
-			Background(p.AgentUser).
-			Foreground(p.FgInverse),
-
-		// Input
-		Input: lipgloss.NewStyle().
-			Foreground(p.FgPrimary).
-			Background(p.BgHighlight).
-			Padding(0, 1),
-		InputFocused: lipgloss.NewStyle().
-			Foreground(p.FgPrimary).
-			Background(p.BgSelected).
-			Border(lipgloss.NormalBorder(), false, false, true, false).
-			BorderForeground(p.BorderFocused).
-			Padding(0, 1),
-		InputError: lipgloss.NewStyle().
-			Foreground(p.FgPrimary).
-			Background(p.BgHighlight).
-			Border(lipgloss.NormalBorder(), false, false, true, false).
-			BorderForeground(p.BorderError).
-			Padding(0, 1),
-
-		// Selection
-		Selected: lipgloss.NewStyle().
-			Background(p.BgSelected).
-			Foreground(p.FgPrimary).
-			Bold(true),
-		Unselected: lipgloss.NewStyle().
-			Foreground(p.FgSecondary),
-	}
-
-	if t == Plain {
-		styles.Selected = lipgloss.NewStyle().
-			Bold(true).
-			Reverse(true)
-		styles.TextWarning = styles.TextWarning.Underline(true)
-		styles.TextError = styles.TextError.Underline(true)
-	}
-
-	return styles
-}
-
-// SemanticStyles returns semantic styles for the current theme.
-func DefaultSemanticStyles() SemanticStyles {
-	return NewSemanticStyles(Current())
 }

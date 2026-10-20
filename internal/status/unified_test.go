@@ -142,180 +142,6 @@ func TestTruncateOutput(t *testing.T) {
 	}
 }
 
-func TestGetStateSummary(t *testing.T) {
-	statuses := []AgentStatus{
-		{State: StateIdle},
-		{State: StateIdle},
-		{State: StateWorking},
-		{State: StateError},
-		{State: StateUnknown},
-	}
-
-	summary := GetStateSummary(statuses)
-
-	if summary[StateIdle] != 2 {
-		t.Errorf("Expected 2 idle, got %d", summary[StateIdle])
-	}
-	if summary[StateWorking] != 1 {
-		t.Errorf("Expected 1 working, got %d", summary[StateWorking])
-	}
-	if summary[StateError] != 1 {
-		t.Errorf("Expected 1 error, got %d", summary[StateError])
-	}
-	if summary[StateUnknown] != 1 {
-		t.Errorf("Expected 1 unknown, got %d", summary[StateUnknown])
-	}
-}
-
-func TestFilterByState(t *testing.T) {
-	statuses := []AgentStatus{
-		{PaneID: "%0", State: StateIdle},
-		{PaneID: "%1", State: StateWorking},
-		{PaneID: "%2", State: StateIdle},
-		{PaneID: "%3", State: StateError},
-	}
-
-	idle := FilterByState(statuses, StateIdle)
-	if len(idle) != 2 {
-		t.Errorf("Expected 2 idle statuses, got %d", len(idle))
-	}
-
-	working := FilterByState(statuses, StateWorking)
-	if len(working) != 1 {
-		t.Errorf("Expected 1 working status, got %d", len(working))
-	}
-
-	error := FilterByState(statuses, StateError)
-	if len(error) != 1 {
-		t.Errorf("Expected 1 error status, got %d", len(error))
-	}
-
-	unknown := FilterByState(statuses, StateUnknown)
-	if len(unknown) != 0 {
-		t.Errorf("Expected 0 unknown statuses, got %d", len(unknown))
-	}
-}
-
-func TestFilterByAgentType(t *testing.T) {
-	statuses := []AgentStatus{
-		{PaneID: "%0", AgentType: "cc"},
-		{PaneID: "%1", AgentType: "cod"},
-		{PaneID: "%2", AgentType: "cc"},
-		{PaneID: "%3", AgentType: "user"},
-	}
-
-	claude := FilterByAgentType(statuses, "cc")
-	if len(claude) != 2 {
-		t.Errorf("Expected 2 claude agents, got %d", len(claude))
-	}
-
-	codex := FilterByAgentType(statuses, "cod")
-	if len(codex) != 1 {
-		t.Errorf("Expected 1 codex agent, got %d", len(codex))
-	}
-
-	gemini := FilterByAgentType(statuses, "gmi")
-	if len(gemini) != 0 {
-		t.Errorf("Expected 0 gemini agents, got %d", len(gemini))
-	}
-
-	claudeAlias := FilterByAgentType(statuses, "claude")
-	if len(claudeAlias) != 2 {
-		t.Errorf("Expected 2 claude alias matches, got %d", len(claudeAlias))
-	}
-
-	codexAlias := FilterByAgentType(statuses, "codex")
-	if len(codexAlias) != 1 {
-		t.Errorf("Expected 1 codex alias match, got %d", len(codexAlias))
-	}
-}
-
-func TestHasErrors(t *testing.T) {
-	tests := []struct {
-		name     string
-		statuses []AgentStatus
-		expected bool
-	}{
-		{
-			name: "no errors",
-			statuses: []AgentStatus{
-				{State: StateIdle},
-				{State: StateWorking},
-			},
-			expected: false,
-		},
-		{
-			name: "has error",
-			statuses: []AgentStatus{
-				{State: StateIdle},
-				{State: StateError},
-			},
-			expected: true,
-		},
-		{
-			name:     "empty list",
-			statuses: []AgentStatus{},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := HasErrors(tt.statuses)
-			if result != tt.expected {
-				t.Errorf("HasErrors = %v, want %v", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestAllHealthy(t *testing.T) {
-	tests := []struct {
-		name     string
-		statuses []AgentStatus
-		expected bool
-	}{
-		{
-			name: "all healthy",
-			statuses: []AgentStatus{
-				{State: StateIdle},
-				{State: StateWorking},
-			},
-			expected: true,
-		},
-		{
-			name: "has error",
-			statuses: []AgentStatus{
-				{State: StateIdle},
-				{State: StateError},
-			},
-			expected: false,
-		},
-		{
-			name: "has unknown",
-			statuses: []AgentStatus{
-				{State: StateIdle},
-				{State: StateUnknown},
-			},
-			expected: false,
-		},
-		{
-			name:     "empty list",
-			statuses: []AgentStatus{},
-			expected: false, // Empty list is not "all healthy"
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := AllHealthy(tt.statuses)
-			if result != tt.expected {
-				t.Errorf("AllHealthy = %v, want %v", result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestAgentStatusIsHealthy(t *testing.T) {
 	tests := []struct {
 		state    AgentState
@@ -439,55 +265,6 @@ func TestErrorTypeString(t *testing.T) {
 				t.Errorf("ErrorType.String() = %q, want %q", result, tt.expected)
 			}
 		})
-	}
-}
-
-// TestAddPromptPattern tests adding custom prompt patterns
-func TestAddPromptPattern(t *testing.T) {
-	// Add a valid pattern
-	err := AddPromptPattern("custom", `custom>\s*$`, "Custom agent prompt")
-	if err != nil {
-		t.Fatalf("AddPromptPattern failed: %v", err)
-	}
-
-	// Verify the pattern works
-	if !IsPromptLine("custom> ", "custom") {
-		t.Error("Custom prompt pattern should match 'custom> '")
-	}
-
-	err = AddPromptPattern("claude", `claude-long>\s*$`, "Claude alias prompt")
-	if err != nil {
-		t.Fatalf("AddPromptPattern long-form alias failed: %v", err)
-	}
-	if !IsPromptLine("claude-long> ", "cc") {
-		t.Error("Claude alias prompt should match canonical short form agent type")
-	}
-
-	// Test invalid regex
-	err = AddPromptPattern("bad", `[invalid(regex`, "Bad pattern")
-	if err == nil {
-		t.Error("AddPromptPattern should fail with invalid regex")
-	}
-}
-
-// TestAddErrorPattern tests adding custom error patterns
-func TestAddErrorPattern(t *testing.T) {
-	// Add a valid pattern
-	err := AddErrorPattern(ErrorGeneric, `(?i)custom error detected`, "Custom error")
-	if err != nil {
-		t.Fatalf("AddErrorPattern failed: %v", err)
-	}
-
-	// Verify the pattern works
-	errType := DetectErrorInOutput("Custom Error Detected in output")
-	if errType != ErrorGeneric {
-		t.Errorf("Custom error pattern should match, got %s", errType)
-	}
-
-	// Test invalid regex
-	err = AddErrorPattern(ErrorGeneric, `[invalid(regex`, "Bad pattern")
-	if err == nil {
-		t.Error("AddErrorPattern should fail with invalid regex")
 	}
 }
 
@@ -1321,6 +1098,50 @@ func TestMuseComposerShowing(t *testing.T) {
 	}
 }
 
+func TestDetermineStateAntigravityIdleBeatsWindowVelocity(t *testing.T) {
+	t.Parallel()
+
+	const idle = "Implemented the requested change.\n" +
+		"──────────────────────────────────────────────────\n" +
+		">\n" +
+		"──────────────────────────────────────────────────\n" +
+		"? for shortcuts\n"
+	const working = "Inspecting the project.\n" +
+		"──────────────────────────────────────────────────\n" +
+		">\n" +
+		"──────────────────────────────────────────────────\n" +
+		"esc to cancel\n"
+	observedAt := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		agentType string
+		output    string
+		quietFor  time.Duration
+		want      AgentState
+	}{
+		{name: "idle with busy sibling", agentType: "agy", output: idle, want: StateIdle},
+		{name: "idle alias with busy sibling", agentType: " Antigravity ", output: idle, want: StateIdle},
+		{name: "idle with quiet window", agentType: "agy", output: idle, quietFor: time.Hour, want: StateIdle},
+		{name: "working with fresh activity", agentType: "agy", output: working, want: StateWorking},
+		{name: "working during quiet tool call", agentType: "agy", output: working, quietFor: time.Hour, want: StateWorking},
+		{name: "ANSI cancel hint", agentType: "AGY", output: strings.ReplaceAll(working, "esc to cancel", "\x1b[33mesc to cancel\x1b[0m"), quietFor: time.Hour, want: StateWorking},
+		{name: "historical cancel hint is not live", agentType: "agy", output: working + strings.Repeat("Previous response line.\n", 20) + idle, want: StateIdle},
+		{name: "no idle evidence keeps fresh activity", agentType: "agy", output: "Inspecting the source tree before choosing the next change", want: StateWorking},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDetector()
+			got := d.AnalyzeAt("%4", "s__agy_1", tt.agentType, tt.output, observedAt.Add(-tt.quietFor), observedAt)
+			if got.State != tt.want || got.ErrorType != ErrorNone {
+				t.Fatalf("AnalyzeAt() = %v/%v, want %v without an error", got.State, got.ErrorType, tt.want)
+			}
+			if got.AgentType != "agy" {
+				t.Fatalf("AnalyzeAt() agent type = %q, want agy", got.AgentType)
+			}
+		})
+	}
+}
+
 // TestObservationConfidenceTrustsMuseComposer guards dispatch safety: an idle
 // Muse pane is recognized by its own composer, not by the fallback heuristics,
 // so its observation must be confident enough to authorize dispatch.
@@ -1510,19 +1331,33 @@ func TestPaneObservationSafeToDispatchFailsClosed(t *testing.T) {
 	if !base.SafeToDispatch() {
 		t.Fatal("fresh, confident idle observation should be dispatchable")
 	}
+	if refusal := base.DispatchRefusal(); refusal != DispatchRefusalNone {
+		t.Fatalf("dispatchable observation reported refusal %q", refusal)
+	}
 
 	tests := []struct {
-		name   string
-		mutate func(*PaneObservation)
+		name    string
+		mutate  func(*PaneObservation)
+		refusal DispatchRefusal
 	}{
-		{name: "stale", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessStale }},
-		{name: "unavailable", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessUnavailable }},
-		{name: "low confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = minimumDispatchConfidence - 0.01 }},
-		{name: "invalid high confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = 1.01 }},
-		{name: "capture error", mutate: func(p *PaneObservation) { p.Current.Error = "capture failed" }},
-		{name: "working", mutate: func(p *PaneObservation) { p.Current.Status.State = StateWorking }},
-		{name: "error", mutate: func(p *PaneObservation) { p.Current.Status.State = StateError }},
-		{name: "unknown", mutate: func(p *PaneObservation) { p.Current.Status.State = StateUnknown }},
+		{name: "stale", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessStale }, refusal: DispatchRefusalStale},
+		{name: "unavailable", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessUnavailable }, refusal: DispatchRefusalStale},
+		{name: "low confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = minimumDispatchConfidence - 0.01 }, refusal: DispatchRefusalLowConfidence},
+		{name: "invalid high confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = 1.01 }, refusal: DispatchRefusalLowConfidence},
+		{name: "capture error", mutate: func(p *PaneObservation) { p.Current.Error = "capture failed" }, refusal: DispatchRefusalError},
+		{name: "working", mutate: func(p *PaneObservation) { p.Current.Status.State = StateWorking }, refusal: DispatchRefusalNotIdle},
+		{name: "error", mutate: func(p *PaneObservation) { p.Current.Status.State = StateError }, refusal: DispatchRefusalNotIdle},
+		{name: "unknown", mutate: func(p *PaneObservation) { p.Current.Status.State = StateUnknown }, refusal: DispatchRefusalNotIdle},
+		// Clause order: a stale capture that is also not idle is reported as
+		// stale, because evidence quality is judged before the state it carries.
+		{name: "stale outranks state", mutate: func(p *PaneObservation) {
+			p.Current.Freshness = FreshnessStale
+			p.Current.Status.State = StateWorking
+		}, refusal: DispatchRefusalStale},
+		{name: "error outranks confidence", mutate: func(p *PaneObservation) {
+			p.Current.Error = "capture failed"
+			p.Current.Confidence = 0.1
+		}, refusal: DispatchRefusalError},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1530,6 +1365,9 @@ func TestPaneObservationSafeToDispatchFailsClosed(t *testing.T) {
 			test.mutate(&candidate)
 			if candidate.SafeToDispatch() {
 				t.Fatal("unsafe observation was accepted for dispatch")
+			}
+			if got := candidate.DispatchRefusal(); got != test.refusal {
+				t.Fatalf("DispatchRefusal() = %q, want %q", got, test.refusal)
 			}
 		})
 	}

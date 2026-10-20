@@ -149,20 +149,6 @@ func (a *BVAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 	}, nil
 }
 
-// HasCapability checks if bv has a specific capability
-func (a *BVAdapter) HasCapability(ctx context.Context, cap Capability) bool {
-	caps, err := a.Capabilities(ctx)
-	if err != nil {
-		return false
-	}
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
-}
-
 // Info returns complete bv tool information
 func (a *BVAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
@@ -223,8 +209,15 @@ func (a *BVAdapter) GetGroupedTriage(ctx context.Context, dir string, opts BVGro
 	return a.runRobotCommand(ctx, dir, "--robot-triage")
 }
 
-func (a *BVAdapter) GetHistory(ctx context.Context, dir string) (json.RawMessage, error) {
-	return a.runRobotCommand(ctx, dir, "--robot-history")
+// GetHistory returns `bv --robot-history`, limited to commits since `since`
+// (bv's relative "14d"/"2w"/"1m" or an ISO date; "" for all). A full history
+// of a large tracker can exceed the 10MB output cap.
+func (a *BVAdapter) GetHistory(ctx context.Context, dir, since string) (json.RawMessage, error) {
+	args := []string{"--robot-history"}
+	if since != "" {
+		args = append(args, "--history-since="+since)
+	}
+	return a.runRobotCommand(ctx, dir, args...)
 }
 
 func (a *BVAdapter) GetBurndown(ctx context.Context, dir string, sprint string) (json.RawMessage, error) {
@@ -245,10 +238,6 @@ func (a *BVAdapter) GetSuggestions(ctx context.Context, dir string) (json.RawMes
 
 func (a *BVAdapter) GetImpact(ctx context.Context, dir string, filePath string) (json.RawMessage, error) {
 	return a.runRobotCommand(ctx, dir, "--robot-impact", filePath)
-}
-
-func (a *BVAdapter) GetSearch(ctx context.Context, dir string, query string) (json.RawMessage, error) {
-	return a.GetSearchWithOptions(ctx, dir, BVSearchOptions{Query: query})
 }
 
 func (a *BVAdapter) GetSearchWithOptions(ctx context.Context, dir string, opts BVSearchOptions) (json.RawMessage, error) {

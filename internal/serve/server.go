@@ -2,6 +2,8 @@
 package serve
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -16,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"log/slog"
 	"math/big"
@@ -40,6 +43,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	approvalpkg "github.com/Dicklesworthstone/ntm/internal/approval"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
@@ -62,6 +66,15 @@ type Server struct {
 	server        *http.Server
 	auth          AuthConfig
 
+	// approvalEng is the durable approval engine over stateStore, shared with
+	// the `ntm approve` / force-release gate workflow (bd-d2uxt). Built lazily
+	// so a Server constructed without a state store stays side-effect-free;
+	// nil when no state store is configured, in which case the approval
+	// endpoints fail closed with 503 instead of falling back to process-local
+	// memory.
+	approvalEng     *approvalpkg.Engine
+	approvalEngOnce sync.Once
+
 	// SSE clients
 	sseClients   map[chan events.BusEvent]struct{}
 	sseClientsMu sync.RWMutex
@@ -73,7 +86,8 @@ type Server struct {
 	idempotencyStore *IdempotencyStore
 
 	// Job management
-	jobStore *JobStore
+	jobStore    *JobStore
+	jobExecutor jobExecutor
 
 	// Chi router for /api/v1
 	router chi.Router
@@ -83,6 +97,10 @@ type Server struct {
 	// wsHubStartOnce ensures the hub loop starts exactly once, even when the
 	// router is used directly in tests without going through Start().
 	wsHubStartOnce sync.Once
+	// wsEventStoreOnce lazily wires WS event persistence/replay exactly once.
+	// Lazy (Start or first WS connection, not New) so that constructing a
+	// Server stays side-effect-free: the store starts a retention goroutine.
+	wsEventStoreOnce sync.Once
 
 	// Pane output streaming
 	streamManager   *tmux.StreamManager
@@ -93,6 +111,13 @@ type Server struct {
 	resolvePane     func(context.Context, string, int) (tmux.Pane, error)
 	sendPaneKeys    func(string, string, bool) error
 	sendPaneKeyName func(string, string) error
+	// listLiveSessions lists the tmux sessions that are running right now.
+	// Nil in production (tmux.ListSessionsContext); tests inject fixtures.
+	listLiveSessions func(context.Context) ([]tmux.Session, error)
+	// liveSessionsTimeout bounds each live tmux session or pane listing made
+	// by the sessions and agents endpoints; zero means
+	// defaultLiveSessionsTimeout. Tests shorten it.
+	liveSessionsTimeout time.Duration
 	// policyWriteFile is optional test-only fault injection for policy updates.
 	// Production servers leave it nil and use os.WriteFile directly.
 	policyWriteFile func(string, []byte, os.FileMode) error
@@ -115,6 +140,9 @@ type Server struct {
 
 	// Redaction configuration for REST API
 	redactionCfg *RedactionConfig
+
+	// webUI is the embedded static dashboard; nil when not mounted.
+	webUI fs.FS
 }
 
 type attentionHeartbeatSourceSummary struct {
@@ -210,6 +238,24 @@ type Config struct {
 	// client from. The zero value has Enabled false, so a server constructed
 	// without them never contacts an Agent Mail server.
 	AgentMail config.AgentMailConfig
+	// WebUI is the embedded static dashboard (internal/webui.FS()). Nil means
+	// no UI is mounted and non-API paths 404 as before (`ntm serve` default;
+	// `ntm web` and `ntm serve --web` set it).
+	WebUI fs.FS
+	// Redaction scrubs secrets/PII from REST bodies and WebSocket event frames.
+	// Nil disables it, which is what every caller effectively did until now:
+	// redactionMiddleware has been mounted since b5d45e20 but the field behind
+	// it had no production writer, so the G1 dead-code gate deleted the
+	// Set/GetRedactionConfig setters in 670f6380 rather than wiring them, and
+	// the middleware has been a permanent no-op ever since. Same failure the
+	// AuditMiddleware comment in buildRouter describes. Ownership of the
+	// contents transfers to New, which deep-copies before storing.
+	Redaction *RedactionConfig
+
+	// Async job limits. Zero selects the default; negative values are invalid.
+	// These limits are fixed for the server lifetime, including after Stop.
+	JobConcurrency   int
+	JobQueueCapacity int
 }
 
 const (
@@ -259,21 +305,44 @@ const (
 	ErrCodeJobPending       = "JOB_PENDING"
 )
 
+// Idempotency cache bounds (bd-vq37v). The 24h TTL alone left the cache
+// unbounded: a remote-auth caller sending unique keys could grow the map (and
+// full buffered response bodies) for a day. Entries are capped with
+// least-recently-used eviction, and oversized responses are never cached.
+const (
+	// idempotencyMaxEntries caps the number of cached responses.
+	idempotencyMaxEntries = 4096
+	// idempotencyMaxBodyBytes caps a single cached (and buffered) response body.
+	idempotencyMaxBodyBytes = 1 << 20 // 1 MiB
+	// idempotencyFingerprintLimit bounds how much of a request body is hashed
+	// for replay fingerprinting. Bodies larger than this are fingerprinted by
+	// prefix, which is still deterministic for mismatch detection.
+	idempotencyFingerprintLimit = 8 << 20 // 8 MiB
+)
+
 // IdempotencyStore caches responses by idempotency key.
 type IdempotencyStore struct {
-	mu        sync.RWMutex
-	entries   map[string]*idempotencyEntry
-	ttl       time.Duration
-	stop      chan struct{}
-	startOnce sync.Once
-	stopOnce  sync.Once
+	mu         sync.RWMutex
+	entries    map[string]*idempotencyEntry
+	flights    map[string]chan struct{}
+	ttl        time.Duration
+	maxEntries int
+	stop       chan struct{}
+	startOnce  sync.Once
+	stopOnce   sync.Once
 }
 
 type idempotencyEntry struct {
 	response     []byte
 	statusCode   int
 	createdAt    time.Time
+	lastAccess   time.Time
 	replayHeader http.Header
+	// fingerprint is a hash of the originating request body. Replays with the
+	// same key but a different body are rejected (422) instead of silently
+	// echoing the first response. Empty means "unknown" (legacy Set callers)
+	// and skips the check.
+	fingerprint string
 }
 
 // NewIdempotencyStore creates an idempotency cache with the given TTL.
@@ -282,9 +351,11 @@ func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
 		ttl = 24 * time.Hour
 	}
 	return &IdempotencyStore{
-		entries: make(map[string]*idempotencyEntry),
-		ttl:     ttl,
-		stop:    make(chan struct{}),
+		entries:    make(map[string]*idempotencyEntry),
+		flights:    make(map[string]chan struct{}),
+		ttl:        ttl,
+		maxEntries: idempotencyMaxEntries,
+		stop:       make(chan struct{}),
 	}
 }
 
@@ -322,30 +393,87 @@ func (s *IdempotencyStore) cleanup() {
 	}
 }
 
-// Get returns a cached response for the idempotency key.
-func (s *IdempotencyStore) Get(key string) ([]byte, int, http.Header, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// GetWithFingerprint returns a cached response plus the fingerprint of the
+// request body that produced it (empty when unknown).
+func (s *IdempotencyStore) GetWithFingerprint(key string) ([]byte, int, http.Header, string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	entry, ok := s.entries[key]
 	if !ok {
-		return nil, 0, nil, false
+		return nil, 0, nil, "", false
 	}
 	if time.Since(entry.createdAt) > s.ttl {
-		return nil, 0, nil, false
+		return nil, 0, nil, "", false
 	}
-	return entry.response, entry.statusCode, cloneReplayHeaders(entry.replayHeader), true
+	entry.lastAccess = time.Now()
+	return entry.response, entry.statusCode, cloneReplayHeaders(entry.replayHeader), entry.fingerprint, true
 }
 
-// Set stores a response for the idempotency key.
-func (s *IdempotencyStore) Set(key string, response []byte, statusCode int, replayHeader http.Header) {
+// SetWithFingerprint stores a response together with the request-body
+// fingerprint. Oversized responses are not cached (bounded memory, bd-vq37v);
+// when the cache is full the least-recently-used entry is evicted.
+func (s *IdempotencyStore) SetWithFingerprint(key, fingerprint string, response []byte, statusCode int, replayHeader http.Header) {
+	if len(response) > idempotencyMaxBodyBytes {
+		return
+	}
 	s.startCleanup()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.entries[key]; !exists && s.maxEntries > 0 && len(s.entries) >= s.maxEntries {
+		s.evictLRULocked()
+	}
+	now := time.Now()
 	s.entries[key] = &idempotencyEntry{
 		response:     response,
 		statusCode:   statusCode,
-		createdAt:    time.Now(),
+		createdAt:    now,
+		lastAccess:   now,
 		replayHeader: cloneReplayHeaders(replayHeader),
+		fingerprint:  fingerprint,
+	}
+}
+
+// evictLRULocked removes the least-recently-used entry. Caller holds s.mu.
+func (s *IdempotencyStore) evictLRULocked() {
+	var oldestKey string
+	var oldest time.Time
+	for key, entry := range s.entries {
+		if oldestKey == "" || entry.lastAccess.Before(oldest) {
+			oldestKey = key
+			oldest = entry.lastAccess
+		}
+	}
+	if oldestKey != "" {
+		delete(s.entries, oldestKey)
+	}
+}
+
+// BeginFlight registers the caller as the executor for key if no request with
+// that key is currently in flight. It returns (nil, true) for the leader; a
+// follower receives a channel that closes when the leader finishes, plus
+// false. This closes the Get-miss..Set window in which two concurrent POSTs
+// with the same Idempotency-Key both executed (bd-vq37v).
+func (s *IdempotencyStore) BeginFlight(key string) (<-chan struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ch, ok := s.flights[key]; ok {
+		return ch, false
+	}
+	if s.flights == nil {
+		s.flights = make(map[string]chan struct{})
+	}
+	ch := make(chan struct{})
+	s.flights[key] = ch
+	return ch, true
+}
+
+// EndFlight releases the in-flight reservation for key, waking any followers.
+func (s *IdempotencyStore) EndFlight(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ch, ok := s.flights[key]; ok {
+		delete(s.flights, key)
+		close(ch)
 	}
 }
 
@@ -359,6 +487,9 @@ type Job struct {
 	Error     string                 `json:"error,omitempty"`
 	CreatedAt string                 `json:"created_at"`
 	UpdatedAt string                 `json:"updated_at"`
+
+	// Admission-time namespace for queued pipeline execution and recovery.
+	ProjectDir string `json:"project_dir,omitempty"`
 }
 
 // JobStatus represents the state of a job.
@@ -374,21 +505,50 @@ const (
 
 // JobStore manages asynchronous jobs.
 type JobStore struct {
-	mu   sync.RWMutex
-	jobs map[string]*Job
+	mu      sync.RWMutex
+	jobs    map[string]*Job
+	cancels map[string]context.CancelFunc
 }
 
 // NewJobStore creates a new job store.
 func NewJobStore() *JobStore {
 	return &JobStore{
-		jobs: make(map[string]*Job),
+		jobs:    make(map[string]*Job),
+		cancels: make(map[string]context.CancelFunc),
 	}
 }
 
-// Create creates a new job.
-func (s *JobStore) Create(jobType string) *Job {
+// SetCancel registers the dispatch goroutine's cancel func so a user-facing
+// cancel actually stops the underlying work, not just the bookkeeping row.
+func (s *JobStore) SetCancel(id string, cancel context.CancelFunc) {
+	s.mu.Lock()
+	s.cancels[id] = cancel
+	job := s.jobs[id]
+	stopped := job == nil || job.Status == JobStatusCancelled || job.Status == JobStatusCompleted || job.Status == JobStatusFailed
+	s.mu.Unlock()
+	if stopped && cancel != nil {
+		cancel()
+	}
+}
+
+// ClearCancel drops the registered cancel func once dispatch has finished.
+func (s *JobStore) ClearCancel(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.cancels, id)
+}
+
+// maxRetainedJobs bounds the job store over the server's lifetime: once the
+// map reaches this size, Create evicts the oldest terminal (completed /
+// failed / cancelled) jobs. Pending and running jobs are never evicted.
+const maxRetainedJobs = 1000
+
+// Create installs optional execution ownership atomically with the pending row.
+// Terminal rows with live owners cannot be evicted before their final writes.
+func (s *JobStore) Create(jobType string, ownership ...jobOwnership) *Job {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evictTerminalLocked(maxRetainedJobs - 1)
 	id := generateRequestID()
 	now := time.Now().UTC().Format(time.RFC3339)
 	job := &Job{
@@ -397,6 +557,12 @@ func (s *JobStore) Create(jobType string) *Job {
 		Status:    JobStatusPending,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+	if len(ownership) > 0 {
+		job.ProjectDir = ownership[0].projectDir
+		if ownership[0].cancel != nil {
+			s.cancels[id] = ownership[0].cancel
+		}
 	}
 	s.jobs[id] = job
 	return s.cloneJob(job)
@@ -418,6 +584,12 @@ func (s *JobStore) Update(id string, status JobStatus, progress float64, result 
 	defer s.mu.Unlock()
 	job, ok := s.jobs[id]
 	if !ok {
+		return
+	}
+	// Terminal states are final: a cancelled job must not later flip to
+	// completed/failed when its (now-cancelled) dispatch goroutine returns.
+	switch job.Status {
+	case JobStatusCompleted, JobStatusFailed, JobStatusCancelled:
 		return
 	}
 	job.Status = status
@@ -442,7 +614,8 @@ func (s *JobStore) cloneJob(job *Job) *Job {
 	return &copy
 }
 
-// List returns all jobs.
+// List returns all jobs, newest first (CreatedAt descending, ID as a
+// deterministic tie-break) rather than random map order.
 func (s *JobStore) List() []*Job {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -450,18 +623,49 @@ func (s *JobStore) List() []*Job {
 	for _, job := range s.jobs {
 		jobs = append(jobs, s.cloneJob(job))
 	}
+	sort.Slice(jobs, func(i, j int) bool {
+		if jobs[i].CreatedAt != jobs[j].CreatedAt {
+			return jobs[i].CreatedAt > jobs[j].CreatedAt
+		}
+		return jobs[i].ID < jobs[j].ID
+	})
 	return jobs
 }
 
-// Delete removes a job.
-func (s *JobStore) Delete(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.jobs[id]; !ok {
-		return false
+// evictTerminalLocked removes the oldest terminal jobs until at most limit
+// jobs remain. Non-terminal jobs are never removed, so the store can exceed
+// the limit only while more than `limit` jobs are actually in flight.
+// Callers must hold s.mu.
+func (s *JobStore) evictTerminalLocked(limit int) {
+	if len(s.jobs) <= limit {
+		return
 	}
-	delete(s.jobs, id)
-	return true
+	type victim struct{ id, createdAt string }
+	terminal := make([]victim, 0, len(s.jobs))
+	for id, job := range s.jobs {
+		// Cancellation is not proof of worker completion. Retain its row and
+		// handle until the final checkpoint and worker fence are released.
+		if _, owned := s.cancels[id]; owned {
+			continue
+		}
+		switch job.Status {
+		case JobStatusCompleted, JobStatusFailed, JobStatusCancelled:
+			terminal = append(terminal, victim{id: id, createdAt: job.CreatedAt})
+		}
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		if terminal[i].createdAt != terminal[j].createdAt {
+			return terminal[i].createdAt < terminal[j].createdAt
+		}
+		return terminal[i].id < terminal[j].id
+	})
+	for _, v := range terminal {
+		if len(s.jobs) <= limit {
+			return
+		}
+		delete(s.jobs, v.id)
+		delete(s.cancels, v.id)
+	}
 }
 
 // ============================================================================
@@ -490,12 +694,20 @@ type WSMessage struct {
 }
 
 // WSSubscribeRequest is sent by clients to subscribe to topics.
+// Since is the replay cursor: the seq of the last event frame the client
+// processed. When present, persisted events with seq > Since matching the
+// requested topics are replayed before live delivery. See the replay contract
+// in ws_events.go.
 type WSSubscribeRequest struct {
 	Topics []string `json:"topics"`
-	Since  int64    `json:"since,omitempty"` // Cursor for replay (Unix ms)
+	Since  int64    `json:"since,omitempty"` // Cursor for replay (event seq)
 }
 
 // WSEvent is an event pushed to clients.
+// Seq is the resume cursor: clients persist the highest seq they have
+// processed and pass it back as `since` on re-subscribe. Replay is set only on
+// frames re-delivered from the event store during cursor replay (additive
+// field; absent on live frames).
 type WSEvent struct {
 	Type      WSMessageType `json:"type"`
 	Timestamp string        `json:"ts"`
@@ -503,6 +715,7 @@ type WSEvent struct {
 	Topic     string        `json:"topic"`
 	EventType string        `json:"event_type"`
 	Data      interface{}   `json:"data"`
+	Replay    bool          `json:"replay,omitempty"`
 }
 
 // WSError represents a WebSocket error frame.
@@ -590,16 +803,28 @@ type WSHub struct {
 	stopOnce     sync.Once
 	redactionCfg *RedactionConfig
 	redactionMu  sync.RWMutex
+
+	// store is the optional persistence/replay backend (see the replay
+	// contract in ws_events.go). Nil pointer = live streaming only.
+	store atomic.Pointer[WSEventStore]
+	// replayCh carries subscribe-with-cursor requests into the Run loop so
+	// replay and live delivery are serialized (gap-free, duplicate-free).
+	replayCh chan *wsReplayRequest
+	// pendingDrops coalesces per-client dropped-event ranges. Owned
+	// exclusively by the Run goroutine; no locking.
+	pendingDrops map[*WSClient]map[string]*wsDropRange
 }
 
 // NewWSHub creates a new WebSocket hub.
 func NewWSHub() *WSHub {
 	return &WSHub{
-		clients:    make(map[*WSClient]struct{}),
-		register:   make(chan *WSClient),
-		unregister: make(chan *WSClient),
-		broadcast:  make(chan *WSEvent, 256),
-		done:       make(chan struct{}),
+		clients:      make(map[*WSClient]struct{}),
+		register:     make(chan *WSClient),
+		unregister:   make(chan *WSClient),
+		broadcast:    make(chan *WSEvent, 256),
+		done:         make(chan struct{}),
+		replayCh:     make(chan *wsReplayRequest),
+		pendingDrops: make(map[*WSClient]map[string]*wsDropRange),
 	}
 }
 
@@ -608,6 +833,9 @@ func (h *WSHub) Run() {
 	for {
 		select {
 		case <-h.done:
+			// Persist any drop ranges still pending so slow-client gaps are
+			// visible in ws_dropped_events across a restart. Best-effort.
+			h.flushAllDrops()
 			return
 		case client := <-h.register:
 			h.clientsMu.Lock()
@@ -616,6 +844,7 @@ func (h *WSHub) Run() {
 			h.clientsMu.Unlock()
 			log.Printf("ws client connected id=%s total=%d", client.id, total)
 		case client := <-h.unregister:
+			h.flushClientDrops(client, false)
 			h.clientsMu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
@@ -624,6 +853,8 @@ func (h *WSHub) Run() {
 			total := len(h.clients)
 			h.clientsMu.Unlock()
 			log.Printf("ws client disconnected id=%s total=%d", client.id, total)
+		case req := <-h.replayCh:
+			h.handleReplay(req)
 		case event := <-h.broadcast:
 			h.broadcastEvent(event)
 		}
@@ -652,16 +883,32 @@ func (h *WSHub) nextSeq() int64 {
 }
 
 // broadcastEvent sends an event to all subscribed clients.
+// Runs on the hub's Run goroutine: the bounded broadcast channel (Publish
+// drops on overflow instead of blocking) keeps the persistence insert below
+// off the publication hot path.
 func (h *WSHub) broadcastEvent(event *WSEvent) {
-	event.Seq = h.nextSeq()
-
-	// Apply redaction if configured
+	// Apply redaction first so the persisted copy matches the wire form and
+	// replay cannot leak content that live delivery would have redacted.
 	h.redactionMu.RLock()
 	cfg := h.redactionCfg
 	h.redactionMu.RUnlock()
 
 	if cfg != nil && cfg.Enabled && cfg.Config.Mode != redaction.ModeOff {
 		event.Data = redactWSEventData(event.Data, cfg.Config)
+	}
+
+	// Assign the frame cursor. When an event store is attached the persisted
+	// seq is authoritative: it survives restarts and is what clients pass back
+	// as `since` to resume (see the replay contract in ws_events.go).
+	if store := h.eventStore(); store != nil {
+		if stored, err := store.Store(event.Topic, event.EventType, event.Data); err == nil {
+			event.Seq = stored.Seq
+		} else {
+			event.Seq = h.nextSeq()
+			log.Printf("ws_events: store failed, using ephemeral seq topic=%s: %v", event.Topic, err)
+		}
+	} else {
+		event.Seq = h.nextSeq()
 	}
 
 	data, err := json.Marshal(event)
@@ -677,8 +924,12 @@ func (h *WSHub) broadcastEvent(event *WSEvent) {
 		if client.isSubscribed(event.Topic) {
 			select {
 			case client.send <- data:
+				// Delivery succeeded again: report and persist any gap this
+				// client accumulated while it was slow.
+				h.flushClientDrops(client, true)
 			default:
 				dropped := h.dropped.Add(1)
+				h.noteClientDrop(client, event.Topic, event.Seq)
 				log.Printf("ws client buffer full id=%s surface=websocket session= pane= queue_depth=%d dropped_count=%d latency_ms=0 decision=coalesce reason_codes=queue_depth,dropped_output", client.id, len(client.send), dropped)
 			}
 		}
@@ -752,27 +1003,6 @@ func (h *WSHub) UnregisterClient(client *WSClient) {
 		return
 	case h.unregister <- client:
 	}
-}
-
-// SetRedactionConfig sets the redaction configuration for WebSocket events.
-func (h *WSHub) SetRedactionConfig(cfg *RedactionConfig) {
-	h.redactionMu.Lock()
-	defer h.redactionMu.Unlock()
-	h.redactionCfg = cfg
-}
-
-// GetRedactionConfig returns the current redaction configuration.
-func (h *WSHub) GetRedactionConfig() *RedactionConfig {
-	h.redactionMu.RLock()
-	defer h.redactionMu.RUnlock()
-	return h.redactionCfg
-}
-
-// ClientCount returns the number of connected clients.
-func (h *WSHub) ClientCount() int {
-	h.clientsMu.RLock()
-	defer h.clientsMu.RUnlock()
-	return len(h.clients)
 }
 
 // isSubscribed checks if a client is subscribed to a topic.
@@ -910,6 +1140,9 @@ func applyDefaults(cfg *Config) {
 // ValidateConfig checks server configuration for security and completeness.
 func ValidateConfig(cfg Config) error {
 	applyDefaults(&cfg)
+	if err := validateJobLimits(cfg.JobConcurrency, cfg.JobQueueCapacity); err != nil {
+		return err
+	}
 
 	mode, err := ParseAuthMode(string(cfg.Auth.Mode))
 	if err != nil {
@@ -959,16 +1192,35 @@ func New(cfg Config) *Server {
 		auth:               cfg.Auth,
 		auditStore:         cfg.AuditStore,
 		agentMail:          cfg.AgentMail,
+		webUI:              cfg.WebUI,
 		sseClients:         make(map[chan events.BusEvent]struct{}),
 		corsAllowedOrigins: cfg.AllowedOrigins,
 		jwksCache:          newJWKSCache(cfg.Auth.OIDC.CacheTTL),
 		idempotencyStore:   NewIdempotencyStore(24 * time.Hour),
 		jobStore:           NewJobStore(),
+		jobExecutor:        jobExecutor{maxConcurrent: cfg.JobConcurrency, maxQueued: cfg.JobQueueCapacity},
 		wsHub:              NewWSHub(),
 		spawnAgents: func(ctx context.Context, opts robot.SpawnOptions) (*robot.SpawnOutput, error) {
 			return robot.GetSpawn(ctx, opts, nil)
 		},
 		waitAgents: robot.GetWaitContext,
+	}
+
+	// Wire redaction into both consumers: redactionMiddleware (REST bodies) and
+	// WSHub.broadcastEvent (event frames). Each gets its own deep copy so a
+	// caller mutating the config it passed in — or either consumer's reference
+	// typed Allowlist/ExtraPatterns/DisabledCategories — cannot reach the other
+	// (the hazard bd-oekc2 fixed in fa8045ea/0b0f0874). Assigning wsHub's field
+	// directly is safe without redactionMu: the hub's Run goroutine has not been
+	// started and s has not been published to any other goroutine yet.
+	if cfg.Redaction != nil {
+		restCfg := *cfg.Redaction
+		restCfg.Config = restCfg.Config.DeepCopy()
+		s.redactionCfg = &restCfg
+
+		hubCfg := *cfg.Redaction
+		hubCfg.Config = hubCfg.Config.DeepCopy()
+		s.wsHub.redactionCfg = &hubCfg
 	}
 
 	// Initialize pane output streaming
@@ -1002,8 +1254,19 @@ func DefaultAuditDir() (string, error) {
 func (s *Server) buildRouter() chi.Router {
 	r := chi.NewRouter()
 
-	// Base middleware stack
-	r.Use(chimw.RealIP)
+	// Base middleware stack.
+	//
+	// chimw.RealIP is deliberately NOT used. It rewrites r.RemoteAddr from
+	// True-Client-IP / X-Real-IP / the leftmost X-Forwarded-For of whatever
+	// client sent them, with no trusted-proxy allowlist — chi itself has
+	// deprecated it for that reason (GHSA-3fxj-6jh8-hvhx and siblings). The
+	// value lands in every AuditRecord.RemoteAddr and in the auth-failure log,
+	// so trusting it let any caller stamp a forged source address onto the
+	// audit trail of a dangerous or approval-gated action with one header.
+	// ntm terminates connections directly (local mode is loopback-only), so
+	// the socket address is the truthful answer. If NTM ever needs to run
+	// behind a reverse proxy, that needs a configured trusted-proxy list
+	// (chi's ClientIPFromXFFTrustedProxies), never blanket header trust.
 	r.Use(s.maxBytesMiddleware)
 	r.Use(s.requestIDMiddlewareFunc)
 	r.Use(s.recovererMiddleware)
@@ -1018,7 +1281,24 @@ func (s *Server) buildRouter() chi.Router {
 	if s.auditStore != nil {
 		r.Use(s.AuditMiddleware(s.auditStore))
 	}
-	r.Use(s.redactionMiddleware) // Redact sensitive content in requests/responses
+	// Redact sensitive content in requests/responses. Inert unless Config.Redaction
+	// was supplied (see that field): the middleware is always mounted, but it
+	// passes through untouched when no redaction config reached New.
+	r.Use(s.redactionMiddleware)
+	// Idempotency-Key replay for EVERY mutating route — the single mount point
+	// (D4, bd-ws3-contract-breadth-psvyu.4). Deleting this one line disables the
+	// feature (rollback lever). The middleware is inert for requests without an
+	// Idempotency-Key header and for non-mutating methods.
+	//
+	// Replay ordering note: this sits ABOVE the per-route RequirePermission
+	// chains, so a cache-hit replay returns without re-running the permission
+	// check. That is sound because scopedIdempotencyKey embeds the caller's
+	// role and user ID: a cached entry can only exist for the same principal
+	// whose original request already passed RequirePermission (only 2xx
+	// responses are cached), and the role→permission mapping is static.
+	// TestIdempotencyReplayStillEnforcesPermission covers the cross-principal
+	// case; TestIdempotencyRouterCoverage covers every mutating route.
+	r.Use(s.idempotencyMiddleware)
 
 	// Health check (no versioning)
 	r.Get("/health", s.handleHealth)
@@ -1057,9 +1337,10 @@ func (s *Server) buildRouter() chi.Router {
 		// Sessions - read endpoints
 		r.With(s.RequirePermission(PermReadSessions)).Get("/sessions", s.handleSessionsV1)
 		r.With(s.RequirePermission(PermReadSessions)).Get("/sessions/{id}", s.handleSessionV1)
-		r.With(s.RequirePermission(PermReadAgents)).Get("/sessions/{id}/agents", func(w http.ResponseWriter, req *http.Request) {
-			s.handleSessionAgentsV1(w, req, chi.URLParam(req, "id"))
-		})
+		// GET /sessions/{id}/agents is served by the Agents API group below.
+		// Do not register it here as well: chi gives "{id}" and "{sessionId}"
+		// the same tree node, and mounting that group replaces every method
+		// on it, so a route registered here never runs.
 		r.With(s.RequirePermission(PermReadEvents)).Get("/sessions/{id}/events", func(w http.ResponseWriter, req *http.Request) {
 			s.handleSessionEventsV1(w, req, chi.URLParam(req, "id"))
 		})
@@ -1112,17 +1393,12 @@ func (s *Server) buildRouter() chi.Router {
 		})
 
 		// Jobs API - read requires PermReadJobs, write requires PermWriteJobs.
-		//
-		// idempotencyMiddleware must sit AFTER RequirePermission in each chain, not
-		// on the sub-router. Chi applies a sub-router's Use middlewares before
-		// routing, hence before an inline With chain, and a cached replay returns
-		// from the middleware without calling next — so the permission check never
-		// ran for a replayed request.
+		// Idempotency replay is provided by the router-level mount above.
 		r.Route("/jobs", func(r chi.Router) {
 			r.With(s.RequirePermission(PermReadJobs)).Get("/", s.handleListJobs)
-			r.With(s.RequirePermission(PermWriteJobs), s.idempotencyMiddleware).Post("/", s.handleCreateJob)
+			r.With(s.RequirePermission(PermWriteJobs)).Post("/", s.handleCreateJob)
 			r.With(s.RequirePermission(PermReadJobs)).Get("/{id}", s.handleGetJob)
-			r.With(s.RequirePermission(PermWriteJobs), s.idempotencyMiddleware).Delete("/{id}", s.handleCancelJob)
+			r.With(s.RequirePermission(PermWriteJobs)).Delete("/{id}", s.handleCancelJob)
 		})
 
 		// Pipeline API
@@ -1172,6 +1448,13 @@ func (s *Server) buildRouter() chi.Router {
 	r.Get("/docs", s.handleSwaggerUI)
 	r.Get("/docs/", s.handleSwaggerUI)
 
+	// Embedded web UI (F1b): every non-API path falls through to the static
+	// export. Registered as the NotFound handler so it can never shadow an
+	// API route, and it runs behind the full middleware chain above.
+	if s.webUI != nil {
+		r.NotFound(s.webUIHandler())
+	}
+
 	return r
 }
 
@@ -1199,12 +1482,30 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
+	// Wire WS event persistence/replay before the hub starts broadcasting so
+	// every published event is Store()d and carries a durable seq. Stopped
+	// after the hub (LIFO defers) so late drop-range flushes still land.
+	s.ensureWSEventStore()
+	defer func() {
+		if st := s.wsHub.eventStore(); st != nil {
+			st.Stop()
+		}
+	}()
+
 	// Start WebSocket hub
 	s.ensureWSHubRunning()
 	defer s.wsHub.Stop()
 
 	// Cleanup pane streaming on shutdown
 	defer s.streamManager.StopAll()
+	// Keep output consumers alive until accepted workers have checkpointed.
+	defer func() {
+		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.drainJobWorkers(drainCtx); err != nil {
+			slog.Warn("job workers still shutting down", "error", err)
+		}
+	}()
 
 	// Subscribe to events for SSE and WebSocket broadcasting
 	if s.eventBus != nil {
@@ -1258,6 +1559,7 @@ func (s *Server) Start(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		log.Println("Shutting down server...")
+		s.jobExecutor.closeAdmission()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return s.server.Shutdown(shutdownCtx)
@@ -1275,12 +1577,39 @@ func (s *Server) ensureWSHubRunning() {
 	})
 }
 
-// Port returns the configured port.
-func (s *Server) Port() int {
-	return s.port
+// ensureWSEventStore wires the WebSocket event persistence/replay store to the
+// hub, backed by the same runtime state store the server already opened
+// (ws_events tables from migration 006_ws_events.sql). Degrades gracefully:
+// without a state store (or without the migrated schema) WebSocket streaming
+// still works — replay falls back to the in-memory ring buffer or is reported
+// unavailable — and the condition is logged exactly once.
+func (s *Server) ensureWSEventStore() {
+	if s == nil || s.wsHub == nil {
+		return
+	}
+	s.wsEventStoreOnce.Do(func() {
+		if s.stateStore == nil {
+			log.Printf("ws_events: no state store configured; event persistence and cursor replay disabled")
+			return
+		}
+		db := s.stateStore.DB()
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM ws_events").Scan(&n); err != nil {
+			log.Printf("ws_events: schema unavailable (%v); events buffered in memory only, no replay across restarts", err)
+			s.wsHub.SetEventStore(NewWSEventStore(nil, DefaultWSEventStoreConfig()))
+			return
+		}
+		store := NewWSEventStore(db, DefaultWSEventStoreConfig())
+		s.wsHub.SetEventStore(store)
+		log.Printf("ws_events: persistence enabled path=%s current_seq=%d", s.stateStore.Path(), store.CurrentSeq())
+	})
 }
 
 func (s *Server) validate() error {
+	limits := s.jobExecutor.snapshot()
+	if err := validateJobLimits(limits.MaxConcurrent, limits.QueueCapacity); err != nil {
+		return err
+	}
 	cfg := Config{
 		Host:           s.host,
 		Port:           s.port,
@@ -1330,20 +1659,6 @@ func (s *Server) maxBytesMiddleware(next http.Handler) http.Handler {
 		// Limit to 10MB default
 		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 		next.ServeHTTP(w, r)
-	})
-}
-
-// requestIDMiddleware assigns a request ID and stores it in context and response headers.
-// Deprecated: Use requestIDMiddlewareFunc for chi router.
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := sanitizeRequestID(r.Header.Get(requestIDHeader))
-		if reqID == "" {
-			reqID = generateRequestID()
-		}
-		w.Header().Set(requestIDHeader, reqID)
-		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
-		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -1439,6 +1754,14 @@ func (s *Server) authMiddlewareFunc(next http.Handler) http.Handler {
 	})
 }
 
+// idempotencyHandledKey marks a request as already processed by
+// idempotencyMiddleware. Some routes stack the middleware a second time on
+// top of the global r.Use (e.g. beads /close); without this marker the inner
+// instance would wait on the outer instance's in-flight reservation forever.
+type idempotencyHandledKeyType struct{}
+
+var idempotencyHandledKey idempotencyHandledKeyType
+
 // idempotencyMiddleware handles Idempotency-Key header for mutating requests.
 func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1448,30 +1771,87 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Re-entrancy guard: an outer instance already owns this request.
+		if r.Context().Value(idempotencyHandledKey) != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), idempotencyHandledKey, true))
+
 		key := scopedIdempotencyKey(r)
 		if key == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Check cache
-		if cached, status, replayHeader, ok := s.idempotencyStore.Get(key); ok {
-			applyReplayHeaders(w.Header(), replayHeader)
-			w.Header().Set("X-Idempotent-Replay", "true")
-			w.WriteHeader(status)
-			_, _ = w.Write(cached) // Best-effort: client may have disconnected
-			return
+		// Fingerprint the request body so a replay with the same key but a
+		// DIFFERENT payload is rejected instead of silently echoing the first
+		// response (bd-vq37v).
+		fingerprint := idempotencyRequestFingerprint(r)
+
+		// Single-flight per scoped key: concurrent duplicates wait for the
+		// first request instead of double-executing (bd-vq37v). The loop
+		// re-checks the cache after each leader finishes; if the leader failed
+		// (nothing cached), the woken follower becomes the new leader.
+		for {
+			if cached, status, replayHeader, storedFP, ok := s.idempotencyStore.GetWithFingerprint(key); ok {
+				if storedFP != "" && fingerprint != "" && storedFP != fingerprint {
+					reqID := requestIDFromContext(r.Context())
+					writeErrorResponse(w, http.StatusUnprocessableEntity, ErrCodeIdempotentReplay,
+						"Idempotency-Key reused with a different request body", nil, reqID)
+					return
+				}
+				applyReplayHeaders(w.Header(), replayHeader)
+				w.Header().Set("X-Idempotent-Replay", "true")
+				w.WriteHeader(status)
+				_, _ = w.Write(cached) // Best-effort: client may have disconnected
+				return
+			}
+			wait, leader := s.idempotencyStore.BeginFlight(key)
+			if leader {
+				break
+			}
+			select {
+			case <-wait:
+				continue
+			case <-r.Context().Done():
+				reqID := requestIDFromContext(r.Context())
+				writeErrorResponse(w, http.StatusRequestTimeout, ErrCodeTimeout,
+					"client canceled while waiting for in-flight idempotent request", nil, reqID)
+				return
+			}
 		}
+		defer s.idempotencyStore.EndFlight(key)
 
 		// Capture response
 		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
-		// Cache successful responses
-		if rec.statusCode >= 200 && rec.statusCode < 300 {
-			s.idempotencyStore.Set(key, rec.body, rec.statusCode, rec.Header())
+		// Cache successful, non-hijacked, bounded responses
+		if rec.statusCode >= 200 && rec.statusCode < 300 && !rec.hijacked && !rec.overflow {
+			s.idempotencyStore.SetWithFingerprint(key, fingerprint, rec.body, rec.statusCode, rec.Header())
 		}
 	})
+}
+
+// idempotencyRequestFingerprint hashes the request body (bounded by
+// idempotencyFingerprintLimit) and restores r.Body for downstream handlers.
+// Returns a non-empty hash even for empty bodies so mismatch detection always
+// has something to compare.
+func idempotencyRequestFingerprint(r *http.Request) string {
+	h := sha256.New()
+	if r.Body != nil && r.Body != http.NoBody {
+		data, err := io.ReadAll(io.LimitReader(r.Body, idempotencyFingerprintLimit))
+		if err != nil {
+			// Body unreadable; hand the bytes read so far plus the original
+			// reader back to the handler, which will surface the read error.
+			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), r.Body))
+			return ""
+		}
+		h.Write(data)
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), r.Body))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // responseRecorder captures the response for idempotency caching.
@@ -1479,6 +1859,12 @@ type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
 	body       []byte
+	// overflow is set when the response exceeds idempotencyMaxBodyBytes; the
+	// buffer stops growing and the response is not cached (bd-vq37v).
+	overflow bool
+	// hijacked is set when the handler took over the connection; nothing
+	// meaningful can be cached afterwards.
+	hijacked bool
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
@@ -1487,12 +1873,43 @@ func (r *responseRecorder) WriteHeader(code int) {
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
-	r.body = append(r.body, b...)
+	if !r.overflow {
+		if len(r.body)+len(b) > idempotencyMaxBodyBytes {
+			r.overflow = true
+			r.body = nil
+		} else {
+			r.body = append(r.body, b...)
+		}
+	}
 	return r.ResponseWriter.Write(b)
 }
 
 func (r *responseRecorder) Bytes() []byte {
 	return r.body
+}
+
+// Flush forwards http.Flusher so streaming mutating handlers keep working
+// when an Idempotency-Key is present (bd-vq37v).
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards http.Hijacker (e.g. websocket upgrades behind a mutating
+// route). A hijacked response is never cached.
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("serve: underlying ResponseWriter does not support hijacking")
+	}
+	r.hijacked = true
+	return h.Hijack()
+}
+
+// Unwrap supports http.ResponseController pass-through.
+func (r *responseRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 func scopedIdempotencyKey(r *http.Request) string {
@@ -1561,11 +1978,26 @@ func cloneReplayHeaders(src http.Header) http.Header {
 	return clone
 }
 
+// idempotencyOriginalRequestIDHeader carries the request ID of the request
+// that produced a cached response. The replay keeps the CURRENT request's
+// X-Request-ID (bd-vq37v: overwriting it corrupted audit correlation) and
+// exposes the original one here for cross-referencing.
+const idempotencyOriginalRequestIDHeader = "X-Idempotency-Original-Request-Id"
+
 func applyReplayHeaders(dst, src http.Header) {
 	if len(src) == 0 {
 		return
 	}
 	for key, values := range src {
+		// Do not clobber the live request's X-Request-ID with the first
+		// request's; surface the original under a dedicated header instead.
+		if http.CanonicalHeaderKey(key) == http.CanonicalHeaderKey(requestIDHeader) {
+			dst.Del(idempotencyOriginalRequestIDHeader)
+			for _, value := range values {
+				dst.Add(idempotencyOriginalRequestIDHeader, value)
+			}
+			continue
+		}
 		dst.Del(key)
 		for _, value := range values {
 			dst.Add(key, value)
@@ -1598,72 +2030,6 @@ func sanitizeRequestID(id string) string {
 		}
 	}
 	return b.String()
-}
-
-// loggingMiddleware logs HTTP requests.
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		reqID := requestIDFromContext(r.Context())
-		if reqID != "" {
-			log.Printf("%s %s %s request_id=%s", r.Method, r.URL.Path, time.Since(start), reqID)
-			return
-		}
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
-	})
-}
-
-// corsMiddleware adds CORS headers with an allowlist (default localhost).
-func (s *Server) corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" {
-			s.mu.RLock()
-			allowed := originAllowed(origin, s.corsAllowedOrigins)
-			s.mu.RUnlock()
-			if !allowed {
-				writeError(w, http.StatusForbidden, "origin not allowed")
-				return
-			}
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, Idempotency-Key, "+AgentMailTokenHeader+", "+requestIDHeader)
-		}
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// authMiddleware enforces configured authentication for all routes.
-func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		claims, err := s.authenticateRequest(r)
-		if err != nil {
-			reqID := requestIDFromContext(r.Context())
-			log.Printf("auth failed mode=%s path=%s remote=%s request_id=%s err=%v", s.auth.Mode, r.URL.Path, r.RemoteAddr, reqID, err)
-			writeError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-
-		if claims != nil {
-			ctx := context.WithValue(r.Context(), authContextKey, claims)
-			r = r.WithContext(ctx)
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
 
 func (s *Server) authenticateRequest(r *http.Request) (map[string]interface{}, error) {
@@ -1749,6 +2115,11 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 
 // toJSONMap converts any value to map[string]interface{} via JSON round-trip.
 func toJSONMap(v any) (map[string]interface{}, error) {
+	// Arrays-never-null holds on the REST surface too: the CLI encode paths
+	// normalize through NormalizeArraysNeverNull, and every robot envelope
+	// served over HTTP funnels through here (bd-ws3-contract-breadth-psvyu.2).
+	// Normalize returns a fixed copy for unaddressable (non-pointer) payloads.
+	v = robot.NormalizeArraysNeverNull(v)
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -1822,7 +2193,16 @@ func robotErrorHTTPStatus(code string) int {
 		return http.StatusNotFound
 	case robot.ErrCodePermissionDenied:
 		return http.StatusForbidden
-	case robot.ErrCodeResourceBusy:
+	case robot.ErrCodeDestructiveCommandBlocked, "SENSITIVE_DATA_BLOCKED":
+		// A safety refusal of the caller's own message: not a server fault,
+		// and retrying the same body cannot succeed.
+		return http.StatusForbidden
+	case robot.ErrCodeResourceBusy, robot.ErrCodeStaleWorkCoordination:
+		return http.StatusConflict
+	case robot.ErrCodeIdempotencyConflict, robot.ErrCodeOperationInProgress, robot.ErrCodeOperationOutcomeUnknown:
+		// The operation ID (Idempotency-Key) is bound to a different command,
+		// or another request holding it is still running: a client-side
+		// conflict to reconcile via the receipt, never a server fault.
 		return http.StatusConflict
 	case robot.ErrCodeTimeout:
 		return http.StatusGatewayTimeout
@@ -1940,25 +2320,24 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSessionAgents handles /api/sessions/{id}/agents.
+// handleSessionAgents handles /api/sessions/{id}/agents. It reports the same
+// agents as GET /api/v1/sessions/{id}/agents in the legacy envelope.
 func (s *Server) handleSessionAgents(w http.ResponseWriter, r *http.Request, sessionID string) {
-	if s.stateStore == nil {
-		writeError(w, http.StatusServiceUnavailable, "state store not available")
+	if err := tmux.ValidateSessionName(sessionID); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid session ID: "+err.Error())
 		return
 	}
 
-	agents, err := s.stateStore.ListAgents(sessionID)
+	roster, err := s.listSessionAgents(r.Context(), sessionID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		status, _, message := sessionAgentsFailure(err)
+		writeError(w, status, message)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success":    true,
-		"session_id": sessionID,
-		"agents":     agents,
-		"count":      len(agents),
-	})
+	body := roster.payload(sessionID)
+	body["success"] = true
+	writeJSON(w, http.StatusOK, body)
 }
 
 // handleSessionEvents handles /api/sessions/{id}/events.
@@ -2133,15 +2512,6 @@ func extractAPIKey(r *http.Request) string {
 		return key
 	}
 	return extractBearerToken(r)
-}
-
-func isWebSocketUpgrade(r *http.Request) bool {
-	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
-	if upgrade != "websocket" {
-		return false
-	}
-	connection := strings.ToLower(r.Header.Get("Connection"))
-	return strings.Contains(connection, "upgrade")
 }
 
 func originAllowed(origin string, allowlist []string) bool {
@@ -2735,6 +3105,31 @@ func performDoctorCheckAPI(ctx context.Context) map[string]interface{} {
 	}
 	report["daemons"] = daemons
 
+	// Pre-commit guard degraded runs (bd-ws1-truth-safety-l5ddi.1): the guard
+	// hook fails open when Agent Mail is unreachable and records each such run
+	// in the state DB; the dashboard surfaces the count as a warning line.
+	guardCheck := map[string]interface{}{
+		"name":          "guard-hook",
+		"status":        "ok",
+		"degraded_runs": 0,
+	}
+	if store, err := state.Open(""); err == nil {
+		if migrateErr := store.Migrate(); migrateErr != nil {
+			log.Printf("doctor: state store migrate error=%v", migrateErr)
+		} else if stats, statsErr := store.GuardDegradedEventStats(time.Time{}); statsErr == nil && stats.Count > 0 {
+			guardCheck["status"] = "warning"
+			guardCheck["degraded_runs"] = stats.Count
+			guardCheck["since"] = stats.FirstAt.UTC().Format(time.RFC3339)
+			guardCheck["message"] = fmt.Sprintf("guard hook ran degraded %d time(s) since %s (commits allowed without a reservation check)",
+				stats.Count, stats.FirstAt.UTC().Format(time.RFC3339))
+			warnings++
+		}
+		if closeErr := store.Close(); closeErr != nil {
+			log.Printf("doctor: close state store error=%v", closeErr)
+		}
+	}
+	report["guard_hook"] = guardCheck
+
 	// Set overall status
 	if errors > 0 {
 		report["overall"] = "unhealthy"
@@ -2792,15 +3187,78 @@ func (s *Server) handleSessionsV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure sessions is never null
-	if sessions == nil {
-		sessions = []state.Session{}
+	// The runtime store only knows sessions that were recorded through it, and
+	// ordinary `ntm spawn` sessions never are. Merge in the sessions tmux is
+	// running right now so the dashboard does not report "no sessions" while
+	// agents are live. A tmux failure degrades to the stored rows.
+	live, err := s.liveTmuxSessions(r.Context())
+	if err != nil {
+		slog.Warn("listing live tmux sessions failed", "request_id", reqID, "error", err)
+		live = nil
+	}
+
+	visible := make([]interface{}, 0, len(sessions)+len(live))
+	known := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		visible = append(visible, session)
+		known[session.Name] = struct{}{}
+	}
+	for _, session := range live {
+		if _, ok := known[session.Name]; ok {
+			continue
+		}
+		known[session.Name] = struct{}{}
+		visible = append(visible, liveSessionRecord(session))
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"sessions": sessions,
-		"count":    len(sessions),
+		"sessions": visible,
+		"count":    len(visible),
 	}, reqID)
+}
+
+// defaultLiveSessionsTimeout bounds the tmux queries behind the sessions and
+// agents endpoints. The web UI polls them every few seconds; without a bound, a
+// wedged tmux server would hang every poll (and pile up tmux processes) instead
+// of degrading to the stored rows.
+const defaultLiveSessionsTimeout = 5 * time.Second
+
+// liveTmuxTimeout is the bound applied to each live tmux query a read endpoint
+// makes.
+func (s *Server) liveTmuxTimeout() time.Duration {
+	if s.liveSessionsTimeout > 0 {
+		return s.liveSessionsTimeout
+	}
+	return defaultLiveSessionsTimeout
+}
+
+// liveTmuxSessions returns the running tmux sessions sorted by name.
+func (s *Server) liveTmuxSessions(ctx context.Context) ([]tmux.Session, error) {
+	list := tmux.ListSessionsContext
+	if s.listLiveSessions != nil {
+		list = s.listLiveSessions
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.liveTmuxTimeout())
+	defer cancel()
+	live, err := list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(live, func(i, j int) bool { return live[i].Name < live[j].Name })
+	return live, nil
+}
+
+// liveSessionRecord describes a running tmux session the runtime store has no
+// row for, using the same field names as state.Session.
+func liveSessionRecord(session tmux.Session) map[string]interface{} {
+	return map[string]interface{}{
+		"id":       session.Name,
+		"name":     session.Name,
+		"status":   state.SessionActive,
+		"windows":  session.Windows,
+		"attached": session.Attached,
+		"source":   "tmux",
+	}
 }
 
 // handleSessionV1 handles GET /api/v1/sessions/{id}.
@@ -2823,39 +3281,34 @@ func (s *Server) handleSessionV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if session == nil {
+		// Same fallback as the list endpoint: a live tmux session without a
+		// store row is still a session the dashboard can open.
+		live, err := s.liveTmuxSessions(r.Context())
+		if err != nil {
+			// tmux, not the server, failed: a bounded listing that ran out of
+			// time is a timeout, anything else (circuit open, tmux error) is
+			// an unavailable dependency. Neither is an internal error.
+			status, code := http.StatusServiceUnavailable, ErrCodeServiceUnavail
+			if errors.Is(err, context.DeadlineExceeded) {
+				status, code = http.StatusGatewayTimeout, ErrCodeTimeout
+			}
+			writeErrorResponse(w, status, code, "listing live tmux sessions failed: "+err.Error(), nil, reqID)
+			return
+		}
+		for _, candidate := range live {
+			if candidate.Name == sessionID {
+				writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+					"session": liveSessionRecord(candidate),
+				}, reqID)
+				return
+			}
+		}
 		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, "session not found", nil, reqID)
 		return
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"session": session,
-	}, reqID)
-}
-
-// handleSessionAgentsV1 handles GET /api/v1/sessions/{id}/agents.
-func (s *Server) handleSessionAgentsV1(w http.ResponseWriter, r *http.Request, sessionID string) {
-	reqID := requestIDFromContext(r.Context())
-
-	if s.stateStore == nil {
-		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeServiceUnavail, "state store not available", nil, reqID)
-		return
-	}
-
-	agents, err := s.stateStore.ListAgents(sessionID)
-	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
-		return
-	}
-
-	// Ensure agents is never null
-	if agents == nil {
-		agents = []state.Agent{}
-	}
-
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"session_id": sessionID,
-		"agents":     agents,
-		"count":      len(agents),
 	}, reqID)
 }
 
@@ -3502,21 +3955,24 @@ func (s *Server) handlePaneInterruptV1(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	paneTarget := pane.ID
 
-	// Press the interrupt key (Ctrl+C, or Escape for Muse Code) as a key
-	// name. tmux.SendKeys sends literal text, so it would type "C-c".
+	// Press the agent's interrupt KEY (Ctrl+C; Escape for omp and Muse Code).
+	// SendKeys is literal (-l) and would have typed the characters "C-c"
+	// instead. sendPaneKeyName is the test seam for tmux.SendKeyName.
 	sendKeyName := tmux.SendKeyName
 	if s.sendPaneKeyName != nil {
 		sendKeyName = s.sendPaneKeyName
 	}
-	if err := sendKeyName(pane.ID, tmux.InterruptKey(pane.Type)); err != nil {
+	if err := sendKeyName(paneTarget, tmux.InterruptKeyForAgent(pane.Type)); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
 		return
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"interrupted": true,
-		"pane":        pane.ID,
+		"pane":        paneTarget,
+		"key":         tmux.InterruptKeyLabel(pane.Type),
 	}, reqID)
 }
 
@@ -3743,20 +4199,171 @@ func (s *Server) handleListAgentsV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	panes, err := tmux.GetPanesContext(r.Context(), sessionID)
+	roster, err := s.listSessionAgents(r.Context(), sessionID)
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		status, code, message := sessionAgentsFailure(err)
+		writeErrorResponse(w, status, code, message, nil, reqID)
 		return
 	}
+	writeSuccessResponse(w, http.StatusOK, roster.payload(sessionID), reqID)
+}
 
-	// Filter to only include recognized agent panes (not user/unknown)
+// sessionAgentRoster is what the agents endpoints report for one session.
+type sessionAgentRoster struct {
+	agents   []map[string]interface{}
+	warnings []string
+}
+
+// payload is the roster's response body, without the envelope fields.
+func (roster sessionAgentRoster) payload(sessionID string) map[string]interface{} {
+	agents := roster.agents
+	if agents == nil {
+		agents = []map[string]interface{}{}
+	}
+	body := map[string]interface{}{
+		"session_id": sessionID,
+		"agents":     agents,
+		"count":      len(agents),
+	}
+	if len(roster.warnings) > 0 {
+		body["warnings"] = roster.warnings
+	}
+	return body
+}
+
+var (
+	// errSessionAgentsNotFound reports a session that tmux is not running and
+	// the state store does not record.
+	errSessionAgentsNotFound = errors.New("session not found")
+	// errSessionAgentsLiveListing wraps a failed live pane listing that no
+	// projection row could stand in for.
+	errSessionAgentsLiveListing = errors.New("listing live tmux panes failed")
+)
+
+// sessionAgentsFailure maps a listSessionAgents error to an HTTP status, an
+// error code and a message.
+func sessionAgentsFailure(err error) (int, string, string) {
+	switch {
+	case errors.Is(err, errSessionAgentsNotFound):
+		return http.StatusNotFound, ErrCodeNotFound, "session not found"
+	case errors.Is(err, errSessionAgentsLiveListing) && errors.Is(err, context.DeadlineExceeded):
+		// The bounded tmux listing ran out of time: tmux, not the server,
+		// failed.
+		return http.StatusGatewayTimeout, ErrCodeTimeout, err.Error()
+	case errors.Is(err, errSessionAgentsLiveListing):
+		return http.StatusServiceUnavailable, ErrCodeServiceUnavail, err.Error()
+	default:
+		return http.StatusInternalServerError, ErrCodeInternalError, err.Error()
+	}
+}
+
+// listSessionAgents reports the agents of one session for
+// GET /api/v1/sessions/{id}/agents and the legacy /api/sessions/{id}/agents.
+// The legacy `agents` table those endpoints used to read (Store.ListAgents)
+// has no production writer, so it only ever answered "no agents".
+//
+// Live tmux panes are the roster: they say which agents exist right now. The
+// runtime projection that `ntm serve` refreshes every few seconds
+// (robot.RefreshNormalizedProjection) adds what a pane listing cannot observe:
+// the agent's state, when it last produced output, its health and its current
+// bead. A live pane with no fresh projection row (right after start, or with
+// no state store) is still reported, just without that state.
+//
+// When tmux answers that the session does not exist, the session has no
+// agents, whatever an unexpired projection row still says: a session the
+// state store records is reported empty, any other is
+// errSessionAgentsNotFound. When tmux fails in any other way (a wedged server
+// past the bound, an open circuit breaker), the fresh projection rows are
+// reported on their own with a warning; with none, the failure is returned.
+func (s *Server) listSessionAgents(ctx context.Context, sessionID string) (sessionAgentRoster, error) {
+	var roster sessionAgentRoster
+	var projected []state.RuntimeAgent
+	if s.stateStore != nil {
+		rows, err := s.stateStore.GetRuntimeAgentsBySession(sessionID)
+		if err != nil {
+			slog.Warn("reading runtime agent projection failed", "session", sessionID, "error", err)
+			roster.warnings = append(roster.warnings, "runtime agent projection unavailable: "+err.Error())
+		} else {
+			projected = rows
+		}
+	}
+
+	paneCtx, cancel := context.WithTimeout(ctx, s.liveTmuxTimeout())
+	panes, err := tmux.GetPanesContext(paneCtx, sessionID)
+	cancel()
+	if err == nil {
+		roster.agents = s.liveAgentRecords(sessionID, panes, projected)
+		return roster, nil
+	}
+
+	switch tmux.ClassifyCommandError(err).Kind {
+	case tmux.CommandErrorSessionNotFound, tmux.CommandErrorNoServer:
+		if s.stateStore != nil {
+			stored, storeErr := s.stateStore.GetSession(sessionID)
+			if storeErr != nil {
+				return sessionAgentRoster{}, storeErr
+			}
+			if stored != nil {
+				roster.agents = []map[string]interface{}{}
+				return roster, nil
+			}
+		}
+		return sessionAgentRoster{}, errSessionAgentsNotFound
+	}
+
+	agents := projectedAgentRecords(sessionID, projected)
+	if len(agents) == 0 {
+		return sessionAgentRoster{}, fmt.Errorf("%w: %w", errSessionAgentsLiveListing, err)
+	}
+	slog.Warn("listing live tmux panes failed; reporting projected agents", "session", sessionID, "error", err)
+	roster.agents = agents
+	roster.warnings = append(roster.warnings, fmt.Sprintf("%v (%v); agents are reported from the runtime projection", errSessionAgentsLiveListing, err))
+	return roster, nil
+}
+
+// liveAgentRecords turns the agent panes of a running session into agent
+// records, adding each pane's fresh projection row when there is one.
+func (s *Server) liveAgentRecords(sessionID string, panes []tmux.Pane, projected []state.RuntimeAgent) []map[string]interface{} {
+	byPane := make(map[string]state.RuntimeAgent, len(projected))
+	for _, row := range projected {
+		byPane[row.Pane] = row
+	}
+
+	// Agent Mail names ("GreenLake") are recorded per pane. Only trust a
+	// mapping whose recorded pane PID still matches: tmux reuses pane IDs
+	// after a server restart, and a stale registry must not rename a new pane.
+	registry, err := agentmail.LoadBestSessionAgentRegistry(sessionID, s.projectDirSnapshot())
+	if err != nil {
+		slog.Debug("loading agent registry failed", "session", sessionID, "error", err)
+		registry = nil
+	}
+
 	agents := make([]map[string]interface{}, 0, len(panes))
 	for _, p := range panes {
-		agentType := string(p.Type)
-		if agentType == "" || agentType == "unknown" || agentType == "user" {
+		// User shells, unrecognized panes and tagged service panes (cm,
+		// cass, ...) are not agents; the projection leaves them out too.
+		agentType := servedAgentType(string(p.Type))
+		if agentType == "" || p.IsServicePane() {
 			continue
 		}
-		agents = append(agents, map[string]interface{}{
+		name := p.Title
+		agentMailName := ""
+		if registry != nil && p.PID != 0 && registry.PanePID(p.ID) == p.PID {
+			if registered, ok := registry.GetAgentByID(p.ID); ok && registered != "" {
+				agentMailName = registered
+				name = registered
+			}
+		}
+		agent := map[string]interface{}{
+			// Agent-record fields (id, session_id, name, type, tmux_pane_id,
+			// status, last_seen, current_task_id) that clients such as the
+			// web dashboard's Agents page render.
+			"id":           p.ID,
+			"session_id":   sessionID,
+			"name":         name,
+			"type":         agentType,
+			"tmux_pane_id": p.ID,
+			// Pane-specific fields.
 			"pane_index": p.Index,
 			"pane_id":    p.ID,
 			"agent_type": agentType,
@@ -3764,14 +4371,102 @@ func (s *Server) handleListAgentsV1(w http.ResponseWriter, r *http.Request) {
 			"variant":    p.Variant,
 			"tags":       p.Tags,
 			"active":     p.Active,
-		})
+			"dead":       p.Dead,
+		}
+		if agentMailName != "" {
+			agent["agent_mail_name"] = agentMailName
+		}
+		if row, ok := byPane[p.ID]; ok {
+			addProjectedAgentState(agent, row)
+		}
+		if p.Dead {
+			// tmux reports the pane's process has exited, which outranks
+			// whatever state the projection last classified.
+			agent["status"] = "dead"
+		}
+		agents = append(agents, agent)
 	}
+	return agents
+}
 
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"session_id": sessionID,
-		"agents":     agents,
-		"count":      len(agents),
-	}, reqID)
+// projectedAgentRecords turns fresh projection rows into agent records, for
+// when tmux cannot be listed. The projection records no pane index or title.
+// Its Agent Mail name is reported as is: without a live pane PID there is
+// nothing to verify it against, and it is the name --robot-status reports.
+func projectedAgentRecords(sessionID string, rows []state.RuntimeAgent) []map[string]interface{} {
+	agents := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		agentType := servedAgentType(row.AgentType)
+		if agentType == "" || row.Pane == "" {
+			continue
+		}
+		name := row.Pane
+		if row.AgentMailName != "" {
+			name = row.AgentMailName
+		}
+		agent := map[string]interface{}{
+			"id":           row.Pane,
+			"session_id":   sessionID,
+			"name":         name,
+			"type":         agentType,
+			"tmux_pane_id": row.Pane,
+			"pane_id":      row.Pane,
+			"agent_type":   agentType,
+		}
+		if row.Variant != "" {
+			agent["variant"] = row.Variant
+		}
+		if row.AgentMailName != "" {
+			agent["agent_mail_name"] = row.AgentMailName
+		}
+		addProjectedAgentState(agent, row)
+		agents = append(agents, agent)
+	}
+	return agents
+}
+
+// addProjectedAgentState copies what the runtime projection observed about an
+// agent into its record: its state (idle, active, busy, error, compacting or
+// unknown, the --robot-status vocabulary), when it last produced output,
+// health, current bead, unread mail, and when the projection collected it.
+func addProjectedAgentState(agent map[string]interface{}, row state.RuntimeAgent) {
+	if row.State != "" {
+		agent["status"] = string(row.State)
+	}
+	if row.StateReason != "" {
+		agent["state_reason"] = row.StateReason
+	}
+	if row.LastOutputAt != nil && !row.LastOutputAt.IsZero() {
+		agent["last_seen"] = row.LastOutputAt.UTC()
+	}
+	if row.HealthStatus != "" {
+		agent["health_status"] = string(row.HealthStatus)
+	}
+	if row.HealthReason != "" {
+		agent["health_reason"] = row.HealthReason
+	}
+	if row.CurrentBead != "" {
+		agent["current_task_id"] = row.CurrentBead
+	}
+	if row.PendingMail > 0 {
+		agent["pending_mail"] = row.PendingMail
+	}
+	if !row.CollectedAt.IsZero() {
+		agent["projected_at"] = row.CollectedAt.UTC()
+	}
+}
+
+// servedAgentType returns the short agent type ("cc", "cod", ...) the agents
+// endpoints report, or "" for a pane that is not an agent. Live panes carry
+// the short form already; projection rows carry the robot form ("claude",
+// "codex").
+func servedAgentType(raw string) string {
+	switch canonical := tmux.AgentType(raw).Canonical(); canonical {
+	case "", tmux.AgentUser, tmux.AgentUnknown:
+		return ""
+	default:
+		return string(canonical)
+	}
 }
 
 // AgentSpawnRequest is the request body for POST /sessions/{id}/agents/spawn.
@@ -3781,10 +4476,23 @@ type AgentSpawnRequest struct {
 	GmiCount  int    `json:"gmi_count,omitempty"`
 	AgyCount  int    `json:"agy_count,omitempty"`
 	GrokCount int    `json:"grok_count,omitempty"`
+	OmpCount  int    `json:"omp_count,omitempty"`
+	OcCount   int    `json:"oc_count,omitempty"`
 	Preset    string `json:"preset,omitempty"`
 	WaitReady bool   `json:"wait_ready,omitempty"`
 	Label     string `json:"label,omitempty"` // Goal label for multi-session support
 }
+
+// hasAgentCountOrPreset reports whether the request names at least one agent
+// to spawn (by count for any supported type, or through a preset).
+func (req AgentSpawnRequest) hasAgentCountOrPreset() bool {
+	return req.CCCount != 0 || req.CodCount != 0 || req.GmiCount != 0 || req.AgyCount != 0 ||
+		req.GrokCount != 0 || req.OmpCount != 0 || req.OcCount != 0 || req.Preset != ""
+}
+
+// agentSpawnCountRequiredMessage is the shared validation error for a spawn
+// request that names no agents.
+const agentSpawnCountRequiredMessage = "at least one agent count (cc_count, cod_count, gmi_count, agy_count, grok_count, omp_count, oc_count) or preset required"
 
 // handleAgentSpawnV1 handles POST /api/v1/sessions/{sessionId}/agents/spawn.
 func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
@@ -3802,8 +4510,8 @@ func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// At least one agent count or preset must be specified
-	if req.CCCount == 0 && req.CodCount == 0 && req.GmiCount == 0 && req.AgyCount == 0 && req.GrokCount == 0 && req.Preset == "" {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "at least one agent count (cc_count, cod_count, gmi_count, agy_count, grok_count) or preset required", nil, reqID)
+	if !req.hasAgentCountOrPreset() {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, agentSpawnCountRequiredMessage, nil, reqID)
 		return
 	}
 
@@ -3815,6 +4523,8 @@ func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
 		GmiCount:  req.GmiCount,
 		AgyCount:  req.AgyCount,
 		GrokCount: req.GrokCount,
+		OmpCount:  req.OmpCount,
+		OcCount:   req.OcCount,
 		Preset:    req.Preset,
 		WaitReady: req.WaitReady,
 	}
@@ -3920,6 +4630,12 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		if result.Hint != "" {
 			details["hint"] = result.Hint
 		}
+		if result.Operation != nil {
+			details["operation"] = result.Operation
+		}
+		if len(result.Warnings) > 0 {
+			details["warnings"] = result.Warnings
+		}
 		writeErrorResponse(w, robotErrorHTTPStatus(result.ErrorCode), result.ErrorCode, result.Error, details, reqID)
 		return
 	}
@@ -3935,10 +4651,11 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 
 // AgentInterruptRequest is the request body for POST /sessions/{id}/agents/interrupt.
 type AgentInterruptRequest struct {
-	Panes   []string `json:"panes,omitempty"`
-	Message string   `json:"message,omitempty"`
-	Force   bool     `json:"force,omitempty"`
-	NoWait  bool     `json:"no_wait,omitempty"`
+	Panes      []string `json:"panes,omitempty"`
+	AgentTypes []string `json:"agent_types,omitempty"`
+	Message    string   `json:"message,omitempty"`
+	Force      bool     `json:"force,omitempty"`
+	NoWait     bool     `json:"no_wait,omitempty"`
 }
 
 // handleAgentInterruptV1 handles POST /api/v1/sessions/{sessionId}/agents/interrupt.
@@ -3973,6 +4690,7 @@ func (s *Server) handleAgentInterruptV1(w http.ResponseWriter, r *http.Request) 
 	opts := robot.InterruptOptions{
 		Session:        sessionID,
 		Panes:          req.Panes,
+		AgentTypes:     req.AgentTypes,
 		Message:        req.Message,
 		Force:          req.Force,
 		NoWait:         req.NoWait,
@@ -3998,6 +4716,12 @@ func (s *Server) handleAgentInterruptV1(w http.ResponseWriter, r *http.Request) 
 		details := map[string]interface{}{}
 		if result.Hint != "" {
 			details["hint"] = result.Hint
+		}
+		if result.Operation != nil {
+			details["operation"] = result.Operation
+		}
+		if len(result.Warnings) > 0 {
+			details["warnings"] = result.Warnings
 		}
 		writeErrorResponse(w, robotErrorHTTPStatus(result.ErrorCode), result.ErrorCode, result.Error, details, reqID)
 		return
@@ -4048,11 +4772,10 @@ func (s *Server) handleAgentWaitV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bound the client-supplied wait. robot.GetWait takes no context, so a
-	// disconnecting client cannot reclaim the goroutine it started: an
-	// unbounded timeout_ms pinned one server-side goroutine (and its tmux
-	// polling) indefinitely. Every other client-supplied bound in this
-	// package is clamped; these two were oversights.
+	// Bound the client-supplied wait so an unbounded timeout_ms cannot pin
+	// one server-side goroutine (and its tmux polling) indefinitely. Every
+	// other client-supplied bound in this package is clamped; these two were
+	// oversights.
 	timeout := 30 * time.Second
 	if req.TimeoutMs > 0 {
 		timeout = time.Duration(req.TimeoutMs) * time.Millisecond
@@ -4129,8 +4852,9 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"jobs":  jobs,
-		"count": len(jobs),
+		"jobs":      jobs,
+		"count":     len(jobs),
+		"execution": s.jobExecutor.snapshot(),
 	}, reqID)
 }
 
@@ -4139,15 +4863,19 @@ type CreateJobRequest struct {
 	Type    string                 `json:"type"`
 	Params  map[string]interface{} `json:"params,omitempty"`
 	Session string                 `json:"session,omitempty"`
+
+	// Internal service ownership; never accepted from JSON or fingerprinted.
+	executionContext    context.Context
+	executionProjectDir string
 }
 
 // handleCreateJob handles POST /api/v1/jobs.
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 
-	var req CreateJobRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body", nil, reqID)
+	req, err := decodeCreateJobRequest(r.Body)
+	if err != nil {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body: "+err.Error(), nil, reqID)
 		return
 	}
 
@@ -4156,50 +4884,38 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate job type
-	validTypes := map[string]bool{
-		"spawn":      true,
-		"scan":       true,
-		"checkpoint": true,
-		"import":     true,
-		"export":     true,
-	}
-	if !validTypes[req.Type] {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid job type", map[string]interface{}{
-			"valid_types": []string{"spawn", "scan", "checkpoint", "import", "export"},
-		}, reqID)
+	// Only the three allow-listed async operations are implemented (D5,
+	// bd-ws3-contract-breadth-psvyu.5). Everything else is an honest
+	// NOT_IMPLEMENTED — never a fake acceptance for work that will not run.
+	if !isImplementedJobType(req.Type) {
+		writeErrorResponse(w, http.StatusNotImplemented, ErrCodeNotImplemented,
+			fmt.Sprintf("job type %q is not implemented", req.Type), map[string]interface{}{
+				"implemented_types": implementedJobTypes,
+			}, reqID)
 		return
 	}
 
-	job := s.jobStore.Create(req.Type)
-
-	// Start job execution in background
-	go s.executeJob(job.ID, req)
+	job, err := s.submitJob(r.Context(), req)
+	if err != nil {
+		code, status := ErrCodeServiceUnavail, http.StatusServiceUnavailable
+		if errors.Is(err, errInvalidJobRequest) {
+			code, status = ErrCodeBadRequest, http.StatusBadRequest
+		}
+		if errors.Is(err, errJobQueueFull) {
+			w.Header().Set("Retry-After", "1")
+		}
+		details := map[string]interface{}{"execution": s.jobExecutor.snapshot()}
+		if job != nil {
+			details["job"] = job
+		}
+		writeErrorResponse(w, status, code, err.Error(), details, reqID)
+		return
+	}
+	w.Header().Set("Location", "/api/v1/jobs/"+job.ID)
 
 	writeSuccessResponse(w, http.StatusAccepted, map[string]interface{}{
 		"job": job,
 	}, reqID)
-}
-
-// executeJob runs a job asynchronously.
-func (s *Server) executeJob(jobID string, req CreateJobRequest) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.jobStore.Update(jobID, JobStatusFailed, 0, nil, fmt.Sprintf("panic: %v", r))
-		}
-	}()
-	s.jobStore.Update(jobID, JobStatusRunning, 0, nil, "")
-
-	// Simulate job execution - in production, this would dispatch to actual handlers
-	time.Sleep(100 * time.Millisecond)
-
-	// Mark as completed
-	result := map[string]interface{}{
-		"type":    req.Type,
-		"params":  req.Params,
-		"session": req.Session,
-	}
-	s.jobStore.Update(jobID, JobStatusCompleted, 100, result, "")
 }
 
 // handleGetJob handles GET /api/v1/jobs/{id}.
@@ -4223,24 +4939,29 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	jobID := chi.URLParam(r, "id")
 
-	job := s.jobStore.Get(jobID)
-	if job == nil {
+	job, err := s.cancelJob(jobID)
+	if errors.Is(err, errJobNotFound) {
 		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, "job not found", nil, reqID)
 		return
 	}
 
-	// Only allow cancelling pending or running jobs
-	if job.Status != JobStatusPending && job.Status != JobStatusRunning {
+	if errors.Is(err, errJobNotCancellable) {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, "job cannot be cancelled", map[string]interface{}{
 			"status": job.Status,
 		}, reqID)
 		return
 	}
 
-	s.jobStore.Update(jobID, JobStatusCancelled, job.Progress, nil, "cancelled by user")
+	if err != nil {
+		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeServiceUnavail,
+			"cancellation signalled but checkpoint failed: "+err.Error(), map[string]interface{}{
+				"job": job, "cancellation_requested": true,
+			}, reqID)
+		return
+	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"job": s.jobStore.Get(jobID),
+		"job": job,
 	}, reqID)
 }
 
@@ -4354,6 +5075,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		authClaims: extractAuthClaims(r),
 	}
 
+	// Wire persistence before the hub loop starts so seq assignment is
+	// durable from the very first broadcast (mirrors ensureWSHubRunning for
+	// routers exercised without Start()).
+	s.ensureWSEventStore()
 	s.ensureWSHubRunning()
 
 	// Register client with hub
@@ -4542,6 +5267,20 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 		}
 	}
 
+	// Optional replay cursor (see the replay contract in ws_events.go).
+	// Presence of "since" requests replay of persisted events with seq > since
+	// for the regular (non-attention) topics before live delivery. Attention
+	// topics use their own durable cursor field, since_cursor.
+	since := int64(-1)
+	if sinceRaw, hasSince := msg.Data["since"]; hasSince {
+		f, ok := sinceRaw.(float64)
+		if !ok || f < 0 {
+			c.sendError(msg.RequestID, "invalid_since", "since must be a non-negative integer event seq")
+			return
+		}
+		since = int64(f)
+	}
+
 	// Check for attention topic subscriptions with durable semantics
 	attentionTopics, regularTopics := partitionAttentionTopics(topics)
 
@@ -4564,8 +5303,22 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 
 	// Regular topics are only committed after any durable attention request has
 	// been accepted, keeping a single subscribe message all-or-nothing.
+	var replayInfo map[string]interface{}
 	if len(regularTopics) > 0 {
-		c.Subscribe(regularTopics)
+		if since >= 0 {
+			// Replay-then-live is serialized through the hub loop; the replay
+			// frames are queued to this client's send channel before the ack
+			// below, so the ack marks the end of replay.
+			res := c.hub.SubscribeWithReplay(c, regularTopics, since)
+			replayInfo = map[string]interface{}{
+				"since":    since,
+				"replayed": res.replayed,
+				"reset":    res.reset,
+				"cursor":   res.cursor,
+			}
+		} else {
+			c.Subscribe(regularTopics)
+		}
 	}
 
 	// Build response
@@ -4575,6 +5328,9 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 	}
 	if attentionResult != nil {
 		response["attention"] = attentionResult
+	}
+	if replayInfo != nil {
+		response["replay"] = replayInfo
 	}
 	c.sendAck(msg.RequestID, response)
 }
@@ -4655,11 +5411,9 @@ func isValidTopic(topic string) bool {
 
 // canSubscribe checks if the client is authorized to subscribe to a topic.
 func (c *WSClient) canSubscribe(topic string) bool {
-	// For now, allow all authenticated clients to subscribe to any topic.
-	// Future: implement RBAC based on auth claims.
-	// Example checks:
-	// - Check if user has access to specific session
-	// - Check if user has agent-type filter permissions
+	// Deliberate: every authenticated client may subscribe to any topic.
+	// ntm serve is a single-operator surface (auth gates the connection, not
+	// individual topics); per-topic RBAC is not part of the current design.
 	return true
 }
 
@@ -5133,11 +5887,6 @@ func (c *WSClient) sendPong(requestID string) {
 	c.trySend(data, func() {
 		// Buffer full, skip
 	})
-}
-
-// WSHub returns the WebSocket hub for testing.
-func (s *Server) WSHub() *WSHub {
-	return s.wsHub
 }
 
 // =============================================================================
@@ -6280,14 +7029,6 @@ func resolvePaneByIndex(ctx context.Context, session string, paneIdx int) (tmux.
 	return tmux.Pane{}, fmt.Errorf("no pane with index %d in session %q", paneIdx, session)
 }
 
-func resolvePaneTargetByIndex(ctx context.Context, session string, paneIdx int) (string, error) {
-	pane, err := resolvePaneByIndex(ctx, session, paneIdx)
-	if err != nil {
-		return "", err
-	}
-	return pane.ID, nil
-}
-
 func (s *Server) resolvePaneForRequest(w http.ResponseWriter, r *http.Request, session string, paneIdx int, reqID string) (tmux.Pane, bool) {
 	resolvePane := resolvePaneByIndex
 	if s.resolvePane != nil {
@@ -6328,11 +7069,21 @@ func parseCSVParam(value string) []string {
 
 // Stop cleans up resources used by the Server.
 func (s *Server) Stop() {
+	if s.jobStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.drainJobWorkers(ctx); err != nil {
+			slog.Warn("job workers still shutting down", "error", err)
+		}
+		cancel()
+	}
 	if s.idempotencyStore != nil {
 		s.idempotencyStore.Stop()
 	}
 	if s.wsHub != nil {
 		s.wsHub.Stop()
+		if st := s.wsHub.eventStore(); st != nil {
+			st.Stop()
+		}
 	}
 	if s.streamManager != nil {
 		s.streamManager.StopAll()

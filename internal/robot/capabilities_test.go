@@ -166,8 +166,26 @@ func TestCapabilitiesProjectionsPreserveRegistryContracts(t *testing.T) {
 	if len(full.Commands) != len(registry.Surfaces) || len(compact.Commands) != len(registry.Surfaces) {
 		t.Fatalf("projection sizes = full:%d compact:%d registry:%d", len(full.Commands), len(compact.Commands), len(registry.Surfaces))
 	}
-	if !reflect.DeepEqual(full.Surfaces, registry.Surfaces) {
-		t.Fatal("full capabilities surfaces drifted from the robot registry")
+	// commands[] carries each surface's command-level fields and surfaces[]
+	// only the surface-level metadata; together they must reproduce the
+	// registry without loss (and without shipping any field twice).
+	if len(full.Surfaces) != len(registry.Surfaces) {
+		t.Fatalf("full capabilities surfaces = %d, registry = %d", len(full.Surfaces), len(registry.Surfaces))
+	}
+	for i, surface := range registry.Surfaces {
+		meta := full.Surfaces[i]
+		if meta.Name != surface.Name || !reflect.DeepEqual(meta.Paginated, surface.Paginated) ||
+			meta.PaginatedReason != surface.PaginatedReason ||
+			!reflect.DeepEqual(meta.ConsumerGuidance, surface.ConsumerGuidance) ||
+			!reflect.DeepEqual(meta.Boundedness, surface.Boundedness) ||
+			!reflect.DeepEqual(meta.FollowUp, surface.FollowUp) ||
+			!reflect.DeepEqual(meta.ActionHandoff, surface.ActionHandoff) ||
+			!reflect.DeepEqual(meta.RequestSemantics, surface.RequestSemantics) ||
+			!reflect.DeepEqual(meta.AttentionOps, surface.AttentionOps) ||
+			!reflect.DeepEqual(meta.Explainability, surface.Explainability) ||
+			!reflect.DeepEqual(meta.Lifecycle, surface.Lifecycle) {
+			t.Errorf("full capability surface metadata %q drifted from the registry\nmetadata: %+v\nsurface: %+v", surface.Name, meta, surface)
+		}
 	}
 
 	for i, surface := range registry.Surfaces {
@@ -206,11 +224,6 @@ func TestCapabilitiesAnnotateDeprecatedParametersAndAdvertiseValidFormats(t *tes
 	}
 	seen := make(map[string]string)
 	for _, command := range output.Commands {
-		for _, format := range command.OutputFormats {
-			if !isSupportedSurfaceOutputFormat(format) {
-				t.Fatalf("command %q advertises invalid output format %q", command.Name, format)
-			}
-		}
 		for _, parameter := range command.Parameters {
 			if parameter.Deprecated {
 				seen[parameter.Flag] = parameter.ReplacedBy
@@ -255,9 +268,14 @@ func TestBuildCommandRegistry_CanonicalPaneContracts(t *testing.T) {
 	for _, parameter := range bulk.Parameters {
 		flags[parameter.Flag] = true
 	}
-	for _, canonical := range []string{"--skip", "--template", "--bulk-parallel", "--bulk-stagger"} {
+	for _, canonical := range []string{"--skip", "--template", "--bulk-parallel", "--bulk-stagger", "--reserve-files", "--reservation-paths"} {
 		if !flags[canonical] {
 			t.Errorf("bulk-assign missing canonical parameter %q", canonical)
+		}
+	}
+	for _, parameter := range bulk.Parameters {
+		if parameter.Flag == "--reserve-files" && parameter.Default != "true" {
+			t.Errorf("bulk-assign --reserve-files default = %q, want true (reserve by default, like ntm assign)", parameter.Default)
 		}
 	}
 	for _, deprecated := range []string{"--skip-panes", "--prompt-template"} {
@@ -274,7 +292,9 @@ func TestBuildCommandRegistry_CanonicalPaneContracts(t *testing.T) {
 	}
 }
 
-func TestSpawnCapabilitiesAdvertiseGrokPhaseOne(t *testing.T) {
+// GH#251 phase 2: grok is fully supported, so the spawn capability must no
+// longer advertise a phase-one launch-only boundary.
+func TestSpawnCapabilitiesAdvertiseGrokFullSupport(t *testing.T) {
 	output, err := GetCapabilitiesWithOptions(CapabilitiesOptions{Command: "spawn"})
 	if err != nil || !output.Success || len(output.Commands) != 1 {
 		t.Fatalf("spawn capabilities output=%+v err=%v", output, err)
@@ -282,8 +302,9 @@ func TestSpawnCapabilitiesAdvertiseGrokPhaseOne(t *testing.T) {
 	command := output.Commands[0]
 	for _, parameter := range command.Parameters {
 		if parameter.Flag == "--spawn-grok" {
-			if !strings.Contains(strings.ToLower(parameter.Description), "launch only") {
-				t.Fatalf("spawn-grok description does not expose phase-one boundary: %q", parameter.Description)
+			lower := strings.ToLower(parameter.Description)
+			if strings.Contains(lower, "launch only") || strings.Contains(lower, "phase one") {
+				t.Fatalf("spawn-grok description still advertises a phase-one boundary: %q", parameter.Description)
 			}
 			return
 		}
@@ -298,8 +319,11 @@ func TestSpawnCapabilitiesAdvertiseMuse(t *testing.T) {
 	}
 	for _, parameter := range output.Commands[0].Parameters {
 		if parameter.Flag == "--spawn-muse" {
-			if parameter.Type != "int" || !strings.Contains(parameter.Description, "Muse") {
-				t.Fatalf("spawn-muse parameter = %+v, want an int Muse Code count", parameter)
+			// Spawn counts are strings since upstream 7982a5e6 gave every
+			// --spawn-* flag the count[:model] grammar; --spawn-muse is a
+			// StringVar taking a count.
+			if parameter.Type != "string" || !strings.Contains(parameter.Description, "Muse") {
+				t.Fatalf("spawn-muse parameter = %+v, want a string Muse Code count", parameter)
 			}
 			return
 		}
@@ -679,7 +703,7 @@ func TestBuildCommandRegistry_UsesCanonicalSharedFlagsForAdjacentCommands(t *tes
 		{command: sendCmd, flags: []string{"--timeout", "--poll"}},
 		{command: ackCmd, flags: []string{"--timeout", "--poll"}},
 		{command: interruptCmd, flags: []string{"--msg", "--all", "--force", "--no-wait", "--timeout"}},
-		{command: spawnCmd, flags: []string{"--spawn-wait", "--timeout", "--spawn-assign-work", "--strategy"}},
+		{command: spawnCmd, flags: []string{"--spawn-wait", "--timeout", "--spawn-assign-work", "--strategy", "--spawn-prompt", "--spawn-prompt-file", "--spawn-stagger-mode", "--spawn-stagger-delay"}},
 		{command: restartPaneCmd, flags: []string{"--panes", "--type", "--all", "--dry-run", "--restart-bead", "--restart-prompt"}},
 		{command: activityCmd, flags: []string{"--panes", "--activity-type"}},
 		{command: isWorkingCmd, flags: []string{"--verbose"}},

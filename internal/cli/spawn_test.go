@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,16 +20,19 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/bv"
-	"github.com/Dicklesworthstone/ntm/internal/cm"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/privacy"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
+	"github.com/Dicklesworthstone/ntm/internal/session"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 func TestShouldStartInternalMonitor_IsDisabledUnderGoTest(t *testing.T) {
-	if shouldStartInternalMonitor() {
+	if resilience.ShouldStartInternalMonitor() {
 		t.Fatal("expected internal monitor to be disabled under go test")
 	}
 }
@@ -107,6 +111,64 @@ func TestSpawnPaneEnvExpansionAndValidation(t *testing.T) {
 	}
 	if err := validateSpawnPaneEnv(map[string]string{"GOOD": "bad\x00value"}); err == nil {
 		t.Fatal("validateSpawnPaneEnv accepted NUL value")
+	}
+}
+
+func TestCaptureAgentLaunchSpecPreservesPreparedPersonaAndExcludesEnvironmentValues(t *testing.T) {
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+	cfg = config.Default()
+	cfg.Agents.ClaudeIsolateCredentials = true
+	launchDir := t.TempDir()
+	t.Chdir(launchDir)
+	cfg.Agents.ClaudeTokenFile = "token-reference"
+	tokenPath := filepath.Join(launchDir, cfg.Agents.ClaudeTokenFile)
+	if err := os.WriteFile(tokenPath, []byte("token-value-not-persisted"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHALLOW_PROFILE", "creation-profile")
+	promptPath := filepath.Join(t.TempDir(), "prepared.md")
+	prompt := []byte("You are the architect.\nProject: /work/rendered-project\n")
+	if err := os.WriteFile(promptPath, prompt, 0600); err != nil {
+		t.Fatal(err)
+	}
+	command := `claude --model 'custom/model' --effort 'high' --append-system-prompt-file ` + tmux.ShellQuote(promptPath)
+	spec, err := captureAgentLaunchSpec(AgentTypeClaude, command, "custom/model", "architect", "architect", "high", promptPath,
+		map[string]string{"API_TOKEN": "must-not-persist", "CUSTOM_PROFILE": "also-private"},
+		map[string]string{"API_TOKEN": "override-not-persisted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Command != command || spec.Model != "custom/model" || spec.Persona != "architect" || spec.ReasoningEffort != "high" || spec.CAAMProfile != "creation-profile" {
+		t.Fatalf("resolved launch settings lost: %+v", spec)
+	}
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(prompt))
+	if spec.SystemPromptFile != promptPath || spec.SystemPromptSHA256 != wantDigest {
+		t.Fatalf("prepared prompt identity lost: %+v", spec)
+	}
+	if !spec.ClaudeIsolateCredentials || spec.ClaudeTokenFile != tokenPath {
+		t.Fatalf("isolation policy lost: %+v", spec)
+	}
+	t.Chdir(t.TempDir())
+	if data, err := os.ReadFile(spec.ClaudeTokenFile); err != nil || string(data) != "token-value-not-persisted" {
+		t.Fatalf("saved token reference changed with working directory: %q (%v)", data, err)
+	}
+	if strings.Join(spec.OmittedEnv, ",") != "API_TOKEN,CUSTOM_PROFILE" {
+		t.Fatalf("omitted environment keys=%v", spec.OmittedEnv)
+	}
+	data, err := json.Marshal(spec)
+	if err != nil || strings.Contains(string(data), "must-not-persist") || strings.Contains(string(data), "also-private") || strings.Contains(string(data), "override-not-persisted") || strings.Contains(string(data), "token-value-not-persisted") {
+		t.Fatalf("injected environment values leaked: %s (%v)", data, err)
+	}
+	if err := spec.Validate(tmux.AgentClaude); err != nil {
+		t.Fatalf("incomplete launch must remain capturable: %v", err)
+	}
+	if err := spec.ValidateReplay(tmux.AgentClaude); err == nil {
+		t.Fatal("replay silently discarded supplied environment")
+	}
+	cfg.Agents.ClaudeTokenFile = tokenPath
+	if _, err := captureAgentLaunchSpec(AgentTypeClaude, command, "", "", "architect", "", filepath.Join(t.TempDir(), "missing.md")); err == nil {
+		t.Fatal("missing prepared persona prompt accepted")
 	}
 }
 
@@ -368,7 +430,7 @@ func TestSpawnAssignCommandOptionsReusesVerifiedAdmissionSnapshot(t *testing.T) 
 }
 
 func TestMonitorProcessPattern_MatchesExactSessionOnly(t *testing.T) {
-	pattern := regexp.MustCompile(monitorProcessPatternForExecutable("/usr/local/bin/ntm-dev", "proj"))
+	pattern := regexp.MustCompile(resilience.MonitorProcessPatternForExecutable("/usr/local/bin/ntm-dev", "proj"))
 
 	if !pattern.MatchString("/usr/local/bin/ntm-dev internal-monitor proj") {
 		t.Fatal("expected exact executable/session monitor command to match")
@@ -486,104 +548,117 @@ func TestValidateSpawnAgentTypes(t *testing.T) {
 		{Type: AgentTypeAider},
 		{Type: AgentTypeOpencode},
 	}
-	if err := validateSpawnAgentTypes(builtins, nil); err != nil {
+	if err := validateSpawnAgentTypes(builtins, nil, nil); err != nil {
 		t.Fatalf("built-in agent validation error = %v", err)
 	}
 
 	pluginMap := map[string]plugins.AgentPlugin{
 		"custom": {Name: "custom", Command: "custom-agent"},
 	}
-	if err := validateSpawnAgentTypes([]FlatAgent{{Type: AgentType("custom")}}, pluginMap); err != nil {
+	if err := validateSpawnAgentTypes([]FlatAgent{{Type: AgentType("custom")}}, pluginMap, nil); err != nil {
 		t.Fatalf("plugin agent validation error = %v", err)
 	}
 
-	err := validateSpawnAgentTypes([]FlatAgent{{Type: AgentType("mystery")}}, pluginMap)
+	err := validateSpawnAgentTypes([]FlatAgent{{Type: AgentType("mystery")}}, pluginMap, nil)
 	if err == nil || !strings.Contains(err.Error(), `unknown agent type "mystery"`) {
 		t.Fatalf("unknown agent validation error = %v", err)
 	}
 }
 
-func TestValidateGrokPhaseOneSpawnFailsClosed(t *testing.T) {
+// GH#251 phase 2: Grok Build spawn now supports prompt delivery, CASS
+// context, marching orders, --assign, and --auto-restart. The only remaining
+// deliberate refusal is persona injection — the Grok Build CLI has no
+// system-prompt flag or env var.
+func TestValidateGrokSpawnAcceptsPhaseTwoSurfacesRejectsPersona(t *testing.T) {
 	base := SpawnOptions{Agents: []FlatAgent{{Type: AgentTypeGrok, Index: 1}}}
 	effectiveConfig := config.Default()
-	if err := validateGrokPhaseOneSpawn(base, effectiveConfig); err != nil {
-		t.Fatalf("plain Grok spawn should be supported: %v", err)
-	}
-	if err := validateGrokPhaseOneSpawn(SpawnOptions{
-		Agents: base.Agents, NoCassContext: true, CassContextQuery: "ignored",
-	}, effectiveConfig); err != nil {
-		t.Fatalf("disabled CASS context should not block Grok spawn: %v", err)
-	}
 
-	tests := []SpawnOptions{
+	accepted := []SpawnOptions{
+		base,
+		{Agents: base.Agents, NoCassContext: true, CassContextQuery: "ignored"},
 		{Agents: base.Agents, Prompt: "work"},
 		{Agents: base.Agents, InitPrompt: "work"},
 		{Agents: base.Agents, CassContextQuery: "history"},
 		{Agents: base.Agents, MarchingOrders: map[int]string{0: "work"}},
 		{Agents: base.Agents, Assign: true},
 		{Agents: base.Agents, AutoRestart: true},
-		{Agents: []FlatAgent{{Type: AgentTypeGrok, Index: 1, Persona: &persona.Persona{Name: "reviewer"}}}},
 	}
-	for _, opts := range tests {
+	for _, opts := range accepted {
+		if err := validateGrokPhaseOneSpawn(opts, effectiveConfig); err != nil {
+			t.Fatalf("phase-2 Grok spawn options unexpectedly rejected: %+v: %v", opts, err)
+		}
+	}
+
+	rejected := []SpawnOptions{
+		{Agents: []FlatAgent{{Type: AgentTypeGrok, Index: 1, Persona: &persona.Persona{Name: "reviewer"}}}},
+		{
+			Agents:     []FlatAgent{{Type: AgentTypeGrok, Index: 1, Model: "reviewer"}},
+			PersonaMap: map[string]*persona.Persona{"reviewer": {Name: "reviewer"}},
+		},
+	}
+	for _, opts := range rejected {
 		if err := validateGrokPhaseOneSpawn(opts, effectiveConfig); err == nil {
-			t.Fatalf("unsupported Grok options unexpectedly accepted: %+v", opts)
+			t.Fatalf("Grok persona injection unexpectedly accepted: %+v", opts)
 		}
 	}
 
 	effectiveConfig.Resilience.AutoRestart = true
-	if err := validateGrokPhaseOneSpawn(base, effectiveConfig); err == nil {
-		t.Fatal("config-enabled automatic restart unexpectedly accepted for Grok")
+	if err := validateGrokPhaseOneSpawn(base, effectiveConfig); err != nil {
+		t.Fatalf("config-enabled automatic restart unexpectedly rejected for Grok: %v", err)
 	}
 }
 
-func TestGrokSpawnSuppressesAmbientContextPromptDelivery(t *testing.T) {
+// GH#251 phase 2: Grok panes are now automated prompt-delivery targets and
+// receive the same spawn prompt sequence as claude/codex.
+func TestGrokSpawnDeliversAmbientContextPrompts(t *testing.T) {
 	grokOnly := []FlatAgent{{Type: AgentTypeGrok, Index: 1}}
-	if spawnHasAutomatedPromptDeliveryTarget(grokOnly) {
-		t.Fatal("Grok-only spawn unexpectedly has an automated prompt-delivery target")
+	if !spawnHasAutomatedPromptDeliveryTarget(grokOnly) {
+		t.Fatal("Grok-only spawn should have an automated prompt-delivery target")
 	}
-	if steps := buildSpawnPromptSequenceForAgent(
+	steps := buildSpawnPromptSequenceForAgent(
 		AgentTypeGrok,
 		"ambient CASS context",
 		"ambient recovery context",
 		"defensive user prompt",
 		time.Second,
-	); len(steps) != 0 {
-		t.Fatalf("Grok prompt steps = %+v, want empty defensive sequence", steps)
+	)
+	if len(steps) != 2 || steps[0].Kind != "recovery_context" || steps[1].Kind != "user_prompt" {
+		t.Fatalf("Grok prompt steps = %+v, want recovery plus CASS-enriched user prompt", steps)
 	}
 
 	mixed := append([]FlatAgent{{Type: AgentTypeClaude, Index: 1}}, grokOnly...)
 	if !spawnHasAutomatedPromptDeliveryTarget(mixed) {
 		t.Fatal("mixed spawn should retain automated context for supported agents")
 	}
-	steps := buildSpawnPromptSequenceForAgent(AgentTypeClaude, "cass", "recovery", "prompt", time.Second)
-	if len(steps) != 2 || steps[0].Kind != "recovery_context" || steps[1].Kind != "user_prompt" {
-		t.Fatalf("supported-agent prompt steps = %+v, want recovery plus CASS-enriched user prompt", steps)
+	claudeSteps := buildSpawnPromptSequenceForAgent(AgentTypeClaude, "cass", "recovery", "prompt", time.Second)
+	if len(claudeSteps) != 2 || claudeSteps[0].Kind != "recovery_context" || claudeSteps[1].Kind != "user_prompt" {
+		t.Fatalf("supported-agent prompt steps = %+v, want recovery plus CASS-enriched user prompt", claudeSteps)
 	}
 }
 
-func TestValidateGrokPhaseOneAddFailsClosed(t *testing.T) {
+// GH#251 phase 2: Grok Build add accepts --prompt and CASS context; only
+// persona injection remains refused (no system-prompt mechanism in the CLI).
+func TestValidateGrokAddAcceptsPhaseTwoSurfacesRejectsPersona(t *testing.T) {
 	base := AddOptions{Agents: AgentSpecs{{Type: AgentTypeGrok, Count: 1}}}
-	if err := validateGrokPhaseOneAdd(base); err != nil {
-		t.Fatalf("plain Grok add should be supported: %v", err)
-	}
-	if err := validateGrokPhaseOneAdd(AddOptions{
-		Agents: base.Agents, NoCassContext: true, CassContextQuery: "ignored",
-	}); err != nil {
-		t.Fatalf("disabled CASS context should not block Grok add: %v", err)
-	}
 
-	tests := []AddOptions{
+	accepted := []AddOptions{
+		base,
+		{Agents: base.Agents, NoCassContext: true, CassContextQuery: "ignored"},
 		{Agents: base.Agents, Prompt: "work"},
 		{Agents: base.Agents, CassContextQuery: "history"},
-		{
-			Agents:     AgentSpecs{{Type: AgentTypeGrok, Count: 1, Model: "reviewer"}},
-			PersonaMap: map[string]*persona.Persona{"reviewer": {Name: "reviewer"}},
-		},
 	}
-	for _, opts := range tests {
-		if err := validateGrokPhaseOneAdd(opts); err == nil {
-			t.Fatalf("unsupported Grok add options unexpectedly accepted: %+v", opts)
+	for _, opts := range accepted {
+		if err := validateGrokPhaseOneAdd(opts); err != nil {
+			t.Fatalf("phase-2 Grok add options unexpectedly rejected: %+v: %v", opts, err)
 		}
+	}
+
+	personaOpts := AddOptions{
+		Agents:     AgentSpecs{{Type: AgentTypeGrok, Count: 1, Model: "reviewer"}},
+		PersonaMap: map[string]*persona.Persona{"reviewer": {Name: "reviewer"}},
+	}
+	if err := validateGrokPhaseOneAdd(personaOpts); err == nil {
+		t.Fatalf("Grok persona injection unexpectedly accepted: %+v", personaOpts)
 	}
 }
 
@@ -638,44 +713,84 @@ func TestValidateSpawnPaneCapacity(t *testing.T) {
 	}
 }
 
-func TestValidateSpawnGrokPaneBaselinesPreflightsCompleteAssignment(t *testing.T) {
+func TestValidateSpawnPaneBaselinesPreflightsCompleteAssignment(t *testing.T) {
 	agents := []FlatAgent{
 		{Type: AgentTypeClaude, Index: 1},
 		{Type: AgentTypeGrok, Index: 1},
 	}
+
+	// #291: an existing session pane that is already running a process (an
+	// agent CLI, `cat`, an editor) must refuse a launch for EVERY agent type,
+	// not only Grok; send-keys would otherwise type the launch line into it.
+	t.Run("occupied first target refuses the batch for a non-Grok agent", func(t *testing.T) {
+		panes := []tmux.Pane{
+			{ID: "%occupied", Index: 0, Command: "cat"},
+			{ID: "%idle", Index: 1, Command: "zsh"},
+		}
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents)
+		if err == nil {
+			t.Fatal("validateSpawnPaneBaselines() error = nil, want occupied Claude pane rejected")
+		}
+		if !errors.Is(err, tmux.ErrPaneOccupied) {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v, want wrapped tmux.ErrPaneOccupied", err)
+		}
+		for _, want := range []string{"cc agent 1", "%occupied", `"cat"`, "non-shell", "ntm add"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("validateSpawnPaneBaselines() error = %q, want %q", err, want)
+			}
+		}
+	})
+
+	t.Run("live agent in a reused pane is refused", func(t *testing.T) {
+		panes := []tmux.Pane{
+			{ID: "%live", Index: 0, Command: "claude"},
+			{ID: "%idle", Index: 1, Command: "zsh"},
+		}
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, []FlatAgent{{Type: AgentTypeCodex, Index: 1}})
+		if err == nil || !errors.Is(err, tmux.ErrPaneOccupied) {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v, want occupied-pane rejection", err)
+		}
+	})
 
 	t.Run("late occupied Grok target rejects mixed batch", func(t *testing.T) {
 		panes := []tmux.Pane{
 			{ID: "%idle", Index: 0, Command: "zsh"},
 			{ID: "%occupied", Index: 1, Command: "sleep"},
 		}
-		err := validateSpawnGrokPaneBaselines(panes, 0, agents)
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents)
 		if err == nil {
-			t.Fatal("validateSpawnGrokPaneBaselines() error = nil")
+			t.Fatal("validateSpawnPaneBaselines() error = nil")
 		}
-		for _, want := range []string{"Grok Build agent 1", "%occupied", "sleep", "non-shell"} {
+		for _, want := range []string{"grok agent 1", "%occupied", "sleep", "non-shell"} {
 			if !strings.Contains(err.Error(), want) {
-				t.Fatalf("validateSpawnGrokPaneBaselines() error = %q, want %q", err, want)
+				t.Fatalf("validateSpawnPaneBaselines() error = %q, want %q", err, want)
 			}
 		}
 	})
 
-	t.Run("user pane offset reaches assigned Grok shell", func(t *testing.T) {
+	t.Run("user pane offset reaches assigned shells", func(t *testing.T) {
 		panes := []tmux.Pane{
-			{ID: "%user", Index: 0, Command: "zsh"},
+			{ID: "%user", Index: 0, Command: "vim"}, // the reserved user pane may be busy
 			{ID: "%claude", Index: 1, Command: "bash"},
 			{ID: "%grok", Index: 2, Command: "fish"},
 		}
-		if err := validateSpawnGrokPaneBaselines(panes, 1, agents); err != nil {
-			t.Fatalf("validateSpawnGrokPaneBaselines() error = %v", err)
+		if err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 1, agents); err != nil {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v", err)
 		}
 	})
 
-	t.Run("missing assigned Grok pane fails closed", func(t *testing.T) {
+	t.Run("empty observation is left to the post-launch stability wait", func(t *testing.T) {
+		panes := []tmux.Pane{{ID: "%fresh", Index: 0}}
+		if err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents[:1]); err != nil {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v", err)
+		}
+	})
+
+	t.Run("missing assigned pane fails closed", func(t *testing.T) {
 		panes := []tmux.Pane{{ID: "%claude", Index: 0, Command: "zsh"}}
-		err := validateSpawnGrokPaneBaselines(panes, 0, agents)
-		if err == nil || !strings.Contains(err.Error(), "no assigned pane for Grok Build agent 1 at offset 1") {
-			t.Fatalf("validateSpawnGrokPaneBaselines() error = %v", err)
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents)
+		if err == nil || !strings.Contains(err.Error(), "no assigned pane for grok agent 1 at offset 1") {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v", err)
 		}
 	})
 }
@@ -842,9 +957,9 @@ func TestRunSpawnAssignmentTextContextFailuresAreTerminal(t *testing.T) {
 
 func TestNewInternalMonitorCommand_ValidatesSessionAndExecutable(t *testing.T) {
 
-	cmd, err := newInternalMonitorCommand("proj")
+	cmd, err := resilience.NewInternalMonitorCommand("proj")
 	if err != nil {
-		t.Fatalf("newInternalMonitorCommand(valid) error = %v", err)
+		t.Fatalf("resilience.NewInternalMonitorCommand(valid) error = %v", err)
 	}
 	if !filepath.IsAbs(cmd.Path) {
 		t.Fatalf("command path = %q, want absolute path", cmd.Path)
@@ -853,7 +968,7 @@ func TestNewInternalMonitorCommand_ValidatesSessionAndExecutable(t *testing.T) {
 		t.Fatalf("command args = %#v, want %#v", got, want)
 	}
 
-	if _, err := newInternalMonitorCommand("bad:name"); err == nil {
+	if _, err := resilience.NewInternalMonitorCommand("bad:name"); err == nil {
 		t.Fatal("expected invalid session name to be rejected")
 	}
 }
@@ -908,7 +1023,7 @@ func TestSpawnSessionLogic(t *testing.T) {
 	// Override templates to avoid dependency on actual agent binaries while
 	// remaining compatible with explicit model overrides under test.
 	cfg.Agents.Claude = testAgentCatCommandTemplate
-	cfg.Agents.Codex = testAgentCatCommandTemplate
+	cfg.Agents.Codex = testAgentCodexCommandTemplate
 	cfg.Agents.Gemini = testAgentCatCommandTemplate
 
 	// Unique session name
@@ -960,9 +1075,11 @@ func TestSpawnSessionLogic(t *testing.T) {
 
 	// Validate user pane and agent pane
 	foundClaude := false
+	claudePaneID := ""
 	for _, p := range panes {
 		if p.Type == tmux.AgentClaude {
 			foundClaude = true
+			claudePaneID = p.ID
 			// Check title format: session__type_index_variant
 			expectedTitle := fmt.Sprintf("%s__cc_1_claude-3-5-sonnet-20241022", sessionName)
 			if p.Title != expectedTitle {
@@ -972,7 +1089,27 @@ func TestSpawnSessionLogic(t *testing.T) {
 	}
 
 	if !foundClaude {
-		t.Error("did not find Claude agent pane")
+		t.Fatal("did not find Claude agent pane")
+	}
+	if err := tmux.SetPaneTitle(claudePaneID, "caam | title replaced by wrapper"); err != nil {
+		t.Fatalf("rewrite spawned Claude title: %v", err)
+	}
+	panes, err = tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("get panes after title rewrite: %v", err)
+	}
+	foundClaude = false
+	for _, p := range panes {
+		if p.ID == claudePaneID && p.Type == tmux.AgentClaude {
+			foundClaude = true
+		}
+	}
+	if !foundClaude {
+		t.Fatalf("spawned pane %s lost its durable Claude type after title rewrite: %+v", claudePaneID, panes)
+	}
+	spec, err := tmux.ReadPaneLaunchSpecContext(t.Context(), claudePaneID)
+	if err != nil || spec == nil || spec.Model != agents[0].Model || spec.AgentType != tmux.AgentClaude || strings.Contains(spec.Command, "NTM_SPAWN_") {
+		t.Fatalf("spawned launch specification lost or retained runtime environment: spec=%+v err=%v", spec, err)
 	}
 
 	// Verify project directory creation
@@ -1459,185 +1596,45 @@ func TestSpawnSessionLogic_Ollama(t *testing.T) {
 	}
 }
 
-// bd-3f53: Tests for getMemoryContext and formatMemoryContext
-
-func TestFormatMemoryContext_Nil(t *testing.T) {
-
-	result := formatMemoryContext(nil)
-	if result != "" {
-		t.Errorf("formatMemoryContext(nil) = %q, want empty string", result)
+// `ntm spawn --privacy` only bound the spawn process: SpawnOptions.PrivacyMode
+// reached nothing, so `ntm send` and every other writer kept persisting the
+// session. Spawn now records the settings on the session (the call below is
+// the one spawn makes), and every ntm process installs tmuxSessionPrivacy
+// (root.go), so a real writer in a fresh manager refuses the session.
+func TestSpawnPrivacyBindsOtherProcessWriters(t *testing.T) {
+	if !tmux.IsInstalled() {
+		t.Skip("tmux not installed")
 	}
-}
-
-func TestFormatMemoryContext_EmptyResult(t *testing.T) {
-
-	result := formatMemoryContext(&cm.CLIContextResponse{
-		Success:         true,
-		Task:            "test task",
-		RelevantBullets: []cm.CLIRule{},
-		AntiPatterns:    []cm.CLIRule{},
-	})
-	if result != "" {
-		t.Errorf("formatMemoryContext(empty) = %q, want empty string", result)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	ctx := context.Background()
+	private := fmt.Sprintf("ntm_privacy_%d", time.Now().UnixNano())
+	ordinary := private + "_open"
+	for _, name := range []string{private, ordinary} {
+		if err := tmux.CreateSession(name, t.TempDir()); err != nil {
+			t.Fatalf("CreateSession(%s): %v", name, err)
+		}
+		t.Cleanup(func() { _ = tmux.KillSession(name) })
 	}
-}
-
-func TestFormatMemoryContext_RulesOnly(t *testing.T) {
-
-	resp := &cm.CLIContextResponse{
-		Success: true,
-		Task:    "test task",
-		RelevantBullets: []cm.CLIRule{
-			{ID: "b-8f3a2c", Content: "Always use structured logging with log/slog", Category: "best-practice"},
-			{ID: "b-4e1d7b", Content: "Database migrations must be idempotent", Category: "database"},
-		},
-		AntiPatterns: []cm.CLIRule{},
+	if err := tmux.SetSessionPrivacyContext(ctx, private, true, false); err != nil {
+		t.Fatal(err)
 	}
 
-	result := formatMemoryContext(resp)
+	original := privacy.GetDefaultManager()
+	t.Cleanup(func() { privacy.SetDefaultManager(original) })
+	privacy.SetDefaultManager(privacy.New(config.DefaultPrivacyConfig()).WithSessionLookup(tmuxSessionPrivacy))
 
-	// Check header
-	if !strings.Contains(result, "# Project Memory from Past Sessions") {
-		t.Error("missing main header")
+	for _, name := range []string{private, ordinary} {
+		if err := session.SavePrompt(session.PromptEntry{Session: name, Content: "deploy key is hunter2", Source: "cli"}); err != nil {
+			t.Fatalf("SavePrompt(%s): %v", name, err)
+		}
 	}
-
-	// Check rules section
-	if !strings.Contains(result, "## Key Rules for This Project") {
-		t.Error("missing Key Rules section header")
+	if history, err := session.LoadPromptHistory(private); err != nil || len(history.Prompts) != 0 {
+		t.Fatalf("private session persisted prompts: %+v, %v", history, err)
 	}
-
-	// Check rule formatting
-	if !strings.Contains(result, "[b-8f3a2c] Always use structured logging with log/slog") {
-		t.Error("missing first rule")
+	if history, err := session.LoadPromptHistory(ordinary); err != nil || len(history.Prompts) != 1 {
+		t.Fatalf("ordinary session prompts = %+v, %v; want the one prompt persisted", history, err)
 	}
-	if !strings.Contains(result, "[b-4e1d7b] Database migrations must be idempotent") {
-		t.Error("missing second rule")
-	}
-
-	// Should NOT have anti-patterns section
-	if strings.Contains(result, "## Anti-Patterns to Avoid") {
-		t.Error("should not have Anti-Patterns section when empty")
-	}
-}
-
-func TestFormatMemoryContext_AntiPatternsOnly(t *testing.T) {
-
-	resp := &cm.CLIContextResponse{
-		Success:         true,
-		Task:            "test task",
-		RelevantBullets: []cm.CLIRule{},
-		AntiPatterns: []cm.CLIRule{
-			{ID: "b-7d3e8c", Content: "Don't add backwards-compatibility shims", Category: "anti-pattern"},
-		},
-	}
-
-	result := formatMemoryContext(resp)
-
-	// Check header
-	if !strings.Contains(result, "# Project Memory from Past Sessions") {
-		t.Error("missing main header")
-	}
-
-	// Should NOT have rules section
-	if strings.Contains(result, "## Key Rules for This Project") {
-		t.Error("should not have Key Rules section when empty")
-	}
-
-	// Check anti-patterns section
-	if !strings.Contains(result, "## Anti-Patterns to Avoid") {
-		t.Error("missing Anti-Patterns section header")
-	}
-	if !strings.Contains(result, "[b-7d3e8c] Don't add backwards-compatibility shims") {
-		t.Error("missing anti-pattern")
-	}
-}
-
-func TestFormatMemoryContext_BothSections(t *testing.T) {
-
-	resp := &cm.CLIContextResponse{
-		Success: true,
-		Task:    "test task",
-		RelevantBullets: []cm.CLIRule{
-			{ID: "b-rule1", Content: "Use Go 1.25 features", Category: "best-practice"},
-		},
-		AntiPatterns: []cm.CLIRule{
-			{ID: "b-anti1", Content: "Avoid using deprecated APIs", Category: "anti-pattern"},
-		},
-	}
-
-	result := formatMemoryContext(resp)
-
-	// Check both sections present
-	if !strings.Contains(result, "## Key Rules for This Project") {
-		t.Error("missing Key Rules section")
-	}
-	if !strings.Contains(result, "## Anti-Patterns to Avoid") {
-		t.Error("missing Anti-Patterns section")
-	}
-
-	// Check both items present
-	if !strings.Contains(result, "[b-rule1]") {
-		t.Error("missing rule ID")
-	}
-	if !strings.Contains(result, "[b-anti1]") {
-		t.Error("missing anti-pattern ID")
-	}
-
-	// Check order: rules should come before anti-patterns
-	rulesIdx := strings.Index(result, "## Key Rules")
-	antiIdx := strings.Index(result, "## Anti-Patterns")
-	if rulesIdx > antiIdx {
-		t.Error("Key Rules should appear before Anti-Patterns")
-	}
-}
-
-func TestGetMemoryContext_ConfigDisabled(t *testing.T) {
-
-	// Save and restore global config
-	oldCfg := cfg
-	defer func() { cfg = oldCfg }()
-
-	// Create config with CM memories disabled
-	cfg = config.Default()
-	cfg.SessionRecovery.IncludeCMMemories = false
-
-	result := getMemoryContext("test-project", "test task")
-	if result != "" {
-		t.Errorf("getMemoryContext with disabled config = %q, want empty string", result)
-	}
-}
-
-func TestGetMemoryContext_NilConfig(t *testing.T) {
-
-	// Save and restore global config
-	oldCfg := cfg
-	defer func() { cfg = oldCfg }()
-
-	cfg = nil
-
-	result := getMemoryContext("test-project", "test task")
-	if result != "" {
-		t.Errorf("getMemoryContext with nil config = %q, want empty string", result)
-	}
-}
-
-func TestGetMemoryContext_EmptyTask(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-
-	// Save and restore global config
-	oldCfg := cfg
-	defer func() { cfg = oldCfg }()
-
-	cfg = config.Default()
-	cfg.SessionRecovery.IncludeCMMemories = true
-
-	// This test verifies the function handles empty task gracefully
-	// Even if CM is not installed, it should return empty string without error
-	result := getMemoryContext("test-project", "")
-
-	// Result should be empty (CM likely not installed in test environment)
-	// but the function should not panic
-	_ = result // Just verify no panic
 }
 
 func TestLegacySpawnTotalAgentCount_IncludesModernTypes(t *testing.T) {
@@ -1741,7 +1738,7 @@ func spawnMusePlan(t *testing.T, session, flagValue string) (SpawnOptions, []str
 
 	opts := SpawnOptions{Session: session, Agents: value.specs.Flatten()}
 	normalizeSpawnOptions(&opts)
-	if err := validateSpawnAgentTypes(opts.Agents, nil); err != nil {
+	if err := validateSpawnAgentTypes(opts.Agents, nil, nil); err != nil {
 		t.Fatalf("validateSpawnAgentTypes() error = %v", err)
 	}
 
@@ -2118,8 +2115,11 @@ func TestWizardLaunchAgentSpecs_RecipeAndTemplateSelectionsDeferCounts(t *testin
 }
 
 // TestSpawnAgentMailRegistrationPrefersEnvOverConfig locks bd-46tqx: spawn
-// registration builds its client through config.AgentMailConfig.NewClient, so
+// registration builds its client from the [agent_mail] config options, so
 // AGENT_MAIL_URL wins over [agent_mail] url as it does for every other caller.
+// Registration runs through spawnidentity, which needs auto_register on and
+// contacts Agent Mail lazily, so the session registration (no panes, no tmux)
+// is the probe.
 func TestSpawnAgentMailRegistrationPrefersEnvOverConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -2128,13 +2128,10 @@ func TestSpawnAgentMailRegistrationPrefersEnvOverConfig(t *testing.T) {
 	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
 
 	oldCfg := cfg
-	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: true, URL: "http://127.0.0.1:1/"}}
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: true, AutoRegister: true, URL: "http://127.0.0.1:1/"}}
 	t.Cleanup(func() { cfg = oldCfg })
 
-	status := registerSpawnedAgents(t.Context(), t.TempDir(), "envwins", nil)
-	if status == nil || !status.Available || !status.ProjectRegistered {
-		t.Fatalf("status = %+v, want available and registered through AGENT_MAIL_URL", status)
-	}
+	registerSessionAgent(t.Context(), "envwins", t.TempDir())
 	if got := calls(); !slices.Contains(got, "tools/call ensure_project") {
 		t.Fatalf("AGENT_MAIL_URL server calls = %v, want ensure_project", got)
 	}
@@ -2156,7 +2153,7 @@ func TestSpawnAgentMailSilentWhenDisabled(t *testing.T) {
 
 	dir := t.TempDir()
 	registerSessionAgent(t.Context(), "disabled", dir)
-	if status := registerSpawnedAgents(t.Context(), dir, "disabled", []spawnedAgentInfo{{paneIndex: 1, paneID: "%1", paneTitle: "disabled__cc_1", agentType: "cc"}}); status != nil {
+	if status := registerSpawnedAgents(t.Context(), dir, "disabled", []spawnidentity.Agent{{PaneIndex: 1, PaneID: "%1", PaneTitle: "disabled__cc_1", AgentType: "cc"}}); status != nil {
 		t.Fatalf("registerSpawnedAgents status = %+v, want nil when disabled", status)
 	}
 	msgs, reservations, transfer, err := loadRecoveryMessages(t.Context(), "disabled", dir)

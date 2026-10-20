@@ -477,8 +477,20 @@ func TestRunForceReleaseReportsAlreadyReleased(t *testing.T) {
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
 	t.Chdir(canonicalTempDir(t))
 
+	// Force-release is approval-gated; this test is about the reply past the
+	// gate, so the hermetic HOME gets an auto policy (as in
+	// TestRunForceReleaseUsesSessionProjectDir).
+	ntmDir := filepath.Join(os.Getenv("HOME"), ".ntm")
+	if err := os.MkdirAll(ntmDir, 0o755); err != nil {
+		t.Fatalf("mkdir hermetic .ntm: %v", err)
+	}
+	autoPolicy := "version: 1\nautomation:\n  force_release: auto\n"
+	if err := os.WriteFile(filepath.Join(ntmDir, "policy.yaml"), []byte(autoPolicy), 0o644); err != nil {
+		t.Fatalf("write auto policy: %v", err)
+	}
+
 	out, err := captureStdout(t, func() error {
-		return runForceRelease(t.Context(), session, 14525, "", false, true)
+		return runForceRelease(t.Context(), session, 14525, "", false, true, "")
 	})
 	if err != nil {
 		t.Fatalf("runForceRelease: %v (stdout %q)", err, out)
@@ -490,7 +502,7 @@ func TestRunForceReleaseReportsAlreadyReleased(t *testing.T) {
 	jsonOutput = true
 	t.Cleanup(func() { jsonOutput = false })
 	out, err = captureStdout(t, func() error {
-		return runForceRelease(t.Context(), session, 14525, "", false, true)
+		return runForceRelease(t.Context(), session, 14525, "", false, true, "")
 	})
 	if err != nil {
 		t.Fatalf("runForceRelease --json: %v (stdout %q)", err, out)

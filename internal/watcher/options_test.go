@@ -1,51 +1,8 @@
 package watcher
 
-import (
-	"testing"
-	"time"
-)
+import "testing"
 
-// ---------------------------------------------------------------------------
-// DefaultFileReservationConfigValues
-// ---------------------------------------------------------------------------
-
-func TestDefaultFileReservationConfigValues(t *testing.T) {
-	t.Parallel()
-
-	cfg := DefaultFileReservationConfigValues()
-
-	if !cfg.Enabled {
-		t.Error("Enabled should be true by default")
-	}
-	if !cfg.AutoReserve {
-		t.Error("AutoReserve should be true by default")
-	}
-	if cfg.AutoReleaseIdleMin != 10 {
-		t.Errorf("AutoReleaseIdleMin = %d, want 10", cfg.AutoReleaseIdleMin)
-	}
-	if !cfg.NotifyOnConflict {
-		t.Error("NotifyOnConflict should be true by default")
-	}
-	if !cfg.ExtendOnActivity {
-		t.Error("ExtendOnActivity should be true by default")
-	}
-	if cfg.DefaultTTLMin != 15 {
-		t.Errorf("DefaultTTLMin = %d, want 15", cfg.DefaultTTLMin)
-	}
-	if cfg.PollIntervalSec != 10 {
-		t.Errorf("PollIntervalSec = %d, want 10", cfg.PollIntervalSec)
-	}
-	if cfg.CaptureLinesForDetect != 100 {
-		t.Errorf("CaptureLinesForDetect = %d, want 100", cfg.CaptureLinesForDetect)
-	}
-	if cfg.Debug {
-		t.Error("Debug should be false by default")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// WithConflictCallback
-// ---------------------------------------------------------------------------
+// Filesystem option tests live beside the shared engine in internal/fs/watcher.
 
 func TestWithConflictCallback(t *testing.T) {
 	t.Parallel()
@@ -68,10 +25,6 @@ func TestWithConflictCallback(t *testing.T) {
 		t.Error("expected callback to be invoked")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// WithCaptureLines
-// ---------------------------------------------------------------------------
 
 func TestWithCaptureLines(t *testing.T) {
 	t.Parallel()
@@ -104,50 +57,6 @@ func TestWithCaptureLines(t *testing.T) {
 		})
 	}
 }
-
-// ---------------------------------------------------------------------------
-// WithDebounceDuration
-// ---------------------------------------------------------------------------
-
-func TestWithDebounceDuration(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name       string
-		dur        time.Duration
-		wantNonNil bool
-	}{
-		{"positive_duration", 500 * time.Millisecond, true},
-		{"zero_ignored", 0, false},
-		{"negative_ignored", -1 * time.Second, false},
-		{"one_second", time.Second, true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			w := &Watcher{}
-			opt := WithDebounceDuration(tc.dur)
-			opt(w)
-
-			if tc.wantNonNil && w.debouncer == nil {
-				t.Error("expected debouncer to be set")
-			}
-			if !tc.wantNonNil && w.debouncer != nil {
-				t.Error("expected debouncer to remain nil")
-			}
-			if tc.wantNonNil && w.debouncer != nil {
-				if w.debouncer.Duration() != tc.dur {
-					t.Errorf("debouncer.Duration() = %v, want %v", w.debouncer.Duration(), tc.dur)
-				}
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
-// NewFileReservationWatcherFromConfig
-// ---------------------------------------------------------------------------
 
 func TestNewFileReservationWatcherFromConfig_Disabled(t *testing.T) {
 	t.Parallel()

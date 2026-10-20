@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -28,6 +29,7 @@ func newActivityCmd() *cobra.Command {
 		filterGemini      bool
 		filterAntigravity bool
 		filterGrok        bool
+		filterOmp         bool
 		filterPane        string
 		watchMode         bool
 		interval          int
@@ -56,6 +58,7 @@ Examples:
   ntm activity myproject           # Specific session
   ntm activity --cc                # Only Claude agents
   ntm activity --grok              # Only Grok Build agents
+  ntm activity --omp               # Only Oh My Pi agents
   ntm activity --watch             # Auto-refresh every 2s
   ntm activity --watch --interval 1000  # Refresh every 1s
   ntm activity --json              # Output as JSON`,
@@ -72,6 +75,7 @@ Examples:
 				filterGemini:      filterGemini,
 				filterAntigravity: filterAntigravity,
 				filterGrok:        filterGrok,
+				filterOmp:         filterOmp,
 				filterPane:        filterPane,
 				watchMode:         watchMode,
 				interval:          time.Duration(interval) * time.Millisecond,
@@ -86,6 +90,7 @@ Examples:
 	cmd.Flags().BoolVar(&filterGemini, "gmi", false, "Only show Gemini agents")
 	cmd.Flags().BoolVar(&filterAntigravity, "agy", false, "Only show Antigravity agents")
 	cmd.Flags().BoolVar(&filterGrok, "grok", false, "Only show Grok Build agents")
+	cmd.Flags().BoolVar(&filterOmp, "omp", false, "Only show Oh My Pi (omp) agents")
 	cmd.Flags().StringVar(&filterPane, "pane", "", "Show specific pane (by name or index)")
 	cmd.Flags().BoolVarP(&watchMode, "watch", "w", false, "Auto-refresh display")
 	cmd.Flags().IntVar(&interval, "interval", 2000, "Refresh interval in milliseconds (with --watch)")
@@ -101,12 +106,21 @@ type activityOptions struct {
 	filterGemini      bool
 	filterAntigravity bool
 	filterGrok        bool
+	filterOmp         bool
 	filterPane        string
 	watchMode         bool
 	interval          time.Duration
+	// watermarkStore is the runtime store used to make state age durable
+	// across one-shot invocations. PersistentPreRun opens it for the real
+	// command path; carrying it explicitly keeps library/unit callers off the
+	// mutable package global.
+	watermarkStore robot.WatermarkStore
 }
 
 func runActivity(session string, opts activityOptions) error {
+	if opts.watermarkStore == nil {
+		opts.watermarkStore = robotStateStore
+	}
 	// bd-ixy2t: emit a JSON envelope on early-fail when --json is set so
 	// automation pipelines (`ntm activity --json | jq ...`) always see a
 	// parseable failure on stdout instead of a stderr "Error:" line.
@@ -137,8 +151,14 @@ func runActivity(session string, opts activityOptions) error {
 		return fmt.Errorf("session '%s' not found", session)
 	}
 
-	// Watch mode
+	// Watch mode. Under --json the watch stream is NDJSON: one compact JSON
+	// frame per refresh tick (the same envelope shape as single-shot --json),
+	// with no ANSI control sequences — previously --watch silently ignored
+	// --json and painted the TUI (bd-ws7-docs-ux-truth-tqh3l.4).
 	if opts.watchMode {
+		if jsonOutput {
+			return runActivityWatchNDJSON(session, opts)
+		}
 		return runActivityWatch(session, opts)
 	}
 
@@ -233,13 +253,19 @@ type activityResult struct {
 }
 
 type agentInfo struct {
-	Pane       int
-	AgentType  string
-	State      string
-	Confidence float64
-	Velocity   float64
-	Duration   time.Duration
-	StateSince time.Time
+	Pane int
+	// WindowIndex and PaneID disambiguate agents whose per-window pane index
+	// collides across windows: in a multi-window session every window has its
+	// own "pane 1", so Pane alone is neither unique nor stable. PaneID is the
+	// tmux %id, stable for the pane's lifetime.
+	WindowIndex int
+	PaneID      string
+	AgentType   string
+	State       string
+	Confidence  float64
+	Velocity    float64
+	Duration    time.Duration
+	StateSince  time.Time
 }
 
 func collectActivityData(session string, opts activityOptions) (*activityResult, error) {
@@ -250,12 +276,18 @@ func collectActivityData(session string, opts activityOptions) (*activityResult,
 
 	result := &activityResult{
 		Session:    session,
-		CapturedAt: time.Now(),
+		CapturedAt: time.Now().UTC(),
 		Agents:     make([]agentInfo, 0),
 		Summary:    make(map[string]int),
 	}
 
 	for _, pane := range panes {
+		// A tagged service pane (ACFS's cm/cass, say) is not an agent: its
+		// idle terminal must not land in the agent activity summary (ntm#305).
+		if pane.IsServicePane() {
+			continue
+		}
+
 		agentType := detectAgentTypeFromPane(pane)
 
 		// Skip non-agent panes
@@ -270,35 +302,57 @@ func collectActivityData(session string, opts activityOptions) (*activityResult,
 
 		// Create classifier and get state
 		classifier := robot.NewStateClassifier(pane.ID, &robot.ClassifierConfig{
-			AgentType: agentType,
+			AgentType:  agentType,
+			PaneWidth:  pane.Width,
+			PaneHeight: pane.Height,
 		})
 
 		activity, err := classifier.Classify()
 		if err != nil {
 			// Include with unknown state on error
 			result.Agents = append(result.Agents, agentInfo{
-				Pane:      pane.Index,
-				AgentType: agentType,
-				State:     "UNKNOWN",
+				Pane:        pane.Index,
+				WindowIndex: pane.WindowIndex,
+				PaneID:      pane.ID,
+				AgentType:   agentType,
+				State:       "UNKNOWN",
 			})
 			result.Summary["UNKNOWN"]++
 			continue
 		}
 
-		// Calculate duration
+		// A one-shot `ntm activity` builds a fresh classifier, so its in-memory
+		// StateSince is necessarily "now" and every state looked brand new.
+		// Reconcile through the runtime store so state_since is stable and
+		// duration actually grows across invocations and watch ticks.
+		stateSince := activity.StateSince
+		if durableSince, persistErr := robot.ObserveActivityState(
+			opts.watermarkStore,
+			activityStateScope(session, pane),
+			activity.State,
+			result.CapturedAt,
+		); persistErr == nil {
+			stateSince = durableSince
+		}
+
+		// Measure against the frame's own timestamp so every row shares one
+		// clock, and a future or corrupt watermark cannot produce a negative
+		// duration.
 		var duration time.Duration
-		if !activity.StateSince.IsZero() {
-			duration = time.Since(activity.StateSince)
+		if !stateSince.IsZero() && !stateSince.After(result.CapturedAt) {
+			duration = result.CapturedAt.Sub(stateSince)
 		}
 
 		info := agentInfo{
-			Pane:       pane.Index,
-			AgentType:  agentType,
-			State:      string(activity.State),
-			Confidence: activity.Confidence,
-			Velocity:   activity.Velocity,
-			Duration:   duration,
-			StateSince: activity.StateSince,
+			Pane:        pane.Index,
+			WindowIndex: pane.WindowIndex,
+			PaneID:      pane.ID,
+			AgentType:   agentType,
+			State:       string(activity.State),
+			Confidence:  activity.Confidence,
+			Velocity:    activity.Velocity,
+			Duration:    duration,
+			StateSince:  stateSince,
 		}
 
 		result.Agents = append(result.Agents, info)
@@ -306,6 +360,13 @@ func collectActivityData(session string, opts activityOptions) (*activityResult,
 	}
 
 	return result, nil
+}
+
+// activityStateScope identifies one pane LIFETIME for the durable state-age
+// watermark. tmux recycles pane IDs, and the same index can belong to a
+// different window, so the scope binds session, pane ID, and the pane's PID.
+func activityStateScope(session string, pane tmux.Pane) string {
+	return fmt.Sprintf("%s|%s|%d", session, pane.ID, pane.PID)
 }
 
 func detectAgentTypeFromPane(pane tmux.Pane) string {
@@ -334,6 +395,8 @@ func detectAgentTypeFromPane(pane tmux.Pane) string {
 		return "aider"
 	case tmux.AgentOpencode:
 		return "oc"
+	case tmux.AgentOmp:
+		return "omp"
 	case tmux.AgentOllama:
 		return "ollama"
 	case tmux.AgentUser:
@@ -360,7 +423,7 @@ func passesFilter(agentType string, pane tmux.Pane, opts activityOptions, multiW
 	}
 
 	// If no type filters, allow all
-	if !opts.filterClaude && !opts.filterCodex && !opts.filterGemini && !opts.filterAntigravity && !opts.filterGrok {
+	if !opts.filterClaude && !opts.filterCodex && !opts.filterGemini && !opts.filterAntigravity && !opts.filterGrok && !opts.filterOmp {
 		return true
 	}
 
@@ -380,55 +443,144 @@ func passesFilter(agentType string, pane tmux.Pane, opts activityOptions, multiW
 	if opts.filterGrok && agentType == "grok" {
 		return true
 	}
+	if opts.filterOmp && agentType == "omp" {
+		return true
+	}
 
 	return false
 }
 
-func outputActivityJSON(result *activityResult) error {
-	type jsonAgent struct {
-		Pane       int     `json:"pane"`
-		AgentType  string  `json:"agent_type"`
-		State      string  `json:"state"`
-		Confidence float64 `json:"confidence"`
-		Velocity   float64 `json:"velocity"`
-		Duration   string  `json:"duration"`
-		StateSince string  `json:"state_since,omitempty"`
-	}
+// activityJSONAgent is one agent row in the --json envelope.
+type activityJSONAgent struct {
+	// Pane is the per-window pane index, kept for compatibility with existing
+	// consumers. It collides across windows; use WindowIndex+Pane to address a
+	// pane topologically, or PaneID (the tmux %id, stable for the pane's
+	// lifetime) to identify it unambiguously.
+	Pane        int     `json:"pane"`
+	WindowIndex int     `json:"window_index"`
+	PaneID      string  `json:"pane_id"`
+	AgentType   string  `json:"agent_type"`
+	State       string  `json:"state"`
+	Confidence  float64 `json:"confidence"`
+	Velocity    float64 `json:"velocity"`
+	Duration    string  `json:"duration"`
+	StateSince  string  `json:"state_since,omitempty"`
+}
 
-	type jsonOutput struct {
-		Success    bool           `json:"success"`
-		Session    string         `json:"session"`
-		CapturedAt string         `json:"captured_at"`
-		Agents     []jsonAgent    `json:"agents"`
-		Summary    map[string]int `json:"summary"`
-	}
+// activityJSONEnvelope is the --json envelope for `ntm activity`. Watch mode
+// streams the same shape as NDJSON frames (one per refresh tick).
+type activityJSONEnvelope struct {
+	Success    bool                `json:"success"`
+	Session    string              `json:"session"`
+	CapturedAt string              `json:"captured_at"`
+	Agents     []activityJSONAgent `json:"agents"`
+	Summary    map[string]int      `json:"summary"`
+	Error      string              `json:"error,omitempty"`
+}
 
-	agents := make([]jsonAgent, len(result.Agents))
+func buildActivityJSONEnvelope(result *activityResult) activityJSONEnvelope {
+	agents := make([]activityJSONAgent, len(result.Agents))
 	for i, a := range result.Agents {
-		agents[i] = jsonAgent{
-			Pane:       a.Pane,
-			AgentType:  a.AgentType,
-			State:      a.State,
-			Confidence: a.Confidence,
-			Velocity:   a.Velocity,
-			Duration:   formatActivityDuration(a.Duration),
+		agents[i] = activityJSONAgent{
+			Pane:        a.Pane,
+			WindowIndex: a.WindowIndex,
+			PaneID:      a.PaneID,
+			AgentType:   a.AgentType,
+			State:       a.State,
+			Confidence:  a.Confidence,
+			Velocity:    a.Velocity,
+			Duration:    formatActivityDuration(a.Duration),
 		}
 		if !a.StateSince.IsZero() {
 			agents[i].StateSince = a.StateSince.Format(time.RFC3339)
 		}
 	}
 
-	output := jsonOutput{
+	return activityJSONEnvelope{
 		Success:    true,
 		Session:    result.Session,
 		CapturedAt: result.CapturedAt.Format(time.RFC3339),
 		Agents:     agents,
 		Summary:    result.Summary,
 	}
+}
 
+func outputActivityJSON(result *activityResult) error {
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	return encoder.Encode(buildActivityJSONEnvelope(result))
+}
+
+// runActivityWatchNDJSON streams activity snapshots as NDJSON: one compact,
+// newline-terminated JSON frame per refresh tick. Collection errors emit a
+// success:false frame and the stream continues (best-effort watch, matching
+// the text watch loop). The stream ends on SIGINT/SIGTERM with exit 0.
+func runActivityWatchNDJSON(session string, opts activityOptions) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-sigChan:
+			cancel()
+		case <-done:
+		}
+	}()
+
+	return activityWatchNDJSONLoop(ctx, os.Stdout, session, opts)
+}
+
+// activityWatchNDJSONLoop emits one compact frame per tick until ctx is
+// canceled. Split from runActivityWatchNDJSON so tests can drive it with a
+// cancellable context and an in-memory writer.
+func activityWatchNDJSONLoop(ctx context.Context, w io.Writer, session string, opts activityOptions) error {
+	// Compact one-object-per-line framing: no SetIndent.
+	encoder := json.NewEncoder(w)
+
+	ticker := time.NewTicker(opts.interval)
+	defer ticker.Stop()
+
+	firstRun := true
+	for {
+		if !firstRun {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+		}
+		firstRun = false
+
+		result, err := collectActivityData(session, opts)
+		if err != nil {
+			frame := activityJSONEnvelope{
+				Success:    false,
+				Session:    session,
+				CapturedAt: time.Now().Format(time.RFC3339),
+				Agents:     []activityJSONAgent{},
+				Summary:    map[string]int{},
+				Error:      err.Error(),
+			}
+			if encErr := encoder.Encode(frame); encErr != nil {
+				return encErr
+			}
+			continue
+		}
+		if encErr := encoder.Encode(buildActivityJSONEnvelope(result)); encErr != nil {
+			return encErr
+		}
+	}
 }
 
 func outputActivityError(session string, err error) error {
@@ -513,11 +665,13 @@ func renderActivityTUI(result *activityResult, watchMode bool) error {
 		return nil
 	}
 
-	// Build table header
-	header := fmt.Sprintf("%-6s  %-8s  %-12s  %-10s  %s",
-		"Pane", "Agent", "State", "Velocity", "Duration")
+	// Build table header. Win and PaneID exist because the per-window Pane
+	// index collides across windows in multi-window sessions; PaneID is the
+	// stable tmux %id.
+	header := fmt.Sprintf("%-4s  %-6s  %-7s  %-8s  %-12s  %-10s  %s",
+		"Win", "Pane", "PaneID", "Agent", "State", "Velocity", "Duration")
 	fmt.Println(headerStyle.Render(header))
-	fmt.Println(mutedStyle.Render(strings.Repeat("─", 55)))
+	fmt.Println(mutedStyle.Render(strings.Repeat("─", 72)))
 
 	// Build table rows
 	for _, agent := range result.Agents {
@@ -534,8 +688,10 @@ func renderActivityTUI(result *activityResult, watchMode bool) error {
 		stateIcon := stateIcon(agent.State)
 		stateStr := stateStyle(agent.State).Render(fmt.Sprintf("%s %s", stateIcon, agent.State))
 
-		row := fmt.Sprintf("%-6d  %s  %-12s  %-10s  %s",
+		row := fmt.Sprintf("%-4d  %-6d  %-7s  %s  %-12s  %-10s  %s",
+			agent.WindowIndex,
 			agent.Pane,
+			agent.PaneID,
 			agentStyle(agent.AgentType).Render(fmt.Sprintf("%-8s", agent.AgentType)),
 			stateStr,
 			velocityStr,
@@ -623,6 +779,8 @@ func activityAgentTypeColor(agentType string, t theme.Theme) lipgloss.Color {
 		return t.Lavender
 	case agent.AgentTypeGrok:
 		return t.Pink
+	case agent.AgentTypeOmp:
+		return t.Sky
 	case agent.AgentTypeCursor:
 		return t.Cursor
 	case agent.AgentTypeWindsurf:

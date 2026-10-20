@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,10 +17,15 @@ import (
 
 // SessionAgentInfo tracks the registered agent identity for a session.
 type SessionAgentInfo struct {
-	AgentName    string    `json:"agent_name"`
-	ProjectKey   string    `json:"project_key"`
-	RegisteredAt time.Time `json:"registered_at"`
-	LastActiveAt time.Time `json:"last_active_at"`
+	AgentName  string `json:"agent_name"`
+	ProjectKey string `json:"project_key"`
+	// RegistrationToken is the server-issued token for this identity.
+	// Persisting it lets a later ntm process re-claim the same agent name
+	// instead of being rejected by a server that requires token auth for
+	// re-registration.
+	RegistrationToken string    `json:"registration_token,omitempty"`
+	RegisteredAt      time.Time `json:"registered_at"`
+	LastActiveAt      time.Time `json:"last_active_at"`
 }
 
 // sanitizeRegex is precompiled for performance (used by sanitizeSessionName)
@@ -267,25 +273,19 @@ func SaveSessionAgent(sessionName, projectKey string, info *SessionAgentInfo) er
 	return nil
 }
 
-// DeleteSessionAgent removes the agent info file for a session.
-func DeleteSessionAgent(sessionName, projectKey string) error {
-	if err := validateSessionStorageName(sessionName); err != nil {
-		return err
-	}
-	path := sessionAgentPath(sessionName, projectKey)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("deleting session agent: %w", err)
-	}
-	return nil
-}
-
 // RegisterSessionAgent registers a session as an agent with Agent Mail.
-// If Agent Mail is unavailable, registration silently fails without blocking.
-// Returns the agent info on success, nil if unavailable, or an error on failure.
+// The required registration calls double as the availability probe: the full
+// health_check diagnostic is deliberately not used here because assembling
+// its snapshot can be slower than ordinary identity operations on a loaded
+// server, which would suppress registration while the server is healthy.
+// Returns the agent info on success or an error on failure.
 func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingDir string) (*SessionAgentInfo, error) {
-	// Check if Agent Mail is available
-	if !c.IsAvailable() {
-		return nil, nil // Silently skip if unavailable
+	// Ensure the project first, even when local session metadata already
+	// exists: Agent Mail may have rebuilt its database from the archive since
+	// the last NTM run, and this lightweight required call is also the
+	// reachability probe.
+	if _, err := c.EnsureProject(ctx, workingDir); err != nil {
+		return nil, fmt.Errorf("ensuring project: %w", err)
 	}
 
 	// Check if already registered
@@ -296,12 +296,17 @@ func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingD
 
 	// If already registered with same project, just update activity
 	if existing != nil && existing.ProjectKey == workingDir && existing.AgentName != "" {
+		// Prime the client's token cache with the persisted token so the
+		// re-register call below authenticates as the existing identity.
+		if existing.RegistrationToken != "" {
+			c.SetRegistrationToken(workingDir, existing.AgentName, existing.RegistrationToken)
+		}
 		existing.LastActiveAt = time.Now()
 		if err := SaveSessionAgent(sessionName, workingDir, existing); err != nil {
 			return nil, err
 		}
 		// Update activity on server (re-register updates last_active_ts)
-		_, serverErr := c.RegisterAgent(ctx, RegisterAgentOptions{
+		agent, serverErr := c.RegisterAgent(ctx, RegisterAgentOptions{
 			ProjectKey:      workingDir,
 			Program:         "ntm",
 			Model:           "coordinator",
@@ -312,12 +317,14 @@ func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingD
 			// Return local state but pass error up so caller can warn
 			return existing, fmt.Errorf("updating server activity: %w", serverErr)
 		}
+		// Persist a (re)issued token for the next process.
+		if agent != nil && agent.RegistrationToken != "" && agent.RegistrationToken != existing.RegistrationToken {
+			existing.RegistrationToken = agent.RegistrationToken
+			if err := SaveSessionAgent(sessionName, workingDir, existing); err != nil {
+				return nil, err
+			}
+		}
 		return existing, nil
-	}
-
-	// Ensure project exists
-	if _, err := c.EnsureProject(ctx, workingDir); err != nil {
-		return nil, fmt.Errorf("ensuring project: %w", err)
 	}
 
 	// Register the agent. Omit Name so the server auto-generates a valid
@@ -334,10 +341,11 @@ func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingD
 
 	// Save locally
 	info := &SessionAgentInfo{
-		AgentName:    agent.Name,
-		ProjectKey:   workingDir,
-		RegisteredAt: time.Now(),
-		LastActiveAt: time.Now(),
+		AgentName:         agent.Name,
+		ProjectKey:        workingDir,
+		RegistrationToken: agent.RegistrationToken,
+		RegisteredAt:      time.Now(),
+		LastActiveAt:      time.Now(),
 	}
 	if err := SaveSessionAgent(sessionName, workingDir, info); err != nil {
 		return nil, err
@@ -374,8 +382,16 @@ func (c *Client) UpdateSessionActivity(ctx context.Context, sessionName, project
 		return nil // Silently skip server update
 	}
 
+	// Prime the client's token cache with the persisted token so the
+	// re-register below authenticates as the existing identity on
+	// mcp-agent-mail >=2.13 instead of being refused (mirrors the
+	// already-registered branch of EnsureSessionAgent).
+	if info.RegistrationToken != "" {
+		c.SetRegistrationToken(info.ProjectKey, info.AgentName, info.RegistrationToken)
+	}
+
 	// Re-register to update last_active_ts on server
-	_, err = c.RegisterAgent(ctx, RegisterAgentOptions{
+	agent, err := c.RegisterAgent(ctx, RegisterAgentOptions{
 		ProjectKey:      info.ProjectKey,
 		Program:         "ntm",
 		Model:           "coordinator",
@@ -385,18 +401,17 @@ func (c *Client) UpdateSessionActivity(ctx context.Context, sessionName, project
 	if err != nil {
 		return fmt.Errorf("updating server activity: %w", err)
 	}
-	return nil
-}
-
-// IsNameTakenError checks if an error indicates the agent name is already taken.
-func IsNameTakenError(err error) bool {
-	if err == nil {
-		return false
+	// Same rotation hazard as the spawn identity path (ntm#321): re-claiming
+	// an existing name can return a replacement credential, and dropping it
+	// leaves the persisted token stale for every later process. An empty
+	// token in the response means "unchanged" and must not clear the record.
+	if agent != nil && agent.RegistrationToken != "" && agent.RegistrationToken != info.RegistrationToken {
+		info.RegistrationToken = agent.RegistrationToken
+		if err := SaveSessionAgent(sessionName, info.ProjectKey, info); err != nil {
+			return fmt.Errorf("persisting rotated registration token: %w", err)
+		}
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "already in use") ||
-		strings.Contains(errStr, "name taken") ||
-		strings.Contains(errStr, "already registered")
+	return nil
 }
 
 // SessionAgentRegistry stores the mapping of pane titles/IDs to Agent Mail agent names
@@ -415,9 +430,24 @@ type SessionAgentRegistry struct {
 	// survives pane renames. `omitempty` + map-pointer treats old
 	// registries that predate this field as if no tokens were known.
 	RegistrationTokens map[string]string `json:"registration_tokens,omitempty"`
-	RegisteredAt       time.Time         `json:"registered_at"`
-	UpdatedAt          time.Time         `json:"updated_at"`
+	// PanePIDs records the tmux #{pane_pid} observed for each pane id when its
+	// binding was written (pane_id -> pid). tmux reuses pane ids across server
+	// restarts, so the pid distinguishes "the pane that registered this name"
+	// from "an unrelated pane that later got the same %N". Together with
+	// PaneIDMap it lets a later process decide whether a recorded binding is
+	// still LIVE instead of trusting a recycled title (ntm#256). Optional:
+	// registries written before this field carry no pids (treated as unknown).
+	PanePIDs     map[string]int `json:"pane_pids,omitempty"`
+	RegisteredAt time.Time      `json:"registered_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
 }
+
+// PaneLiveness reports whether a pane id recorded in the registry still refers
+// to the pane that registered it. recordedPID is the #{pane_pid} stored at
+// registration time, or 0 when unknown. Implementations typically require the
+// pane to exist in the session and, when a pid was recorded, to still carry
+// that pid.
+type PaneLiveness func(paneID string, recordedPID int) bool
 
 // NewSessionAgentRegistry creates a new empty registry.
 func NewSessionAgentRegistry(sessionName, projectKey string) *SessionAgentRegistry {
@@ -635,18 +665,6 @@ func SaveSessionAgentRegistry(registry *SessionAgentRegistry) error {
 	return nil
 }
 
-// DeleteSessionAgentRegistry removes the agent registry for a session.
-func DeleteSessionAgentRegistry(sessionName, projectKey string) error {
-	if err := validateSessionStorageName(sessionName); err != nil {
-		return err
-	}
-	path := registryPath(sessionName, projectKey)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("deleting agent registry: %w", err)
-	}
-	return nil
-}
-
 // AddAgent adds a pane -> agent name mapping to the registry.
 func (r *SessionAgentRegistry) AddAgent(paneTitle, paneID, agentName string) {
 	if r.Agents == nil {
@@ -668,10 +686,130 @@ func (r *SessionAgentRegistry) AddAgent(paneTitle, paneID, agentName string) {
 		for existingPaneID, existingAgent := range r.PaneIDMap {
 			if existingAgent == agentName && existingPaneID != paneID {
 				delete(r.PaneIDMap, existingPaneID)
+				// The pid belonged to the binding we just retired.
+				delete(r.PanePIDs, existingPaneID)
 			}
 		}
 		r.PaneIDMap[paneID] = agentName
 	}
+}
+
+// SetPanePID records the #{pane_pid} observed for paneID when its binding was
+// written. A pid <= 0 clears the record (liveness falls back to pane
+// existence only).
+func (r *SessionAgentRegistry) SetPanePID(paneID string, pid int) {
+	if r == nil || paneID == "" {
+		return
+	}
+	if pid <= 0 {
+		delete(r.PanePIDs, paneID)
+		return
+	}
+	if r.PanePIDs == nil {
+		r.PanePIDs = make(map[string]int)
+	}
+	r.PanePIDs[paneID] = pid
+}
+
+// PanePID returns the pid recorded for paneID, or 0 when none was recorded.
+func (r *SessionAgentRegistry) PanePID(paneID string) int {
+	if r == nil || r.PanePIDs == nil {
+		return 0
+	}
+	return r.PanePIDs[paneID]
+}
+
+// PaneIDForAgent returns the pane id currently bound to agentName, if any.
+func (r *SessionAgentRegistry) PaneIDForAgent(agentName string) (string, bool) {
+	if r == nil || r.PaneIDMap == nil || agentName == "" {
+		return "", false
+	}
+	for paneID, name := range r.PaneIDMap {
+		if name == agentName {
+			return paneID, true
+		}
+	}
+	return "", false
+}
+
+// paneBindingLive reports whether the binding recorded for paneID is still
+// held by a live pane. A nil isLive means the caller cannot observe liveness;
+// the binding is then treated as LIVE (occupied) so an unobservable slot is
+// never handed to a second pane — the conservative failure is a fresh
+// identity, never a shared one.
+func (r *SessionAgentRegistry) paneBindingLive(paneID string, isLive PaneLiveness) bool {
+	if paneID == "" {
+		return false
+	}
+	if isLive == nil {
+		return true
+	}
+	return isLive(paneID, r.PanePID(paneID))
+}
+
+// ResolveForPane decides which registered identity, if any, the pane
+// (paneTitle, paneID) should reuse. It returns the agent name, the pane id the
+// identity is being recovered from (empty when the name was bound to this very
+// pane or to no pane at all), and whether a reuse is allowed.
+//
+// Resolution order (ntm#256):
+//  1. paneID itself is bound -> that name. The stable physical pane id is the
+//     primary key; a title is only a hint.
+//  2. paneTitle is bound -> that name, but ONLY when the pane currently
+//     holding it is dead per isLive. A live holder makes the slot OCCUPIED and
+//     the caller must mint a fresh identity instead of re-issuing a running
+//     agent's name to a second pane. Dead-slot reuse (same-session respawn
+//     after a kill) keeps working exactly as before.
+//
+// Callers that cannot observe liveness may pass a nil isLive; every recorded
+// holder is then treated as live, i.e. titles never trigger reuse.
+func (r *SessionAgentRegistry) ResolveForPane(paneTitle, paneID string, isLive PaneLiveness) (name string, recoveredFrom string, ok bool) {
+	if r == nil {
+		return "", "", false
+	}
+	if paneID != "" {
+		if name, found := r.GetAgentByID(paneID); found && name != "" {
+			return name, "", true
+		}
+	}
+	if paneTitle == "" {
+		return "", "", false
+	}
+	name, found := r.GetAgentByTitle(paneTitle)
+	if !found || name == "" {
+		return "", "", false
+	}
+	holder, bound := r.PaneIDForAgent(name)
+	if !bound || holder == "" || holder == paneID {
+		// Title known but no (other) pane on record: nothing can be live.
+		return name, "", true
+	}
+	if r.paneBindingLive(holder, isLive) {
+		return "", "", false
+	}
+	return name, holder, true
+}
+
+// OccupiedTitles returns the registry titles whose bound pane is still live
+// per isLive. `ntm add` folds these into its next-index derivation so a live
+// pane whose title was overwritten by the agent (or the user) still counts as
+// occupying its slot (ntm#256). Order is deterministic (sorted).
+func (r *SessionAgentRegistry) OccupiedTitles(isLive PaneLiveness) []string {
+	if r == nil || len(r.Agents) == 0 {
+		return nil
+	}
+	titles := make([]string, 0, len(r.Agents))
+	for title, name := range r.Agents {
+		holder, bound := r.PaneIDForAgent(name)
+		if !bound {
+			continue
+		}
+		if r.paneBindingLive(holder, isLive) {
+			titles = append(titles, title)
+		}
+	}
+	sort.Strings(titles)
+	return titles
 }
 
 // GetAgentByTitle returns the agent name for a pane title.

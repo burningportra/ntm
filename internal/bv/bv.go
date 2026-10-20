@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,36 @@ var ErrNotInstalled = errors.New("bv is not installed")
 
 // ErrNoBaseline indicates no baseline exists for drift checking
 var ErrNoBaseline = errors.New("no baseline found")
+
+// IsNotInitialized reports whether a br or bv call failed only because the
+// project has no beads workspace (no .beads directory or database), a state
+// of the project rather than a fault. It matches the phrasings br has used
+// across versions, including its NOT_INITIALIZED JSON code, and bv's
+// "failed to read beads directory" for a directory that does not exist.
+func IsNotInitialized(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "error loading beads") {
+		// bv appends "initialized with 'br init'" to every load failure,
+		// permission errors included; only a missing directory means no
+		// workspace.
+		return strings.Contains(msg, "failed to read beads directory") && strings.Contains(msg, "no such file or directory")
+	}
+	for _, fragment := range []string{
+		"no .beads",
+		"not initialized",
+		"not_initialized",
+		"no beads database",
+		"br init",
+	} {
+		if strings.Contains(msg, fragment) {
+			return true
+		}
+	}
+	return false
+}
 
 // DefaultTimeout is the default timeout for external command execution
 const DefaultTimeout = 30 * time.Second
@@ -108,7 +139,7 @@ func IsInstalled() bool {
 // run executes bv with given args and returns stdout.
 // It includes retry logic for transient database locks.
 func run(dir string, args ...string) (string, error) {
-	return runWithTimeout(dir, DefaultTimeout, args...)
+	return runWithTimeout(dir, CommandTimeout(), args...)
 }
 
 func runWithTimeout(dir string, timeout time.Duration, args ...string) (string, error) {
@@ -126,7 +157,7 @@ func runWithContextTimeout(parent context.Context, dir string, timeout time.Dura
 		return "", ErrNotInstalled
 	}
 	if timeout <= 0 {
-		timeout = DefaultTimeout
+		timeout = CommandTimeout()
 	}
 
 	normalizedDir, err := normalizeTriageDir(dir)
@@ -176,13 +207,15 @@ func runWithContextTimeout(parent context.Context, dir string, timeout time.Dura
 			return "", ErrNoBaseline
 		}
 
-		// Handle transient database locks (SQLite)
-		if attempt < maxAttempts && (strings.Contains(stderrStr, "database is locked") ||
-			strings.Contains(stdoutStr, "database is locked") ||
-			strings.Contains(stderrStr, "database is busy")) {
-			backoff := transientBeadsDBBackoff(attempt)
-			if time.Until(deadline) <= backoff {
-				return "", fmt.Errorf("bv timed out after %v: %w", timeout, ErrTimeout)
+		// Handle transient workspace contention (SQLite locks, br write lock).
+		if isTransientBeadsDBError(stderrStr, stdoutStr) {
+			backoff, retry := transientBeadsRetryDelay(attempt, maxAttempts, deadline)
+			if !retry {
+				if attempt < maxAttempts {
+					return "", fmt.Errorf("bv timed out after %v: %w", timeout, ErrTimeout)
+				}
+				return "", fmt.Errorf("bv %s: workspace still contended after %d attempt(s): %w: %s",
+					strings.Join(args, " "), attempt, err, stderrStr)
 			}
 			if err := waitForBeadsRetry(parent, backoff); err != nil {
 				return "", err
@@ -203,7 +236,7 @@ func GetInsights(dir string) (*InsightsResponse, error) {
 
 // GetInsightsContext returns graph insights with caller cancellation.
 func GetInsightsContext(ctx context.Context, dir string) (*InsightsResponse, error) {
-	output, err := runWithContextTimeout(ctx, dir, DefaultTimeout, "--robot-insights")
+	output, err := runWithContextTimeout(ctx, dir, CommandTimeout(), "--robot-insights")
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +271,7 @@ func GetPlan(dir string) (*PlanResponse, error) {
 
 // GetPlanContext returns the parallel execution plan with caller cancellation.
 func GetPlanContext(ctx context.Context, dir string) (*PlanResponse, error) {
-	output, err := runWithContextTimeout(ctx, dir, DefaultTimeout, "--robot-plan")
+	output, err := runWithContextTimeout(ctx, dir, CommandTimeout(), "--robot-plan")
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +392,7 @@ func CheckDrift(dir string) DriftResult {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), CommandTimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bv", "--check-drift")
@@ -460,80 +493,6 @@ func GetNextActions(dir string, n int) ([]PriorityRecommendation, error) {
 	}
 
 	return recommendations, nil
-}
-
-// GetParallelTracks returns available parallel work tracks
-func GetParallelTracks(dir string) ([]Track, error) {
-	plan, err := GetPlan(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	return plan.Plan.Tracks, nil
-}
-
-// IsBottleneck checks if an issue ID is in the bottleneck list
-func IsBottleneck(dir, issueID string) (bool, float64, error) {
-	insights, err := GetInsights(dir)
-	if err != nil {
-		return false, 0, err
-	}
-
-	for _, b := range insights.Bottlenecks {
-		if b.ID == issueID {
-			return true, b.Value, nil
-		}
-	}
-
-	return false, 0, nil
-}
-
-// IsKeystone checks if an issue ID is in the keystone list
-func IsKeystone(dir, issueID string) (bool, float64, error) {
-	insights, err := GetInsights(dir)
-	if err != nil {
-		return false, 0, err
-	}
-
-	for _, k := range insights.Keystones {
-		if k.ID == issueID {
-			return true, k.Value, nil
-		}
-	}
-
-	return false, 0, nil
-}
-
-// IsHub checks if an issue ID is in the hub list (HITS algorithm)
-func IsHub(dir, issueID string) (bool, float64, error) {
-	insights, err := GetInsights(dir)
-	if err != nil {
-		return false, 0, err
-	}
-
-	for _, h := range insights.Hubs {
-		if h.ID == issueID {
-			return true, h.Value, nil
-		}
-	}
-
-	return false, 0, nil
-}
-
-// IsAuthority checks if an issue ID is in the authority list (HITS algorithm)
-func IsAuthority(dir, issueID string) (bool, float64, error) {
-	insights, err := GetInsights(dir)
-	if err != nil {
-		return false, 0, err
-	}
-
-	for _, a := range insights.Authorities {
-		if a.ID == issueID {
-			return true, a.Value, nil
-		}
-	}
-
-	return false, 0, nil
 }
 
 // GraphPosition represents the position of an issue in the dependency graph
@@ -798,13 +757,15 @@ func GetDependencyContext(dir string, n int) (*DependencyContext, error) {
 	// Get blocked tasks (what is blocking progress)
 	blockedOutput, err := RunBd(dir, "blocked", "--json")
 	if err == nil {
-		var blocked []struct {
+		// br blocked --json answers {"issues":[...],"total":...}; decoding it
+		// as a bare array failed silently and left TopBlockers empty.
+		blocked, decodeErr := UnmarshalBdList[struct {
 			ID             string   `json:"id"`
 			Title          string   `json:"title"`
 			BlockedByCount int      `json:"blocked_by_count"`
 			BlockedBy      []string `json:"blocked_by"`
-		}
-		if json.Unmarshal([]byte(blockedOutput), &blocked) == nil {
+		}](blockedOutput)
+		if decodeErr == nil {
 			for _, task := range blocked {
 				if len(ctx.TopBlockers) >= n {
 					break
@@ -824,8 +785,8 @@ func GetDependencyContext(dir string, n int) (*DependencyContext, error) {
 // HasLocalBeadsDB returns true when `dir` itself contains a .beads directory.
 // Recovery callers use this to refuse to walk up into a parent repo's
 // work-item database when the child has none of its own (#130). Generic
-// list helpers (`GetInProgressList`, `GetRecentlyCompletedList`,
-// `GetBlockedList`) deliberately do not gate on this — they preserve br's
+// list helpers (`GetInProgressList`, `GetRecentlyCompletedListContext`,
+// `GetBlockedListContext`) deliberately do not gate on this — they preserve br's
 // walk-up behavior so callers that *want* parent rows (alerts, status,
 // triage) keep working from a child directory. Recovery and other
 // trust-sensitive callers must pre-check.
@@ -913,6 +874,7 @@ func runBdContext(parent context.Context, dir string, allowNoDB bool, args ...st
 	}
 
 	const maxAttempts = 6 // Canonical default: config.RetryConfig.DB.MaxAttempts
+	retryDeadline := time.Now().Add(transientBeadsRetryBudget)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(parent, DefaultTimeout)
 
@@ -948,8 +910,15 @@ func runBdContext(parent context.Context, dir string, allowNoDB bool, args ...st
 			attempt = 0
 			continue
 		}
-		if attempt < maxAttempts && isTransientBeadsDBError(stderrStr, stdoutStr) {
-			if err := waitForBeadsRetry(parent, transientBeadsDBBackoff(attempt)); err != nil {
+		if isTransientBeadsDBError(stderrStr, stdoutStr) {
+			delay, retry := transientBeadsRetryDelay(attempt, maxAttempts, retryDeadline)
+			if !retry {
+				return "", fmt.Errorf(
+					"br %s: workspace still contended after %d attempt(s): %w: %s",
+					strings.Join(args, " "), attempt, err, diagnostics,
+				)
+			}
+			if err := waitForBeadsRetry(parent, delay); err != nil {
 				return "", err
 			}
 			continue
@@ -1003,6 +972,12 @@ var beadsDBCorruptionSignatures = []string{
 // corruption signature anywhere in its chain's message.
 func isBeadsDBCorruptionError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Typed authorization/ownership refusals can contain task IDs or mutex
+	// names that happen to match a SQLite diagnostic. They are not evidence
+	// of database corruption and must never trigger a destructive rebuild.
+	if errors.Is(err, ErrBeadAssignmentIneligible) || errors.Is(err, ErrBeadAlreadyClaimed) || errors.Is(err, ErrBeadTerminal) {
 		return false
 	}
 	message := strings.ToLower(err.Error())
@@ -1213,15 +1188,6 @@ func OperatorGatedLabels() []string {
 	operatorGatedMu.RUnlock()
 	sort.Strings(labels)
 	return labels
-}
-
-// IsOperatorGatedLabel reports whether label blocks automated assignment.
-func IsOperatorGatedLabel(label string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(label))
-	operatorGatedMu.RLock()
-	_, gated := operatorGatedLabels[normalized]
-	operatorGatedMu.RUnlock()
-	return gated
 }
 
 // AssignmentEligibilityError reports the exact tracker preconditions that
@@ -1647,6 +1613,9 @@ func claimBeadForAssignmentTransaction(ctx context.Context, databasePath, beadID
 			Template: issue.Template, Wisp: wisp,
 		}
 	}
+	if err := requireAssignmentMutexes(ctx, tx, beadID); err != nil {
+		return BeadClaimResult{}, false, err
+	}
 	if sameActorInProgress {
 		if err := tx.Commit(); err != nil {
 			return BeadClaimResult{}, false, fmt.Errorf("commit idempotent assignment Beads claim: %w", err)
@@ -1833,6 +1802,9 @@ func claimBeadNonTerminalTransaction(ctx context.Context, databasePath, beadID, 
 			Deferred: issue.Deferred, Pinned: issue.Pinned, Ephemeral: issue.Ephemeral,
 			Template: issue.Template, Wisp: wisp,
 		}
+	}
+	if err := requireAssignmentMutexes(ctx, tx, beadID); err != nil {
+		return BeadClaimResult{}, false, err
 	}
 	if status == "in_progress" && currentAssignee == actor {
 		if err := tx.Commit(); err != nil {
@@ -2265,13 +2237,23 @@ func beadClaimArgs(beadID, actor string) []string {
 }
 
 func parseBeadClaimOutput(output string) (BeadClaimResult, error) {
-	var rows []struct {
+	type claimRow struct {
 		ID     string `json:"id"`
 		Title  string `json:"title"`
 		Status string `json:"status"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &rows); err != nil {
-		return BeadClaimResult{}, fmt.Errorf("parse atomic claim output: %w", err)
+	var rows []claimRow
+	trimmed := strings.TrimSpace(output)
+	if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+		// Under a workflow capacity soft limit br wraps the rows as
+		// {"updated":[...],"warnings":[...]}; the claim itself succeeded.
+		var envelope struct {
+			Updated []claimRow `json:"updated"`
+		}
+		if envErr := json.Unmarshal([]byte(trimmed), &envelope); envErr != nil || envelope.Updated == nil {
+			return BeadClaimResult{}, fmt.Errorf("parse atomic claim output: %w", err)
+		}
+		rows = envelope.Updated
 	}
 	if len(rows) != 1 {
 		return BeadClaimResult{}, fmt.Errorf("atomic claim returned %d rows, want 1", len(rows))
@@ -2378,23 +2360,80 @@ func isNoBeadsDBError(streams ...string) bool {
 	return strings.Contains(s, "no beads database found") || strings.Contains(s, "use 'br --no-db'")
 }
 
+// isTransientBeadsDBError reports whether a failed br/bv invocation died on
+// workspace contention that a later attempt can reasonably expect to clear:
+//
+//   - SQLite "database is busy" / "database is locked" (another writer holds
+//     the SQLite lock);
+//   - br's cross-process workspace write lock timing out ("Timed out after
+//     Nms waiting for write lock (...) at .beads/.write.lock"). br reports
+//     this as a CONFIG_ERROR, but it is contention, not configuration: the
+//     command never ran, so retrying it is safe for reads and for
+//     compare-and-set mutations alike.
+//
+// Every other diagnostic (including other CONFIG_ERRORs such as a genuinely
+// unwritable lock file) is terminal and must not be retried.
 func isTransientBeadsDBError(streams ...string) bool {
 	s := strings.ToLower(strings.Join(streams, "\n"))
-	return strings.Contains(s, "database is busy") || strings.Contains(s, "database is locked")
+	if strings.Contains(s, "database is busy") || strings.Contains(s, "database is locked") {
+		return true
+	}
+	return strings.Contains(s, "timed out after") && strings.Contains(s, "waiting for write lock")
 }
 
-func transientBeadsDBBackoff(attempt int) time.Duration {
+const (
+	// transientBeadsDBBackoffBase is the first retry delay after workspace
+	// contention; each later attempt doubles it up to transientBeadsDBBackoffCap.
+	transientBeadsDBBackoffBase = 50 * time.Millisecond
+	transientBeadsDBBackoffCap  = 800 * time.Millisecond
+)
+
+// transientBeadsRetryBudget bounds the total wall-clock time one br/bv
+// invocation may spend retrying workspace contention, measured from the first
+// attempt. It is a var so tests can shrink it; production code never writes it.
+var transientBeadsRetryBudget = 20 * time.Second
+
+// transientBeadsDBBackoffBounds returns the inclusive [min, max] delay window
+// for the given 1-based attempt: exponential growth capped at
+// transientBeadsDBBackoffCap, with the lower bound at half the ceiling so
+// jitter spreads contending processes without collapsing to zero.
+func transientBeadsDBBackoffBounds(attempt int) (time.Duration, time.Duration) {
 	if attempt < 1 {
 		attempt = 1
 	}
-	backoff := 50 * time.Millisecond
-	for i := 1; i < attempt; i++ {
-		backoff *= 2
-		if backoff >= 800*time.Millisecond {
-			return 800 * time.Millisecond
-		}
+	ceiling := transientBeadsDBBackoffBase
+	for i := 1; i < attempt && ceiling < transientBeadsDBBackoffCap; i++ {
+		ceiling *= 2
 	}
-	return backoff
+	if ceiling > transientBeadsDBBackoffCap {
+		ceiling = transientBeadsDBBackoffCap
+	}
+	return ceiling / 2, ceiling
+}
+
+// transientBeadsDBBackoff returns the jittered delay before retrying the
+// given 1-based attempt, uniformly drawn from transientBeadsDBBackoffBounds.
+func transientBeadsDBBackoff(attempt int) time.Duration {
+	low, high := transientBeadsDBBackoffBounds(attempt)
+	if high <= low {
+		return low
+	}
+	return low + rand.N(high-low+1)
+}
+
+// transientBeadsRetryDelay decides whether a transient failure on the given
+// attempt should be retried and, if so, how long to wait first. It returns
+// false when the attempt budget is spent or when the next delay would push the
+// invocation past deadline; the caller then surfaces the last br error.
+func transientBeadsRetryDelay(attempt, maxAttempts int, deadline time.Time) (time.Duration, bool) {
+	if attempt >= maxAttempts {
+		return 0, false
+	}
+	delay := transientBeadsDBBackoff(attempt)
+	if time.Until(deadline) <= delay {
+		return 0, false
+	}
+	return delay, true
 }
 
 func containsString(list []string, value string) bool {
@@ -2445,8 +2484,11 @@ func GetBeadStatusContext(ctx context.Context, dir, beadID string) (string, erro
 // Unlike triage output, br show is keyed by the requested ID and is not capped
 // or ranking-dependent.
 type BeadAssignmentDetails struct {
-	ID                   string
-	Title                string
+	ID    string
+	Title string
+	// Description is the bead body. Assignment reads the paths it must
+	// reserve from it as well as from the title (ntm#336).
+	Description          string
 	IssueType            string
 	Status               string
 	Priority             int
@@ -2471,22 +2513,6 @@ type BeadAssignmentAuthorization struct {
 	AllowOwnedOpen            bool
 	AllowUnassignedInProgress bool
 	AllowOwnedInProgress      bool
-}
-
-// ValidateBeadAssignmentAuthorization checks an exact live br show result at
-// the final read-only boundary before an assignment mutates leases or durable
-// intent. The later ClaimBeadForAssignment transaction remains the race-safe
-// compare-and-set.
-func ValidateBeadAssignmentAuthorization(details *BeadAssignmentDetails, authorization BeadAssignmentAuthorization) error {
-	return validateBeadAssignmentAuthorization(details, authorization, IsOperatorGatedLabel)
-}
-
-// ValidateBeadAssignmentAuthorizationForProject validates against the policy
-// registered for one authoritative Beads workspace.
-func ValidateBeadAssignmentAuthorizationForProject(projectDir string, details *BeadAssignmentDetails, authorization BeadAssignmentAuthorization) error {
-	return validateBeadAssignmentAuthorization(details, authorization, func(label string) bool {
-		return IsOperatorGatedLabelForProject(projectDir, label)
-	})
 }
 
 // ValidateBeadAssignmentAuthorizationWithOperatorGatedLabels validates against
@@ -2588,6 +2614,7 @@ type beadShowDependency struct {
 type beadShowAssignmentRow struct {
 	ID           string               `json:"id"`
 	Title        string               `json:"title"`
+	Description  string               `json:"description"`
 	IssueType    string               `json:"issue_type"`
 	Status       string               `json:"status"`
 	Priority     int                  `json:"priority"`
@@ -2631,14 +2658,9 @@ func IsBlockingDependencyType(dependencyType string) bool {
 	}
 }
 
-// GetBeadAssignmentDetails returns exact title, status, assignee, labels, and
-// unresolved blocking dependencies for one bead using br show --json.
-func GetBeadAssignmentDetails(dir, beadID string) (*BeadAssignmentDetails, error) {
-	return GetBeadAssignmentDetailsContext(context.Background(), dir, beadID)
-}
-
-// GetBeadAssignmentDetailsContext returns exact assignment-gate state with
-// caller cancellation.
+// GetBeadAssignmentDetailsContext returns exact title, status, assignee,
+// labels, and unresolved blocking dependencies for one bead using
+// br show --json, with caller cancellation.
 func GetBeadAssignmentDetailsContext(ctx context.Context, dir, beadID string) (*BeadAssignmentDetails, error) {
 	beadID = strings.TrimSpace(beadID)
 	if beadID == "" {
@@ -2658,25 +2680,24 @@ func GetBeadAssignmentDetailsContext(ctx context.Context, dir, beadID string) (*
 	return details, nil
 }
 
-// GetBeadDependencyStateContext returns every blocking dependency for one bead,
-// including closed and tombstoned dependencies, with caller cancellation.
-func GetBeadDependencyStateContext(ctx context.Context, dir, beadID string) ([]BeadDependencyState, error) {
-	beadID = strings.TrimSpace(beadID)
-	if beadID == "" {
-		return nil, errors.New("bead ID is required")
+// BeadTextReader narrows a live assignment-details reader to a bead's title
+// and description, the shape reservation discovery reads
+// (assign.DiscoverReservationPaths), so `ntm assign` and the robot assignment
+// surfaces discover a bead's file scope from the same read.
+func BeadTextReader(read func(context.Context, string, string) (*BeadAssignmentDetails, error)) func(context.Context, string, string) (string, string, error) {
+	return func(ctx context.Context, dir, beadID string) (string, string, error) {
+		if read == nil {
+			return "", "", errors.New("bead reader is not configured")
+		}
+		details, err := read(ctx, dir, beadID)
+		if err != nil {
+			return "", "", err
+		}
+		if details == nil {
+			return "", "", errors.New("live work-item details are missing")
+		}
+		return details.Title, details.Description, nil
 	}
-	output, err := RunBdContext(ctx, dir, "show", beadID, "--json")
-	if err != nil {
-		return nil, err
-	}
-	row, err := parseBeadShowAssignmentRow(output)
-	if err != nil {
-		return nil, err
-	}
-	if row.ID != beadID {
-		return nil, fmt.Errorf("br show returned bead %q, want %q", row.ID, beadID)
-	}
-	return blockingDependencyStates(row.Dependencies)
 }
 
 // GetBeadBlockingDependentsContext returns every local work item whose
@@ -2736,7 +2757,7 @@ func parseBeadAssignmentDetailsOutput(output string) (*BeadAssignmentDetails, er
 	sort.Strings(labels)
 
 	return &BeadAssignmentDetails{
-		ID: row.ID, Title: row.Title, IssueType: row.IssueType, Status: row.Status, Priority: row.Priority,
+		ID: row.ID, Title: row.Title, Description: row.Description, IssueType: row.IssueType, Status: row.Status, Priority: row.Priority,
 		Assignee: row.Assignee, DeferUntil: row.DeferUntil, Pinned: row.Pinned, Ephemeral: row.Ephemeral,
 		Template: row.Template, Wisp: strings.Contains(strings.ToLower(row.ID), "-wisp-"), Labels: labels,
 		BlockedBy: blockedBy, BlockingDependencies: dependencyStates,
@@ -2999,15 +3020,9 @@ func GetBeadsSummaryContext(ctx context.Context, dir string, limit int) (*BeadsS
 	return result, nil
 }
 
-// GetReadyPreview returns top N ready beads sorted by priority
-func GetReadyPreview(dir string, limit int) []BeadPreview {
-	previews, _ := GetReadyPreviewContext(context.Background(), dir, limit)
-	return previews
-}
-
-// GetReadyPreviewContext returns up to limit ready beads, or every ready bead
-// when limit is zero, and preserves command, parse, and cancellation failures
-// so callers can distinguish checked-empty from unknown.
+// GetReadyPreviewContext returns up to limit ready beads sorted by priority, or
+// every ready bead when limit is zero, and preserves command, parse, and
+// cancellation failures so callers can distinguish checked-empty from unknown.
 func GetReadyPreviewContext(ctx context.Context, dir string, limit int) ([]BeadPreview, error) {
 	if limit < 0 {
 		return nil, fmt.Errorf("ready limit must not be negative: %d", limit)
@@ -3105,19 +3120,13 @@ func GetInProgressListContext(ctx context.Context, dir string, limit int) ([]Bea
 	return items, nil
 }
 
-// GetRecentlyCompletedList returns recently completed beads.
-// These are beads with status=closed, ordered by completion time descending.
+// GetRecentlyCompletedListContext returns recently completed beads (beads with
+// status=closed, ordered by completion time descending) without erasing
+// command, parse, or cancellation failures.
 //
 // Like [`GetInProgressList`] this will walk up to a parent .beads/ when the
 // directory has none of its own; callers that need a strict per-directory
 // view should pre-check [`HasLocalBeadsDB`] (#130).
-func GetRecentlyCompletedList(dir string, limit int) []BeadPreview {
-	items, _ := GetRecentlyCompletedListContext(context.Background(), dir, limit)
-	return items
-}
-
-// GetRecentlyCompletedListContext returns recently completed beads without
-// erasing command, parse, or cancellation failures.
 func GetRecentlyCompletedListContext(ctx context.Context, dir string, limit int) ([]BeadPreview, error) {
 	items := make([]BeadPreview, 0)
 
@@ -3151,19 +3160,13 @@ func GetRecentlyCompletedListContext(ctx context.Context, dir string, limit int)
 	return items, nil
 }
 
-// GetBlockedList returns blocked beads (beads that are blocked by dependencies).
+// GetBlockedListContext returns up to limit blocked beads (beads that are
+// blocked by dependencies), or every blocked bead when limit is zero, without
+// erasing command, parse, or cancellation failures.
 //
 // Like [`GetInProgressList`] this will walk up to a parent .beads/ when the
 // directory has none of its own; callers that need a strict per-directory
 // view should pre-check [`HasLocalBeadsDB`] (#130).
-func GetBlockedList(dir string, limit int) []BeadPreview {
-	items, _ := GetBlockedListContext(context.Background(), dir, limit)
-	return items
-}
-
-// GetBlockedListContext returns up to limit blocked beads, or every blocked
-// bead when limit is zero, without erasing command, parse, or cancellation
-// failures.
 func GetBlockedListContext(ctx context.Context, dir string, limit int) ([]BeadPreview, error) {
 	if limit < 0 {
 		return nil, fmt.Errorf("blocked limit must not be negative: %d", limit)
@@ -3197,166 +3200,4 @@ func GetBlockedListContext(ctx context.Context, dir string, limit int) ([]BeadPr
 	}
 
 	return items, nil
-}
-
-// RunRaw executes bv with given args and returns the raw output.
-// This is useful for commands where the caller wants to parse or display
-// the output directly rather than using typed wrappers.
-func RunRaw(dir string, args ...string) (string, error) {
-	return run(dir, args...)
-}
-
-// GetForecast returns forecast analysis
-func GetForecast(dir, target string) (*ForecastResponse, error) {
-	args := []string{"--robot-forecast"}
-	if target != "" {
-		args = append(args, target)
-	} else {
-		args = append(args, "all")
-	}
-	output, err := run(dir, args...)
-	if err != nil {
-		return nil, err
-	}
-	var resp ForecastResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing forecast: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetSuggestions returns hygiene suggestions
-func GetSuggestions(dir string) (*SuggestionsResponse, error) {
-	output, err := run(dir, "--robot-suggest")
-	if err != nil {
-		return nil, err
-	}
-	var resp SuggestionsResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing suggestions: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetImpact returns impact analysis for a file
-func GetImpact(dir, filePath string) (*ImpactResponse, error) {
-	output, err := run(dir, "--robot-impact", filePath)
-	if err != nil {
-		return nil, err
-	}
-	var resp ImpactResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing impact: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetSearch performs semantic search
-func GetSearch(dir, query string) (*SearchResponse, error) {
-	output, err := run(dir, "--robot-search", "--search", query)
-	if err != nil {
-		return nil, err
-	}
-	var resp SearchResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing search: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetLabelAttention returns label attention ranking
-func GetLabelAttention(dir string, limit int) (*LabelAttentionResponse, error) {
-	args := []string{"--robot-label-attention"}
-	if limit > 0 {
-		args = append(args, fmt.Sprintf("--attention-limit=%d", limit))
-	}
-	output, err := run(dir, args...)
-	if err != nil {
-		return nil, err
-	}
-	var resp LabelAttentionResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing label attention: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetLabelFlow returns cross-label dependency flow
-func GetLabelFlow(dir string) (*LabelFlowResponse, error) {
-	output, err := run(dir, "--robot-label-flow")
-	if err != nil {
-		return nil, err
-	}
-	var resp LabelFlowResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing label flow: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetLabelHealth returns per-label health metrics
-func GetLabelHealth(dir string) (*LabelHealthResponse, error) {
-	output, err := run(dir, "--robot-label-health")
-	if err != nil {
-		return nil, err
-	}
-	var resp LabelHealthResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing label health: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetFileBeads returns file-to-bead mapping
-func GetFileBeads(dir, filePath string, limit int) (*FileBeadsResponse, error) {
-	args := []string{"--robot-file-beads", filePath}
-	if limit > 0 {
-		args = append(args, fmt.Sprintf("--file-beads-limit=%d", limit))
-	}
-	output, err := run(dir, args...)
-	if err != nil {
-		return nil, err
-	}
-	var resp FileBeadsResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing file beads: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetFileHotspots returns frequently changed files
-func GetFileHotspots(dir string, limit int) (*FileHotspotsResponse, error) {
-	args := []string{"--robot-file-hotspots"}
-	if limit > 0 {
-		args = append(args, fmt.Sprintf("--hotspots-limit=%d", limit))
-	}
-	output, err := run(dir, args...)
-	if err != nil {
-		return nil, err
-	}
-	var resp FileHotspotsResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing file hotspots: %w", err)
-	}
-	return &resp, nil
-}
-
-// GetFileRelations returns file co-change relationships
-func GetFileRelations(dir, filePath string, limit int, threshold float64) (*FileRelationsResponse, error) {
-	args := []string{"--robot-file-relations", filePath}
-	if limit > 0 {
-		args = append(args, fmt.Sprintf("--relations-limit=%d", limit))
-	}
-	if threshold > 0 {
-		args = append(args, fmt.Sprintf("--relations-threshold=%f", threshold))
-	}
-	output, err := run(dir, args...)
-	if err != nil {
-		return nil, err
-	}
-	var resp FileRelationsResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing file relations: %w", err)
-	}
-	return &resp, nil
 }

@@ -3,6 +3,7 @@ package caut
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,12 +13,55 @@ type MockExecutor struct {
 	response  []byte
 	err       error
 	callCount int
+	args      []string
 }
 
-func (m *MockExecutor) Run(_ context.Context, _ ...string) ([]byte, error) {
+func (m *MockExecutor) Run(_ context.Context, args ...string) ([]byte, error) {
 	m.callCount++
+	m.args = args
 	return m.response, m.err
 }
+
+// cautUsageDocument is the full usage document from caut's own schema
+// contract test (coding_agent_usage_tracker tests/schema_contract_test.rs,
+// test_provider_payload_full), which caut validates against its published
+// schemas/caut-v1.schema.json.
+const cautUsageDocument = `{
+	"schemaVersion": "caut.v1",
+	"generatedAt": "2026-01-18T10:30:00Z",
+	"command": "usage",
+	"data": [{
+		"provider": "claude",
+		"account": "test@example.com",
+		"version": "1.0.0",
+		"source": "oauth",
+		"status": {
+			"indicator": "none",
+			"description": "All systems operational",
+			"url": "https://status.anthropic.com"
+		},
+		"usage": {
+			"primary": {
+				"usedPercent": 30.0,
+				"windowMinutes": 180,
+				"resetsAt": "2026-01-18T12:30:00Z",
+				"resetDescription": "in 2 hours"
+			},
+			"secondary": {
+				"usedPercent": 15.0,
+				"windowMinutes": 10080,
+				"resetDescription": "in 5 days"
+			},
+			"updatedAt": "2026-01-18T10:30:00Z",
+			"identity": {
+				"accountEmail": "test@example.com",
+				"loginMethod": "oauth"
+			}
+		}
+	}],
+	"errors": [],
+	"meta": { "format": "json", "flags": [], "runtime": "cli" }
+}`
 
 func TestNewClient(t *testing.T) {
 	c := NewClient()
@@ -31,107 +75,94 @@ func TestNewClient(t *testing.T) {
 
 func TestNewClientWithOptions(t *testing.T) {
 	c := NewClient(
-		WithBinaryPath("/custom/caut"),
-		WithTimeout(10*time.Second),
+		WithTimeout(10 * time.Second),
 	)
 
 	if c.timeout != 10*time.Second {
 		t.Errorf("expected timeout 10s, got %v", c.timeout)
 	}
 
-	execImpl, ok := c.executor.(*DefaultExecutor)
-	if !ok {
+	if _, ok := c.executor.(*DefaultExecutor); !ok {
 		t.Fatal("executor is not DefaultExecutor")
-	}
-	if execImpl.BinaryPath != "/custom/caut" {
-		t.Errorf("expected binary path /custom/caut, got %s", execImpl.BinaryPath)
 	}
 }
 
-func TestFetchUsage(t *testing.T) {
-	mockResponse := `{
-		"schema_version": "caut.v1",
-		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": [{
-				"provider": "claude",
-				"account": "user@example.com",
-				"source": "web",
-				"usage": {
-					"primary_rate_window": {
-						"used_percent": 67.5,
-						"window_minutes": 480,
-						"resets_at": "2026-01-20T23:00:00Z",
-						"reset_description": "8-hour rolling window"
-					},
-					"identity": {
-						"account_email": "user@example.com",
-						"plan_name": "Claude Max"
-					}
-				}
-			}]
-		},
-		"errors": []
-	}`
+// ntm parsed a snake_case envelope with data.payloads, which caut has never
+// emitted: every real caut response failed to unmarshal and usage-aware health
+// saw no provider data at all.
+func TestFetchUsageParsesCautContractDocument(t *testing.T) {
+	exec := &MockExecutor{response: []byte(cautUsageDocument)}
+	c := NewClient(WithExecutor(exec))
 
-	c := NewClient(WithExecutor(&MockExecutor{response: []byte(mockResponse)}))
-
-	result, err := c.FetchUsage(context.Background(), []string{"claude"})
+	result, err := c.FetchUsage(context.Background(), "claude")
 	if err != nil {
 		t.Fatalf("FetchUsage failed: %v", err)
 	}
-
-	if result.SchemaVersion != "caut.v1" {
-		t.Errorf("expected schema_version 'caut.v1', got %s", result.SchemaVersion)
+	if got := strings.Join(exec.args, " "); got != "usage --format json --provider claude" {
+		t.Errorf("caut args = %q, want usage --format json --provider claude", got)
 	}
-
+	if result.SchemaVersion != "caut.v1" {
+		t.Errorf("expected schemaVersion 'caut.v1', got %s", result.SchemaVersion)
+	}
 	if len(result.Payloads) != 1 {
 		t.Fatalf("expected 1 payload, got %d", len(result.Payloads))
 	}
 
 	payload := result.Payloads[0]
-	if payload.Provider != "claude" {
-		t.Errorf("expected provider 'claude', got %s", payload.Provider)
+	if payload.Provider != "claude" || payload.Source != "oauth" {
+		t.Errorf("provider/source = %s/%s, want claude/oauth", payload.Provider, payload.Source)
 	}
+	if usedPct := payload.UsedPercent(); usedPct == nil || *usedPct != 30.0 {
+		t.Errorf("expected usedPercent 30, got %v", usedPct)
+	}
+	if got := payload.GetWindowMinutes(); got == nil || *got != 180 {
+		t.Errorf("GetWindowMinutes = %v, want 180", got)
+	}
+	if reset := payload.GetResetTime(); reset == nil || !reset.Equal(time.Date(2026, 1, 18, 12, 30, 0, 0, time.UTC)) {
+		t.Errorf("GetResetTime = %v, want 2026-01-18T12:30:00Z", reset)
+	}
+	if got := payload.GetResetDescription(); got != "in 2 hours" {
+		t.Errorf("GetResetDescription = %q, want %q", got, "in 2 hours")
+	}
+	if payload.Usage.SecondaryRateWindow == nil || *payload.Usage.SecondaryRateWindow.UsedPercent != 15.0 {
+		t.Errorf("secondary window = %+v, want 15%% used", payload.Usage.SecondaryRateWindow)
+	}
+	if got := payload.GetAccountEmail(); got != "test@example.com" {
+		t.Errorf("GetAccountEmail = %q, want test@example.com", got)
+	}
+	if !payload.IsOperational() || payload.Status.Description == nil || *payload.Status.Description != "All systems operational" {
+		t.Errorf("status = %+v, want operational with its description", payload.Status)
+	}
+	if !payload.IsRateLimited(25) || payload.IsRateLimited(35) {
+		t.Error("IsRateLimited should compare the primary window's 30% against the threshold")
+	}
+}
 
-	usedPct := payload.UsedPercent()
-	if usedPct == nil || *usedPct != 67.5 {
-		t.Errorf("expected used_percent 67.5, got %v", usedPct)
-	}
-
-	if !payload.IsRateLimited(60) {
-		t.Error("expected IsRateLimited(60) to return true for 67.5% usage")
-	}
-	if payload.IsRateLimited(70) {
-		t.Error("expected IsRateLimited(70) to return false for 67.5% usage")
-	}
-
-	if payload.GetPlanName() != "Claude Max" {
-		t.Errorf("expected plan name 'Claude Max', got %s", payload.GetPlanName())
+func TestStatusInfoOperationalByIndicator(t *testing.T) {
+	for indicator, want := range map[string]bool{
+		"none": true, "minor": true, "maintenance": true, "unknown": true, "": true,
+		"major": false, "critical": false, "CRITICAL": false,
+	} {
+		if got := (&StatusInfo{Indicator: indicator}).Operational(); got != want {
+			t.Errorf("Operational(%q) = %v, want %v", indicator, got, want)
+		}
 	}
 }
 
 func TestFetchUsageWithErrors(t *testing.T) {
 	mockResponse := `{
-		"schema_version": "caut.v1",
+		"schemaVersion": "caut.v1",
+		"generatedAt": "2026-01-20T15:30:00Z",
 		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": []
-		},
+		"data": [],
 		"errors": ["provider claude not configured", "network timeout"]
 	}`
 
 	c := NewClient(WithExecutor(&MockExecutor{response: []byte(mockResponse)}))
 
-	result, err := c.FetchUsage(context.Background(), []string{"claude"})
+	result, err := c.FetchUsage(context.Background(), "claude")
 	if err != nil {
 		t.Fatalf("FetchUsage failed: %v", err)
-	}
-
-	if !result.HasErrors() {
-		t.Error("expected HasErrors to return true")
 	}
 
 	if len(result.Errors) != 2 {
@@ -144,7 +175,7 @@ func TestFetchUsageExecutorError(t *testing.T) {
 		err: errors.New("command failed"),
 	}))
 
-	_, err := c.FetchUsage(context.Background(), []string{"claude"})
+	_, err := c.FetchUsage(context.Background(), "claude")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -155,7 +186,7 @@ func TestFetchUsageInvalidJSON(t *testing.T) {
 		response: []byte("not valid json"),
 	}))
 
-	_, err := c.FetchUsage(context.Background(), []string{"claude"})
+	_, err := c.FetchUsage(context.Background(), "claude")
 	if err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
 	}
@@ -163,20 +194,17 @@ func TestFetchUsageInvalidJSON(t *testing.T) {
 
 func TestGetProviderUsage(t *testing.T) {
 	mockResponse := `{
-		"schema_version": "caut.v1",
+		"schemaVersion": "caut.v1",
+		"generatedAt": "2026-01-20T15:30:00Z",
 		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": [{
-				"provider": "codex",
-				"source": "api",
-				"usage": {
-					"primary_rate_window": {
-						"used_percent": 45.0
-					}
-				}
-			}]
-		},
+		"data": [{
+			"provider": "codex",
+			"source": "api",
+			"usage": {
+				"primary": {"usedPercent": 45.0},
+				"updatedAt": "2026-01-20T15:30:00Z"
+			}
+		}],
 		"errors": []
 	}`
 
@@ -190,16 +218,17 @@ func TestGetProviderUsage(t *testing.T) {
 	if payload.Provider != "codex" {
 		t.Errorf("expected provider 'codex', got %s", payload.Provider)
 	}
+	if used := payload.UsedPercent(); used == nil || *used != 45.0 {
+		t.Errorf("UsedPercent = %v, want 45", used)
+	}
 }
 
 func TestGetProviderUsageNoData(t *testing.T) {
 	mockResponse := `{
-		"schema_version": "caut.v1",
+		"schemaVersion": "caut.v1",
+		"generatedAt": "2026-01-20T15:30:00Z",
 		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": []
-		},
+		"data": [],
 		"errors": []
 	}`
 
@@ -208,76 +237,6 @@ func TestGetProviderUsageNoData(t *testing.T) {
 	_, err := c.GetProviderUsage(context.Background(), "claude")
 	if !errors.Is(err, ErrNoData) {
 		t.Errorf("expected ErrNoData, got %v", err)
-	}
-}
-
-func TestGetAgentUsage(t *testing.T) {
-	mockResponse := `{
-		"schema_version": "caut.v1",
-		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": [{
-				"provider": "claude",
-				"source": "web",
-				"usage": {
-					"primary_rate_window": {
-						"used_percent": 25.0
-					}
-				}
-			}]
-		},
-		"errors": []
-	}`
-
-	c := NewClient(WithExecutor(&MockExecutor{response: []byte(mockResponse)}))
-
-	payload, err := c.GetAgentUsage(context.Background(), "cc")
-	if err != nil {
-		t.Fatalf("GetAgentUsage failed: %v", err)
-	}
-
-	if payload.Provider != "claude" {
-		t.Errorf("expected provider 'claude', got %s", payload.Provider)
-	}
-}
-
-func TestGetAgentUsageAlias(t *testing.T) {
-	mockResponse := `{
-		"schema_version": "caut.v1",
-		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": [{
-				"provider": "codex",
-				"source": "cli",
-				"usage": {
-					"primary_rate_window": {
-						"used_percent": 10.0
-					}
-				}
-			}]
-		},
-		"errors": []
-	}`
-
-	c := NewClient(WithExecutor(&MockExecutor{response: []byte(mockResponse)}))
-
-	payload, err := c.GetAgentUsage(context.Background(), "openai-codex")
-	if err != nil {
-		t.Fatalf("GetAgentUsage alias failed: %v", err)
-	}
-	if payload.Provider != "codex" {
-		t.Errorf("expected provider 'codex', got %s", payload.Provider)
-	}
-}
-
-func TestGetAgentUsageUnknownType(t *testing.T) {
-	c := NewClient(WithExecutor(&MockExecutor{}))
-
-	_, err := c.GetAgentUsage(context.Background(), "unknown")
-	if err == nil {
-		t.Fatal("expected error for unknown agent type, got nil")
 	}
 }
 
@@ -292,7 +251,7 @@ func TestAgentTypeToProvider(t *testing.T) {
 		{"openai-codex", "codex"},
 		{"gmi", "gemini"},
 		{"google-gemini", "gemini"},
-		{"ws", "windsurf"},
+		{"ws", ""}, // caut has no windsurf provider
 		{"unknown", ""},
 		{"", ""},
 	}
@@ -307,38 +266,11 @@ func TestAgentTypeToProvider(t *testing.T) {
 	}
 }
 
-func TestProviderToAgentType(t *testing.T) {
-	tests := []struct {
-		provider string
-		expected string
-	}{
-		{"claude", "cc"},
-		{"anthropic", "cc"},
-		{"codex", "cod"},
-		{"openai", "cod"},
-		{"gemini", "gmi"},
-		{"google", "gmi"},
-		{"ws", "windsurf"},
-		{"unknown", ""},
-		{"", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.provider, func(t *testing.T) {
-			got := ProviderToAgentType(tt.provider)
-			if got != tt.expected {
-				t.Errorf("ProviderToAgentType(%q) = %q, want %q", tt.provider, got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestProviderPayloadHelpers(t *testing.T) {
 	usedPct := 75.5
 	windowMins := 480
 	resetDesc := "8-hour rolling window"
 	email := "user@example.com"
-	planName := "Claude Max"
 
 	payload := &ProviderPayload{
 		Provider: "claude",
@@ -351,7 +283,6 @@ func TestProviderPayloadHelpers(t *testing.T) {
 			},
 			Identity: &Identity{
 				AccountEmail: &email,
-				PlanName:     &planName,
 			},
 		},
 	}
@@ -370,10 +301,6 @@ func TestProviderPayloadHelpers(t *testing.T) {
 
 	if got := payload.GetAccountEmail(); got != email {
 		t.Errorf("GetAccountEmail = %q, want %q", got, email)
-	}
-
-	if got := payload.GetPlanName(); got != planName {
-		t.Errorf("GetPlanName = %q, want %q", got, planName)
 	}
 
 	if !payload.IsOperational() {
@@ -405,48 +332,8 @@ func TestProviderPayloadNoData(t *testing.T) {
 	}
 }
 
-func TestUsageResultGetPayloadByProvider(t *testing.T) {
-	result := &UsageResult{
-		Payloads: []ProviderPayload{
-			{Provider: "claude"},
-			{Provider: "codex"},
-			{Provider: "gemini"},
-		},
-	}
-
-	got := result.GetPayloadByProvider("codex")
-	if got == nil {
-		t.Fatal("GetPayloadByProvider returned nil")
-	}
-	if got.Provider != "codex" {
-		t.Errorf("expected provider 'codex', got %s", got.Provider)
-	}
-
-	if result.GetPayloadByProvider("unknown") != nil {
-		t.Error("expected nil for unknown provider")
-	}
-}
-
 func TestCachedClient(t *testing.T) {
-	mockResponse := `{
-		"schema_version": "caut.v1",
-		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": [{
-				"provider": "claude",
-				"source": "web",
-				"usage": {
-					"primary_rate_window": {
-						"used_percent": 50.0
-					}
-				}
-			}]
-		},
-		"errors": []
-	}`
-
-	mockExec := &MockExecutor{response: []byte(mockResponse)}
+	mockExec := &MockExecutor{response: []byte(cautUsageDocument)}
 	client := NewClient(WithExecutor(mockExec))
 	cachedClient := NewCachedClient(client, 5*time.Minute)
 
@@ -468,67 +355,17 @@ func TestCachedClient(t *testing.T) {
 		t.Errorf("expected still 1 call (cached), got %d", mockExec.callCount)
 	}
 
-	// Check cache stats
-	stats := cachedClient.CacheStats()
-	if stats["valid_entries"].(int) != 1 {
-		t.Errorf("expected 1 valid entry, got %d", stats["valid_entries"])
-	}
-
-	// Invalidate and call again
-	cachedClient.Invalidate("claude")
-	_, err = cachedClient.GetProviderUsage(context.Background(), "claude")
-	if err != nil {
-		t.Fatalf("third call failed: %v", err)
-	}
-	if mockExec.callCount != 2 {
-		t.Errorf("expected 2 calls after invalidation, got %d", mockExec.callCount)
-	}
-}
-
-func TestCachedClientInvalidateAll(t *testing.T) {
-	mockResponse := `{
-		"schema_version": "caut.v1",
-		"command": "usage",
-		"timestamp": "2026-01-20T15:30:00Z",
-		"data": {
-			"payloads": [{
-				"provider": "claude",
-				"source": "web",
-				"usage": {}
-			}]
-		},
-		"errors": []
-	}`
-
-	client := NewClient(WithExecutor(&MockExecutor{response: []byte(mockResponse)}))
-	cachedClient := NewCachedClient(client, 5*time.Minute)
-
-	// Populate cache
-	_, _ = cachedClient.GetProviderUsage(context.Background(), "claude")
-
-	stats := cachedClient.CacheStats()
-	if stats["total_entries"].(int) != 1 {
-		t.Errorf("expected 1 entry before invalidation")
-	}
-
-	// Invalidate all
-	cachedClient.InvalidateAll()
-
-	stats = cachedClient.CacheStats()
-	if stats["total_entries"].(int) != 0 {
-		t.Errorf("expected 0 entries after InvalidateAll")
-	}
 }
 
 func TestSupportedProviders(t *testing.T) {
 	providers := SupportedProviders()
-	if len(providers) != 6 {
-		t.Errorf("expected 6 providers, got %d", len(providers))
+	if len(providers) != 4 {
+		t.Errorf("expected 4 providers, got %d", len(providers))
 	}
 
+	// Every one must be a caut provider name: caut rejects others outright.
 	expected := map[string]bool{
-		"claude": true, "codex": true, "gemini": true,
-		"cursor": true, "windsurf": true, "aider": true,
+		"claude": true, "codex": true, "gemini": true, "cursor": true,
 	}
 	for _, p := range providers {
 		if !expected[p] {

@@ -10,8 +10,8 @@ import (
 
 // TestParseAgentMixAcceptsEveryPromptableAgentType checks --agent-mix takes
 // the types the old list rejected (pi, kimi, muse) plus opencode and aliases,
-// rejects a bogus type with the valid list, and rejects Grok up front because
-// every ensemble pane needs an injected prompt Grok can't receive yet.
+// rejects a bogus type with the valid list, and takes Grok, whose prompt
+// delivery upstream implemented in GH#251 phase 2.
 func TestParseAgentMixAcceptsEveryPromptableAgentType(t *testing.T) {
 	mix, err := parseAgentMix("pi=1, kimi=1, moonshot=1, muse=2, opencode=1, cc=1")
 	if err != nil {
@@ -37,8 +37,8 @@ func TestParseAgentMixAcceptsEveryPromptableAgentType(t *testing.T) {
 		}
 	}
 
-	_, err = parseAgentMix("grok=1")
-	if err == nil || !strings.Contains(err.Error(), "Grok Build prompt delivery") {
-		t.Fatalf("parseAgentMix(grok=1) error = %v, want the Grok prompt-delivery hint", err)
+	mix, err = parseAgentMix("grok=1")
+	if err != nil || mix["grok"] != 1 {
+		t.Fatalf("parseAgentMix(grok=1) = %v, %v; want grok accepted now that its prompt delivery is implemented (GH#251)", mix, err)
 	}
 }

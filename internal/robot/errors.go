@@ -3,7 +3,6 @@
 package robot
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -21,18 +20,10 @@ import (
 // ErrorsOptions configures the errors command.
 type ErrorsOptions struct {
 	Session   string   // Session name (required)
-	Panes     []string // Pane indices to check (empty = all agent panes)
+	Panes     []string // N, W.P, or %N pane selectors to check (empty = all agent panes)
 	Lines     int      // Lines to capture per pane (default: 1000)
 	AgentType string   // Filter by agent type (claude, codex, gemini)
 	Context   int      // Context lines before/after error (default: 2)
-}
-
-// DefaultErrorsOptions returns sensible defaults.
-func DefaultErrorsOptions() ErrorsOptions {
-	return ErrorsOptions{
-		Lines:   1000,
-		Context: 2,
-	}
 }
 
 // ErrorEntry represents a single error detected in pane output.
@@ -129,11 +120,6 @@ func isRobotErrorLine(line string) (bool, string) {
 	return false, ""
 }
 
-// agentTypeFromPaneType converts tmux pane type to string.
-func agentTypeFromPaneType(t tmux.AgentType) string {
-	return agentTypeString(t)
-}
-
 func detectErrorsPaneAgentType(pane tmux.Pane, paneOutput string) string {
 	detection := DetectAgentTypeEnhanced(pane, paneOutput)
 	return detection.Type
@@ -193,28 +179,39 @@ func GetErrors(opts ErrorsOptions) (*ErrorsOutput, error) {
 		opts.Context = 2
 	}
 
-	// Build pane filter set. parseErrorsIndex reports success through its bool,
-	// never through the error, so checking the error accepted every malformed
-	// selector and silently filtered to pane 0 instead.
-	paneFilter := make(map[int]bool)
-	for _, p := range opts.Panes {
-		var idx int
-		ok, err := parseErrorsIndex(p, &idx)
-		if err != nil || !ok {
+	// Resolve the pane filter through the shared N / W.P / %N resolver used by
+	// every robot --panes flag. A malformed or unknown selector fails the
+	// whole scan instead of silently narrowing it.
+	var paneFilter map[string]struct{}
+	if len(opts.Panes) > 0 {
+		selected, err := tmux.ResolvePaneSelectors(panes, opts.Panes, false)
+		if err != nil {
 			output.RobotResponse = NewErrorResponse(
-				fmt.Errorf("invalid --panes value %q: expected a pane index", p),
-				ErrCodeInvalidFlag,
-				"Pass pane indices such as --panes=1,2",
+				err,
+				paneSelectorRobotErrorCode(err),
+				"Use comma-separated N, W.P, or %N pane selectors, e.g. --panes=1,2.0,%7",
 			)
 			return output, nil
 		}
-		paneFilter[idx] = true
+		paneFilter = make(map[string]struct{}, len(selected))
+		for _, pane := range selected {
+			paneFilter[pane.Ref().StableKey()] = struct{}{}
+		}
 	}
 
 	// Process each pane
 	for _, pane := range panes {
 		// Apply pane filter
-		if len(paneFilter) > 0 && !paneFilter[pane.Index] {
+		if paneFilter != nil {
+			if _, ok := paneFilter[pane.Ref().StableKey()]; !ok {
+				continue
+			}
+		}
+
+		// A tagged service pane is not an agent: its scrollback is service
+		// logging, not agent failure, and searching it would both cost a
+		// capture and manufacture errors nobody can act on (ntm#305).
+		if pane.IsServicePane() {
 			continue
 		}
 
@@ -285,21 +282,4 @@ func PrintErrors(opts ErrorsOptions) error {
 		return err
 	}
 	return encodeTerminalRobotOutput(output, output.RobotResponse, "robot error scan failed")
-}
-
-// parseErrorsIndex parses a string to int (helper).
-func parseErrorsIndex(s string, idx *int) (bool, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false, nil
-	}
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false, nil
-		}
-		n = n*10 + int(c-'0')
-	}
-	*idx = n
-	return true, nil
 }

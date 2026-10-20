@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/agents"
+	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 )
 
@@ -180,9 +182,38 @@ func effectiveAgentModel(profile *agents.AgentProfile) string {
 	return profile.Model
 }
 
+// newObservedProfileMatcher returns the agent profiles with each agent type's
+// performance taken from recorded assignment outcomes across every session
+// (completed and failed assignments, live and archived), instead of the seeded
+// prior. Unreadable ledgers are skipped; with no outcomes the seeds stay and
+// report as unmeasured.
+func newObservedProfileMatcher() *agents.ProfileMatcher {
+	pm := agents.NewProfileMatcher()
+	outcomes, _, err := assignment.AggregateOutcomes()
+	if err != nil {
+		slog.Default().Debug("assignment outcomes unavailable", "error", err)
+		return pm
+	}
+	observed := make(map[agents.AgentType]agents.Performance, len(outcomes))
+	for kind, stats := range outcomes {
+		rate, ok := stats.SuccessRate()
+		if !ok {
+			continue
+		}
+		observed[agents.AgentType(kind)] = agents.Performance{
+			AvgCompletionTime: stats.AvgCompletionTime(),
+			SuccessRate:       rate,
+			TasksCompleted:    stats.Completed,
+			LastUpdated:       stats.LastActivity,
+		}
+	}
+	pm.ApplyObservedPerformance(observed)
+	return pm
+}
+
 // runAgentsList displays all agent profiles.
 func runAgentsList() error {
-	pm := agents.NewProfileMatcher()
+	pm := newObservedProfileMatcher()
 	profiles := pm.AllProfiles()
 
 	// Reflect the config-resolved spawn model rather than the baked-in default
@@ -219,7 +250,7 @@ func runAgentsList() error {
 
 // runAgentsShow displays a specific agent profile.
 func runAgentsShow(agentName string) error {
-	pm := agents.NewProfileMatcher()
+	pm := newObservedProfileMatcher()
 	profile := pm.GetProfileByName(agentName)
 
 	if profile == nil {
@@ -261,11 +292,18 @@ func runAgentsShow(agentName string) error {
 		}
 	}
 
+	// Only report performance that was actually observed (recorded assignment
+	// outcomes); the seeded SuccessRate is a prior, and printing it once
+	// produced "Tasks Completed: 0" above "Success Rate: 90.0%".
 	fmt.Printf("\nPerformance:\n")
-	fmt.Printf("  Tasks Completed: %d\n", profile.Performance.TasksCompleted)
-	fmt.Printf("  Success Rate:    %.1f%%\n", profile.Performance.SuccessRate*100)
-	if profile.Performance.AvgCompletionTime > 0 {
-		fmt.Printf("  Avg Time:        %s\n", profile.Performance.AvgCompletionTime)
+	if !profile.Performance.Measured() {
+		fmt.Printf("  No task outcomes recorded yet\n")
+	} else {
+		fmt.Printf("  Tasks Completed: %d\n", profile.Performance.TasksCompleted)
+		fmt.Printf("  Success Rate:    %.1f%%\n", profile.Performance.SuccessRate*100)
+		if profile.Performance.AvgCompletionTime > 0 {
+			fmt.Printf("  Avg Time:        %s\n", profile.Performance.AvgCompletionTime)
+		}
 	}
 
 	return nil
@@ -273,7 +311,7 @@ func runAgentsShow(agentName string) error {
 
 // runAgentsStats displays performance statistics for all agents.
 func runAgentsStats() error {
-	pm := agents.NewProfileMatcher()
+	pm := newObservedProfileMatcher()
 	stats := pm.GetPerformanceStats()
 
 	if IsJSONOutput() {
@@ -307,8 +345,14 @@ func runAgentsStats() error {
 		if p.AvgCompletionTime > 0 {
 			avgTime = p.AvgCompletionTime.String()
 		}
-		fmt.Fprintf(w, "%s\t%d\t%.1f%%\t%s\t%s\n",
-			t, p.TasksCompleted, p.SuccessRate*100, avgTime, lastActive)
+		// "-" rather than a seeded rate: with no outcomes recorded there is no
+		// success rate to report, and printing one invents a statistic.
+		successRate := "-"
+		if p.Measured() {
+			successRate = fmt.Sprintf("%.1f%%", p.SuccessRate*100)
+		}
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\n",
+			t, p.TasksCompleted, successRate, avgTime, lastActive)
 	}
 
 	return w.Flush()
@@ -316,7 +360,7 @@ func runAgentsStats() error {
 
 // runAgentsRecommend recommends the best agent for a task.
 func runAgentsRecommend(task agents.TaskInfo) error {
-	pm := agents.NewProfileMatcher()
+	pm := newObservedProfileMatcher()
 
 	// Get scores for all agents
 	type agentScore struct {

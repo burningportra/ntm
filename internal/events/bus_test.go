@@ -1,8 +1,6 @@
 package events
 
 import (
-	"bytes"
-	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -102,6 +100,33 @@ func TestEventBus_Publish(t *testing.T) {
 	}
 }
 
+// WaitHandlers reports false while a handler Publish started is still running
+// and true once it returns, so a consumer is unsubscribed only after the events
+// already published have reached it.
+func TestEventBus_WaitHandlersWaitsForAsyncHandlers(t *testing.T) {
+	t.Parallel()
+
+	bus := NewEventBus(10)
+	release := make(chan struct{})
+	var handled atomic.Int32
+	bus.SubscribeAll(func(BusEvent) {
+		<-release
+		handled.Add(1)
+	})
+
+	bus.Publish(BaseEvent{Type: "wait_handlers_test", Timestamp: time.Now()})
+	if bus.WaitHandlers(20 * time.Millisecond) {
+		t.Fatal("WaitHandlers returned true while the handler was blocked")
+	}
+	close(release)
+	if !bus.WaitHandlers(2 * time.Second) {
+		t.Fatal("WaitHandlers timed out after the handler was released")
+	}
+	if got := handled.Load(); got != 1 {
+		t.Fatalf("handler ran %d times, want 1 before WaitHandlers returned", got)
+	}
+}
+
 func TestEventBus_PublishSync(t *testing.T) {
 	t.Parallel()
 
@@ -198,29 +223,6 @@ func TestEventBus_HistoryLimit(t *testing.T) {
 	}
 }
 
-func TestEventBus_EnableRobotMode(t *testing.T) {
-	t.Parallel()
-
-	bus := NewEventBus(10)
-	var buf bytes.Buffer
-
-	unsub := bus.EnableRobotMode(&buf)
-	defer unsub()
-
-	event := NewProfileAssignedEvent("test-session", "agent1", "architect", "")
-	bus.PublishSync(event)
-
-	// Parse JSON output
-	var decoded map[string]interface{}
-	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
-		t.Fatalf("failed to parse JSON output: %v", err)
-	}
-
-	if decoded["type"] != "profile_assigned" {
-		t.Errorf("expected type 'profile_assigned', got %v", decoded["type"])
-	}
-}
-
 func TestBaseEvent_Interface(t *testing.T) {
 	t.Parallel()
 
@@ -240,213 +242,6 @@ func TestBaseEvent_Interface(t *testing.T) {
 
 	if event.EventTimestamp().IsZero() {
 		t.Error("expected non-zero timestamp")
-	}
-}
-
-func TestProfileEvents(t *testing.T) {
-	t.Parallel()
-
-	t.Run("ProfileAssignedEvent", func(t *testing.T) {
-		event := NewProfileAssignedEvent("session1", "agent1", "architect", "")
-		if event.EventType() != "profile_assigned" {
-			t.Errorf("expected type 'profile_assigned', got %q", event.EventType())
-		}
-		if event.AgentID != "agent1" {
-			t.Errorf("expected agent_id 'agent1', got %q", event.AgentID)
-		}
-	})
-
-	t.Run("ProfileSwitchedEvent", func(t *testing.T) {
-		event := NewProfileSwitchedEvent("session1", "agent1", "architect", "implementer")
-		if event.EventType() != "profile_switched" {
-			t.Errorf("expected type 'profile_switched', got %q", event.EventType())
-		}
-	})
-}
-
-func TestRotationEvents(t *testing.T) {
-	t.Parallel()
-
-	t.Run("ContextWarningEvent", func(t *testing.T) {
-		event := NewContextWarningEvent("session1", "agent1", 75.5, 50000)
-		if event.EventType() != "context_warning" {
-			t.Errorf("expected type 'context_warning', got %q", event.EventType())
-		}
-		if event.UsagePercent != 75.5 {
-			t.Errorf("expected usage 75.5, got %f", event.UsagePercent)
-		}
-	})
-
-	t.Run("RotationStartedEvent", func(t *testing.T) {
-		event := NewRotationStartedEvent("session1", "agent1", 85.0, "architect")
-		if event.EventType() != "rotation_started" {
-			t.Errorf("expected type 'rotation_started', got %q", event.EventType())
-		}
-	})
-
-	t.Run("RotationCompletedEvent", func(t *testing.T) {
-		event := NewRotationCompletedEvent("session1", "agent1", "agent2", 2000, true, "")
-		if event.EventType() != "rotation_completed" {
-			t.Errorf("expected type 'rotation_completed', got %q", event.EventType())
-		}
-		if !event.Success {
-			t.Error("expected success to be true")
-		}
-	})
-}
-
-func TestCheckpointEvents(t *testing.T) {
-	t.Parallel()
-
-	t.Run("CheckpointCreatedEvent", func(t *testing.T) {
-		event := NewCheckpointCreatedEvent("session1", "checkpoint1", "full", 1024000, 3)
-		if event.EventType() != "checkpoint_created" {
-			t.Errorf("expected type 'checkpoint_created', got %q", event.EventType())
-		}
-		if event.SizeBytes != 1024000 {
-			t.Errorf("expected size 1024000, got %d", event.SizeBytes)
-		}
-	})
-
-	t.Run("CheckpointRestoredEvent", func(t *testing.T) {
-		event := NewCheckpointRestoredEvent("session1", "checkpoint1", 3)
-		if event.EventType() != "checkpoint_restored" {
-			t.Errorf("expected type 'checkpoint_restored', got %q", event.EventType())
-		}
-	})
-}
-
-func TestWorkflowEvents(t *testing.T) {
-	t.Parallel()
-
-	t.Run("WorkflowStartedEvent", func(t *testing.T) {
-		event := NewWorkflowStartedEvent("session1", "code-review", "run123", []string{"agent1", "agent2"})
-		if event.EventType() != "workflow_started" {
-			t.Errorf("expected type 'workflow_started', got %q", event.EventType())
-		}
-		if len(event.Agents) != 2 {
-			t.Errorf("expected 2 agents, got %d", len(event.Agents))
-		}
-	})
-
-	t.Run("StageTransitionEvent", func(t *testing.T) {
-		event := NewStageTransitionEvent("session1", "code-review", "run123", "design", "implement", "completion")
-		if event.EventType() != "stage_transition" {
-			t.Errorf("expected type 'stage_transition', got %q", event.EventType())
-		}
-	})
-
-	t.Run("WorkflowPausedEvent", func(t *testing.T) {
-		event := NewWorkflowPausedEvent("session1", "code-review", "run123", "user request")
-		if event.EventType() != "workflow_paused" {
-			t.Errorf("expected type 'workflow_paused', got %q", event.EventType())
-		}
-	})
-
-	t.Run("WorkflowCompletedEvent", func(t *testing.T) {
-		event := NewWorkflowCompletedEvent("session1", "code-review", "run123", 300, 5, true, "")
-		if event.EventType() != "workflow_completed" {
-			t.Errorf("expected type 'workflow_completed', got %q", event.EventType())
-		}
-		if event.DurationSec != 300 {
-			t.Errorf("expected duration 300, got %d", event.DurationSec)
-		}
-	})
-}
-
-func TestNewWorkflowStartedEvent_DefensiveCopiesAgents(t *testing.T) {
-	t.Parallel()
-
-	agents := []string{"agent1", "agent2"}
-	event := NewWorkflowStartedEvent("session1", "code-review", "run123", agents)
-	agents[0] = "mutated"
-
-	if got, want := event.Agents[0], "agent1"; got != want {
-		t.Fatalf("event.Agents[0] = %q, want %q", got, want)
-	}
-}
-
-func TestAgentEvents(t *testing.T) {
-	t.Parallel()
-
-	t.Run("AgentStallEvent", func(t *testing.T) {
-		event := NewAgentStallEvent("session1", "agent1", 120.5, "last prompt")
-		if event.EventType() != "agent_stall" {
-			t.Errorf("expected type 'agent_stall', got %q", event.EventType())
-		}
-	})
-
-	t.Run("AgentErrorEvent", func(t *testing.T) {
-		event := NewAgentErrorEvent("session1", "agent1", "rate_limit", "Rate limit exceeded")
-		if event.EventType() != "agent_error" {
-			t.Errorf("expected type 'agent_error', got %q", event.EventType())
-		}
-	})
-}
-
-func TestAlertEvent(t *testing.T) {
-	t.Parallel()
-
-	event := NewAlertEvent("session1", "alert123", "agent_stuck", "warning", "Agent stuck for 5 minutes")
-	if event.EventType() != "alert" {
-		t.Errorf("expected type 'alert', got %q", event.EventType())
-	}
-	if event.Severity != "warning" {
-		t.Errorf("expected severity 'warning', got %q", event.Severity)
-	}
-}
-
-func TestHumanOverlayEvents(t *testing.T) {
-	t.Parallel()
-
-	t.Run("HumanZoomEvent", func(t *testing.T) {
-		event := NewHumanZoomEvent("session1", 3, "codex", 42)
-		if event.EventType() != EventHumanZoom {
-			t.Fatalf("expected type %q, got %q", EventHumanZoom, event.EventType())
-		}
-		if event.EventSession() != "session1" {
-			t.Fatalf("expected session session1, got %q", event.EventSession())
-		}
-		if event.PaneIndex != 3 {
-			t.Fatalf("expected pane index 3, got %d", event.PaneIndex)
-		}
-		if event.AgentType != "codex" {
-			t.Fatalf("expected agent type codex, got %q", event.AgentType)
-		}
-		if event.Cursor != 42 {
-			t.Fatalf("expected cursor 42, got %d", event.Cursor)
-		}
-	})
-
-	t.Run("HumanOverlayDismissEvent", func(t *testing.T) {
-		event := NewHumanOverlayDismissEvent("session1", -1, 99)
-		if event.EventType() != EventHumanOverlayDismiss {
-			t.Fatalf("expected type %q, got %q", EventHumanOverlayDismiss, event.EventType())
-		}
-		if event.DurationSeconds != 0 {
-			t.Fatalf("expected negative durations to clamp to 0, got %.3f", event.DurationSeconds)
-		}
-		if event.Cursor != 99 {
-			t.Fatalf("expected cursor 99, got %d", event.Cursor)
-		}
-	})
-}
-
-func TestGlobalFunctions(t *testing.T) {
-	t.Parallel()
-
-	var received atomic.Int32
-
-	unsub := Subscribe("global_test", func(e BusEvent) {
-		received.Add(1)
-	})
-	defer unsub()
-
-	event := BaseEvent{Type: "global_test", Timestamp: time.Now()}
-	PublishSync(event)
-
-	if received.Load() != 1 {
-		t.Errorf("expected 1 event received, got %d", received.Load())
 	}
 }
 
@@ -475,6 +270,108 @@ func TestEventBus_ConcurrentPublish(t *testing.T) {
 
 	if received.Load() != 100 {
 		t.Errorf("expected 100 events received, got %d", received.Load())
+	}
+}
+
+func TestEventBus_ReentrantPublishAtCapacityDoesNotDeadlock(t *testing.T) {
+	publishers := []struct {
+		name string
+		fn   func(*EventBus, BusEvent)
+	}{
+		{name: "Publish", fn: func(bus *EventBus, event BusEvent) { bus.Publish(event) }},
+		{name: "PublishSync", fn: func(bus *EventBus, event BusEvent) { bus.PublishSync(event) }},
+	}
+	for _, outer := range publishers {
+		for _, nested := range publishers {
+			t.Run(outer.name+"/nested_"+nested.name, func(t *testing.T) {
+				assertReentrantPublishAtCapacityDoesNotDeadlock(t, outer.fn, nested.fn)
+			})
+		}
+	}
+}
+
+func assertReentrantPublishAtCapacityDoesNotDeadlock(
+	t *testing.T,
+	publishOuter func(*EventBus, BusEvent),
+	publishNested func(*EventBus, BusEvent),
+) {
+	t.Helper()
+
+	bus := NewEventBus(10)
+	ready := make(chan struct{}, DefaultMaxConcurrentHandlers)
+	release := make(chan struct{})
+	completed := make(chan struct{}, DefaultMaxConcurrentHandlers)
+	nestedCompleted := make(chan struct{}, DefaultMaxConcurrentHandlers)
+	var nestedReceived atomic.Int32
+
+	bus.Subscribe("nested", func(BusEvent) {
+		nestedReceived.Add(1)
+		nestedCompleted <- struct{}{}
+	})
+	bus.Subscribe("outer", func(BusEvent) {
+		ready <- struct{}{}
+		<-release
+		publishNested(bus, BaseEvent{Type: "nested", Timestamp: time.Now()})
+		completed <- struct{}{}
+	})
+
+	var publishers sync.WaitGroup
+	publishers.Add(DefaultMaxConcurrentHandlers)
+	for i := 0; i < DefaultMaxConcurrentHandlers; i++ {
+		go func() {
+			defer publishers.Done()
+			publishOuter(bus, BaseEvent{Type: "outer", Timestamp: time.Now()})
+		}()
+	}
+
+	readyDeadline := time.After(2 * time.Second)
+	for i := 0; i < DefaultMaxConcurrentHandlers; i++ {
+		select {
+		case <-ready:
+		case <-readyDeadline:
+			t.Fatalf("only %d/%d outer handlers reached the saturation barrier", i, DefaultMaxConcurrentHandlers)
+		}
+	}
+	close(release)
+
+	outerDeadline := time.After(2 * time.Second)
+	for i := 0; i < DefaultMaxConcurrentHandlers; i++ {
+		select {
+		case <-completed:
+		case <-outerDeadline:
+			t.Fatalf("only %d/%d reentrant outer handlers completed", i, DefaultMaxConcurrentHandlers)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		publishers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reentrant publish deadlocked with every handler semaphore slot occupied")
+	}
+
+	nestedDeadline := time.After(2 * time.Second)
+	for i := 0; i < DefaultMaxConcurrentHandlers; i++ {
+		select {
+		case <-nestedCompleted:
+		case <-nestedDeadline:
+			t.Fatalf("only %d/%d nested handlers completed", i, DefaultMaxConcurrentHandlers)
+		}
+	}
+
+	if got := nestedReceived.Load(); got != DefaultMaxConcurrentHandlers {
+		t.Fatalf("nested handlers received %d events, want %d", got, DefaultMaxConcurrentHandlers)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(bus.handlerSem) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(bus.handlerSem); got != 0 {
+		t.Fatalf("handler semaphore retained %d slots after all handlers completed", got)
 	}
 }
 
@@ -564,121 +461,6 @@ func TestEventBus_UnsubscribeMultiple(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Conflict Event Tests (br-vdfjr)
-// =============================================================================
-
-func TestNewReservationConflictEvent(t *testing.T) {
-	t.Parallel()
-
-	event := NewReservationConflictEvent("proj", "src/auth.go", "BlueLake", "cc_1", []string{"GreenCastle"})
-	if event.EventType() != "conflict.reservation" {
-		t.Errorf("EventType() = %q, want %q", event.EventType(), "conflict.reservation")
-	}
-	if event.EventSession() != "proj" {
-		t.Errorf("EventSession() = %q, want %q", event.EventSession(), "proj")
-	}
-	if event.Path != "src/auth.go" {
-		t.Errorf("Path = %q, want %q", event.Path, "src/auth.go")
-	}
-	if event.RequestorAgent != "BlueLake" {
-		t.Errorf("RequestorAgent = %q, want %q", event.RequestorAgent, "BlueLake")
-	}
-	if len(event.Holders) != 1 || event.Holders[0] != "GreenCastle" {
-		t.Errorf("Holders = %v, want [GreenCastle]", event.Holders)
-	}
-	if event.EventTimestamp().IsZero() {
-		t.Error("expected non-zero timestamp")
-	}
-}
-
-func TestNewFileConflictEvent(t *testing.T) {
-	t.Parallel()
-
-	event := NewFileConflictEvent("proj", "cmd/main.go", []string{"Agent1", "Agent2"})
-	if event.EventType() != "conflict.file" {
-		t.Errorf("EventType() = %q, want %q", event.EventType(), "conflict.file")
-	}
-	if event.EventSession() != "proj" {
-		t.Errorf("EventSession() = %q, want %q", event.EventSession(), "proj")
-	}
-	if event.Path != "cmd/main.go" {
-		t.Errorf("Path = %q, want %q", event.Path, "cmd/main.go")
-	}
-	if len(event.Agents) != 2 {
-		t.Errorf("Agents count = %d, want 2", len(event.Agents))
-	}
-}
-
-func TestConflictEvents_ImplementBusEvent(t *testing.T) {
-	t.Parallel()
-
-	// Compile-time interface check
-	var _ BusEvent = ReservationConflictEvent{}
-	var _ BusEvent = FileConflictEvent{}
-
-	// Publish and receive through the bus
-	bus := NewEventBus(10)
-	var received atomic.Int32
-
-	bus.SubscribeAll(func(event BusEvent) {
-		received.Add(1)
-	})
-
-	bus.PublishSync(NewReservationConflictEvent("s", "f.go", "A", "p1", []string{"B"}))
-	bus.PublishSync(NewFileConflictEvent("s", "g.go", []string{"A", "B"}))
-
-	if received.Load() != 2 {
-		t.Errorf("expected 2 events received, got %d", received.Load())
-	}
-
-	// Verify in history
-	history := bus.History(10)
-	if len(history) != 2 {
-		t.Errorf("expected 2 events in history, got %d", len(history))
-	}
-}
-
-func TestConflictEvents_JSONMarshal(t *testing.T) {
-	t.Parallel()
-
-	event := NewReservationConflictEvent("proj", "auth.go", "A", "cc_1", []string{"B", "C"})
-	data, err := json.Marshal(event)
-	if err != nil {
-		t.Fatalf("Marshal error: %v", err)
-	}
-	if !bytes.Contains(data, []byte(`"conflict.reservation"`)) {
-		t.Errorf("JSON should contain event type, got %s", data)
-	}
-	if !bytes.Contains(data, []byte(`"auth.go"`)) {
-		t.Errorf("JSON should contain path, got %s", data)
-	}
-}
-
-func TestNewReservationConflictEvent_DefensiveCopiesHolders(t *testing.T) {
-	t.Parallel()
-
-	holders := []string{"BlueLake", "GreenCastle"}
-	event := NewReservationConflictEvent("proj", "auth.go", "A", "cc_1", holders)
-	holders[0] = "mutated"
-
-	if got, want := event.Holders[0], "BlueLake"; got != want {
-		t.Fatalf("event.Holders[0] = %q, want %q", got, want)
-	}
-}
-
-func TestNewFileConflictEvent_DefensiveCopiesAgents(t *testing.T) {
-	t.Parallel()
-
-	agents := []string{"Agent1", "Agent2"}
-	event := NewFileConflictEvent("proj", "cmd/main.go", agents)
-	agents[0] = "mutated"
-
-	if got, want := event.Agents[0], "Agent1"; got != want {
-		t.Fatalf("event.Agents[0] = %q, want %q", got, want)
-	}
-}
-
 func TestNewWebhookEvent_DefensiveCopiesDetails(t *testing.T) {
 	t.Parallel()
 
@@ -691,5 +473,186 @@ func TestNewWebhookEvent_DefensiveCopiesDetails(t *testing.T) {
 
 	if got, want := event.Details["severity"], "warning"; got != want {
 		t.Fatalf("event.Details[severity] = %q, want %q", got, want)
+	}
+}
+
+func waitForBusDelivery(t *testing.T, done <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+// The CLI and webhook bridge use WaitHandlers before closing consumers. A
+// PublishSync running on another goroutine is just as important to that drain
+// as an asynchronous Publish, even though the publisher itself waits.
+func TestEventBus_WaitHandlersIncludesSynchronousDelivery(t *testing.T) {
+	t.Parallel()
+	bus := NewEventBus(10)
+	entered := make(chan struct{})
+	block := make(chan struct{})
+	release := sync.OnceFunc(func() { close(block) })
+	defer release()
+	var delivered atomic.Int32
+	bus.SubscribeAll(func(BusEvent) {
+		close(entered)
+		<-block
+		delivered.Add(1)
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bus.PublishSync(NewWebhookEvent(WebhookAgentCompleted, "proj", "%1", "worker", "done", nil))
+	}()
+	waitForBusDelivery(t, entered, "synchronous handler")
+	if bus.WaitHandlers(20 * time.Millisecond) {
+		t.Error("drain reported success before the synchronous consumer completed")
+	}
+	release()
+	waitForBusDelivery(t, done, "synchronous publisher")
+	if !bus.WaitHandlers(time.Second) || delivered.Load() != 1 {
+		t.Fatal("drain did not observe completed synchronous delivery")
+	}
+}
+
+// Fill a real handler slot, then keep the caller-runs fallback blocked after
+// the asynchronous handler has left. The remaining inline consumer must not
+// disappear from the shutdown drain just because it owns no semaphore slot.
+func TestEventBus_WaitHandlersIncludesInlineDelivery(t *testing.T) {
+	t.Parallel()
+	bus := NewEventBus(10)
+	bus.handlerSem = make(chan struct{}, 1)
+	asyncEntered := make(chan struct{})
+	asyncBlock := make(chan struct{})
+	releaseAsync := sync.OnceFunc(func() { close(asyncBlock) })
+	defer releaseAsync()
+	inlineEntered := make(chan struct{})
+	inlineBlock := make(chan struct{})
+	releaseInline := sync.OnceFunc(func() { close(inlineBlock) })
+	defer releaseInline()
+	var delivered atomic.Int32
+	bus.Subscribe("occupy", func(BusEvent) {
+		close(asyncEntered)
+		<-asyncBlock
+	})
+	bus.Subscribe(WebhookSessionEnded, func(BusEvent) {
+		close(inlineEntered)
+		<-inlineBlock
+		delivered.Add(1)
+	})
+	bus.Publish(BaseEvent{Type: "occupy"})
+	waitForBusDelivery(t, asyncEntered, "asynchronous handler")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bus.Publish(NewWebhookEvent(WebhookSessionEnded, "proj", "", "", "ended", nil))
+	}()
+	waitForBusDelivery(t, inlineEntered, "inline handler")
+	releaseAsync()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(bus.handlerSem) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(bus.handlerSem) != 0 {
+		t.Fatal("asynchronous handler did not release its slot")
+	}
+	if bus.WaitHandlers(20 * time.Millisecond) {
+		t.Error("drain reported success while the inline consumer was still blocked")
+	}
+	releaseInline()
+	waitForBusDelivery(t, done, "inline publisher")
+	if !bus.WaitHandlers(time.Second) || delivered.Load() != 1 {
+		t.Fatal("drain did not observe completed inline delivery")
+	}
+}
+
+type busDeliveryTypeEvent struct {
+	BaseEvent
+	typeFunc func() string
+}
+
+func (e busDeliveryTypeEvent) EventType() string { return e.typeFunc() }
+
+func TestEventBus_WaitHandlersIncludesDispatchSetup(t *testing.T) {
+	for _, synchronous := range []bool{false, true} {
+		name := "Publish"
+		if synchronous {
+			name = "PublishSync"
+		}
+		t.Run(name, func(t *testing.T) {
+			bus := NewEventBus(10)
+			entered := make(chan struct{})
+			block := make(chan struct{})
+			release := sync.OnceFunc(func() { close(block) })
+			defer release()
+			var delivered atomic.Int32
+			bus.SubscribeAll(func(BusEvent) { delivered.Add(1) })
+			event := busDeliveryTypeEvent{typeFunc: func() string {
+				close(entered)
+				<-block
+				return WebhookBeadCompleted
+			}}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if synchronous {
+					bus.PublishSync(event)
+				} else {
+					bus.Publish(event)
+				}
+			}()
+			waitForBusDelivery(t, entered, "dispatch setup")
+			if bus.WaitHandlers(20 * time.Millisecond) {
+				t.Error("drain missed a publication before its first handler was scheduled")
+			}
+			release()
+			waitForBusDelivery(t, done, "publisher")
+			if !bus.WaitHandlers(time.Second) || delivered.Load() != 1 {
+				t.Fatal("publication was not delivered exactly once after setup resumed")
+			}
+		})
+	}
+}
+
+func TestEventBus_EventTypePanicDoesNotPoisonSubscriptions(t *testing.T) {
+	for _, synchronous := range []bool{false, true} {
+		name := "Publish"
+		if synchronous {
+			name = "PublishSync"
+		}
+		t.Run(name, func(t *testing.T) {
+			bus := NewEventBus(10)
+			event := busDeliveryTypeEvent{typeFunc: func() string { panic("bad event type") }}
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Error("expected the event's panic to reach the publisher")
+					}
+				}()
+				if synchronous {
+					bus.PublishSync(event)
+				} else {
+					bus.Publish(event)
+				}
+			}()
+			// Detect a leaked read lock without leaving a blocked Subscribe
+			// goroutine behind when this regression runs on the old code.
+			if !bus.mu.TryLock() {
+				t.Fatal("EventType panic left the subscriber registry locked")
+			}
+			bus.mu.Unlock()
+			if !bus.WaitHandlers(0) {
+				t.Fatal("panicking publication leaked drain accounting")
+			}
+			var delivered int
+			unsub := bus.Subscribe("healthy", func(BusEvent) { delivered++ })
+			bus.PublishSync(BaseEvent{Type: "healthy"})
+			unsub()
+			if delivered != 1 {
+				t.Fatalf("subsequent healthy delivery count = %d, want 1", delivered)
+			}
+		})
 	}
 }

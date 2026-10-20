@@ -89,11 +89,13 @@ func TestExitAgentMuseSendsVerifiedSequence(t *testing.T) {
 		t.Fatalf("exitAgent(muse) error = %v", err)
 	}
 
+	// formatTargetWin exact-matches the session with a leading "=" (upstream
+	// b7f5da79), so a sibling session sharing the prefix is never hit.
 	want := []string{
-		"send-keys -t proj:3.2 Escape",
-		"send-keys -t proj:3.2 C-c",
-		"send-keys -t proj:3.2 C-c",
-		"send-keys -t proj:3.2 C-c",
+		"send-keys -t =proj:3.2 Escape",
+		"send-keys -t =proj:3.2 C-c",
+		"send-keys -t =proj:3.2 C-c",
+		"send-keys -t =proj:3.2 C-c",
 	}
 	got := drainTmuxCalls(calls)
 	gotArgs := make([]string, len(got))
@@ -172,7 +174,7 @@ func TestExitAgentPiAndKimiSendTheirExitSequences(t *testing.T) {
 
 			want := make([]string, len(tc.wantKeys))
 			for i, key := range tc.wantKeys {
-				want[i] = "send-keys -t proj:3.2 " + key
+				want[i] = "send-keys -t =proj:3.2 " + key
 			}
 			got := drainTmuxCalls(calls)
 			gotArgs := make([]string, len(got))
@@ -250,10 +252,12 @@ func TestSendExitChoreographyUsesEachAgentsExitSequence(t *testing.T) {
 			want: doubleCtrlC("%11"),
 		},
 		{
+			// Upstream 3445ce31 (GH#345): Escape opens Codex transcript
+			// browsing, so the clear reads the pane first and sends Codex no
+			// blind editing keys when no composer is visible.
 			name: "codex clears its composer and never types /exit unverified",
 			pane: tmux.Pane{ID: "%12", Type: tmux.AgentCodex, Title: "proj__cod_1"},
 			want: []string{
-				"send-keys -t %12 Escape", "send-keys -t %12 Escape", "send-keys -t %12 Escape", "send-keys -t %12 C-u",
 				"capture-pane -t %12 -p -S 0",
 				"send-keys -t %12 C-c", "send-keys -t %12 C-c",
 			},

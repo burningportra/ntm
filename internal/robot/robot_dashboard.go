@@ -94,7 +94,7 @@ func GetDashboard() (*DashboardOutput, error) {
 	}
 
 	// Alerts (best-effort)
-	alertCfg := alertConfigForProject(cfg, wd)
+	alertCfg := AlertConfigForProject(cfg, wd)
 	activeAlerts := alerts.GetActiveAlerts(alertCfg)
 	alertSummary := alerts.GetGlobalTracker().Summary()
 	for _, a := range activeAlerts {
@@ -139,9 +139,19 @@ func GetDashboard() (*DashboardOutput, error) {
 	return output, nil
 }
 
+// dashboardAgentType is the type the dashboard lists a pane under. A tagged
+// service pane is never listed, whatever its command looks like (ntm#305).
+// User shells are listed as "user", the way --robot-snapshot lists them.
+func dashboardAgentType(pane tmux.Pane) (string, bool) {
+	if pane.IsServicePane() {
+		return "", false
+	}
+	return agentTypeString(pane.Type), true
+}
+
 // addDashboardSession lists every observed pane of one session and adds them
-// to the summary. User shells are listed too, with type and state "user", the
-// way --robot-snapshot lists them, so the User Panes and User counts see them.
+// to the summary, user shells included, so the User Panes and User counts see
+// them.
 func addDashboardSession(output *DashboardOutput, sess tmux.Session, panes []statuspkg.PaneObservation, parser agent.Parser) {
 	snapSession := SnapshotSession{
 		Name:     sess.Name,
@@ -150,7 +160,10 @@ func addDashboardSession(output *DashboardOutput, sess tmux.Session, panes []sta
 	}
 	for _, paneObservation := range panes {
 		pane := paneObservation.Metadata
-		agentType := agentTypeString(pane.Type)
+		agentType, ok := dashboardAgentType(pane)
+		if !ok {
+			continue
+		}
 		agentState := string(runtimeAgentState(agentType, observedPaneWork(parser, paneObservation)))
 		snapSession.Agents = append(snapSession.Agents, SnapshotAgent{
 			Pane:           fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
@@ -431,9 +444,16 @@ func dashboardOtherAgentCount(totalPanes, userPanes int, typeCounts map[string]i
 }
 
 // dashboardAgentTypeLabel is an agent type's name without its product suffix
-// ("Claude" for Claude Code, "Cursor" for Cursor Agent).
+// ("Claude" for Claude Code, "Cursor" for Cursor Agent, "Grok" for Grok
+// Build). A name with no such suffix stays whole ("Oh My Pi").
 func dashboardAgentTypeLabel(agentType agent.AgentType) string {
-	return strings.Fields(agentType.DisplayName())[0]
+	name := agentType.DisplayName()
+	for _, suffix := range []string{" Code", " CLI", " Agent", " Build"} {
+		if label, ok := strings.CutSuffix(name, suffix); ok {
+			return label
+		}
+	}
+	return name
 }
 
 func writeAgentsTable(sb *strings.Builder, sessions []SnapshotSession, maxRows int) {

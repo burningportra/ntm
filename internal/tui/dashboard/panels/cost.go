@@ -42,6 +42,10 @@ type CostAgentRow struct {
 	OutputTokens int
 	CostUSD      float64
 	Trend        CostTrend
+	// PricingMatch records how the rate was resolved. Anything short of an
+	// exact match means the amount was priced at a rate nobody verified for
+	// this model, which the panel marks rather than hiding.
+	PricingMatch cost.PricingMatch
 }
 
 type CostPanelData struct {
@@ -66,8 +70,11 @@ type CostPanel struct {
 
 func costConfig() PanelConfig {
 	return PanelConfig{
-		ID:              "cost",
-		Title:           "Cost Tracking",
+		ID: "cost",
+		// Not "Cost Tracking": nothing here is tracked. Token counts are a
+		// ~3.5-chars-per-token estimate over scraped pane output, priced from a
+		// static table. Provider billing is not consulted.
+		Title:           "Cost (estimated)",
 		Priority:        PriorityNormal,
 		RefreshInterval: 10 * time.Second,
 		MinWidth:        30,
@@ -210,17 +217,38 @@ func (c *CostPanel) View() string {
 	}
 
 	// Totals
-	totalLine := fmt.Sprintf("Session Total: %s", cost.FormatCost(c.data.SessionTotalUSD))
+	totalLine := fmt.Sprintf("Session Total: %s", cost.FormatCostEstimate(c.data.SessionTotalUSD))
 	if c.data.LastHourUSD > 0 {
-		totalLine += fmt.Sprintf("  (1h: %s)", cost.FormatCost(c.data.LastHourUSD))
+		totalLine += fmt.Sprintf("  (1h: %s)", cost.FormatCostEstimate(c.data.LastHourUSD))
 	}
 	totals := []string{
 		lipgloss.NewStyle().Foreground(t.Text).Bold(true).Render(totalLine),
 	}
 
+	// State the basis and the vintage. Without it a dollar figure in a dashboard
+	// reads as billing; this one is a token estimate over scraped output priced
+	// from a table older than most of the models it is pricing.
+	basis := "est. from output volume, not provider billing; prices as of " + cost.PricingTableVintage
+	var anyFamily, anyUnknown bool
+	for _, agent := range c.data.Agents {
+		switch agent.PricingMatch {
+		case cost.PricingUnknown:
+			anyUnknown = true
+		case cost.PricingFamily:
+			anyFamily = true
+		}
+	}
+	if anyFamily {
+		basis += "; ~ = priced from model family"
+	}
+	if anyUnknown {
+		basis += "; ? = model not in price table"
+	}
+	totals = append(totals, lipgloss.NewStyle().Foreground(t.Overlay).Render(basis))
+
 	if c.data.DailyBudgetUSD > 0 {
 		remaining := c.data.DailyBudgetUSD - c.data.BudgetUsedUSD
-		remainingStr := cost.FormatCost(remaining)
+		remainingStr := cost.FormatCostEstimate(remaining)
 
 		budgetColor := t.Green
 		if remaining <= 0 {
@@ -234,6 +262,8 @@ func (c *CostPanel) View() string {
 			}
 		}
 
+		// The limit is a real number the operator set; the remainder is an
+		// estimate subtracted from it, so only the remainder carries the "~".
 		budgetLine := fmt.Sprintf("Budget Left: %s  (limit: %s)", remainingStr, cost.FormatCost(c.data.DailyBudgetUSD))
 		totals = append(totals, lipgloss.NewStyle().Foreground(budgetColor).Bold(true).Render(budgetLine))
 	}
@@ -330,7 +360,12 @@ func (c *CostPanel) costTableColumns(tableWidth int) []table.Column {
 
 	inW := 7
 	outW := 7
-	costW := 8
+	// Wide enough for the longest estimate plus a confidence marker:
+	// "~$1234.50?" is ten columns. At the previous width of eight, the "~"
+	// prefix and the marker pushed ordinary amounts past the edge and the table
+	// truncated them, so "~$123.45?" rendered as "~$123.4" — a figure that reads
+	// as precise and is not even the right number.
+	costW := 10
 	trendW := 2
 
 	fixedW := costW + trendW
@@ -359,18 +394,12 @@ func (c *CostPanel) costTableColumns(tableWidth int) []table.Column {
 }
 
 // costTableRows builds table rows from the current data.
+//
+// Each row carries exactly one cell per column, derived from the column titles
+// themselves. bubbles/table indexes its columns by cell position, so a row with
+// more cells than columns panics (GH #331: at table widths 36-43 the "In"
+// column is dropped but rows still carried an input-token cell).
 func (c *CostPanel) costTableRows(cols []table.Column, maxRows int) []table.Row {
-	showTokens := len(cols) >= 4 // Agent + In + ... (4+ columns means In is present)
-	showOut := len(cols) >= 4    // Check by column title presence instead
-	for _, col := range cols {
-		if col.Title == "In" {
-			showTokens = true
-		}
-		if col.Title == "Out" {
-			showOut = true
-		}
-	}
-
 	nameW := 8
 	if len(cols) > 0 {
 		nameW = cols[0].Width
@@ -381,16 +410,31 @@ func (c *CostPanel) costTableRows(cols []table.Column, maxRows int) []table.Row 
 		if i >= maxRows {
 			break
 		}
-		name := layout.TruncatePaneTitle(agent.PaneTitle, nameW)
-		row := []string{name}
-		if showTokens {
-			row = append(row, formatTokenShort(agent.InputTokens))
+		row := make(table.Row, 0, len(cols))
+		for _, col := range cols {
+			switch col.Title {
+			case "Agent":
+				row = append(row, layout.TruncatePaneTitle(agent.PaneTitle, nameW))
+			case "In":
+				row = append(row, formatTokenShort(agent.InputTokens))
+			case "Out":
+				row = append(row, formatTokenShort(agent.OutputTokens))
+			case "Cost":
+				// Mark rates nobody verified for this model: "?" for the default row,
+				// "~" for a family prefix (claude-opus-5 priced from claude-opus).
+				costCell := cost.FormatCostEstimate(agent.CostUSD)
+				switch agent.PricingMatch {
+				case cost.PricingUnknown:
+					costCell += "?"
+				case cost.PricingFamily:
+					costCell += "~"
+				}
+				row = append(row, costCell)
+			default:
+				// The untitled trailing column holds the trend arrow.
+				row = append(row, agent.Trend.Arrow())
+			}
 		}
-		if showOut {
-			row = append(row, formatTokenShort(agent.OutputTokens))
-		}
-		row = append(row, cost.FormatCost(agent.CostUSD))
-		row = append(row, agent.Trend.Arrow())
 		rows = append(rows, row)
 	}
 	return rows
@@ -407,24 +451,4 @@ func formatTokenShort(tokens int) string {
 		return fmt.Sprintf("%.1fK", float64(tokens)/1000.0)
 	}
 	return fmt.Sprintf("%.1fM", float64(tokens)/1000000.0)
-}
-
-func padRight(s string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	if len(s) >= width {
-		return s
-	}
-	return s + strings.Repeat(" ", width-len(s))
-}
-
-func padLeft(s string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	if len(s) >= width {
-		return s
-	}
-	return strings.Repeat(" ", width-len(s)) + s
 }

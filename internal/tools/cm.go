@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -142,37 +142,11 @@ func (a *CMAdapter) isDaemonRunning(ctx context.Context) bool {
 		}
 	}
 
+	// The daemon speaks MCP JSON-RPC at its root; there is no /health route.
 	directCtx, directCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer directCancel()
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", a.serverPort)
-	req, err := http.NewRequestWithContext(directCtx, "GET", url, nil)
-	if err != nil {
-		return false
-	}
-
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == http.StatusOK
-}
-
-// HasCapability checks if cm has a specific capability
-func (a *CMAdapter) HasCapability(ctx context.Context, cap Capability) bool {
-	caps, err := a.Capabilities(ctx)
-	if err != nil {
-		return false
-	}
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
+	return cm.NewPortClient(a.serverPort, "").Health(directCtx) == nil
 }
 
 // Info returns complete cm tool information
@@ -182,20 +156,35 @@ func (a *CMAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 
 // CM-specific methods
 
-// GetContext retrieves contextual information for a task. The CMAdapter
-// itself doesn't carry workspace identity (it's called from generic tool
-// adapters with no workingDir context), so it forwards an empty workspace
-// to CM's unscoped query. Callers that need workspace-scoped retrieval
-// should use the workspace-aware paths in `internal/cm/client.go` directly.
-func (a *CMAdapter) GetContext(ctx context.Context, taskDescription string) (json.RawMessage, error) {
-	if a.client != nil {
-		res, err := a.client.GetContext(ctx, taskDescription, "")
-		if err == nil {
-			return json.Marshal(res)
+// GetContext retrieves rules for the explicit workspace using the same typed
+// daemon and CLI clients as recovery. An absent scope never becomes a query
+// against the caller's current directory.
+func (a *CMAdapter) GetContext(ctx context.Context, taskDescription, workspace, sessionID string) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(workspace) {
+		return nil, fmt.Errorf("cm context requires an absolute workspace")
+	}
+	// Discover a client for this request, rather than mutating the adapter's
+	// connected endpoint when a builder serves several projects concurrently.
+	if sessionID != "" {
+		if client, err := cm.NewClient(workspace, sessionID); err == nil {
+			if res, err := client.GetContext(ctx, taskDescription, workspace); err == nil {
+				return json.Marshal(res)
+			}
 		}
 		// Fallback to CLI if HTTP fails
 	}
-	return a.runCommand(ctx, "context", taskDescription, "--json")
+	client := cm.NewCLIClient(cm.WithCLIBinaryPath(a.BinaryName()), cm.WithCLITimeout(a.Timeout()))
+	result, err := client.GetContext(ctx, taskDescription, workspace)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil || !result.Success {
+		return nil, fmt.Errorf("cm context returned no successful result")
+	}
+	return json.Marshal(result)
 }
 
 // OnboardStatus returns onboarding status

@@ -948,6 +948,7 @@ func TestE2ESpawnGrokPhaseOneBuiltBinary(t *testing.T) {
 				"--robot-format=json",
 				"--robot-bulk-assign="+hardeningSession,
 				"--allocation="+string(allocation),
+				"--reserve-files=false",
 			)
 			fixture.requireUnavailableJSONFailure(t, bulk, agent.GrokPhaseOneCapabilityHint)
 			var bulkEnvelope struct {
@@ -1220,9 +1221,11 @@ reasoning_effort = "medium"
 			t.Fatalf("reset Grok ambient-context CASS invocation log: %v", err)
 		}
 		checkpointMarker := "GROK_RECOVERY_CONTEXT_MUST_NOT_SEND"
-		checkpointStorage := checkpoint.NewStorageWithDir(
-			filepath.Join(fixture.root, "home", checkpoint.DefaultCheckpointDir),
-		)
+		// checkpoint.NewStorageWithDir was removed in the G1 dead-code
+		// burndown (670f6380); BaseDir is exported, construct directly.
+		checkpointStorage := &checkpoint.Storage{
+			BaseDir: filepath.Join(fixture.root, "home", checkpoint.DefaultCheckpointDir),
+		}
 		ambientCheckpoint := &checkpoint.Checkpoint{
 			Version:     checkpoint.CurrentVersion,
 			ID:          "ambient-context",
@@ -4435,7 +4438,7 @@ func TestE2ESpawnAssignmentPartialCoverageBuiltBinary(t *testing.T) {
 
 	fixture := newSpawnAssignmentCLIFixture(t)
 	baseArgs := fixture.spawnArgs()
-	args := make([]string, 0, len(baseArgs)-1)
+	args := make([]string, 0, len(baseArgs))
 	for _, arg := range baseArgs {
 		switch arg {
 		case "--spawn-cc=1":
@@ -4444,9 +4447,12 @@ func TestE2ESpawnAssignmentPartialCoverageBuiltBinary(t *testing.T) {
 			arg = "--timeout=20s"
 		case "--spawn-names=" + spawnAssignmentDisplayName:
 			arg = "--spawn-names=" + spawnAssignmentDisplayName + ",NoWorkAgent"
-		case "--spawn-wait":
-			continue
 		}
+		// --spawn-wait is kept: this test proves PARTIAL ASSIGNMENT COVERAGE
+		// (two eligible agents, one bead), not the no-wait spawn path. The
+		// claim gate requires a fresh idle observation (SafeToDispatch), so
+		// claiming immediately after typing the launch command races the
+		// fake agent's first paint and fails closed nondeterministically.
 		args = append(args, arg)
 	}
 
@@ -4821,6 +4827,7 @@ func TestE2ESpawnAssignmentSignalCancellationMatrix(t *testing.T) {
 			"--from-bv",
 			"--bulk-strategy=ready",
 			"--bulk-parallel",
+			"--reserve-files=false",
 		)
 		assertSpawnSignalJSONFailure(t, result, "TIMEOUT")
 		for _, beadID := range []string{firstBead, secondBead} {
@@ -7202,6 +7209,13 @@ func newSpawnAssignmentPreflightFixture(t *testing.T) *spawnAssignmentPreflightF
 	}
 
 	root := t.TempDir()
+	// macOS t.TempDir() lives under /var, a symlink to /private/var. The
+	// product resolves and reports canonical paths (worktree retention
+	// messages, Agent Mail project keys), so hold the resolved form or
+	// substring/equality assertions against reported paths fail.
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	fixture := &spawnAssignmentPreflightFixture{
 		ntmPath:      ntmPath,
 		tmuxPath:     tmuxPath,
@@ -8022,6 +8036,15 @@ func newSpawnAssignmentCLIFixture(t *testing.T) *spawnAssignmentCLIFixture {
 	}
 
 	root := t.TempDir()
+	// macOS t.TempDir() lives under /var, a symlink to /private/var. The
+	// production coordinator resolves the project path before Agent Mail
+	// lookups (effective_project_key), so the fixture must hold the resolved
+	// form or the seeded pane registry's project key never matches and every
+	// claim fails with "no canonical Agent Mail identity" (bd-fe90b
+	// precedent).
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	tmuxRoot := testutil.ShortTmuxTempDir(t)
 	fixture := &spawnAssignmentCLIFixture{
 		ntmPath:    ntmPath,
@@ -8049,23 +8072,27 @@ func newSpawnAssignmentCLIFixture(t *testing.T) *spawnAssignmentCLIFixture {
 	}
 
 	fixture.env = spawnAssignmentIsolatedEnv(map[string]string{
-		"HOME":                fixture.homeDir,
-		"XDG_CONFIG_HOME":     fixture.configDir,
-		"XDG_DATA_HOME":       filepath.Join(root, "data"),
-		"TMUX_TMPDIR":         tmuxRoot,
-		"PATH":                fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"AGENT_MAIL_URL":      "http://127.0.0.1:1/mcp/",
-		"AGENT_MAIL_TOKEN":    "",
-		"HTTP_PROXY":          "",
-		"HTTPS_PROXY":         "",
-		"ALL_PROXY":           "",
-		"NO_PROXY":            "127.0.0.1,localhost",
-		"NO_COLOR":            "1",
-		"TERM":                "xterm-256color",
-		"NTM_CONFIG":          "",
-		"NTM_OUTPUT_FORMAT":   "",
-		"NTM_ROBOT_FORMAT":    "",
-		"TOON_DEFAULT_FORMAT": "",
+		"HOME":            fixture.homeDir,
+		"XDG_CONFIG_HOME": fixture.configDir,
+		"XDG_DATA_HOME":   filepath.Join(root, "data"),
+		"TMUX_TMPDIR":     tmuxRoot,
+		// No test here asserts monitor state, and the detached resilience
+		// monitor keeps writing under HOME after the tmux server dies,
+		// racing t.TempDir cleanup ("directory not empty") under load.
+		"NTM_DISABLE_INTERNAL_MONITOR": "1",
+		"PATH":                         fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"AGENT_MAIL_URL":               "http://127.0.0.1:1/mcp/",
+		"AGENT_MAIL_TOKEN":             "",
+		"HTTP_PROXY":                   "",
+		"HTTPS_PROXY":                  "",
+		"ALL_PROXY":                    "",
+		"NO_PROXY":                     "127.0.0.1,localhost",
+		"NO_COLOR":                     "1",
+		"TERM":                         "xterm-256color",
+		"NTM_CONFIG":                   "",
+		"NTM_OUTPUT_FORMAT":            "",
+		"NTM_ROBOT_FORMAT":             "",
+		"TOON_DEFAULT_FORMAT":          "",
 	})
 
 	writeSpawnFakeClaude(t, filepath.Join(fakeBin, "claude"))
@@ -8263,13 +8290,22 @@ func (f *spawnAssignmentCLIFixture) seedAgentRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal Agent Mail pane registry: %v", err)
 	}
-	path := filepath.Join(f.configDir, "ntm", "sessions", f.session,
-		agentmail.ProjectSlugFromPath(f.projectDir), "agent_registry.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("create Agent Mail registry directory: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("write Agent Mail pane registry: %v", err)
+	// The product loads the registry from os.UserConfigDir(): on Linux that
+	// honors XDG_CONFIG_HOME, but on macOS it is always
+	// "$HOME/Library/Application Support" — seed both bases so the claim's
+	// canonical-identity resolution finds the pane registry on either OS.
+	for _, base := range []string{
+		filepath.Join(f.configDir, "ntm", "sessions"),
+		filepath.Join(f.homeDir, "Library", "Application Support", "ntm", "sessions"),
+	} {
+		path := filepath.Join(base, f.session,
+			agentmail.ProjectSlugFromPath(f.projectDir), "agent_registry.json")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("create Agent Mail registry directory: %v", err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("write Agent Mail pane registry: %v", err)
+		}
 	}
 }
 
@@ -8472,18 +8508,21 @@ func (f *spawnAssignmentCLIFixture) tmuxOutput(ctx context.Context, args ...stri
 
 func writeSpawnFakeClaude(t *testing.T, path string) {
 	t.Helper()
-	content := `#!/bin/sh
-stty -echo
-print_idle_prompt() {
-    printf '\342\227\217 Ready\n\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\n\342\235\257 \n\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\n'
-}
-printf 'Claude Code v0.0.0\n'
-print_idle_prompt
-while IFS= read -r line; do
-    printf 'RECEIVED:%s\n' "$line"
-    print_idle_prompt
-done
-`
+	// The fake Claude must be a non-shell foreground process: prompt dispatch
+	// crosses the PANE_AGENT_DEAD liveness gate (ntm-0g0b), and a `#!/bin/sh`
+	// fake reports pane_current_command "bash" on macOS (the kernel resolves
+	// the interpreter, not the script name). The wrapper execs the fakeshell
+	// fixture (bd-h4t0j) in echo mode, preserving the historical surface:
+	// "Claude Code v0.0.0" banner for the ready gate, the "❯" composer glyph
+	// for the bd-dp9oy visibility gate, tty echo disabled, and one
+	// "RECEIVED:<line>" transcript row per submitted line.
+	fakeshellBin, err := ensureFakeshellBin()
+	if err != nil {
+		t.Fatalf("build fakeshell fixture: %v", err)
+	}
+	content := fmt.Sprintf(`#!/bin/sh
+exec %s --mode=echo --tty-noecho --prompt='❯ ' --banner='Claude Code v0.0.0\n● Ready'
+`, tmux.ShellQuote(fakeshellBin))
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("write fake Claude executable: %v", err)
 	}
@@ -8491,19 +8530,24 @@ done
 
 func writeSpawnGatedFakeClaude(t *testing.T, path, readyFile string) {
 	t.Helper()
+	// The gate itself stays in the sh wrapper (WAITING chrome, no composer,
+	// not agent-ready), then execs the fakeshell fixture so the post-gate
+	// pane is a non-shell foreground process with the "❯" composer glyph —
+	// otherwise prompt delivery after the gate opens fails PANE_AGENT_DEAD
+	// (see writeSpawnFakeClaude).
+	fakeshellBin, err := ensureFakeshellBin()
+	if err != nil {
+		t.Fatalf("build fakeshell fixture: %v", err)
+	}
 	quotedReadyFile := strings.ReplaceAll(readyFile, "'", "'\"'\"'")
 	content := fmt.Sprintf(`#!/bin/sh
-stty -echo
 ready_file='%s'
 printf 'WAITING_FOR_E2E_READY\n'
 while [ ! -f "$ready_file" ]; do
     sleep 0.05
 done
-printf '\342\227\217 Ready\n\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\n\342\235\257 \n\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\n'
-while IFS= read -r line; do
-    printf 'RECEIVED:%%s\n' "$line"
-done
-`, quotedReadyFile)
+exec %s --mode=echo --tty-noecho --prompt='❯ ' --banner='● Ready'
+`, quotedReadyFile, tmux.ShellQuote(fakeshellBin))
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("write gated fake Claude executable: %v", err)
 	}
@@ -8511,20 +8555,20 @@ done
 
 func writeSpawnLaunchMarkerAgent(t *testing.T, path, markerPath string) {
 	t.Helper()
+	// Non-shell foreground process for the PANE_AGENT_DEAD gate (see
+	// writeSpawnFakeClaude). This writer serves multiple agent binaries
+	// (claude and codex), so the prompt carries both composer glyphs — each
+	// type's bd-dp9oy visibility check only looks for its own marker on the
+	// bottom-most line, and an empty composer follows either glyph.
+	fakeshellBin, err := ensureFakeshellBin()
+	if err != nil {
+		t.Fatalf("build fakeshell fixture: %v", err)
+	}
 	quotedMarker := strings.ReplaceAll(markerPath, "'", "'\"'\"'")
 	content := fmt.Sprintf(`#!/bin/sh
 printf 'launched\n' > '%s'
-stty -echo
-print_idle_prompt() {
-    printf '\342\227\217 Ready\n\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\n\342\235\257 \n\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\342\224\200\n'
-}
-printf 'Claude Code v0.0.0\n'
-print_idle_prompt
-while IFS= read -r line; do
-    printf 'RECEIVED:%%s\n' "$line"
-    print_idle_prompt
-done
-`, quotedMarker)
+exec %s --mode=echo --tty-noecho --prompt='❯ › ' --banner='Claude Code v0.0.0\n● Ready'
+`, quotedMarker, tmux.ShellQuote(fakeshellBin))
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("write launch-marker agent executable: %v", err)
 	}
@@ -8655,6 +8699,7 @@ func spawnAssignmentIsolatedEnv(overrides map[string]string) []string {
 	replaced := map[string]struct{}{
 		"HOME": {}, "XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_STATE_HOME": {}, "XDG_CACHE_HOME": {},
 		"PWD": {}, "OLDPWD": {}, "GIT_DIR": {}, "GIT_WORK_TREE": {}, "BR_DB": {}, "BD_DB": {}, "BEADS_DB": {}, "AGENT_NAME": {},
+		"BR_NO_DAEMON": {}, "BD_NO_DAEMON": {},
 		"PATH": {},
 		"TMUX": {}, "TMUX_PANE": {}, "TMUX_TMPDIR": {},
 		"NTM_CONFIG": {}, "NTM_OUTPUT_FORMAT": {}, "NTM_ROBOT_FORMAT": {}, "TOON_DEFAULT_FORMAT": {},
@@ -8673,6 +8718,15 @@ func spawnAssignmentIsolatedEnv(overrides map[string]string) []string {
 	}
 	for key, value := range overrides {
 		result = append(result, key+"="+value)
+	}
+	// Hermetic br: pin the daemon off so host-level br daemons/config cannot
+	// answer reads for beads seeded through the fixture's isolated state
+	// (#263). A no-op on br >=0.5; the discriminator on older installs.
+	if _, ok := overrides["BR_NO_DAEMON"]; !ok {
+		result = append(result, "BR_NO_DAEMON=1")
+	}
+	if _, ok := overrides["BD_NO_DAEMON"]; !ok {
+		result = append(result, "BD_NO_DAEMON=1")
 	}
 	sort.Strings(result)
 	return result
@@ -8730,6 +8784,9 @@ type spawnAssignmentMCPStub struct {
 	list       int
 	reserve    int
 	errors     []string
+	// granted holds the live rows behind file_reservation_paths receipts;
+	// ntm reads them back through the resource view to verify each grant.
+	granted []map[string]any
 	// blockAgentsPath makes the agents resource wait for request cancellation
 	// after recording a marker. It is used only by the signal-cancellation E2E.
 	blockAgentsPath string
@@ -8814,14 +8871,16 @@ func (s *spawnAssignmentMCPStub) handleTool(w http.ResponseWriter, id any, name 
 		}
 		s.reserve++
 		now := time.Now().UTC()
+		grant := map[string]any{
+			"id": spawnAssignmentReservationID, "path_pattern": s.path,
+			"agent_name": s.recipient, "project_id": spawnAssignmentProjectID,
+			"exclusive": true, "reason": "bead assignment: " + s.beadID,
+			"created_ts": now.Format(time.RFC3339Nano),
+			"expires_ts": now.Add(time.Hour).Format(time.RFC3339Nano),
+		}
+		s.granted = append(s.granted, grant)
 		s.writeResult(w, id, map[string]any{
-			"granted": []map[string]any{{
-				"id": spawnAssignmentReservationID, "path_pattern": s.path,
-				"agent_name": s.recipient, "project_id": spawnAssignmentProjectID,
-				"exclusive": true, "reason": "bead assignment: " + s.beadID,
-				"created_ts": now.Format(time.RFC3339Nano),
-				"expires_ts": now.Add(time.Hour).Format(time.RFC3339Nano),
-			}},
+			"granted":   []map[string]any{grant},
 			"conflicts": []any{},
 		})
 	default:
@@ -8837,9 +8896,36 @@ func (s *spawnAssignmentMCPStub) handleResource(ctx context.Context, w http.Resp
 			s.failRPCLocked(w, id, -32602, "unexpected reservation resource URI: "+resourceURI)
 			return
 		}
+		text, err := json.Marshal(append([]map[string]any{}, s.granted...))
+		if err != nil {
+			s.failRPCLocked(w, id, -32603, "encode reservations: "+err.Error())
+			return
+		}
 		s.writeResult(w, id, map[string]any{
 			"contents": []map[string]any{{
-				"uri": resourceURI, "mimeType": "application/json", "text": "[]",
+				"uri": resourceURI, "mimeType": "application/json", "text": string(text),
+			}},
+		})
+		return
+	}
+	if strings.HasPrefix(resourceURI, "resource://project/") {
+		// Read-only project identity used to verify reservation grants.
+		defer s.mu.Unlock()
+		project, err := url.PathUnescape(strings.TrimPrefix(resourceURI, "resource://project/"))
+		if err != nil || project != s.projectDir {
+			s.failRPCLocked(w, id, -32602, fmt.Sprintf("project resource=%q err=%v want=%q", project, err, s.projectDir))
+			return
+		}
+		text, err := json.Marshal(map[string]any{
+			"id": spawnAssignmentProjectID, "slug": "spawn-assignment-e2e", "human_key": s.projectDir, "agents": []any{},
+		})
+		if err != nil {
+			s.failRPCLocked(w, id, -32603, "encode project: "+err.Error())
+			return
+		}
+		s.writeResult(w, id, map[string]any{
+			"contents": []map[string]any{{
+				"uri": resourceURI, "mimeType": "application/json", "text": string(text),
 			}},
 		})
 		return

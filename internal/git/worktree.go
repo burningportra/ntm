@@ -483,9 +483,13 @@ func (wm *WorktreeManager) SyncWorktree(ctx context.Context, worktreePath string
 		return fmt.Errorf("worktree sync canceled before merge: %w", err)
 	}
 
-	// Get the base branch (what this agent branch was created from)
-	// For now, assume 'main' - this could be enhanced to track the actual base
-	cmd = exec.CommandContext(ctx, "git", "merge", "origin/main")
+	// Merge the repository's actual default branch instead of a hardcoded
+	// 'main' so master/trunk-default target repos sync correctly.
+	baseBranch, err := DefaultBranch(ctx, worktreePath)
+	if err != nil {
+		return fmt.Errorf("failed to determine base branch for sync: %w", err)
+	}
+	cmd = exec.CommandContext(ctx, "git", "merge", "origin/"+baseBranch)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = worktreePath
 	output, commandErr = cmd.CombinedOutput()

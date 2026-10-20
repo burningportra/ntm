@@ -108,6 +108,9 @@ func scan(input string, allowlist []*regexp.Regexp, disabled []Category, extra [
 		// Find all matches for this pattern.
 		locs := p.regex.FindAllStringIndex(input, -1)
 		for _, loc := range locs {
+			if p.reject != nil && p.reject(input, loc[0], loc[1]) {
+				continue
+			}
 			matchStr := input[loc[0]:loc[1]]
 
 			allMatches = append(allMatches, match{
@@ -252,13 +255,6 @@ func Redact(input string, cfg Config) (string, []Finding) {
 	cfg.Mode = ModeRedact
 	result := ScanAndRedact(input, cfg)
 	return result.Output, result.Findings
-}
-
-// ContainsSensitive checks if input contains any sensitive content.
-func ContainsSensitive(input string, cfg Config) bool {
-	cfg.Mode = ModeWarn
-	result := ScanAndRedact(input, cfg)
-	return len(result.Findings) > 0
 }
 
 // AddLineInfo enriches findings with line and column information.

@@ -23,13 +23,27 @@ var dateSuffixRe = regexp.MustCompile(`-\d{8}$`)
 // ContextLimits maps canonical model names to their context window sizes in tokens.
 // These are approximate values based on published specifications.
 var ContextLimits = map[string]int{
-	// Anthropic Claude models
+	// Anthropic Claude models. Current models default to a 1M window; each
+	// is listed explicitly so the longest-prefix fallback can never resolve
+	// a newer point release to an older 200K sibling (claude-opus-4-8 to
+	// claude-opus-4, claude-sonnet-5-5 to claude-sonnet-5). GH #338: a 200K
+	// window made 1M sessions read as over-full.
+	"claude-fable-5":    1000000,
+	"claude-fable-5-1":  1000000,
+	"claude-mythos-5":   1000000,
+	"claude-mythos-5-1": 1000000,
+	"claude-opus-5":     1000000,
+	"claude-opus-5-5":   1000000,
+	"claude-opus-4-8":   1000000,
+	"claude-opus-4-7":   1000000,
+	"claude-opus-4-6":   1000000,
+	"claude-sonnet-5":   1000000,
+	"claude-sonnet-5-5": 1000000,
+	"claude-sonnet-4-6": 1000000,
 	"claude-sonnet-4":   200000,
 	"claude-sonnet-4-5": 200000,
-	"claude-sonnet-4-6": 200000,
 	"claude-opus-4":     200000,
 	"claude-opus-4-5":   200000,
-	"claude-opus-4-6":   200000,
 	"claude-haiku":      200000,
 	"claude-haiku-4-5":  200000,
 	"claude-3-opus":     200000,
@@ -63,7 +77,10 @@ var ContextLimits = map[string]int{
 	"gemini-1.5-flash":      1000000,
 	"gemini-3-pro-preview":  1000000,
 	"gemini-3-flash":        1000000,
-	"gemini-pro":            32000,
+	// Gemini 4 Argon: 1M per Artificial Analysis; Google had not published
+	// the input limit when agy was pinned to it (2026-10-13).
+	"gemini-4-argon": 1000000,
+	"gemini-pro":     32000,
 
 	// Moonshot Kimi models
 	"kimi-k2":      256000,
@@ -86,6 +103,10 @@ var Aliases = map[string]string{
 	"opus-4":        "claude-opus-4",
 	"opus-4.5":      "claude-opus-4-5",
 	"opus-4.6":      "claude-opus-4-6",
+	"opus-5":        "claude-opus-5",
+	"sonnet-5":      "claude-sonnet-5",
+	"fable":         "claude-fable-5",
+	"fable-5":       "claude-fable-5",
 	"claude-opus":   "claude-opus-4",
 	"claude-sonnet": "claude-sonnet-4",
 	"sonnet":        "claude-sonnet-4",
@@ -227,6 +248,143 @@ func GetContextLimit(model string) int {
 	return DefaultContextLimit
 }
 
+// KnownModel reports whether a model identifier resolves in the registry
+// through the same rules GetContextLimit uses (exact match, alias, date-suffix
+// strip, or longest-prefix match) — i.e. whether GetContextLimit would return
+// a real registry value rather than the DefaultContextLimit fallback.
+func KnownModel(model string) bool {
+	if model == "" {
+		return false
+	}
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+
+	lower := strings.ToLower(model)
+	if _, ok := ContextLimits[lower]; ok {
+		return true
+	}
+	if canonical, ok := Aliases[lower]; ok {
+		if _, ok := ContextLimits[canonical]; ok {
+			return true
+		}
+	}
+	stripped := dateSuffixRe.ReplaceAllString(lower, "")
+	if stripped != lower {
+		if _, ok := ContextLimits[stripped]; ok {
+			return true
+		}
+		if canonical, ok := Aliases[stripped]; ok {
+			if _, ok := ContextLimits[canonical]; ok {
+				return true
+			}
+		}
+	}
+	for key := range ContextLimits {
+		if strings.HasPrefix(lower, key) || strings.HasPrefix(stripped, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// SuggestModel returns the canonical registry identifier closest to an
+// unrecognized model ID within a small edit distance, or "" when the ID is
+// already known or no confident match exists. Field evidence shows agents
+// mistyping near-miss model IDs on spawn (e.g. "claude-opus5"); a
+// did-you-mean pointing at the real registry ID saves a discovery
+// round-trip. Alias matches resolve to their canonical name.
+func SuggestModel(model string) string {
+	if model == "" || KnownModel(model) {
+		return ""
+	}
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+
+	lower := strings.ToLower(model)
+	best := ""
+	bestDist := len(lower)/3 + 2 // confidence bound scales with length
+	// A suggestion that rewrites the whole input is noise, not a near miss:
+	// without this cap, "x" suggested "o1" (distance 2 ≥ the entire input).
+	if bestDist >= len(lower) {
+		bestDist = len(lower) - 1
+	}
+	if bestDist < 1 {
+		return ""
+	}
+	bestPrefix := -1
+	bestSuffix := -1
+	consider := func(candidate, canonical string) {
+		d := editDistance(lower, candidate)
+		if d > bestDist {
+			return
+		}
+		// Ties break toward the candidate sharing the longest prefix with
+		// the guess, then the longest suffix ("claude-opus5" should suggest
+		// claude-opus-5, not the equally distant "claude-opus" alias), then
+		// lexicographically for deterministic output across map iteration
+		// orders.
+		p := 0
+		for p < len(lower) && p < len(candidate) && lower[p] == candidate[p] {
+			p++
+		}
+		s := 0
+		for s < len(lower) && s < len(candidate) && lower[len(lower)-1-s] == candidate[len(candidate)-1-s] {
+			s++
+		}
+		better := d < bestDist
+		if !better && d == bestDist {
+			switch {
+			case p != bestPrefix:
+				better = p > bestPrefix
+			case s != bestSuffix:
+				better = s > bestSuffix
+			default:
+				better = best == "" || canonical < best
+			}
+		}
+		if better {
+			bestDist = d
+			bestPrefix = p
+			bestSuffix = s
+			best = canonical
+		}
+	}
+	for key := range ContextLimits {
+		consider(key, key)
+	}
+	for alias, canonical := range Aliases {
+		if _, ok := ContextLimits[canonical]; ok {
+			consider(alias, canonical)
+		}
+	}
+	return best
+}
+
+// editDistance is a plain O(len(a)*len(b)) Levenshtein distance over bytes;
+// model IDs are short ASCII so this is cheap.
+func editDistance(a, b string) int {
+	if a == b {
+		return 0
+	}
+	prev := make([]int, len(b)+1)
+	curr := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		curr[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			curr[j] = min(min(curr[j-1]+1, prev[j]+1), prev[j-1]+cost)
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(b)]
+}
+
 // agentTypeBudgetPct defines what fraction of the model's context limit
 // to allocate as a safe working budget per agent type. The remainder is
 // reserved for system prompts, tool definitions, and overhead.
@@ -250,7 +408,7 @@ var agentTypeDefaultModels = map[string]string{
 	"cc":       "claude-opus-4",
 	"cod":      "gpt-5-codex",
 	"gmi":      "gemini-2.0-flash",
-	"agy":      "gemini-3-pro-preview", // Antigravity pins Gemini 3 Pro
+	"agy":      "gemini-4-argon", // Antigravity pins Gemini 4 Argon (High)
 	"pi":       "claude-opus-4",
 	"kimi":     "kimi-k2",
 	"muse":     "muse-wonder-1.0",

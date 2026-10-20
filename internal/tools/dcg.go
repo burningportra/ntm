@@ -104,20 +104,6 @@ func (a *DCGAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 	}, nil
 }
 
-// HasCapability checks if dcg has a specific capability
-func (a *DCGAdapter) HasCapability(ctx context.Context, cap Capability) bool {
-	caps, err := a.Capabilities(ctx)
-	if err != nil {
-		return false
-	}
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
-}
-
 // Info returns complete dcg tool information
 func (a *DCGAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
@@ -157,13 +143,12 @@ type BlockedCommand struct {
 
 // ExtendedCheckResult represents the result of an extended DCG check with full details.
 type ExtendedCheckResult struct {
-	Command          string `json:"command"`
-	Blocked          bool   `json:"blocked"`
-	Reason           string `json:"reason,omitempty"`
-	Severity         string `json:"severity,omitempty"`          // critical, high, medium, low, safe
-	RuleMatched      string `json:"rule_matched,omitempty"`      // e.g., RECURSIVE_DELETE_ROOT
-	Suggestion       string `json:"suggestion,omitempty"`        // e.g., "Use trash-cli instead"
-	SaferAlternative string `json:"safer_alternative,omitempty"` // e.g., "trash-put /data/backup"
+	Command     string `json:"command"`
+	Blocked     bool   `json:"blocked"`
+	Reason      string `json:"reason,omitempty"`
+	Severity    string `json:"severity,omitempty"`     // critical, high, medium, low, safe
+	RuleMatched string `json:"rule_matched,omitempty"` // dcg rule_id, e.g. core.git:reset-hard
+	Suggestion  string `json:"suggestion,omitempty"`   // dcg explanation: what the command would do and safer forms
 }
 
 // DCGStatus represents the current DCG configuration status
@@ -242,6 +227,12 @@ func (a *DCGAdapter) GetAvailability(ctx context.Context) (*DCGAvailability, err
 
 	availability := a.fetchAvailability(ctx)
 
+	// A probe cut short by the caller's cancellation or deadline says nothing
+	// about dcg; caching it would switch the send guard off for every caller
+	// until the TTL lapsed.
+	if ctx.Err() != nil {
+		return availability, nil
+	}
 	dcgAvailabilityCache = *availability
 	dcgAvailabilityExpiry = time.Now().Add(dcgAvailabilityTTL)
 
@@ -463,19 +454,16 @@ func (a *DCGAdapter) CheckCommandExtended(ctx context.Context, command, context_
 			// Try to parse extended JSON output
 			if json.Valid(output) {
 				var parsed struct {
-					Command          string `json:"command"`
-					Reason           string `json:"reason"`
-					Severity         string `json:"severity"`
-					RuleMatched      string `json:"rule_matched"`
-					Suggestion       string `json:"suggestion"`
-					SaferAlternative string `json:"safer_alternative"`
+					Reason      string `json:"reason"`
+					Severity    string `json:"severity"`
+					RuleID      string `json:"rule_id"`
+					Explanation string `json:"explanation"`
 				}
 				if jsonErr := json.Unmarshal(output, &parsed); jsonErr == nil {
 					result.Reason = parsed.Reason
 					result.Severity = parsed.Severity
-					result.RuleMatched = parsed.RuleMatched
-					result.Suggestion = parsed.Suggestion
-					result.SaferAlternative = parsed.SaferAlternative
+					result.RuleMatched = parsed.RuleID
+					result.Suggestion = parsed.Explanation
 					return result, nil
 				}
 			}

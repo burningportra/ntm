@@ -510,7 +510,7 @@ func (ws *WorktreeService) changeDirectoryInPane(ctx context.Context, paneID, wo
 		return err
 	}
 	// Send Ctrl-C first to interrupt any running command
-	if err := tmux.DefaultClient.RunSilentContext(ctx, "send-keys", "-t", paneID, "C-c"); err != nil {
+	if err := tmux.DefaultClient.RunSilentContext(ctx, "send-keys", "-t", tmux.ExactTarget(paneID), "C-c"); err != nil {
 		return fmt.Errorf("failed to send interrupt: %w", err)
 	}
 
@@ -543,60 +543,4 @@ func waitForWorktreePaneDelay(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-// GetAllWorktrees returns worktrees across all managed projects
-func (ws *WorktreeService) GetAllWorktrees(ctx context.Context) (map[string][]*WorktreeInfo, error) {
-	if err := validateWorktreeContext(ctx); err != nil {
-		return nil, err
-	}
-	ws.mu.Lock()
-	snapshot := make(map[string]*WorktreeManager, len(ws.managers))
-	for k, v := range ws.managers {
-		snapshot[k] = v
-	}
-	ws.mu.Unlock()
-
-	result := make(map[string][]*WorktreeInfo)
-	for projectDir, manager := range snapshot {
-		if err := validateWorktreeContext(ctx); err != nil {
-			return nil, fmt.Errorf("worktree listing canceled: %w", err)
-		}
-		worktrees, err := manager.ListWorktrees(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list worktrees for %s: %w", projectDir, err)
-		}
-		result[projectDir] = worktrees
-	}
-	if err := validateWorktreeContext(ctx); err != nil {
-		return nil, fmt.Errorf("worktree listing canceled: %w", err)
-	}
-
-	return result, nil
-}
-
-// CleanupStaleWorktrees removes stale worktrees across all managed projects
-func (ws *WorktreeService) CleanupStaleWorktrees(ctx context.Context, maxAge time.Duration) error {
-	if err := validateWorktreeContext(ctx); err != nil {
-		return err
-	}
-	ws.mu.Lock()
-	snapshot := make([]*WorktreeManager, 0, len(ws.managers))
-	for _, v := range ws.managers {
-		snapshot = append(snapshot, v)
-	}
-	ws.mu.Unlock()
-
-	for _, manager := range snapshot {
-		if err := validateWorktreeContext(ctx); err != nil {
-			return fmt.Errorf("stale worktree cleanup canceled: %w", err)
-		}
-		if err := manager.CleanupStaleWorktrees(ctx, maxAge); err != nil {
-			return err
-		}
-	}
-	if err := validateWorktreeContext(ctx); err != nil {
-		return fmt.Errorf("stale worktree cleanup canceled: %w", err)
-	}
-	return nil
 }

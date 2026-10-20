@@ -16,17 +16,6 @@ func TestNewParser(t *testing.T) {
 	}
 }
 
-func TestNewParserWithConfig(t *testing.T) {
-	cfg := ParserConfig{
-		ContextLowThreshold: 30.0,
-		SampleLength:        200,
-	}
-	p := NewParserWithConfig(cfg)
-	if p == nil {
-		t.Fatal("NewParserWithConfig returned nil")
-	}
-}
-
 func TestParser_Parse_EmptyOutput(t *testing.T) {
 	p := NewParser()
 	state, err := p.Parse("")
@@ -1132,7 +1121,7 @@ func TestParser_Parse_OpencodeCaptures(t *testing.T) {
 				if shared := OpencodeIdlePromptShowing(output); state.IsIdle != shared {
 					t.Errorf("hint %q: IsIdle = %v but OpencodeIdlePromptShowing = %v", hint, state.IsIdle, shared)
 				}
-				if shared := OpencodeActivelyWorking(output); state.IsWorking != shared {
+				if shared := OpencodeActivelyWorking(output, 0); state.IsWorking != shared {
 					t.Errorf("hint %q: IsWorking = %v but OpencodeActivelyWorking = %v", hint, state.IsWorking, shared)
 				}
 			}
@@ -1198,7 +1187,7 @@ func TestOpencodeRecognizers(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := OpencodeActivelyWorking(tt.output); got != tt.wantWorking {
+			if got := OpencodeActivelyWorking(tt.output, 0); got != tt.wantWorking {
 				t.Errorf("OpencodeActivelyWorking() = %v, want %v", got, tt.wantWorking)
 			}
 			if got := OpencodeIdlePromptShowing(tt.output); got != tt.wantIdle {
@@ -1540,6 +1529,37 @@ codex> `
 	}
 }
 
+func TestParser_ParseWithHint_AntigravityLiveFrames(t *testing.T) {
+	p := NewParser()
+
+	idleOutput := `Antigravity
+
+  >
+
+  ? for shortcuts
+  Gemini 4 Argon (High)`
+	idle, err := p.ParseWithHint(idleOutput, AgentTypeAntigravity)
+	if err != nil {
+		t.Fatalf("parse idle Antigravity frame: %v", err)
+	}
+	if !idle.IsIdle || idle.IsWorking || idle.IsInError {
+		t.Fatalf("idle Antigravity frame = %+v, want idle only", idle)
+	}
+
+	workingOutput := `Antigravity
+  >
+  ⠹ Analyzing repository
+  esc to cancel
+  Gemini 4 Argon (High)`
+	working, err := p.ParseWithHint(workingOutput, AgentTypeAntigravity)
+	if err != nil {
+		t.Fatalf("parse working Antigravity frame: %v", err)
+	}
+	if !working.IsWorking || working.IsIdle || working.IsInError {
+		t.Fatalf("working Antigravity frame = %+v, want working only", working)
+	}
+}
+
 func TestParser_Parse_Codex_LowContext(t *testing.T) {
 	p := NewParser()
 	output := `Some work done...
@@ -1633,10 +1653,10 @@ func TestParser_Parse_ANSIStripping(t *testing.T) {
 }
 
 func TestParser_Parse_RawSample(t *testing.T) {
-	p := NewParserWithConfig(ParserConfig{
+	p := &parserImpl{config: ParserConfig{
 		ContextLowThreshold: 20.0,
 		SampleLength:        50,
-	})
+	}}
 
 	// Create output longer than sample length
 	output := strings.Repeat("x", 100)
@@ -2559,7 +2579,7 @@ func TestClaudeActivelyWorking_RealCaptures(t *testing.T) {
 			}
 			body := stripCaptureHeader(string(raw))
 
-			if got := ClaudeActivelyWorking(body); got != c.wantWork {
+			if got := ClaudeActivelyWorking(body, 0); got != c.wantWork {
 				t.Errorf("ClaudeActivelyWorking = %v, want %v (%s)", got, c.wantWork, c.desc)
 			}
 
@@ -2694,7 +2714,7 @@ func TestClaudeActivelyWorking(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ClaudeActivelyWorking(tt.output); got != tt.want {
+			if got := ClaudeActivelyWorking(tt.output, 0); got != tt.want {
 				t.Errorf("ClaudeActivelyWorking() = %v, want %v", got, tt.want)
 			}
 		})
@@ -2762,7 +2782,7 @@ func TestClaudeActivelyWorking_NeverFalseIdleInvariant(t *testing.T) {
 		if err != nil {
 			t.Fatalf("sample %d: parse: %v", i, err)
 		}
-		if !ClaudeActivelyWorking(s) {
+		if !ClaudeActivelyWorking(s, 0) {
 			t.Errorf("sample %d: expected ClaudeActivelyWorking=true", i)
 		}
 		if st.IsIdle {
@@ -2812,7 +2832,7 @@ func TestClaudeCompletionLine_AccentedVerb(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ClaudeActivelyWorking(tt.output); got != tt.wantWorking {
+			if got := ClaudeActivelyWorking(tt.output, 0); got != tt.wantWorking {
 				t.Errorf("ClaudeActivelyWorking() = %v, want %v", got, tt.wantWorking)
 			}
 			// The accented completion line must be recognized as a turn-ended
@@ -2821,6 +2841,46 @@ func TestClaudeCompletionLine_AccentedVerb(t *testing.T) {
 				t.Errorf("claudeIsCompletionLine failed to recognize accented verb")
 			}
 		})
+	}
+}
+
+// Current Claude Code ends a turn with "· done <time>" and "· N shell(s) still
+// running" after the duration; every completion line in a live swarm carried
+// them (2026-10). Unrecognized, a stale spinner above the line kept the pane
+// WORKING and a failed tool call above it read as a terminal error.
+func TestClaudeCompletionLine_DoneAndShellSuffixes(t *testing.T) {
+	for _, line := range []string{
+		"✻ Crunched for 10s · done 11:09 PM · 1 shell still running",
+		"✻ Worked for 42s · done 9:03 AM",
+		"✻ Cogitated for 3m 12s · done 11:40 PM · 2 shells still running",
+		"  ✻ Sautéed for 8s · done 10:58 PM",
+	} {
+		if !claudeIsCompletionLine(line) {
+			t.Errorf("claudeIsCompletionLine(%q) = false, want a turn-ended marker", line)
+		}
+	}
+	for _, line := range []string{
+		"✻ Crunching… (12s · ↓ 1.2k tokens · esc to interrupt)",
+		"✻ Whirlpooling… (ctrl+c to interrupt · 2m 44s · thinking)",
+		"● The suite ran for 10s · done",
+		"  thought for 14s · done",
+	} {
+		if claudeIsCompletionLine(line) {
+			t.Errorf("claudeIsCompletionLine(%q) = true, want no turn-ended marker", line)
+		}
+	}
+
+	stale := "✻ Whirlpooling… (ctrl+c to interrupt · 2m 44s · thinking)\n" +
+		"● Summary of the change.\n" +
+		"✻ Crunched for 10s · done 11:09 PM · 1 shell still running\n────────────\n❯ \n────────────\n"
+	if ClaudeActivelyWorking(stale, 0) {
+		t.Error("a suffixed completion line below a stale spinner must end the turn, not leave the pane WORKING")
+	}
+	toolFailure := "● Bash(pkill -f run_c7.sh; echo cleared)\n" +
+		"  ⎿  Error: Exit code 144\n\n" +
+		"✻ Crunched for 10s · done 11:09 PM · 1 shell still running\n────────────\n❯ \n"
+	if got := DetectClaudeTurnState(toolFailure, 0); got != ClaudeTurnEnded {
+		t.Errorf("DetectClaudeTurnState(failed tool call, then suffixed completion) = %v, want ClaudeTurnEnded", got)
 	}
 }
 
@@ -2839,7 +2899,7 @@ func TestClaudeComposeBoxFooter_FreshSpawnIdle(t *testing.T) {
 		"────────────────────────\n" +
 		"  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
 
-	if ClaudeActivelyWorking(freshSpawn) {
+	if ClaudeActivelyWorking(freshSpawn, 0) {
 		t.Fatalf("fresh-spawn compose box (no spinner) must NOT be classified working")
 	}
 	if !ClaudeIdlePromptShowing(freshSpawn) {
@@ -2848,7 +2908,7 @@ func TestClaudeComposeBoxFooter_FreshSpawnIdle(t *testing.T) {
 
 	// Even an ellipsis-only box (no prefilled text) with the footer is idle.
 	ellipsisOnly := "────────────\n❯ …\n────────────\n  ⏵⏵ accept edits on\n"
-	if ClaudeActivelyWorking(ellipsisOnly) {
+	if ClaudeActivelyWorking(ellipsisOnly, 0) {
 		t.Fatalf("ellipsis-only compose box must NOT be working")
 	}
 	if !ClaudeIdlePromptShowing(ellipsisOnly) {
@@ -2862,7 +2922,7 @@ func TestClaudeComposeBoxFooter_FreshSpawnIdle(t *testing.T) {
 		"❯ \n" +
 		"────────────\n" +
 		"  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
-	if !ClaudeActivelyWorking(working) {
+	if !ClaudeActivelyWorking(working, 0) {
 		t.Errorf("compose box with active spinner must be classified working")
 	}
 }
@@ -2906,7 +2966,7 @@ func TestCodexActivelyWorkingUsesOnlyStructuralLiveTailMarkers(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := CodexActivelyWorking(test.output); got != test.want {
+			if got := CodexActivelyWorking(test.output, 0); got != test.want {
 				t.Fatalf("CodexActivelyWorking() = %v, want %v", got, test.want)
 			}
 		})

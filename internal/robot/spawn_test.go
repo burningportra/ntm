@@ -6,15 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
@@ -23,6 +23,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
@@ -88,6 +89,9 @@ func testSpawnLifecycleDependencies(panes []tmux.Pane) *SpawnLifecycleDependenci
 func testSpawnConfig() *config.Config {
 	cfg := config.Default()
 	cfg.SpawnPacing.Enabled = false
+	// Lifecycle-contract tests stay off Agent Mail identity provisioning;
+	// spawn_agentmail_identity_test.go enables it explicitly.
+	cfg.AgentMail.Enabled = false
 	return cfg
 }
 
@@ -188,6 +192,7 @@ func TestValidateSpawnRequestRejectsInvalidCountsAndEmptySpawn(t *testing.T) {
 		{name: "negative gemini", opts: SpawnOptions{Session: "invalid-gmi", CCCount: 1, GmiCount: -1}, want: "--spawn-gmi"},
 		{name: "negative antigravity", opts: SpawnOptions{Session: "invalid-agy", CCCount: 1, AgyCount: -1}, want: "--spawn-agy"},
 		{name: "negative grok", opts: SpawnOptions{Session: "invalid-grok", CCCount: 1, GrokCount: -1}, want: "--spawn-grok"},
+		{name: "negative opencode", opts: SpawnOptions{Session: "invalid-oc", CCCount: 1, OcCount: -1}, want: "--spawn-oc"},
 		{name: "zero total", opts: SpawnOptions{Session: "invalid-zero"}, want: "no agents specified"},
 	}
 
@@ -252,21 +257,163 @@ func TestGetSpawnGrokUsesConfiguredDefaultModelWithFakeLifecycle(t *testing.T) {
 	}
 }
 
-func TestLaunchAgentGrokRejectsBusyPaneBeforeMutation(t *testing.T) {
-	agent, err := launchAgent(
-		t.Context(),
-		tmux.Pane{ID: "%9", WindowIndex: 0, Index: 2, Command: "claude"},
-		"busy-session",
-		"grok",
-		1,
-		t.TempDir(),
-		"grok --always-approve",
-	)
-	if err == nil || !strings.Contains(err.Error(), "pre-launch current command") {
-		t.Fatalf("launchAgent error=%v, want pre-launch baseline rejection", err)
+func TestGetSpawnPersistsLaunchSpecBeforeCommandDelivery(t *testing.T) {
+	for _, fail := range []string{"", "metadata-failure"} {
+		t.Run(fail, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "tmux")
+			script := `#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> "$NTM_SPAWN_SPEC_TEST_ROOT/calls"
+case "$1" in
+  list-panes)
+    command=''
+    if [ -f "$NTM_SPAWN_SPEC_TEST_ROOT/launched" ]; then command='node'; fi
+    printf '%%17_NTM_SEP_0_NTM_SEP_wrapper title_NTM_SEP_%s_NTM_SEP_80_NTM_SEP_24_NTM_SEP_1_NTM_SEP_0_NTM_SEP_0_NTM_SEP_cod_NTM_SEP__NTM_SEP__NTM_SEP_0\n' "$command"
+    ;;
+  set-option)
+    if [ "${5:-}" = '@ntm_agent_launch' ]; then
+      [ "$4" = '%17' ] || exit 63
+      if [ "$NTM_SPAWN_SPEC_TEST_FAIL" = 'metadata-failure' ]; then exit 64; fi
+      printf '%s' "$6" > "$NTM_SPAWN_SPEC_TEST_ROOT/spec"
+    fi
+    ;;
+  show-options)
+    [ "$5" = '%17' ] && [ "$6" = '@ntm_agent_launch' ] || exit 65
+    cat "$NTM_SPAWN_SPEC_TEST_ROOT/spec"
+    ;;
+  send-keys)
+    [ -f "$NTM_SPAWN_SPEC_TEST_ROOT/spec" ] || exit 66
+    if [ "${4:-}" = 'Enter' ]; then : > "$NTM_SPAWN_SPEC_TEST_ROOT/launched"; fi
+    ;;
+  select-pane) ;;
+  *) exit 67 ;;
+esac
+`
+			if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestGetSpawnLaunchSpecTransportHelper$")
+			cmd.Env = append(os.Environ(), "NTM_TEST_TMUX_ENV_OWNED=1", "NTM_TMUX_BINARY="+path,
+				"NTM_SPAWN_SPEC_TEST_ROOT="+root, "NTM_SPAWN_SPEC_TEST_FAIL="+fail, "SHALLOW_PROFILE=creation-profile")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("spawn launch metadata: %v\n%s", err, output)
+			}
+		})
 	}
-	if !strings.Contains(agent.Error, "pre-launch current command") {
-		t.Fatalf("spawned agent error=%q, want baseline rejection", agent.Error)
+}
+
+func TestGetSpawnLaunchSpecTransportHelper(t *testing.T) {
+	root := os.Getenv("NTM_SPAWN_SPEC_TEST_ROOT")
+	if root == "" {
+		return
+	}
+	panes := []tmux.Pane{{ID: "%17", WindowIndex: 0, Index: 0}}
+	deps := testSpawnLifecycleDependencies(panes)
+	deps.LaunchAgent = launchAgent
+	cfg := testSpawnConfig()
+	cfg.Agents.Codex = `codex --model {{shellQuote .Model}} --effort {{shellQuote .ReasoningEffort}} --custom 'literal;flag'`
+	out, err := GetSpawn(t.Context(), SpawnOptions{
+		Session: "saved-launch", CodCount: 1, CodModel: "pinned/model", CodReasoningEffort: "high",
+		NoUserPane: true, WorkingDir: root, LifecycleDeps: deps,
+	}, cfg)
+	if os.Getenv("NTM_SPAWN_SPEC_TEST_FAIL") != "" {
+		if err != nil || out.Success || !strings.Contains(out.Error, "recording launch specification") {
+			t.Fatalf("metadata failure should refuse launch: output=%+v err=%v", out, err)
+		}
+		calls, err := os.ReadFile(filepath.Join(root, "calls"))
+		if err != nil || strings.Contains(string(calls), "send-keys") {
+			t.Fatalf("launch was delivered without durable specification: %q (%v)", calls, err)
+		}
+		return
+	}
+	if err != nil || !out.Success {
+		t.Fatalf("spawn output=%+v err=%v", out, err)
+	}
+	spec, err := tmux.ReadPaneLaunchSpecContext(t.Context(), "%17")
+	if err != nil || spec == nil {
+		t.Fatalf("persisted specification=(%+v,%v)", spec, err)
+	}
+	want := `codex --model 'pinned/model' --effort 'high' --custom 'literal;flag'`
+	if spec.Command != want || spec.CAAMProfile != "creation-profile" || spec.AgentType != tmux.AgentCodex {
+		t.Fatalf("persisted launch=%+v, want exact rendered command and original profile", spec)
+	}
+	if err := spec.ValidateReplay(tmux.AgentCodex); err != nil {
+		t.Fatalf("normal spawned agent must be recoverable: %v", err)
+	}
+}
+
+// #291: every agent type launches by typing into the pane, so every agent
+// type must refuse a pane that is already running a non-shell process.
+func TestLaunchAgentRejectsBusyPaneBeforeMutationForEveryAgentType(t *testing.T) {
+	for _, agentType := range []string{"claude", "codex", "gemini", "antigravity", "grok"} {
+		t.Run(agentType, func(t *testing.T) {
+			agent, err := launchAgent(
+				t.Context(),
+				tmux.Pane{ID: "%9", WindowIndex: 0, Index: 2, Command: "cat"},
+				"busy-session",
+				agentType,
+				1,
+				t.TempDir(),
+				agentType+" --launch",
+			)
+			if err == nil || !errors.Is(err, tmux.ErrPaneOccupied) || !strings.Contains(err.Error(), "pre-launch current command") {
+				t.Fatalf("launchAgent(%s) error=%v, want pre-launch baseline rejection", agentType, err)
+			}
+			if !strings.Contains(agent.Error, "pre-launch current command") || agent.Ready {
+				t.Fatalf("launchAgent(%s) agent=%+v, want baseline rejection recorded", agentType, agent)
+			}
+		})
+	}
+}
+
+func TestGetSpawnRefusesOccupiedExistingPaneForNonGrokAgents(t *testing.T) {
+	panes := []tmux.Pane{
+		{ID: "%0", WindowIndex: 0, Index: 0, Command: "zsh"},
+		{ID: "%1", WindowIndex: 0, Index: 1, Command: "cat"},
+	}
+	deps := testSpawnLifecycleDependencies(panes)
+	var splitCalls, layoutCalls, launchCalls int
+	deps.SplitWindow = func(context.Context, string, string) (string, error) {
+		splitCalls++
+		return "%new", nil
+	}
+	deps.ApplyTiledLayout = func(context.Context, string) error {
+		layoutCalls++
+		return nil
+	}
+	deps.LaunchAgent = func(context.Context, tmux.Pane, string, string, int, string, string) (SpawnedAgent, error) {
+		launchCalls++
+		return SpawnedAgent{}, nil
+	}
+
+	out, err := GetSpawn(t.Context(), SpawnOptions{
+		Session: "occupied-existing", CCCount: 1, CodCount: 1, WorkingDir: t.TempDir(), LifecycleDeps: deps,
+	}, testSpawnConfig())
+	if err != nil {
+		t.Fatalf("GetSpawn returned transport error: %v", err)
+	}
+	if out.Success || !strings.Contains(out.Error, "agent pane 1") || !strings.Contains(out.Error, `"cat"`) {
+		t.Fatalf("GetSpawn output=%+v, want occupied pane 1 rejected before any mutation", out)
+	}
+	if out.RobotResponse.Success || !strings.Contains(out.RobotResponse.Hint, "idle shell") {
+		t.Fatalf("GetSpawn robot response=%+v, want actionable idle-shell hint", out.RobotResponse)
+	}
+	if splitCalls != 0 || layoutCalls != 0 || launchCalls != 0 {
+		t.Fatalf("occupied pane lifecycle calls: split=%d layout=%d launch=%d, want zero", splitCalls, layoutCalls, launchCalls)
+	}
+}
+
+func TestSpawnAgentPaneRangeCountsEveryAgentFamily(t *testing.T) {
+	start, count := spawnAgentPaneRange(SpawnOptions{CCCount: 2, CodCount: 1, GmiCount: 1, AgyCount: 1, GrokCount: 1})
+	if start != 1 || count != 6 {
+		t.Fatalf("spawnAgentPaneRange() = (%d, %d), want (1, 6)", start, count)
+	}
+	start, count = spawnAgentPaneRange(SpawnOptions{CCCount: 1, NoUserPane: true})
+	if start != 0 || count != 1 {
+		t.Fatalf("spawnAgentPaneRange(no user pane) = (%d, %d), want (0, 1)", start, count)
 	}
 }
 
@@ -341,21 +488,23 @@ func TestGetSpawnGrokAllowsIdleExistingPaneBeforeAddingMissingPane(t *testing.T)
 	}
 }
 
-func TestGetSpawnGrokRejectsUnverifiedTUISemantics(t *testing.T) {
+// Grok Build phase 2 (GH#251) implemented TUI readiness and composer-gated,
+// submission-verified prompt delivery, and the human `ntm spawn` already
+// allows waiting for and assigning work to Grok panes. Robot spawn used to
+// keep refusing both with NOT_IMPLEMENTED.
+func TestValidateSpawnRequestAcceptsGrokWaitAndAssignWork(t *testing.T) {
 	for _, opts := range []SpawnOptions{
 		{Session: "grok-wait", GrokCount: 1, WaitReady: true},
 		{Session: "grok-assign", GrokCount: 1, AssignWork: true, AssignStrategy: "top-n"},
 	} {
-		out, err := GetSpawn(t.Context(), opts, testSpawnConfig())
-		if err != nil {
-			t.Fatalf("GetSpawn returned transport error: %v", err)
+		if _, err := validateSpawnRequest(opts); err != nil {
+			t.Fatalf("validateSpawnRequest(%+v) = %v, want Grok accepted", opts, err)
 		}
-		if out.Success || out.ErrorCode != ErrCodeNotImplemented || !strings.Contains(strings.ToLower(out.Error), "grok") {
-			t.Fatalf("output=%+v, want Grok NOT_IMPLEMENTED", out)
-		}
-		if ExitCodeForResponse(out.RobotResponse) != 2 || out.Hint != agent.GrokPhaseOneCapabilityHint {
-			t.Fatalf("output=%+v, want unavailable exit 2 and Grok capability hint", out)
-		}
+	}
+	// The readiness wait recognizes Grok's idle TUI (bordered composer with
+	// the always-approve status line).
+	if !agentpkg.IsReadyOutput("╭──────╮\n│ ❯                 │\n╰──────╯\n grok-4 · always-approve", agentpkg.AgentTypeGrok) {
+		t.Fatal("Grok's idle TUI is not recognized as ready")
 	}
 }
 
@@ -666,8 +815,9 @@ func TestPrintSpawn(t *testing.T) {
 	}
 
 	cfg := config.Default()
-	// Override agent command to be fast
-	cfg.Agents.Claude = "echo test"
+	// A persistent fake agent: the launch waits for a stable non-shell process,
+	// so an instant-exit command would (correctly) count as a failed launch.
+	cfg.Agents.Claude = "/bin/cat"
 	// Admission behavior has dedicated tests below. Keep this spawn/JSON smoke
 	// test independent of ambient agents and host pressure while still using a
 	// real tmux session.
@@ -727,11 +877,20 @@ func TestAgentTypeShort(t *testing.T) {
 // Unit tests, E2E scripts, schema stability, deterministic ordering
 // =============================================================================
 
-// TestGetAgentCommands validates command resolution with/without config
+// TestGetAgentCommands validates command resolution with/without config and
+// no model override.
 func TestGetAgentCommands(t *testing.T) {
+	getAgentCommands := func(t *testing.T, cfg *config.Config) map[string]string {
+		t.Helper()
+		cmds, err := getAgentCommandsWithOverrides(cfg, SpawnOptions{})
+		if err != nil {
+			t.Fatalf("getAgentCommandsWithOverrides() error = %v", err)
+		}
+		return cmds
+	}
 
 	t.Run("NilConfig", func(t *testing.T) {
-		cmds := getAgentCommands(nil)
+		cmds := getAgentCommands(t, nil)
 
 		// Should have default commands
 		if cmds["claude"] == "" {
@@ -753,7 +912,7 @@ func TestGetAgentCommands(t *testing.T) {
 		cfg.Agents.Codex = "custom-codex --flag"
 		cfg.Agents.Gemini = "custom-gemini"
 
-		cmds := getAgentCommands(cfg)
+		cmds := getAgentCommands(t, cfg)
 
 		if cmds["claude"] != "custom-claude --arg" {
 			t.Errorf("[E2E-SPAWN] Expected custom claude command, got %q", cmds["claude"])
@@ -773,7 +932,7 @@ func TestGetAgentCommands(t *testing.T) {
 		cfg.Agents.Claude = "custom-claude"
 		// Leave codex and gemini as defaults
 
-		cmds := getAgentCommands(cfg)
+		cmds := getAgentCommands(t, cfg)
 
 		if cmds["claude"] != "custom-claude" {
 			t.Errorf("[E2E-SPAWN] Expected custom claude, got %q", cmds["claude"])
@@ -789,19 +948,19 @@ func TestGetAgentCommands(t *testing.T) {
 	t.Run("Muse", func(t *testing.T) {
 		// Without a config Muse still launches with --yolo, so the pane does
 		// not stop at the workspace-trust prompt.
-		if got := getAgentCommands(nil)["muse"]; got != "muse --yolo" {
+		if got := getAgentCommands(t, nil)["muse"]; got != "muse --yolo" {
 			t.Errorf("getAgentCommands(nil)[muse] = %q, want %q", got, "muse --yolo")
 		}
 
 		// The default config renders the launch template with the pinned
 		// default model.
-		if got, want := getAgentCommands(config.Default())["muse"], "muse --yolo --model 'muse-wonder-1.0'"; got != want {
+		if got, want := getAgentCommands(t, config.Default())["muse"], "muse --yolo --model 'muse-wonder-1.0'"; got != want {
 			t.Errorf("getAgentCommands(default)[muse] = %q, want %q", got, want)
 		}
 
 		cfg := config.Default()
 		cfg.Agents.Muse = "muse --provider echo --yolo"
-		if got := getAgentCommands(cfg)["muse"]; got != "muse --provider echo --yolo" {
+		if got := getAgentCommands(t, cfg)["muse"]; got != "muse --provider echo --yolo" {
 			t.Errorf("getAgentCommands(custom)[muse] = %q, want the configured command", got)
 		}
 	})
@@ -851,6 +1010,44 @@ func TestSpawnOptions_RejectsNegativeMuseCount(t *testing.T) {
 	}
 	if resp.Success || !strings.Contains(resp.Error, "--spawn-muse must be zero or greater") {
 		t.Fatalf("response = success:%v error:%q, want --spawn-muse validation error", resp.Success, resp.Error)
+	}
+}
+
+// TestGetSpawnRejectsUnhonorableModelOverrideBeforeMutation proves a spawn
+// with a model override that the launch template cannot carry fails with
+// INVALID_FLAG before any tmux session or pane is touched (bd-rr8gn).
+func TestGetSpawnRejectsUnhonorableModelOverrideBeforeMutation(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agents.Codex = "custom-codex --flag" // no {{.Model}} placeholder
+	mutated := false
+	deps := &SpawnLifecycleDependencies{
+		IsTMUXInstalled: func() bool { return true },
+		GetAllPanes: func(context.Context) (map[string][]tmux.Pane, error) {
+			return map[string][]tmux.Pane{}, nil
+		},
+		SessionExists: func(context.Context, string) (bool, error) { return false, nil },
+		CreateSession: func(context.Context, string, string, int) error {
+			mutated = true
+			return nil
+		},
+	}
+	output, err := GetSpawn(context.Background(), SpawnOptions{
+		Session:       "override-guard",
+		CodCount:      1,
+		CodModel:      "gpt-5.6-terra",
+		LifecycleDeps: deps,
+	}, cfg)
+	if err != nil {
+		t.Fatalf("GetSpawn: %v", err)
+	}
+	if output.Success {
+		t.Fatal("expected failure output")
+	}
+	if output.ErrorCode != ErrCodeInvalidFlag {
+		t.Fatalf("ErrorCode=%q, want %q", output.ErrorCode, ErrCodeInvalidFlag)
+	}
+	if mutated {
+		t.Fatal("session was created despite unhonorable model override")
 	}
 }
 
@@ -993,6 +1190,7 @@ func TestSpawnOptions_DryRunAdmissionRefusesAgentCap(t *testing.T) {
 	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1
 	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 0
 	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 0
+	cfg.SpawnPacing.AgentCaps.OmpMaxConcurrent = 0
 
 	resp, err := GetSpawn(t.Context(), SpawnOptions{
 		Session:    "test_dryrun_admission_refuse",
@@ -1014,6 +1212,38 @@ func TestSpawnOptions_DryRunAdmissionRefusesAgentCap(t *testing.T) {
 	}
 	if !resp.Success {
 		t.Error("dry-run should stay successful even when admission would refuse a real spawn")
+	}
+}
+
+// TestSpawnAdmission_OmpSwarmOfEightIsAdmitted pins that the default budget
+// admits a whole 8-pane omp swarm in one robot spawn, even with a default-size
+// Claude/Codex/Gemini swarm already running on the host. Caps are summed into
+// one host budget (running + requested), so omp's term must cover the swarm;
+// at the former omp default of 2 the same request was refused outright.
+func TestSpawnAdmission_OmpSwarmOfEightIsAdmitted(t *testing.T) {
+	cfg := config.Default()
+	// Isolate the agent-cap clause: a request below the large-spawn threshold
+	// is never deferred by live host pressure, which would make this flaky.
+	cfg.SpawnPacing.MaxConcurrentSpawns = 1000
+	running := map[string][]tmux.Pane{"other": {
+		{ID: "%1", Type: tmux.AgentClaude}, {ID: "%2", Type: tmux.AgentClaude}, {ID: "%3", Type: tmux.AgentClaude},
+		{ID: "%4", Type: tmux.AgentCodex}, {ID: "%5", Type: tmux.AgentCodex},
+		{ID: "%6", Type: tmux.AgentGemini}, {ID: "%7", Type: tmux.AgentGemini},
+	}}
+	panes := func(context.Context) (map[string][]tmux.Pane, error) { return running, nil }
+	opts := SpawnOptions{Session: "omp-swarm", OmpCount: 8, NoUserPane: true}
+
+	input := collectSpawnAdmissionInputWithPanes(t.Context(), opts, cfg, opts.totalAgentCount(), 8, panes)
+	decision := pressure.EvaluateSpawnAdmission(input)
+	if input.MaxAgents != 15 || input.RunningAgents != 7 || decision.Decision != pressure.SpawnAdmissionAdmit {
+		t.Fatalf("default budget: max=%d running=%d decision=%s (%s), want 15/7/admit",
+			input.MaxAgents, input.RunningAgents, decision.Decision, decision.Reason)
+	}
+
+	cfg.SpawnPacing.AgentCaps.OmpMaxConcurrent = 2
+	input = collectSpawnAdmissionInputWithPanes(t.Context(), opts, cfg, opts.totalAgentCount(), 8, panes)
+	if decision := pressure.EvaluateSpawnAdmission(input); decision.Decision != pressure.SpawnAdmissionRefuse || decision.Reason != "agent_limit_exceeded" {
+		t.Fatalf("control at omp cap 2: decision=%s (%s), want refuse agent_limit_exceeded", decision.Decision, decision.Reason)
 	}
 }
 
@@ -1070,7 +1300,7 @@ func TestSpawnOptions_NoAgentsSpecified(t *testing.T) {
 	if resp.Error == "" {
 		t.Error("[E2E-SPAWN] Expected error for no agents specified")
 	}
-	if resp.Error != "no agents specified (use cc, cod, gmi, pi, kimi, muse, agy, or grok counts)" {
+	if resp.Error != "no agents specified (use cc, cod, gmi, pi, kimi, muse, agy, grok, omp, or oc counts)" {
 		t.Errorf("[E2E-SPAWN] Unexpected error message: %s", resp.Error)
 	}
 
@@ -1097,7 +1327,7 @@ func TestSpawnOptions_SafetyMode(t *testing.T) {
 	}
 
 	cfg := config.Default()
-	cfg.Agents.Claude = "echo test"
+	cfg.Agents.Claude = "/bin/cat" // persistent fake agent (see above)
 
 	output, _ := captureStdout(t, func() error { return PrintSpawn(t.Context(), opts, cfg) })
 
@@ -1139,10 +1369,10 @@ func TestSpawnOptions_MultipleAgentTypes(t *testing.T) {
 	cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent = 1024
 	cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent = 1024
 	cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent = 1024
-	// Use fast echo commands
-	cfg.Agents.Claude = "echo claude_test"
-	cfg.Agents.Codex = "echo codex_test"
-	cfg.Agents.Gemini = "echo gemini_test"
+	// Persistent fake agents: the launch requires a stable non-shell process.
+	cfg.Agents.Claude = "/bin/cat"
+	cfg.Agents.Codex = "/bin/cat"
+	cfg.Agents.Gemini = "/bin/cat"
 
 	output, err := captureStdout(t, func() error { return PrintSpawn(t.Context(), opts, cfg) })
 	if err != nil {
@@ -1187,6 +1417,30 @@ func TestSpawnOptions_MultipleAgentTypes(t *testing.T) {
 	}
 	if typeCounts["gemini"] != 1 {
 		t.Errorf("[E2E-SPAWN] Expected 1 gemini, got %d", typeCounts["gemini"])
+	}
+
+	panes, err := tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("[E2E-SPAWN] GetPanes before title rewrite: %v", err)
+	}
+	wantTypeByID := make(map[string]tmux.AgentType)
+	for _, pane := range panes {
+		if pane.Type == tmux.AgentUser {
+			continue
+		}
+		wantTypeByID[pane.ID] = pane.Type
+		if err := tmux.SetPaneTitle(pane.ID, "caam | title replaced by wrapper"); err != nil {
+			t.Fatalf("[E2E-SPAWN] rewrite pane %s title: %v", pane.ID, err)
+		}
+	}
+	panes, err = tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("[E2E-SPAWN] GetPanes after title rewrite: %v", err)
+	}
+	for _, pane := range panes {
+		if want, ok := wantTypeByID[pane.ID]; ok && pane.Type != want {
+			t.Errorf("[E2E-SPAWN] pane %s type after wrapper/title rewrite = %s, want %s", pane.ID, pane.Type, want)
+		}
 	}
 
 	t.Logf("[E2E-SPAWN] Operation=MultiAgentTypes | Session=%s | Agents=%d | Types=%v",
@@ -1704,6 +1958,11 @@ func TestGetSpawnAssignmentPreflightFailurePreventsEveryActuation(t *testing.T) 
 			name: "unverified live labels in dry run", dryRun: true, actionableErr: errors.New("live labels are incomplete"),
 			wantCode: ErrCodeInternalError, wantPolicyCalls: 1, wantActionableCalls: 1,
 		},
+		{
+			name:          "stale work source",
+			actionableErr: fmt.Errorf("plan: %w", &worksource.StaleError{Reason: "tracker changed during source capture"}),
+			wantCode:      ErrCodeStaleWorkCoordination, wantPolicyCalls: 1, wantActionableCalls: 1,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			projectDir := t.TempDir()
@@ -1780,7 +2039,7 @@ func TestGetSpawnAssignmentPreflightFailurePreventsEveryActuation(t *testing.T) 
 					claimCalls.Add(1)
 					return bv.BeadClaimResult{}, nil
 				},
-				ReservationPort: assignment.ReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
+				ReservationPort: testReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
 					reservationCalls.Add(1)
 					return assignment.LeaseReceipt{}, nil
 				}),
@@ -1860,7 +2119,7 @@ func TestSpawnOptions_AssignWorkDryRunPreflightsPolicyAndActionablePlan(t *testi
 			mutations++
 			return bv.BeadClaimResult{}, nil
 		},
-		ReservationPort: assignment.ReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
+		ReservationPort: testReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
 			mutations++
 			return assignment.LeaseReceipt{}, nil
 		}),
@@ -1957,7 +2216,7 @@ func TestGetSpawnEmptyVerifiedAssignmentSetPrecedesTopologyAndLaunch(t *testing.
 			assignmentSideEffects++
 			return bv.BeadClaimResult{}, nil
 		},
-		ReservationPort: assignment.ReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
+		ReservationPort: testReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
 			assignmentSideEffects++
 			return assignment.LeaseReceipt{}, nil
 		}),
@@ -2062,7 +2321,7 @@ func TestAssignWorkEmptyVerifiedPlanReplaysOnlyExactDurableSentIntent(t *testing
 					mutations.Add(1)
 					return "", errors.New("replay must not generate a key")
 				},
-				ReservationPort: assignment.ReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
+				ReservationPort: testReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
 					mutations.Add(1)
 					return assignment.LeaseReceipt{}, errors.New("replay must not reserve")
 				}),
@@ -2080,7 +2339,7 @@ func TestAssignWorkEmptyVerifiedPlanReplaysOnlyExactDurableSentIntent(t *testing
 
 			got, err := assignWorkToAgentsWithError(
 				t.Context(), output, t.TempDir(), session, "top-n", config.Default(),
-				true, reservationPaths, deps, emptyPlan,
+				true, reservationPaths, deps, emptyPlan, "", PromptContextOptions{}, nil,
 			)
 			if err != nil {
 				t.Fatalf("assignWorkToAgentsWithError: %v", err)
@@ -2110,189 +2369,8 @@ func TestAssignWorkEmptyVerifiedPlanReplaysOnlyExactDurableSentIntent(t *testing
 	}
 }
 
-func TestAssignWorkUsesAtomicClaimReservationAndDispatchWithDurableReplay(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	store := assignment.NewStore("spawn-atomic")
-	var mu sync.Mutex
-	var order []string
-	claimCalls := 0
-	reserveCalls := 0
-	deliverCalls := 0
-	keyCalls := 0
-	observeCalls := 0
-	policyLabels := []string{"spawn-release-gate"}
-
-	panes := []tmux.Pane{
-		{ID: "%1", WindowIndex: 0, Index: 0, Type: tmux.AgentUser},
-		{ID: "%9", WindowIndex: 1, Index: 0, Title: "spawn-atomic__cod_1", Type: tmux.AgentCodex},
-	}
-	workDir := t.TempDir()
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return mockTriage([]bv.TriageRecommendation{{ID: "bd-spawn", Title: "Atomic spawn", Status: "ready", Priority: 1}}, nil), nil
-		},
-		ListPanes: func(context.Context, string) ([]tmux.Pane, error) { return append([]tmux.Pane(nil), panes...), nil },
-		LoadStore: func(string) (*assignment.AssignmentStore, error) { return store, nil },
-		GetBeadDetails: func(_ context.Context, _ string, beadID string) (*bv.BeadAssignmentDetails, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			order = append(order, "authorize")
-			return &bv.BeadAssignmentDetails{ID: beadID, Status: "open"}, nil
-		},
-		ClaimBeadWithOperatorGatedLabels: func(_ context.Context, _ string, beadID, actor string, labels []string) (bv.BeadClaimResult, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			claimCalls++
-			order = append(order, "claim")
-			if !reflect.DeepEqual(labels, policyLabels) {
-				t.Fatalf("guarded claim labels=%v, want captured %v", labels, policyLabels)
-			}
-			if !strings.HasPrefix(actor, "BlueLake/ntm-") {
-				t.Fatalf("claim actor=%q, want resolved Agent Mail identity", actor)
-			}
-			return bv.BeadClaimResult{ID: beadID, Actor: actor, Status: "in_progress", ClaimedAt: time.Now().UTC()}, nil
-		},
-		NewIdempotencyKey: func() (string, error) {
-			keyCalls++
-			return "spawn-key", nil
-		},
-		ReservationPort: assignment.ReservationFunc(func(_ context.Context, req assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			reserveCalls++
-			order = append(order, "reserve")
-			expires := time.Now().UTC().Add(time.Hour)
-			return assignment.LeaseReceipt{AgentName: req.AgentName, Target: req.Target, Requested: append([]string(nil), req.RequestedPaths...), Granted: append([]string(nil), req.RequestedPaths...), ReservationIDs: []int{77}, ExpiresAt: &expires}, nil
-		}),
-		DispatchDeliverer: dispatchsvc.DelivererFunc(func(_ context.Context, delivery dispatchsvc.Delivery) error {
-			mu.Lock()
-			defer mu.Unlock()
-			deliverCalls++
-			order = append(order, "dispatch")
-			if delivery.Target.Ref.ID != "%9" {
-				t.Errorf("dispatch target=%q, want %%9", delivery.Target.Ref.ID)
-			}
-			return nil
-		}),
-		ObserveSession: func(_ context.Context, gotSession string) (statuspkg.SessionObservation, error) {
-			observeCalls++
-			if observeCalls > 2 {
-				t.Fatal("durable replay re-ran the fresh-idle observation gate")
-			}
-			if gotSession != "spawn-atomic" {
-				t.Fatalf("observed session=%q, want spawn-atomic", gotSession)
-			}
-			return spawnObservation(gotSession, statuspkg.StateIdle, panes...), nil
-		},
-		ResolveAgentName: func(_ context.Context, projectKey, gotSession, paneID, paneTitle string) (string, error) {
-			if projectKey != workDir || gotSession != "spawn-atomic" || paneID != "%9" || paneTitle != "spawn-atomic__cod_1" {
-				t.Fatalf("resolver args project=%q session=%q pane=%q title=%q", projectKey, gotSession, paneID, paneTitle)
-			}
-			return "BlueLake", nil
-		},
-	}
-	output := &SpawnOutput{Session: "spawn-atomic", Agents: []SpawnedAgent{{Pane: "1.0", Name: "GeneratedName", Type: "codex"}}}
-	cfg := config.Default()
-	cfg.Assign.OperatorGatedLabels = append([]string(nil), policyLabels...)
-
-	reservationPaths := []string{"internal/robot/**"}
-	first := assignWorkToAgents(t.Context(), output, workDir, output.Session, "top-n", cfg, true, reservationPaths, deps)
-	second := assignWorkToAgents(t.Context(), output, workDir, output.Session, "top-n", cfg, true, reservationPaths, deps)
-	if len(first) != 1 || !first[0].Claimed || !first[0].PromptSent || first[0].DispatchReceiptID == "" {
-		t.Fatalf("first assignment=%+v", first)
-	}
-	if len(second) != 1 || !second[0].PromptSent || second[0].IdempotencyKey != first[0].IdempotencyKey {
-		t.Fatalf("replayed assignment=%+v", second)
-	}
-	if !reflect.DeepEqual(order, []string{"authorize", "claim", "reserve", "dispatch"}) {
-		t.Fatalf("side-effect order=%v", order)
-	}
-	if claimCalls != 1 || reserveCalls != 1 || deliverCalls != 1 || keyCalls != 1 || observeCalls != 2 {
-		t.Fatalf("calls claim=%d reserve=%d dispatch=%d key=%d observe=%d", claimCalls, reserveCalls, deliverCalls, keyCalls, observeCalls)
-	}
-}
-
 func spawnOpenAssignmentDetails(_ context.Context, _ string, beadID string) (*bv.BeadAssignmentDetails, error) {
 	return &bv.BeadAssignmentDetails{ID: beadID, Status: "open"}, nil
-}
-
-func TestAssignWorkRequiredReservationWithoutIdentityFailsBeforeClaimAndDispatch(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	claimCalls := 0
-	reserveCalls := 0
-	deliverCalls := 0
-	panes := []tmux.Pane{{ID: "%5", WindowIndex: 0, Index: 1, Type: tmux.AgentClaude}}
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return mockTriage([]bv.TriageRecommendation{{ID: "bd-required", Title: "Required", Status: "ready"}}, nil), nil
-		},
-		ListPanes: func(context.Context, string) ([]tmux.Pane, error) {
-			return append([]tmux.Pane(nil), panes...), nil
-		},
-		LoadStore: func(string) (*assignment.AssignmentStore, error) { return assignment.NewStore("spawn-required"), nil },
-		ClaimBead: func(context.Context, string, string, string) (bv.BeadClaimResult, error) {
-			claimCalls++
-			return bv.BeadClaimResult{}, errors.New("should not claim")
-		},
-		NewIdempotencyKey: func() (string, error) { return "required-key", nil },
-		ReservationPort: assignment.ReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
-			reserveCalls++
-			return assignment.LeaseReceipt{}, errors.New("should not reserve")
-		}),
-		DispatchDeliverer: dispatchsvc.DelivererFunc(func(context.Context, dispatchsvc.Delivery) error {
-			deliverCalls++
-			return nil
-		}),
-		ObserveSession: func(_ context.Context, session string) (statuspkg.SessionObservation, error) {
-			return spawnObservation(session, statuspkg.StateIdle, panes...), nil
-		},
-	}
-	output := &SpawnOutput{Session: "spawn-required", Agents: []SpawnedAgent{{Pane: "0.1", Name: "BlueLake", Type: "claude"}}}
-	got := assignWorkToAgents(t.Context(), output, t.TempDir(), output.Session, "top-n", config.Default(), true, []string{"internal/robot/**"}, deps)
-	if len(got) != 1 || !strings.Contains(got[0].ClaimError, "no exact Agent Mail pane-identity resolver") {
-		t.Fatalf("assignment=%+v", got)
-	}
-	if claimCalls != 0 || reserveCalls != 0 || deliverCalls != 0 {
-		t.Fatalf("claim=%d reserve=%d dispatch=%d, want zero", claimCalls, reserveCalls, deliverCalls)
-	}
-}
-
-func TestAssignWorkCancellationAfterObservationStopsClaimReservationAndDispatch(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	ctx, cancel := context.WithCancel(t.Context())
-	panes := []tmux.Pane{{ID: "%31", WindowIndex: 0, Index: 1, Title: "cancel__cc_1", Type: tmux.AgentClaude}}
-	var claims, reservations, dispatches atomic.Int32
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return mockTriage([]bv.TriageRecommendation{{ID: "bd-cancel", Title: "Cancel", Status: "ready"}}, nil), nil
-		},
-		ListPanes: func(context.Context, string) ([]tmux.Pane, error) { return append([]tmux.Pane(nil), panes...), nil },
-		LoadStore: func(string) (*assignment.AssignmentStore, error) { return assignment.NewStore("spawn-cancel"), nil },
-		ObserveSession: func(_ context.Context, session string) (statuspkg.SessionObservation, error) {
-			cancel()
-			return spawnObservation(session, statuspkg.StateIdle, panes...), nil
-		},
-		ClaimBead: func(context.Context, string, string, string) (bv.BeadClaimResult, error) {
-			claims.Add(1)
-			return bv.BeadClaimResult{}, errors.New("claim must not run")
-		},
-		ReservationPort: assignment.ReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
-			reservations.Add(1)
-			return assignment.LeaseReceipt{}, errors.New("reservation must not run")
-		}),
-		DispatchDeliverer: dispatchsvc.DelivererFunc(func(context.Context, dispatchsvc.Delivery) error {
-			dispatches.Add(1)
-			return errors.New("dispatch must not run")
-		}),
-	}
-	output := &SpawnOutput{Session: "spawn-cancel", Agents: []SpawnedAgent{{Pane: "0.1", Name: "CancelAgent", Type: "claude"}}}
-	got := assignWorkToAgents(ctx, output, t.TempDir(), output.Session, "top-n", config.Default(), true, []string{"internal/robot/**"}, deps)
-	if len(got) == 0 || !strings.Contains(got[0].ClaimError, "canceled") {
-		t.Fatalf("canceled assignment = %+v", got)
-	}
-	if claims.Load() != 0 || reservations.Load() != 0 || dispatches.Load() != 0 {
-		t.Fatalf("post-cancel side effects claim=%d reservation=%d dispatch=%d", claims.Load(), reservations.Load(), dispatches.Load())
-	}
 }
 
 func TestWaitForAgentsReadyCancellationInterruptsPolling(t *testing.T) {
@@ -2332,313 +2410,6 @@ func TestGetSpawnCanceledContextReturnsSingleStructuredFailure(t *testing.T) {
 	}
 	if out == nil || out.Success || out.ErrorCode != ErrCodeTimeout || !strings.Contains(out.Error, "canceled") {
 		t.Fatalf("canceled spawn output = %+v", out)
-	}
-}
-
-func TestAssignWorkUnsafeObservationHasNoAssignmentSideEffects(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	panes := []tmux.Pane{{ID: "%17", WindowIndex: 0, Index: 1, Title: "unsafe__cc_1", Type: tmux.AgentClaude}}
-	claimCalls := 0
-	reserveCalls := 0
-	deliverCalls := 0
-	keyCalls := 0
-	resolverCalls := 0
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return mockTriage([]bv.TriageRecommendation{{ID: "bd-unsafe", Title: "Unsafe pane", Status: "ready"}}, nil), nil
-		},
-		ListPanes: func(context.Context, string) ([]tmux.Pane, error) { return append([]tmux.Pane(nil), panes...), nil },
-		LoadStore: func(string) (*assignment.AssignmentStore, error) { return assignment.NewStore("spawn-unsafe"), nil },
-		ClaimBead: func(context.Context, string, string, string) (bv.BeadClaimResult, error) {
-			claimCalls++
-			return bv.BeadClaimResult{}, errors.New("should not claim")
-		},
-		NewIdempotencyKey: func() (string, error) {
-			keyCalls++
-			return "unsafe-key", nil
-		},
-		ReservationPort: assignment.ReservationFunc(func(context.Context, assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
-			reserveCalls++
-			return assignment.LeaseReceipt{}, errors.New("should not reserve")
-		}),
-		ResolveAgentName: func(context.Context, string, string, string, string) (string, error) {
-			resolverCalls++
-			return "UnsafeAgent", nil
-		},
-		ObserveSession: func(_ context.Context, session string) (statuspkg.SessionObservation, error) {
-			return spawnObservation(session, statuspkg.StateWorking, panes...), nil
-		},
-		DispatchDeliverer: dispatchsvc.DelivererFunc(func(context.Context, dispatchsvc.Delivery) error {
-			deliverCalls++
-			return errors.New("should not dispatch")
-		}),
-	}
-	output := &SpawnOutput{Session: "spawn-unsafe", Agents: []SpawnedAgent{{Pane: "0.1", Name: "UnsafeAgent", Type: "claude"}}}
-
-	got := assignWorkToAgents(t.Context(), output, t.TempDir(), output.Session, "top-n", config.Default(), true, []string{"internal/robot/**"}, deps)
-	if len(got) != 1 || !strings.Contains(got[0].ClaimError, "not safe to dispatch") {
-		t.Fatalf("assignment=%+v", got)
-	}
-	if claimCalls != 0 || reserveCalls != 0 || deliverCalls != 0 || keyCalls != 0 || resolverCalls != 0 {
-		t.Fatalf("unsafe side effects claim=%d reserve=%d dispatch=%d key=%d resolver=%d", claimCalls, reserveCalls, deliverCalls, keyCalls, resolverCalls)
-	}
-}
-
-func TestAssignWorkRequiredReservationRejectsIdentityAndTargetReceiptMismatch(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		mutate    func(*assignment.LeaseReceipt)
-		wantError string
-	}{
-		{
-			name: "identity",
-			mutate: func(receipt *assignment.LeaseReceipt) {
-				receipt.AgentName = "WrongAgent"
-			},
-			wantError: "reservation receipt agent mismatch",
-		},
-		{
-			name: "target",
-			mutate: func(receipt *assignment.LeaseReceipt) {
-				receipt.Target = "%999"
-			},
-			wantError: "reservation receipt target mismatch",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
-			workDir := t.TempDir()
-			panes := []tmux.Pane{{ID: "%42", WindowIndex: 2, Index: 0, Title: "receipts__cod_1", Type: tmux.AgentCodex}}
-			claimCalls := 0
-			reserveCalls := 0
-			deliverCalls := 0
-			deps := &SpawnAssignmentDependencies{
-				FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-					return mockTriage([]bv.TriageRecommendation{{ID: "bd-mismatch-" + test.name, Title: "Receipt mismatch", Status: "ready"}}, nil), nil
-				},
-				ListPanes: func(context.Context, string) ([]tmux.Pane, error) { return append([]tmux.Pane(nil), panes...), nil },
-				LoadStore: func(string) (*assignment.AssignmentStore, error) {
-					return assignment.NewStore("spawn-mismatch-" + test.name), nil
-				},
-				GetBeadDetails: spawnOpenAssignmentDetails,
-				ClaimBead: func(_ context.Context, _ string, beadID, actor string) (bv.BeadClaimResult, error) {
-					claimCalls++
-					if !strings.HasPrefix(actor, "MailAgent/ntm-") {
-						t.Fatalf("claim actor=%q, want exact resolved MailAgent identity", actor)
-					}
-					return bv.BeadClaimResult{ID: beadID, Actor: actor, Status: "in_progress", ClaimedAt: time.Now().UTC()}, nil
-				},
-				NewIdempotencyKey: func() (string, error) { return "mismatch-key-" + test.name, nil },
-				ReservationPort: assignment.ReservationFunc(func(_ context.Context, req assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
-					reserveCalls++
-					if req.AgentName != "MailAgent" || req.Target != "%42" {
-						t.Fatalf("reservation request agent=%q target=%q", req.AgentName, req.Target)
-					}
-					expires := time.Now().UTC().Add(time.Hour)
-					receipt := assignment.LeaseReceipt{
-						AgentName: req.AgentName, Target: req.Target,
-						Requested: append([]string(nil), req.RequestedPaths...), Granted: append([]string(nil), req.RequestedPaths...),
-						ReservationIDs: []int{91}, ExpiresAt: &expires,
-					}
-					test.mutate(&receipt)
-					return receipt, nil
-				}),
-				ResolveAgentName: func(_ context.Context, projectKey, session, paneID, paneTitle string) (string, error) {
-					if projectKey != workDir || session != "spawn-receipts" || paneID != "%42" || paneTitle != "receipts__cod_1" {
-						t.Fatalf("resolver args project=%q session=%q pane=%q title=%q", projectKey, session, paneID, paneTitle)
-					}
-					return "MailAgent", nil
-				},
-				ObserveSession: func(_ context.Context, session string) (statuspkg.SessionObservation, error) {
-					return spawnObservation(session, statuspkg.StateIdle, panes...), nil
-				},
-				DispatchDeliverer: dispatchsvc.DelivererFunc(func(context.Context, dispatchsvc.Delivery) error {
-					deliverCalls++
-					return nil
-				}),
-			}
-			output := &SpawnOutput{Session: "spawn-receipts", Agents: []SpawnedAgent{{Pane: "2.0", Name: "GeneratedButNotCanonical", Type: "codex"}}}
-
-			got := assignWorkToAgents(t.Context(), output, workDir, output.Session, "top-n", config.Default(), true, []string{"internal/robot/**"}, deps)
-			if len(got) != 1 || !got[0].Claimed || got[0].PromptSent || !strings.Contains(got[0].PromptError, test.wantError) {
-				t.Fatalf("assignment=%+v", got)
-			}
-			if claimCalls != 1 || reserveCalls != 1 || deliverCalls != 0 {
-				t.Fatalf("calls claim=%d reserve=%d dispatch=%d", claimCalls, reserveCalls, deliverCalls)
-			}
-		})
-	}
-}
-
-func TestAssignWorkDoesNotFabricateMissingIdentity(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	panes := []tmux.Pane{{ID: "%51", WindowIndex: 0, Index: 1, Type: tmux.AgentClaude}}
-	claimCalls := 0
-	deliverCalls := 0
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return mockTriage([]bv.TriageRecommendation{{ID: "bd-no-name", Title: "No name", Status: "ready"}}, nil), nil
-		},
-		ListPanes: func(context.Context, string) ([]tmux.Pane, error) { return append([]tmux.Pane(nil), panes...), nil },
-		LoadStore: func(string) (*assignment.AssignmentStore, error) { return assignment.NewStore("spawn-no-name"), nil },
-		ClaimBead: func(context.Context, string, string, string) (bv.BeadClaimResult, error) {
-			claimCalls++
-			return bv.BeadClaimResult{}, errors.New("should not claim")
-		},
-		ObserveSession: func(_ context.Context, session string) (statuspkg.SessionObservation, error) {
-			return spawnObservation(session, statuspkg.StateIdle, panes...), nil
-		},
-		DispatchDeliverer: dispatchsvc.DelivererFunc(func(context.Context, dispatchsvc.Delivery) error {
-			deliverCalls++
-			return nil
-		}),
-	}
-	output := &SpawnOutput{Session: "spawn-no-name", Agents: []SpawnedAgent{{Pane: "0.1", Name: "  ", Type: "claude"}}}
-
-	got := assignWorkToAgents(t.Context(), output, t.TempDir(), output.Session, "top-n", config.Default(), false, nil, deps)
-	if len(got) != 1 || !strings.Contains(got[0].ClaimError, "no canonical assignment identity") {
-		t.Fatalf("assignment=%+v", got)
-	}
-	if claimCalls != 0 || deliverCalls != 0 {
-		t.Fatalf("claim=%d dispatch=%d, want zero", claimCalls, deliverCalls)
-	}
-}
-
-func TestAssignWorkCanonicalMultiWindowDuplicateLocalIndices(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	store := assignment.NewStore("spawn-multi-window")
-	panes := []tmux.Pane{
-		{ID: "%22", WindowIndex: 1, Index: 0, Title: "multi__cod_1", Type: tmux.AgentCodex},
-		{ID: "%11", WindowIndex: 0, Index: 0, Title: "multi__cc_1", Type: tmux.AgentClaude},
-	}
-	keys := []string{"multi-key-0", "multi-key-1"}
-	keyIndex := 0
-	var delivered []string
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return mockTriage([]bv.TriageRecommendation{
-				{ID: "bd-window-0", Title: "Window zero", Status: "ready", Priority: 1},
-				{ID: "bd-window-1", Title: "Window one", Status: "ready", Priority: 2},
-			}, nil), nil
-		},
-		ListPanes:      func(context.Context, string) ([]tmux.Pane, error) { return append([]tmux.Pane(nil), panes...), nil },
-		LoadStore:      func(string) (*assignment.AssignmentStore, error) { return store, nil },
-		GetBeadDetails: spawnOpenAssignmentDetails,
-		ClaimBead: func(_ context.Context, _ string, beadID, actor string) (bv.BeadClaimResult, error) {
-			return bv.BeadClaimResult{ID: beadID, Actor: actor, Status: "in_progress", ClaimedAt: time.Now().UTC()}, nil
-		},
-		NewIdempotencyKey: func() (string, error) {
-			key := keys[keyIndex]
-			keyIndex++
-			return key, nil
-		},
-		ObserveSession: func(_ context.Context, session string) (statuspkg.SessionObservation, error) {
-			return spawnObservation(session, statuspkg.StateIdle, panes...), nil
-		},
-		DispatchDeliverer: dispatchsvc.DelivererFunc(func(_ context.Context, delivery dispatchsvc.Delivery) error {
-			delivered = append(delivered, delivery.Target.Ref.ID)
-			return nil
-		}),
-	}
-	output := &SpawnOutput{Session: "spawn-multi-window", Agents: []SpawnedAgent{
-		{Pane: "0.0", Name: "WindowZero", Type: "claude"},
-		{Pane: "1.0", Name: "WindowOne", Type: "codex"},
-	}}
-
-	got := assignWorkToAgents(t.Context(), output, t.TempDir(), output.Session, "top-n", config.Default(), false, nil, deps)
-	if len(got) != 2 || !got[0].Claimed || !got[0].PromptSent || !got[1].Claimed || !got[1].PromptSent {
-		t.Fatalf("assignments=%+v", got)
-	}
-	if got[0].Pane != "0.0" || got[1].Pane != "1.0" {
-		t.Fatalf("canonical panes=%q,%q, want 0.0,1.0", got[0].Pane, got[1].Pane)
-	}
-	if !reflect.DeepEqual(delivered, []string{"%11", "%22"}) {
-		t.Fatalf("delivery targets=%v, want [%%11 %%22]", delivered)
-	}
-	first := store.Get("bd-window-0")
-	second := store.Get("bd-window-1")
-	if first == nil || second == nil {
-		t.Fatalf("stored assignments first=%+v second=%+v", first, second)
-	}
-	if first.Pane != 0 || second.Pane != 0 || first.OccupancyKey != "%11" || second.OccupancyKey != "%22" {
-		t.Fatalf("stored pane occupancy first=%+v second=%+v", first, second)
-	}
-}
-
-func TestFinalizeSpawnAssignmentOutputReturnsStructuredTerminalFailure(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	store := assignment.NewStore("spawn-partial")
-	panes := []tmux.Pane{
-		{ID: "%61", WindowIndex: 0, Index: 0, Type: tmux.AgentClaude},
-		{ID: "%62", WindowIndex: 1, Index: 0, Type: tmux.AgentCodex},
-	}
-	keys := []string{"partial-key-0", "partial-key-1"}
-	keyIndex := 0
-	claimCalls := 0
-	var delivered []string
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return mockTriage([]bv.TriageRecommendation{
-				{ID: "bd-ok", Title: "Safe target", Status: "ready"},
-				{ID: "bd-failed", Title: "Unsafe target", Status: "ready"},
-			}, nil), nil
-		},
-		ListPanes:      func(context.Context, string) ([]tmux.Pane, error) { return append([]tmux.Pane(nil), panes...), nil },
-		LoadStore:      func(string) (*assignment.AssignmentStore, error) { return store, nil },
-		GetBeadDetails: spawnOpenAssignmentDetails,
-		ClaimBead: func(_ context.Context, _ string, beadID, actor string) (bv.BeadClaimResult, error) {
-			claimCalls++
-			return bv.BeadClaimResult{ID: beadID, Actor: actor, Status: "in_progress", ClaimedAt: time.Now().UTC()}, nil
-		},
-		NewIdempotencyKey: func() (string, error) {
-			key := keys[keyIndex]
-			keyIndex++
-			return key, nil
-		},
-		ObserveSession: func(_ context.Context, session string) (statuspkg.SessionObservation, error) {
-			observation := spawnObservation(session, statuspkg.StateIdle, panes[0])
-			unsafe := spawnObservation(session, statuspkg.StateWorking, panes[1])
-			observation.Panes = append(observation.Panes, unsafe.Panes[0])
-			return observation, nil
-		},
-		DispatchDeliverer: dispatchsvc.DelivererFunc(func(_ context.Context, delivery dispatchsvc.Delivery) error {
-			delivered = append(delivered, delivery.Target.Ref.ID)
-			return nil
-		}),
-	}
-	output := &SpawnOutput{
-		RobotResponse: NewRobotResponse(true),
-		Session:       "spawn-partial",
-		Agents: []SpawnedAgent{
-			{Pane: "0.0", Name: "SafeAgent", Type: "claude"},
-			{Pane: "1.0", Name: "UnsafeAgent", Type: "codex"},
-		},
-	}
-	output.Assignments = assignWorkToAgents(t.Context(), output, t.TempDir(), output.Session, "top-n", config.Default(), false, nil, deps)
-	if len(output.Assignments) != 2 || !output.Assignments[0].PromptSent || !strings.Contains(output.Assignments[1].ClaimError, "not safe to dispatch") {
-		t.Fatalf("assignments=%+v", output.Assignments)
-	}
-	if claimCalls != 1 || !reflect.DeepEqual(delivered, []string{"%61"}) {
-		t.Fatalf("claim calls=%d delivered=%v, want one safe transaction", claimCalls, delivered)
-	}
-	finalizeSpawnAssignmentOutput(output)
-	if output.Success || output.ErrorCode != "ASSIGNMENT_FAILED" || !strings.Contains(output.Error, "1 of 2") {
-		t.Fatalf("response=%+v error=%q", output.RobotResponse, output.Error)
-	}
-
-	encoded, err := captureStdout(t, func() error {
-		return encodeTerminalRobotOutput(output, output.RobotResponse, "robot spawn failed")
-	})
-	var exitErr *ProcessExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || !exitErr.JSONWritten() {
-		t.Fatalf("terminal error=%T %v, want written exit-1 ProcessExitError", err, err)
-	}
-	var decoded SpawnOutput
-	if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
-		t.Fatalf("decode terminal JSON: %v\n%s", err, encoded)
-	}
-	if decoded.Success || len(decoded.Assignments) != 2 || !strings.Contains(decoded.Assignments[1].ClaimError, "not safe to dispatch") {
-		t.Fatalf("decoded=%+v", decoded)
 	}
 }
 
@@ -2710,6 +2481,7 @@ func TestFinalizeSpawnAssignmentOutputRequiresEveryEligibleAgent(t *testing.T) {
 }
 
 func TestGetSpawnReportsZeroAssignmentCoverageAsFailure(t *testing.T) {
+	hermeticGlobalConfig(t)
 	panes := []tmux.Pane{
 		{ID: "%1", WindowIndex: 0, Index: 0},
 		{ID: "%2", WindowIndex: 0, Index: 1},
@@ -2738,6 +2510,7 @@ func TestGetSpawnReportsZeroAssignmentCoverageAsFailure(t *testing.T) {
 }
 
 func TestGetSpawnPreservesTypedAssignmentPreflightTimeoutWithoutLifecycleMutation(t *testing.T) {
+	hermeticGlobalConfig(t)
 	panes := []tmux.Pane{{ID: "%1", WindowIndex: 0, Index: 0}}
 	deps := testSpawnLifecycleDependencies(panes)
 	lifecycleCalls := 0
@@ -2773,38 +2546,6 @@ func TestGetSpawnPreservesTypedAssignmentPreflightTimeoutWithoutLifecycleMutatio
 	}
 	if lifecycleCalls != 0 {
 		t.Fatalf("assignment preflight timeout reached %d spawn lifecycle call(s)", lifecycleCalls)
-	}
-}
-
-func TestAssignWorkTriageFailureIsStructured(t *testing.T) {
-	deps := &SpawnAssignmentDependencies{
-		FetchTriage: func(context.Context, string) (*bv.TriageResponse, error) {
-			return nil, errors.New("bv unavailable")
-		},
-		LoadStore: func(string) (*assignment.AssignmentStore, error) {
-			t.Fatal("triage failure loaded assignment store")
-			return nil, nil
-		},
-	}
-	output := &SpawnOutput{
-		RobotResponse: NewRobotResponse(true), Session: "spawn-triage-failure",
-		Agents: []SpawnedAgent{
-			{Pane: "0.0", Name: "One", Type: "claude"},
-			{Pane: "1.0", Name: "Two", Type: "codex"},
-		},
-	}
-	output.Assignments = assignWorkToAgents(t.Context(), output, t.TempDir(), output.Session, "top-n", config.Default(), false, nil, deps)
-	if len(output.Assignments) != 2 {
-		t.Fatalf("assignments=%+v", output.Assignments)
-	}
-	for _, spawnAssignment := range output.Assignments {
-		if !strings.Contains(spawnAssignment.ClaimError, "load bv triage: bv unavailable") {
-			t.Fatalf("assignment=%+v", spawnAssignment)
-		}
-	}
-	finalizeSpawnAssignmentOutput(output)
-	if output.Success || !strings.Contains(output.Error, "2 of 2") {
-		t.Fatalf("output=%+v", output)
 	}
 }
 
@@ -3158,4 +2899,233 @@ func TestSpawnOutputExposesEffectiveProjectKeyOnlyWhenItDiffers(t *testing.T) {
 			t.Fatal("effective key equals working_dir; nothing was actually resolved")
 		}
 	})
+}
+
+// skillMatchTriageFixture is a discriminating fixture for the strategy
+// difference tests: top-n order (by triage score) is refactor, docs, bug —
+// but capability matching pairs codex with the bug and gemini with the docs.
+func skillMatchTriageFixture() *bv.TriageResponse {
+	return &bv.TriageResponse{
+		Triage: bv.TriageData{
+			Recommendations: []bv.TriageRecommendation{
+				{ID: "bd-refactor", Title: "Restructure config loading", Type: "refactor", Priority: 1, Score: 0.95},
+				{ID: "bd-docs", Title: "Document the robot surface", Type: "docs", Priority: 2, Score: 0.90},
+				{ID: "bd-bug", Title: "Broken pane resolution", Type: "bug", Priority: 1, Score: 0.85},
+			},
+		},
+	}
+}
+
+// TestGetWorkItemsForStrategySkillMatchedDiffersFromTopN is the C4-style
+// difference test: the same fixture must produce DIFFERENT positional
+// assignments under skill-matched than under top-n, proving skill-matched
+// no longer silently falls back.
+func TestGetWorkItemsForStrategySkillMatchedDiffersFromTopN(t *testing.T) {
+	triage := skillMatchTriageFixture()
+	agents := []SpawnedAgent{
+		{Pane: "0.1", Type: "cod"},
+		{Pane: "0.2", Type: "gmi"},
+		{Pane: "0.3", Type: "cc"},
+	}
+
+	topN := getWorkItemsForStrategy(triage, "top-n", agents)
+	matched := getWorkItemsForStrategy(triage, "skill-matched", agents)
+
+	if len(topN) != 3 || len(matched) != 3 {
+		t.Fatalf("expected 3 items each, got top-n=%d skill-matched=%d", len(topN), len(matched))
+	}
+
+	// top-n pairs positionally by triage score: cod→refactor, gmi→docs, cc→bug.
+	wantTopN := []string{"bd-refactor", "bd-docs", "bd-bug"}
+	for i, want := range wantTopN {
+		if topN[i].ID != want {
+			t.Fatalf("top-n[%d] = %s, want %s", i, topN[i].ID, want)
+		}
+	}
+
+	// Capability matrix: cod scores bug 0.90 > refactor 0.75 > docs 0.70;
+	// gmi scores docs 0.90; cc scores refactor 0.95.
+	wantMatched := []string{"bd-bug", "bd-docs", "bd-refactor"}
+	for i, want := range wantMatched {
+		if matched[i].ID != want {
+			t.Fatalf("skill-matched[%d] = %s, want %s (full: %+v)", i, matched[i].ID, want, matched)
+		}
+	}
+
+	same := true
+	for i := range topN {
+		if topN[i].ID != matched[i].ID {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Fatal("skill-matched produced identical positional assignments to top-n on a discriminating fixture (silent fallback)")
+	}
+
+	for i, item := range matched {
+		if item.MatchReason == "" {
+			t.Fatalf("skill-matched[%d] (%s) has no MatchReason recorded", i, item.ID)
+		}
+		if !strings.Contains(item.MatchReason, "skill-matched") {
+			t.Fatalf("skill-matched[%d] MatchReason = %q, want skill-matched rationale", i, item.MatchReason)
+		}
+		if len(item.Reasons) == 0 || !strings.Contains(item.Reasons[len(item.Reasons)-1], "skill-matched") {
+			t.Fatalf("skill-matched[%d] Reasons missing rationale: %v", i, item.Reasons)
+		}
+	}
+	// Genuine matching must state the capability score, not a fallback note.
+	if !strings.Contains(matched[0].MatchReason, "capability") {
+		t.Fatalf("MatchReason %q does not cite a capability score", matched[0].MatchReason)
+	}
+}
+
+// TestGetSkillMatchedWorkItemsNoSignalIsLoud verifies the degenerate class
+// (unknown agent type, uniform 0.5 scores) is recorded loudly instead of
+// silently masquerading as skill matching.
+func TestGetSkillMatchedWorkItemsNoSignalIsLoud(t *testing.T) {
+	triage := skillMatchTriageFixture()
+	agents := []SpawnedAgent{{Pane: "0.1", Type: "totally-unknown-agent"}}
+
+	items := getSkillMatchedWorkItems(triage, agents)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	// Uniform scores keep triage order (top item first).
+	if items[0].ID != "bd-refactor" {
+		t.Fatalf("degenerate matching picked %s, want triage-order bd-refactor", items[0].ID)
+	}
+	if !strings.Contains(items[0].MatchReason, "no discriminating capability signal") {
+		t.Fatalf("degenerate matching MatchReason = %q, want loud no-signal note", items[0].MatchReason)
+	}
+}
+
+// TestGetWorkItemsForStrategyUnknownStrategyIsLoud verifies that a strategy
+// value leaking past strict normalization records a fallback reason.
+func TestGetWorkItemsForStrategyUnknownStrategyIsLoud(t *testing.T) {
+	triage := skillMatchTriageFixture()
+	agents := []SpawnedAgent{{Pane: "0.1", Type: "cc"}}
+
+	items := getWorkItemsForStrategy(triage, "not-a-strategy", agents)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if !strings.Contains(items[0].MatchReason, "fell back to top-n") {
+		t.Fatalf("unknown strategy MatchReason = %q, want loud fallback note", items[0].MatchReason)
+	}
+}
+
+// TestSpawnTaskTypeForRecommendationLadder covers the explicit-type, label,
+// and title-inference rungs.
+func TestSpawnTaskTypeForRecommendationLadder(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  bv.TriageRecommendation
+		want string
+	}{
+		{"explicit type wins", bv.TriageRecommendation{Type: "refactor", Title: "fix bug"}, "refactor"},
+		{"label used when type generic", bv.TriageRecommendation{Type: "task", Labels: []string{"lane", "docs"}, Title: "misc"}, "docs"},
+		{"title inference last", bv.TriageRecommendation{Type: "task", Title: "Fix broken spawn crash"}, "bug"},
+		{"generic stays task", bv.TriageRecommendation{Type: "task", Title: "misc chores galore maybe"}, "task"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(spawnTaskTypeForRecommendation(tc.rec)); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSpawnModelHints(t *testing.T) {
+	cfg := config.Default()
+
+	// Known models and empty overrides produce no hints.
+	if hints := spawnModelHints(cfg, SpawnOptions{}); len(hints) != 0 {
+		t.Fatalf("no-override hints = %v, want none", hints)
+	}
+	if hints := spawnModelHints(cfg, SpawnOptions{CCModel: "claude-opus-5"}); len(hints) != 0 {
+		t.Fatalf("known-model hints = %v, want none", hints)
+	}
+
+	// A near-miss typo yields a did-you-mean hint (advisory, never an error).
+	hints := spawnModelHints(cfg, SpawnOptions{CCModel: "claude-opus5"})
+	if len(hints) != 1 || !strings.Contains(hints[0], "claude-opus-5") || !strings.Contains(hints[0], "did you mean") {
+		t.Fatalf("typo hints = %v, want one did-you-mean for claude-opus-5", hints)
+	}
+
+	// Completely custom model IDs stay silent so self-hosted models work.
+	if hints := spawnModelHints(cfg, SpawnOptions{CodModel: "totally-custom-model-xyz-42"}); len(hints) != 0 {
+		t.Fatalf("custom-model hints = %v, want none", hints)
+	}
+}
+
+// GH #333: --robot-spawn had no OpenCode flag, so an agent trusting the
+// capabilities document concluded oc panes were unsupported. --spawn-oc
+// launches them through the same template as `ntm spawn --oc`.
+func TestGetAgentCommandsWithOverridesOpencode(t *testing.T) {
+	cfg := config.Default()
+	commands, err := getAgentCommandsWithOverrides(cfg, SpawnOptions{OcCount: 1, OcModel: "opencode/big-pickle"})
+	if err != nil {
+		t.Fatalf("getAgentCommandsWithOverrides: %v", err)
+	}
+	if got, want := commands["oc"], "opencode --model 'opencode/big-pickle'"; got != want {
+		t.Fatalf("oc command = %q, want %q", got, want)
+	}
+
+	commands, err = getAgentCommandsWithOverrides(cfg, SpawnOptions{OcCount: 1})
+	if err != nil {
+		t.Fatalf("getAgentCommandsWithOverrides without model: %v", err)
+	}
+	if got := commands["oc"]; got != "opencode" {
+		t.Fatalf("oc command without model = %q, want bare opencode (OpenCode picks its own default)", got)
+	}
+
+	cfg.Agents.Opencode = `opencode --print-logs{{if .Model}} --model {{shellQuote .Model}}{{end}}`
+	commands, err = getAgentCommandsWithOverrides(cfg, SpawnOptions{OcCount: 1, OcModel: "anthropic/claude-x"})
+	if err != nil {
+		t.Fatalf("getAgentCommandsWithOverrides with [agents] oc: %v", err)
+	}
+	if got, want := commands["oc"], "opencode --print-logs --model 'anthropic/claude-x'"; got != want {
+		t.Fatalf("configured oc command = %q, want %q", got, want)
+	}
+}
+
+func TestSpawnDryRunPlansOpencodePanes(t *testing.T) {
+	opts := SpawnOptions{Session: "oc_dryrun", CCCount: 1, OcCount: 2, NoUserPane: true, DryRun: true}
+	out, err := GetSpawn(t.Context(), opts, config.Default())
+	if err != nil {
+		t.Fatalf("GetSpawn: %v", err)
+	}
+	if !out.Success {
+		t.Fatalf("dry run failed: %s", out.Error)
+	}
+	var titles []string
+	for _, agent := range out.WouldCreate {
+		if agent.Type == "oc" {
+			titles = append(titles, agent.Title)
+		}
+	}
+	if want := []string{"oc_dryrun__oc_1", "oc_dryrun__oc_2"}; !reflect.DeepEqual(titles, want) {
+		t.Fatalf("oc panes planned = %v, want %v (all: %+v)", titles, want, out.WouldCreate)
+	}
+}
+
+func TestIsAgentReadyOpencodeWaitsForComposer(t *testing.T) {
+	composer := strings.Join([]string{
+		"",
+		"  ┃",
+		"  ┃  Ask anything… \"Fix a TODO in the codebase\"",
+		"  ┃",
+		"  ┃  Build · Big Pickle OpenCode Zen",
+		"  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+	}, "\n")
+	if !agentpkg.IsReadyOutput(composer, agentpkg.AgentTypeOpencode) {
+		t.Fatal("OpenCode composer not recognized as ready")
+	}
+	// The launching shell's prompt satisfies the generic prompt patterns,
+	// but the OpenCode TUI is not up until its composer is drawn.
+	if agentpkg.IsReadyOutput("user@host:~/proj$ opencode --model 'x/y'\n$ ", agentpkg.AgentTypeOpencode) {
+		t.Fatal("bare shell prompt reported an OpenCode pane ready")
+	}
 }

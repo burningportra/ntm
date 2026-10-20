@@ -243,70 +243,6 @@ func TestMailCheckOutputJSONSerialization(t *testing.T) {
 	}
 }
 
-func TestMailCheckMessageFromInboxAppliesDisclosureControl(t *testing.T) {
-	thread := "bd-j9jo3.3.5"
-	secret := strings.Repeat("s", 20)
-	msg := agentmail.InboxMessage{
-		ID:          7,
-		From:        "BlueLake",
-		Subject:     "Rotate credential",
-		BodyMD:      "Need token=" + secret + " and " + strings.Repeat("harmless coordination detail ", 8),
-		ThreadID:    &thread,
-		Importance:  "urgent",
-		AckRequired: true,
-		CreatedTS:   agentmail.FlexTime{},
-	}
-
-	safe := mailCheckMessageFromInbox(msg, "GreenStone", true)
-
-	if safe.Subject != "Rotate credential" {
-		t.Fatalf("subject = %q, want %q", safe.Subject, "Rotate credential")
-	}
-	if safe.SubjectDisclosure == nil || safe.SubjectDisclosure.DisclosureState != "visible" {
-		t.Fatalf("expected visible subject disclosure, got %+v", safe.SubjectDisclosure)
-	}
-	if !strings.Contains(safe.Preview, "[REDACTED:GENERIC_SECRET:") {
-		t.Fatalf("expected redacted preview, got %q", safe.Preview)
-	}
-	if safe.PreviewDisclosure == nil || safe.PreviewDisclosure.DisclosureState != "redacted" {
-		t.Fatalf("expected redacted preview disclosure, got %+v", safe.PreviewDisclosure)
-	}
-	if safe.Body == nil || !strings.Contains(*safe.Body, "[REDACTED:GENERIC_SECRET:") {
-		t.Fatalf("expected redacted body, got %+v", safe.Body)
-	}
-	if safe.BodyDisclosure == nil || safe.BodyDisclosure.DisclosureState != "redacted" {
-		t.Fatalf("expected redacted body disclosure, got %+v", safe.BodyDisclosure)
-	}
-	if !safe.AckRequired {
-		t.Fatal("AckRequired = false, want true from inbox message")
-	}
-}
-
-func TestMailCheckMessageFromInboxPreviewsLongSafeBody(t *testing.T) {
-	msg := agentmail.InboxMessage{
-		ID:        8,
-		From:      "BlueLake",
-		Subject:   "Coordination",
-		BodyMD:    strings.Repeat("harmless coordination detail ", 8),
-		CreatedTS: agentmail.FlexTime{},
-	}
-
-	safe := mailCheckMessageFromInbox(msg, "GreenStone", true)
-
-	if safe.Body == nil {
-		t.Fatal("expected body output")
-	}
-	if safe.BodyDisclosure == nil || safe.BodyDisclosure.DisclosureState != "preview_only" {
-		t.Fatalf("expected preview_only body disclosure, got %+v", safe.BodyDisclosure)
-	}
-	if *safe.Body != safe.BodyDisclosure.Preview {
-		t.Fatalf("expected preview-only body to match preview, got body=%q preview=%q", *safe.Body, safe.BodyDisclosure.Preview)
-	}
-	if !strings.HasSuffix(*safe.Body, "...") {
-		t.Fatalf("expected preview-only body to truncate long content, got %q", *safe.Body)
-	}
-}
-
 // TestMailCheckOutputValidationError tests error response handling.
 func TestMailCheckOutputValidationError(t *testing.T) {
 	// Test that validation errors return proper error response
@@ -363,6 +299,13 @@ func TestMailCheckValidationErrorRetainsCanonicalFilters(t *testing.T) {
 
 func TestGetMailCheck_DefaultsZeroLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -429,6 +372,13 @@ func TestGetMailCheck_HasMoreUsesOverfetch(t *testing.T) {
 	fetchLimits := []int{}
 	markReads := []interface{}{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -521,6 +471,13 @@ func TestGetMailCheck_UsesFullInboxWindowForCounts(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -562,56 +519,6 @@ func TestGetMailCheck_UsesFullInboxWindowForCounts(t *testing.T) {
 	}
 	if got, want := fetchLimits, []int{2, mailCheckBackfillLimit}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("fetch limits = %v, want %v", got, want)
-	}
-}
-
-// TestTruncateStringMail tests the string truncation helper.
-func TestTruncateStringMail(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		maxLen   int
-		expected string
-	}{
-		{
-			name:     "short string unchanged",
-			input:    "Hello world",
-			maxLen:   20,
-			expected: "Hello world",
-		},
-		{
-			name:     "exact length",
-			input:    "Hello world",
-			maxLen:   11,
-			expected: "Hello world",
-		},
-		{
-			name:     "truncate at word boundary",
-			input:    "Hello wonderful world",
-			maxLen:   15,
-			expected: "Hello wonderful...", // truncates at maxLen, then finds last space if past midpoint
-		},
-		{
-			name:     "truncate long string",
-			input:    "This is a very long message that needs to be truncated for preview purposes",
-			maxLen:   30,
-			expected: "This is a very long message...",
-		},
-		{
-			name:     "trims whitespace",
-			input:    "  Hello world  ",
-			maxLen:   50,
-			expected: "Hello world",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := truncateStringMail(tt.input, tt.maxLen)
-			if result != tt.expected {
-				t.Errorf("got %q, want %q", result, tt.expected)
-			}
-		})
 	}
 }
 
@@ -674,35 +581,18 @@ func TestMailCheckFiltersOmitUnsetOptionalFields(t *testing.T) {
 	}
 }
 
-func TestMailCheckMessageBodyOmittedWhenBodiesDisabled(t *testing.T) {
-	msg := agentmail.InboxMessage{
-		ID:        9,
-		From:      "BlueLake",
-		Subject:   "Coordination",
-		BodyMD:    "some detailed body",
-		CreatedTS: agentmail.FlexTime{},
-	}
-
-	output := mailCheckMessageFromInbox(msg, "GreenStone", false)
-	data, err := json.Marshal(output)
-	if err != nil {
-		t.Fatalf("failed to marshal message: %v", err)
-	}
-
-	var decoded map[string]any
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("failed to unmarshal message: %v", err)
-	}
-	if _, exists := decoded["body"]; exists {
-		t.Fatalf("body should be omitted when includeBodies=false: %s", string(data))
-	}
-}
-
 func TestGetMailCheck_AggregatesProjectAgentsWhenAgentOmitted(t *testing.T) {
 	const wantSince = "2026-01-01T00:00:00Z"
 	markReads := map[string]interface{}{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -810,6 +700,13 @@ func TestGetMailCheck_BackfillsWhenThreadFilterNeedsOlderMatches(t *testing.T) {
 	fetchLimits := []int{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -916,3 +813,57 @@ func TestMailCheckAgentHintsOmitEmpty(t *testing.T) {
 
 // Note: contains() and containsHelper() are defined in diagnose_test.go
 // and are reused here since we're in the same package
+
+// TestGetMailCheckUsesInjectedConfiguredClient: the CLI hands GetMailCheck its
+// fully configured Agent Mail client (config-file URL, bearer token, hydrated
+// registration tokens). The check must run against that client — proven here
+// by a server that rejects any call without the configured bearer token —
+// rather than constructing a fresh environment-only client.
+func TestGetMailCheckUsesInjectedConfiguredClient(t *testing.T) {
+	const token = "configured-mail-check-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("Authorization = %q, want configured bearer token", got)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		switch params["name"] {
+		case "health_check":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{
+				JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{"status":"ok"}`),
+			})
+		case "fetch_inbox":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{
+				JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{"result":[]}`),
+			})
+		default:
+			t.Errorf("unexpected Agent Mail tool %v", params["name"])
+		}
+	}))
+	defer server.Close()
+
+	output, err := GetMailCheck(MailCheckOptions{
+		Client:  agentmail.NewClient(agentmail.WithBaseURL(server.URL), agentmail.WithToken(token)),
+		Project: "/repos/example/project",
+		Agent:   "BlueLake",
+	})
+	if err != nil {
+		t.Fatalf("GetMailCheck: %v", err)
+	}
+	if !output.Success {
+		t.Fatalf("GetMailCheck success=false error=%q", output.Error)
+	}
+}

@@ -488,6 +488,7 @@ type RateLimitDetection struct {
 	ExitCode    int
 	Source      string // "output" or "exit_code"
 	AgentType   string // Agent type hint (e.g., "cod") when available
+	ResetHint   string // Human-readable reset phrase (e.g., "try again at 7:00 PM"), best-effort
 }
 
 const (
@@ -553,9 +554,79 @@ func ParseExitCode(output string) (int, bool) {
 	return 0, false
 }
 
+// usageLimitBannerPatterns match provider usage-limit banners that lack the
+// literal words "rate limit" and so slip past the generic detectors. They are
+// deliberately anchored on limit-ish context ("usage limit", "plan limit") so
+// a stray mention of "limit" in normal output (e.g. "increase the limit of
+// retries") never matches. Agent-agnostic: the Codex CLI banner ("You've hit
+// your usage limit. ... try again at <date>") has appeared on panes whose
+// agent type was mis-hinted, so these run for every agent in DetectRateLimit.
+var usageLimitBannerPatterns = []*regexp.Regexp{
+	// "You've hit your usage limit" / "You have hit your usage limit" /
+	// curly or straight apostrophe / OCR-ish "you.ve" variants.
+	regexp.MustCompile(`(?i)\bhit\s+your\s+usage\s+limit`),
+	regexp.MustCompile(`(?i)\breached\s+your\s+usage\s+limit`),
+	regexp.MustCompile(`(?i)\busage\s+limits?\s+(?:reached|exceeded|hit)\b`),
+	regexp.MustCompile(`(?i)\bplan\s+limits?\s+(?:reached|exceeded|hit)\b`),
+	// Gemini / Google quota phrasings.
+	regexp.MustCompile(`(?i)\bquota\s+(?:exceeded|exhausted|reached)\b`),
+	regexp.MustCompile(`RESOURCE_EXHAUSTED`),
+	// "upgrade to continue" only counts with limit/quota context nearby.
+	regexp.MustCompile(`(?i)(?:usage|plan|rate)\s+limit[^\n]{0,120}upgrade\s+to\s+continue`),
+}
+
+// matchUsageLimitBanner returns true when the (ANSI-stripped) output contains
+// a provider usage-limit banner.
+func matchUsageLimitBanner(cleaned string) bool {
+	for _, pat := range usageLimitBannerPatterns {
+		if pat.MatchString(cleaned) {
+			return true
+		}
+	}
+	return false
+}
+
+// resetHintPatterns capture the human-readable reset phrase providers print
+// alongside usage-limit banners, e.g. Codex's "try again at 7:00 PM" or
+// Claude's "resets at 3am (America/New_York)".
+var resetHintPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\btry\s+again\s+(?:at|after|on)\s+[^\n]+`),
+	regexp.MustCompile(`(?i)\b(?:limit\s+)?resets?\s+(?:at|on|in)\s+[^\n]+`),
+	regexp.MustCompile(`(?i)\bresets\s+\d{1,2}(?::\d{2})?\s*[ap]\.?m\.?`),
+	regexp.MustCompile(`(?i)\bavailable\s+again\s+at\s+[^\n]+`),
+}
+
+// maxResetHintLen caps ExtractResetHint output so a matched line with trailing
+// UI chrome cannot balloon downstream JSON payloads.
+const maxResetHintLen = 120
+
+// ExtractResetHint returns the human-readable reset phrase found in output
+// (e.g. "try again at 7:00 PM"), or "" when none is present. Best-effort: the
+// value is meant for display/logging, not for machine parsing.
+func ExtractResetHint(content string) string {
+	if content == "" {
+		return ""
+	}
+	cleaned := status.StripANSI(content)
+	for _, pat := range resetHintPatterns {
+		if m := pat.FindString(cleaned); m != "" {
+			m = strings.TrimSpace(m)
+			m = strings.TrimRight(m, " .,;:!")
+			if len(m) > maxResetHintLen {
+				m = strings.TrimSpace(m[:maxResetHintLen])
+			}
+			return m
+		}
+	}
+	return ""
+}
+
 // DetectRateLimit inspects output for rate limit signals, including exit code 429.
 func DetectRateLimit(output string) RateLimitDetection {
-	detection := RateLimitDetection{WaitSeconds: ParseWaitSeconds(output)}
+	detection := RateLimitDetection{
+		WaitSeconds: ParseWaitSeconds(output),
+		ResetHint:   ExtractResetHint(output),
+	}
 
 	if code, ok := ParseExitCode(output); ok {
 		detection.ExitCode = code
@@ -574,6 +645,16 @@ func DetectRateLimit(output string) RateLimitDetection {
 			detection.Source = detectionSourceOutput
 			return detection
 		}
+	}
+
+	// Provider usage-limit banners (Codex "You've hit your usage limit",
+	// "Plan limit reached", Gemini quota exhaustion). Checked for every
+	// agent type: bd-wtm0w saw these slip through when only Claude's
+	// "hit your limit" phrasing was recognized.
+	if matchUsageLimitBanner(status.StripANSI(output)) {
+		detection.RateLimited = true
+		detection.Source = detectionSourceOutput
+		return detection
 	}
 
 	return detection
@@ -614,6 +695,12 @@ var codexRateLimitPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)please\s+try\s+again`),
 	regexp.MustCompile(`(?i)usage.*(?:cap|limit).*reached`),
 	regexp.MustCompile(`(?i)RateLimitError`),
+	// Codex CLI usage-limit banner variants (bd-wtm0w): "You've hit your
+	// usage limit. ... try again at <date>", "You have hit your usage
+	// limit", "usage limit reached", "Plan limit reached".
+	regexp.MustCompile(`(?i)hit\s+your\s+usage\s+limit`),
+	regexp.MustCompile(`(?i)usage\s+limits?\s+reached`),
+	regexp.MustCompile(`(?i)plan\s+limits?\s+reached`),
 }
 
 // DetectCodexRateLimit checks output for Codex-specific rate limit patterns.
@@ -629,295 +716,4 @@ func DetectCodexRateLimit(output string) bool {
 		}
 	}
 	return false
-}
-
-// =============================================================================
-// CodexThrottle: AIMD-based adaptive throttling for Codex launches (bd-3qoly)
-// =============================================================================
-
-// ThrottlePhase describes the current throttle state.
-type ThrottlePhase string
-
-const (
-	// ThrottleNormal means no throttling is active.
-	ThrottleNormal ThrottlePhase = "normal"
-	// ThrottlePaused means new cod launches are paused due to rate limiting.
-	ThrottlePaused ThrottlePhase = "paused"
-	// ThrottleRecovering means throttle is gradually allowing launches again (AIMD additive increase).
-	ThrottleRecovering ThrottlePhase = "recovering"
-)
-
-// AIMD parameters for Codex throttle.
-const (
-	// AIMDMultiplicativeDecrease halves the allowed rate on rate-limit detection.
-	AIMDMultiplicativeDecrease = 0.5
-	// AIMDAdditiveIncrease adds one allowed launch per recovery interval.
-	AIMDAdditiveIncrease = 1
-	// DefaultCooldownWindow is the minimum pause after a rate-limit event.
-	DefaultCooldownWindow = 30 * time.Second
-	// MaxCooldownWindow caps the cooldown to prevent indefinite pausing.
-	MaxCooldownWindow = 5 * time.Minute
-	// RecoveryCheckInterval is how often to re-evaluate recovery during additive increase.
-	RecoveryCheckInterval = 15 * time.Second
-)
-
-// CodexThrottle implements AIMD-based adaptive throttling for Codex (cod) agent launches.
-// It is safe for concurrent use.
-type CodexThrottle struct {
-	mu sync.RWMutex
-
-	phase         ThrottlePhase
-	cooldownUntil time.Time
-	cooldownDur   time.Duration // Current cooldown window (grows on repeated rate limits)
-
-	// AIMD state
-	allowedConcurrent int // Current allowed concurrent cod launches (AIMD window size)
-	maxConcurrent     int // Maximum allowed (ceiling for additive increase)
-
-	// Bookkeeping
-	rateLimitCount   int       // Total rate-limit events observed
-	lastRateLimit    time.Time // When last rate-limit was observed
-	lastRecoveryStep time.Time // When last additive increase happened
-	affectedPanes    []string  // Pane IDs that were rate-limited
-
-	// nowFn allows test time injection.
-	nowFn func() time.Time
-}
-
-// CodexThrottleStatus is a read-only snapshot of the throttle state.
-type CodexThrottleStatus struct {
-	Phase             ThrottlePhase `json:"phase"`
-	CooldownRemaining time.Duration `json:"cooldown_remaining"`
-	AllowedConcurrent int           `json:"allowed_concurrent"`
-	MaxConcurrent     int           `json:"max_concurrent"`
-	RateLimitCount    int           `json:"rate_limit_count"`
-	AffectedPanes     []string      `json:"affected_panes,omitempty"`
-	Guidance          string        `json:"guidance"`
-}
-
-// NewCodexThrottle creates a CodexThrottle with the given max concurrency ceiling.
-func NewCodexThrottle(maxConcurrent int) *CodexThrottle {
-	if maxConcurrent < 1 {
-		maxConcurrent = 3
-	}
-	return &CodexThrottle{
-		phase:             ThrottleNormal,
-		allowedConcurrent: maxConcurrent,
-		maxConcurrent:     maxConcurrent,
-		nowFn:             time.Now,
-	}
-}
-
-// now returns the current time, using the injectable nowFn.
-func (ct *CodexThrottle) now() time.Time {
-	if ct.nowFn != nil {
-		return ct.nowFn()
-	}
-	return time.Now()
-}
-
-// RecordRateLimit is called when a Codex rate-limit event is detected on the given pane.
-// It triggers multiplicative decrease and sets a cooldown window.
-func (ct *CodexThrottle) RecordRateLimit(paneID string, waitSeconds int) {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-
-	now := ct.now()
-	ct.rateLimitCount++
-	ct.lastRateLimit = now
-
-	// Track affected pane
-	ct.addAffectedPane(paneID)
-
-	// AIMD multiplicative decrease
-	newAllowed := int(float64(ct.allowedConcurrent) * AIMDMultiplicativeDecrease)
-	if newAllowed < 0 {
-		newAllowed = 0
-	}
-	ct.allowedConcurrent = newAllowed
-
-	// Calculate cooldown window
-	cooldown := DefaultCooldownWindow
-	if waitSeconds > 0 {
-		cooldown = time.Duration(waitSeconds) * time.Second
-	}
-
-	// Scale up cooldown on repeated rate limits (exponential backoff)
-	if ct.rateLimitCount > 1 {
-		multiplier := 1.0
-		for i := 1; i < ct.rateLimitCount; i++ {
-			multiplier *= 1.5
-		}
-		cooldown = time.Duration(float64(cooldown) * multiplier)
-	}
-
-	if cooldown > MaxCooldownWindow {
-		cooldown = MaxCooldownWindow
-	}
-	ct.cooldownDur = cooldown
-
-	cooldownUntil := now.Add(cooldown)
-	if cooldownUntil.After(ct.cooldownUntil) {
-		ct.cooldownUntil = cooldownUntil
-	}
-
-	ct.phase = ThrottlePaused
-}
-
-// addAffectedPane adds a pane ID to the affected list if not already present.
-func (ct *CodexThrottle) addAffectedPane(paneID string) {
-	if paneID == "" {
-		return
-	}
-	for _, p := range ct.affectedPanes {
-		if p == paneID {
-			return
-		}
-	}
-	ct.affectedPanes = append(ct.affectedPanes, paneID)
-}
-
-// MayLaunch reports whether a new cod launch is allowed right now.
-// It also advances the AIMD state (checks cooldown expiry, additive increase).
-func (ct *CodexThrottle) MayLaunch(currentRunning int) bool {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-
-	ct.advanceStateLocked()
-
-	switch ct.phase {
-	case ThrottleNormal:
-		return true
-	case ThrottlePaused:
-		return false
-	case ThrottleRecovering:
-		return currentRunning < ct.allowedConcurrent
-	}
-	return true
-}
-
-// advanceStateLocked transitions state based on elapsed time. Caller must hold ct.mu.
-func (ct *CodexThrottle) advanceStateLocked() {
-	now := ct.now()
-
-	if ct.phase == ThrottlePaused {
-		if now.After(ct.cooldownUntil) {
-			// Cooldown expired: enter recovery with additive increase
-			ct.phase = ThrottleRecovering
-			ct.lastRecoveryStep = now
-			// Start recovery with at least 1 allowed concurrent
-			if ct.allowedConcurrent < 1 {
-				ct.allowedConcurrent = 1
-			}
-		}
-		return
-	}
-
-	if ct.phase == ThrottleRecovering {
-		// AIMD additive increase: add 1 per recovery interval
-		if now.Sub(ct.lastRecoveryStep) >= RecoveryCheckInterval {
-			steps := int(now.Sub(ct.lastRecoveryStep) / RecoveryCheckInterval)
-			ct.allowedConcurrent += steps * AIMDAdditiveIncrease
-			if ct.allowedConcurrent >= ct.maxConcurrent {
-				ct.allowedConcurrent = ct.maxConcurrent
-				ct.phase = ThrottleNormal
-				ct.affectedPanes = nil // Clear affected panes on full recovery
-			}
-			ct.lastRecoveryStep = ct.lastRecoveryStep.Add(time.Duration(steps) * RecoveryCheckInterval)
-		}
-	}
-}
-
-// RecordSuccess is called when a cod agent completes work successfully.
-// This does NOT advance recovery -- only time does. But it resets the
-// rate-limit counter so that future cooldowns are not over-penalized.
-func (ct *CodexThrottle) RecordSuccess() {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-
-	// Reset consecutive penalty count on success so next
-	// rate-limit event does not immediately escalate.
-	ct.rateLimitCount = 0
-}
-
-// Status returns a read-only snapshot of the current throttle state.
-func (ct *CodexThrottle) Status() CodexThrottleStatus {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-
-	ct.advanceStateLocked()
-
-	var remaining time.Duration
-	if ct.phase == ThrottlePaused {
-		remaining = ct.cooldownUntil.Sub(ct.now())
-		if remaining < 0 {
-			remaining = 0
-		}
-	}
-
-	panes := make([]string, len(ct.affectedPanes))
-	copy(panes, ct.affectedPanes)
-
-	return CodexThrottleStatus{
-		Phase:             ct.phase,
-		CooldownRemaining: remaining,
-		AllowedConcurrent: ct.allowedConcurrent,
-		MaxConcurrent:     ct.maxConcurrent,
-		RateLimitCount:    ct.rateLimitCount,
-		AffectedPanes:     panes,
-		Guidance:          ct.guidanceLocked(),
-	}
-}
-
-// guidanceLocked returns human-readable remediation guidance. Caller must hold ct.mu.
-func (ct *CodexThrottle) guidanceLocked() string {
-	switch ct.phase {
-	case ThrottlePaused:
-		remaining := ct.cooldownUntil.Sub(ct.now())
-		if remaining < 0 {
-			remaining = 0
-		}
-		return fmt.Sprintf(
-			"Codex rate-limited: new cod launches paused for %s. "+
-				"Claude and Gemini agents are unaffected. "+
-				"Consider reducing concurrent cod panes or waiting for quota reset.",
-			FormatDelay(remaining),
-		)
-	case ThrottleRecovering:
-		return fmt.Sprintf(
-			"Codex recovering: allowing %d/%d concurrent cod launches. "+
-				"Rate will increase gradually. Other agent types are unaffected.",
-			ct.allowedConcurrent, ct.maxConcurrent,
-		)
-	default:
-		return "Codex throttle inactive: all launches permitted."
-	}
-}
-
-// ClearAffectedPane removes a pane from the affected list (e.g., on pane restart).
-func (ct *CodexThrottle) ClearAffectedPane(paneID string) {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-
-	for i, p := range ct.affectedPanes {
-		if p == paneID {
-			ct.affectedPanes = append(ct.affectedPanes[:i], ct.affectedPanes[i+1:]...)
-			return
-		}
-	}
-}
-
-// Reset restores the throttle to a clean normal state.
-func (ct *CodexThrottle) Reset() {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-
-	ct.phase = ThrottleNormal
-	ct.cooldownUntil = time.Time{}
-	ct.cooldownDur = 0
-	ct.allowedConcurrent = ct.maxConcurrent
-	ct.rateLimitCount = 0
-	ct.lastRateLimit = time.Time{}
-	ct.lastRecoveryStep = time.Time{}
-	ct.affectedPanes = nil
 }

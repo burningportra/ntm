@@ -4,6 +4,7 @@ package robot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -99,12 +100,16 @@ type PTHealthSignals struct {
 
 // PTHealthInfo contains process_triage classification data for a pane.
 type PTHealthInfo struct {
-	Classification  string           `json:"classification"`             // useful, waiting, idle, stuck, zombie, unknown
-	Since           string           `json:"since,omitempty"`            // RFC3339 timestamp when classification started
-	DurationSeconds int              `json:"duration_seconds,omitempty"` // Seconds in current state
-	Signals         *PTHealthSignals `json:"signals,omitempty"`          // Underlying signals
-	Confidence      float64          `json:"confidence"`                 // 0.0 to 1.0
-	Reason          string           `json:"reason,omitempty"`           // Classification reason
+	Classification         string           `json:"classification"`             // useful, waiting, idle, stuck, zombie, unknown
+	Since                  string           `json:"since,omitempty"`            // RFC3339 timestamp when classification started
+	DurationSeconds        int              `json:"duration_seconds,omitempty"` // Seconds in current state
+	Signals                *PTHealthSignals `json:"signals,omitempty"`          // Underlying signals
+	Confidence             float64          `json:"confidence"`                 // 0.0 to 1.0
+	Reason                 string           `json:"reason,omitempty"`           // Classification reason
+	Source                 string           `json:"source,omitempty"`
+	ObservedAt             string           `json:"observed_at,omitempty"`
+	Recommendation         string           `json:"recommendation,omitempty"` // PT advice, never authorization to act
+	AbandonmentProbability *float64         `json:"abandonment_probability,omitempty"`
 }
 
 // PTHealthSummary contains counts by classification.
@@ -138,7 +143,10 @@ type ProviderStats struct {
 	PanesUsing     []string `json:"panes_using"`
 }
 
-// FleetHealthSummary contains overall health statistics across all panes.
+// FleetHealthSummary contains overall health statistics across the graded
+// agent panes. Non-agent panes (AgentHealthOutput.NonAgentPanes) are not
+// counted in TotalPanes; with no agent panes OverallGrade is
+// FleetGradeNoAgents rather than "F".
 type FleetHealthSummary struct {
 	TotalPanes     int     `json:"total_panes"`
 	HealthyCount   int     `json:"healthy_count"`
@@ -158,8 +166,8 @@ type AgentHealthQuery struct {
 }
 
 // PTAvailability describes whether process_triage can supply health data for
-// this response. A binary alone is not enough: the monitor must be running to
-// have observations for the current panes.
+// this response. A binary alone is not enough: a resident or one-shot sample
+// must provide observations for the current panes.
 type PTAvailability string
 
 const (
@@ -167,20 +175,35 @@ const (
 	PTAvailabilityUnavailable       PTAvailability = "unavailable"
 	PTAvailabilityMonitorNotRunning PTAvailability = "monitor_not_running"
 	PTAvailabilityAvailable         PTAvailability = "available"
+	PTAvailabilityNoObservations    PTAvailability = "no_observations"
+	PTAvailabilitySampleFailed      PTAvailability = "sample_failed"
+	PTAvailabilityTimedOut          PTAvailability = "timed_out"
 )
 
 // AgentHealthOutput is the response for --robot-agent-health.
 type AgentHealthOutput struct {
 	RobotResponse
-	Session         string                      `json:"session"`
-	Query           AgentHealthQuery            `json:"query"`
-	CautAvailable   bool                        `json:"caut_available"`
-	PTAvailable     bool                        `json:"pt_available"` // True only when PT observations are available.
-	PTStatus        PTAvailability              `json:"pt_status"`
-	Panes           map[string]PaneHealthStatus `json:"panes"`
-	ProviderSummary map[string]ProviderStats    `json:"provider_summary"`
-	PTSummary       *PTHealthSummary            `json:"pt_summary,omitempty"`
-	FleetHealth     FleetHealthSummary          `json:"fleet_health"`
+	Session           string                      `json:"session"`
+	Query             AgentHealthQuery            `json:"query"`
+	CautAvailable     bool                        `json:"caut_available"`
+	PTAvailable       bool                        `json:"pt_available"` // True only when PT observations are available.
+	PTStatus          PTAvailability              `json:"pt_status"`
+	PTObservationMode string                      `json:"pt_observation_mode,omitempty"` // monitor or snapshot
+	Panes             map[string]PaneHealthStatus `json:"panes"`
+	// NonAgentPanes lists selected panes that run no agent: a plain user
+	// shell, or a pane ntm cannot attribute to an agent CLI. They carry no
+	// agent health, so they are kept out of Panes and FleetHealth instead of
+	// being graded F for lacking an agent prompt (ntm#335).
+	NonAgentPanes   map[string]NonAgentPane  `json:"non_agent_panes,omitempty"`
+	ProviderSummary map[string]ProviderStats `json:"provider_summary"`
+	PTSummary       *PTHealthSummary         `json:"pt_summary,omitempty"`
+	FleetHealth     FleetHealthSummary       `json:"fleet_health"`
+}
+
+// NonAgentPane is a selected pane that is not running an agent.
+type NonAgentPane struct {
+	AgentType string `json:"agent_type"`
+	Reason    string `json:"reason"`
 }
 
 // PrintAgentHealth outputs the health state for specified panes in a session
@@ -270,30 +293,62 @@ func GetAgentHealth(opts AgentHealthOptions) (*AgentHealthOutput, error) {
 		}
 	}
 
-	// Step 2.5: Query process_triage for health states (if enabled)
+	// Step 2.5: Reuse a resident sample, or obtain one bounded passive sample
+	// for a standalone CLI/API reader. Neither path starts a background worker.
 	var ptStates map[string]*pt.AgentState
 	var ptSummary *PTHealthSummary
 	if opts.IncludePT {
-		ptAdapter := tools.NewPTAdapter()
-		ctx, cancel := context.WithTimeout(context.Background(), opts.PTTimeout)
-		binaryAvailable := ptAdapter.IsAvailable(ctx)
-		monitorRunning := false
-		var monitor *pt.HealthMonitor
-		if binaryAvailable {
-			monitor = pt.GetGlobalMonitor()
-			monitorRunning = monitor.Running()
+		output.PTStatus = PTAvailabilityNoObservations
+		if hasPTHealthTargets(isWorkingResult.Panes) {
+			timeout := opts.PTTimeout
+			if timeout <= 0 {
+				timeout = DefaultAgentHealthOptions().PTTimeout
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			ptAdapter := tools.NewPTAdapter()
+			binaryAvailable := ptAdapter.IsAvailable(ctx)
+			monitor := pt.GetGlobalMonitor()
+			monitorRunning := monitor.Running()
+			output.PTStatus, output.PTAvailable = ptAvailability(true, binaryAvailable, monitorRunning)
+			if binaryAvailable {
+				if monitorRunning {
+					output.PTObservationMode = "monitor"
+					ptStates = monitor.GetAllStates()
+				} else {
+					output.PTObservationMode = "snapshot"
+					var sampleErr error
+					ptStates, sampleErr = pt.SampleSession(ctx, opts.Session)
+					if sampleErr != nil {
+						output.PTStatus, output.PTAvailable = PTAvailabilitySampleFailed, false
+						if errors.Is(sampleErr, context.DeadlineExceeded) || errors.Is(sampleErr, tools.ErrTimeout) {
+							output.PTStatus = PTAvailabilityTimedOut
+						}
+					} else {
+						output.PTStatus, output.PTAvailable = PTAvailabilityAvailable, true
+					}
+				}
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				output.PTStatus, output.PTAvailable = PTAvailabilityTimedOut, false
+				ptStates = nil
+			}
+			if output.PTAvailable {
+				ptSummary = &PTHealthSummary{}
+			}
+			cancel()
 		}
-		output.PTStatus, output.PTAvailable = ptAvailability(true, binaryAvailable, monitorRunning)
-		if output.PTAvailable {
-			ptStates = monitor.GetAllStates()
-			ptSummary = &PTHealthSummary{}
-		}
-		cancel()
 	}
-
 	// Step 3: Build health status for each pane
 	totalScore := 0
 	for paneStr, workStatus := range isWorkingResult.Panes {
+		if nonAgent, ok := nonAgentPaneFor(workStatus); ok {
+			if output.NonAgentPanes == nil {
+				output.NonAgentPanes = make(map[string]NonAgentPane)
+			}
+			output.NonAgentPanes[paneStr] = nonAgent
+			continue
+		}
+
 		// Convert IsWorking result to our local state structure
 		localState := LocalStateInfo{
 			IsWorking:             workStatus.IsWorking,
@@ -334,7 +389,7 @@ func GetAgentHealth(opts AgentHealthOptions) (*AgentHealthOutput, error) {
 		// Get PT health state if available
 		if output.PTAvailable && ptStates != nil {
 			// Try to find state by pane identifier (e.g., "myproject__cc_1")
-			if state := findPTState(ptStates, opts.Session, paneStr, workStatus.AgentType); state != nil {
+			if state := findPTState(ptStates, opts.Session, paneStr, workStatus.AgentType); ptHealthMatchesObservation(state, workStatus) {
 				healthStatus.PTHealth = convertPTState(state, workStatus.IsWorking)
 				// Update PT summary
 				if ptSummary != nil {
@@ -379,19 +434,53 @@ func GetAgentHealth(opts AgentHealthOptions) (*AgentHealthOutput, error) {
 	}
 
 	// Step 4: Calculate fleet health summary
-	output.FleetHealth.TotalPanes = len(output.Panes)
-	if output.FleetHealth.TotalPanes > 0 {
-		output.FleetHealth.AvgHealthScore = float64(totalScore) / float64(output.FleetHealth.TotalPanes)
-	}
-	output.FleetHealth.OverallGrade = HealthGrade(int(output.FleetHealth.AvgHealthScore))
+	finalizeFleetHealth(&output.FleetHealth, len(output.Panes), totalScore)
 	output.Query.PanesRequested = isWorkingResult.Query.PanesRequested
 
 	// Include PT summary if we have PT data
 	if output.PTAvailable && ptSummary != nil {
-		output.PTSummary = ptSummary
+		if ptSummary.Useful+ptSummary.Waiting+ptSummary.Idle+ptSummary.Stuck+ptSummary.Zombie+ptSummary.Unknown == 0 {
+			// A running process with no matching sample is not evidence about
+			// this selection. In particular a failed monitor poll clears data.
+			output.PTStatus, output.PTAvailable = PTAvailabilityNoObservations, false
+		} else {
+			output.PTSummary = ptSummary
+		}
 	}
 
 	return output, nil
+}
+
+// FleetGradeNoAgents is the overall_grade of a selection with no graded agent
+// panes, such as a session of plain shells (ntm#335). An average over zero
+// panes is not a failing grade.
+const FleetGradeNoAgents = "N/A"
+
+// finalizeFleetHealth fills in the fleet totals from the graded agent panes.
+func finalizeFleetHealth(fleet *FleetHealthSummary, gradedPanes, totalScore int) {
+	fleet.TotalPanes = gradedPanes
+	if gradedPanes == 0 {
+		fleet.AvgHealthScore = 0
+		fleet.OverallGrade = FleetGradeNoAgents
+		return
+	}
+	fleet.AvgHealthScore = float64(totalScore) / float64(gradedPanes)
+	fleet.OverallGrade = HealthGrade(int(fleet.AvgHealthScore))
+}
+
+// nonAgentPaneFor reports whether a pane is a non-agent pane by its
+// tmux-recorded type. A pane missing from the observation has no recorded
+// type and is not exempted: it keeps the "observation unavailable" grade.
+func nonAgentPaneFor(workStatus PaneWorkStatus) (NonAgentPane, bool) {
+	if workStatus.paneType == "" || !isNonAgentPaneType(workStatus.paneType) {
+		return NonAgentPane{}, false
+	}
+	paneType := normalizeAgentType(workStatus.paneType)
+	reason := "pane runs a user shell, not an agent"
+	if paneType != "user" {
+		reason = "no agent CLI detected in this pane"
+	}
+	return NonAgentPane{AgentType: paneType, Reason: reason}, true
 }
 
 func ptAvailability(enabled, binaryAvailable, monitorRunning bool) (PTAvailability, bool) {
@@ -444,10 +533,10 @@ func convertProviderUsage(payload *caut.ProviderPayload) *ProviderUsageInfo {
 	// Convert status
 	if payload.Status != nil {
 		info.Status = &ProviderStatusInfo{
-			Operational: payload.Status.Operational,
+			Operational: payload.Status.Operational(),
 		}
-		if payload.Status.Message != nil {
-			info.Status.Message = *payload.Status.Message
+		if payload.Status.Description != nil {
+			info.Status.Message = *payload.Status.Description
 		}
 	}
 
@@ -486,10 +575,34 @@ func updateProviderSummary(summary map[string]ProviderStats, provider string, pa
 	summary[provider] = stats
 }
 
-// findPTState finds the PT state for a pane by trying various identifier patterns.
+// findPTState resolves live monitor samples by session and physical topology,
+// or by exact tmux ID. A bare index matching several windows is ambiguous.
+// Metadata-bearing samples never fall back to mutable title/suffix guesses.
 func findPTState(ptStates map[string]*pt.AgentState, session, paneStr, agentType string) *pt.AgentState {
 	if ptStates == nil {
 		return nil
+	}
+	var matched *pt.AgentState
+	hasTopology := false
+	for key, state := range ptStates {
+		if state == nil || state.Session == "" {
+			continue
+		}
+		hasTopology = true
+		if state.Session != session || state.Pane != key || !strings.HasPrefix(key, "%") {
+			continue
+		}
+		if paneStr != key && paneStr != fmt.Sprintf("%d.%d", state.WindowIndex, state.PaneIndex) &&
+			paneStr != fmt.Sprint(state.PaneIndex) {
+			continue
+		}
+		if matched != nil {
+			return nil
+		}
+		matched = state
+	}
+	if hasTopology {
+		return matched
 	}
 
 	// Try direct pane string match first
@@ -520,6 +633,8 @@ func findPTState(ptStates map[string]*pt.AgentState, session, paneStr, agentType
 		agentPrefix = "windsurf"
 	case agent.AgentTypeAider:
 		agentPrefix = "aider"
+	case agent.AgentTypeOmp:
+		agentPrefix = "omp"
 	case agent.AgentTypeOllama:
 		agentPrefix = "ollama"
 	}
@@ -552,6 +667,9 @@ func convertPTState(state *pt.AgentState, isWorking bool) *PTHealthInfo {
 		Confidence:      state.Confidence,
 		DurationSeconds: int(time.Since(state.Since).Seconds()),
 	}
+	if !state.LastCheck.IsZero() {
+		info.ObservedAt = state.LastCheck.UTC().Format(time.RFC3339Nano)
+	}
 
 	if !state.Since.IsZero() {
 		info.Since = state.Since.Format(time.RFC3339)
@@ -561,6 +679,12 @@ func convertPTState(state *pt.AgentState, isWorking bool) *PTHealthInfo {
 	if len(state.History) > 0 {
 		latest := state.History[len(state.History)-1]
 		info.Reason = latest.Reason
+		info.Source = latest.Source
+		info.Recommendation = latest.Recommendation
+		if latest.Recommendation != "" {
+			probability := latest.AbandonmentProbability
+			info.AbandonmentProbability = &probability
+		}
 		info.Signals = &PTHealthSignals{
 			NetworkActive: latest.NetworkActive,
 			OutputRecent:  isWorking, // Use local state as proxy for output activity

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -46,6 +47,94 @@ func TestClient_Search(t *testing.T) {
 	}
 	if len(resp.Hits) != 1 || resp.Hits[0].Title != "test session" {
 		t.Errorf("unexpected hits: %v", resp.Hits)
+	}
+}
+
+func TestClient_TimelineDecodesCassEnvelope(t *testing.T) {
+	// Shape of `cass timeline --json --group-by day` (cass 2026-10).
+	resp := `{"range":{"start":1788731419970,"end":1791323419970},"total_sessions":2,"groups":{
+	  "2026-09-22":[{"id":312,"agent":"claude_code","title":"miner","started_at":1790097662897,"ended_at":1790097845226,
+	    "source_path":"/s/a.jsonl","message_count":39,"source_id":"local","origin_kind":"local","origin_host":null}],
+	  "2026-09-21":[{"id":221,"agent":"pi_agent","title":"plan","started_at":1790009672964,"ended_at":1790009672972,
+	    "source_path":"/s/b.jsonl","message_count":1,"source_id":"local"}]}}`
+	mock := &mockExecutor{output: []byte(resp)}
+	client := NewClient(WithExecutor(mock))
+
+	got, err := client.Timeline(context.Background(), "30d", "day", "claude_code")
+	if err != nil {
+		t.Fatalf("Timeline() error: %v", err)
+	}
+	if want := []string{"timeline", "--json", "--since=30d", "--group-by=day", "--agent=claude_code"}; !slices.Equal(mock.args[0], want) {
+		t.Fatalf("args = %v, want %v", mock.args[0], want)
+	}
+	day := got.Groups["2026-09-22"]
+	if got.TotalSessions != 2 || len(got.Groups) != 2 || len(day) != 1 || day[0].Agent != "claude_code" ||
+		day[0].MessageCount != 39 || !day[0].StartTime().Equal(time.UnixMilli(1790097662897)) {
+		t.Fatalf("Timeline() = %+v", got)
+	}
+}
+
+// TestTimelineReadsInstalledCass checks the installed cass's timeline against
+// its own invariants, whatever sessions this machine has indexed.
+func TestTimelineReadsInstalledCass(t *testing.T) {
+	client := NewClient()
+	if !client.IsInstalled() {
+		t.Skip("cass not installed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	flat, err := client.Timeline(ctx, "30d", "none")
+	if err != nil {
+		t.Fatalf("Timeline(none) error: %v", err)
+	}
+	if flat.Sessions == nil || flat.TotalSessions != len(flat.Sessions) || flat.Range.End <= flat.Range.Start {
+		t.Fatalf("Timeline(none): total=%d sessions=%d range=%+v", flat.TotalSessions, len(flat.Sessions), flat.Range)
+	}
+	for _, s := range flat.Sessions {
+		if s.Agent == "" || s.StartedAt == 0 || s.SourcePath == "" {
+			t.Fatalf("Timeline(none) session missing agent/start/path: %+v", s)
+		}
+	}
+
+	byDay, err := client.Timeline(ctx, "30d", "day")
+	if err != nil {
+		t.Fatalf("Timeline(day) error: %v", err)
+	}
+	grouped := 0
+	for _, sessions := range byDay.Groups {
+		grouped += len(sessions)
+	}
+	if byDay.TotalSessions != grouped {
+		t.Fatalf("Timeline(day): total=%d but groups hold %d sessions", byDay.TotalSessions, grouped)
+	}
+}
+
+// TestStatusAndVersionReadInstalledCass: `cass status --json` reports the
+// database size as database.db_bytes and has no version, which comes from
+// `cass --version`.
+func TestStatusAndVersionReadInstalledCass(t *testing.T) {
+	client := NewClient()
+	if !client.IsInstalled() {
+		t.Skip("cass not installed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	version, err := client.Version(ctx)
+	if err != nil || !regexp.MustCompile(`^\d+\.\d+\.\d+`).MatchString(version) {
+		t.Fatalf("Version() = %q, %v; want a semver", version, err)
+	}
+
+	status, err := client.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status() error: %v", err)
+	}
+	if status.Database.Exists && status.Database.SizeMB() <= 0 {
+		t.Fatalf("database exists but size is %v MB (db_bytes not read)", status.Database.SizeMB())
+	}
+	if status.Index.Exists && status.Index.IsReady() && status.Index.Documents <= 0 {
+		t.Fatalf("ready index reports %d documents", status.Index.Documents)
 	}
 }
 

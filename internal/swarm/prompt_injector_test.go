@@ -10,37 +10,31 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
+// countingPromptInjectionTmuxClient is the injector's fake tmux. It shows
+// captureOutput to readiness polls, lists panes (a default cc/grok/cod
+// session unless panes is set) and records each prompt handed to the shared
+// submit. commands are the pane's foreground process on successive polls, the
+// last one repeating; none means the lookup finds nothing.
 type countingPromptInjectionTmuxClient struct {
 	captureCount  int
 	commandCount  int
 	getPanesCount int
 	submitCount   int
-}
 
-func (c *countingPromptInjectionTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
-	c.captureCount++
-	return "", nil
-}
-
-func (c *countingPromptInjectionTmuxClient) PaneCurrentCommand(context.Context, string) (string, error) {
-	c.commandCount++
-	return "", nil
-}
-
-func (c *countingPromptInjectionTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
-	c.getPanesCount++
-	return nil, nil
-}
-
-func (c *countingPromptInjectionTmuxClient) SubmitPrompt(context.Context, string, tmux.AgentType, string) error {
-	c.submitCount++
-	return nil
+	// captureOutput is returned from readiness polls; an idle-looking prompt
+	// keeps WaitForReady from burning its full 30s timeout per pane.
+	captureOutput string
+	commands      []string
+	panes         []tmux.Pane
+	afterCapture  func()
+	// submitted records every prompt handed to SubmitPrompt; submitErr fails it.
+	submitted []submittedPrompt
+	submitErr error
 }
 
 type submittedPrompt struct {
@@ -49,56 +43,119 @@ type submittedPrompt struct {
 	prompt    string
 }
 
-// submitRecordingTmuxClient shows an idle composer and records each prompt
-// handed to the shared submit. commands are the pane's foreground process on
-// successive polls, the last one repeating; none means the lookup finds
-// nothing.
-type submitRecordingTmuxClient struct {
-	screen       string
-	commands     []string
-	commandCalls int
-	submitted    []submittedPrompt
+func (c *countingPromptInjectionTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
+	c.captureCount++
+	if c.afterCapture != nil {
+		c.afterCapture()
+	}
+	return c.captureOutput, nil
 }
 
-func (c *submitRecordingTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
-	return c.screen, nil
-}
-
-func (c *submitRecordingTmuxClient) PaneCurrentCommand(context.Context, string) (string, error) {
+func (c *countingPromptInjectionTmuxClient) PaneCurrentCommand(context.Context, string) (string, error) {
+	defer func() { c.commandCount++ }()
 	if len(c.commands) == 0 {
 		return "", nil
 	}
-	command := c.commands[min(c.commandCalls, len(c.commands)-1)]
-	c.commandCalls++
-	return command, nil
+	return c.commands[min(c.commandCount, len(c.commands)-1)], nil
 }
 
-func (c *submitRecordingTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
-	return nil, nil
+func (c *countingPromptInjectionTmuxClient) GetPanesContext(context.Context, string) ([]tmux.Pane, error) {
+	c.getPanesCount++
+	if c.panes != nil {
+		return c.panes, nil
+	}
+	return []tmux.Pane{
+		{ID: "%1", Index: 1, WindowIndex: 1, Title: "proj__cc_1", Type: tmux.AgentClaude, Command: "claude"},
+		{ID: "%2", Index: 2, WindowIndex: 1, Title: "proj__grok_2", Type: tmux.AgentGrok, Command: "grok"},
+		{ID: "%3", Index: 3, WindowIndex: 1, Title: "proj__cod_3", Type: tmux.AgentCodex, Command: "codex"},
+	}, nil
 }
 
-func (c *submitRecordingTmuxClient) SubmitPrompt(_ context.Context, target string, agentType tmux.AgentType, prompt string) error {
+func (c *countingPromptInjectionTmuxClient) RunContext(context.Context, ...string) (string, error) {
+	return "proj", nil
+}
+
+func (c *countingPromptInjectionTmuxClient) SubmitPrompt(_ context.Context, target string, agentType tmux.AgentType, prompt string) error {
+	c.submitCount++
 	c.submitted = append(c.submitted, submittedPrompt{target: target, agentType: agentType, prompt: prompt})
-	return nil
+	return c.submitErr
+}
+
+// agentPaneAt12 is session proj's one pane, proj:1.2 (%2), running agentType.
+func agentPaneAt12(agentType, command string) []tmux.Pane {
+	canonical := tmux.AgentType(agentType).Canonical()
+	return []tmux.Pane{{ID: "%2", Index: 2, WindowIndex: 1, Title: fmt.Sprintf("proj__%s_2", canonical), Type: canonical, Command: command}}
 }
 
 // TestPromptInjector_SubmitsThroughSharedProtocol checks that the injector
 // hands each prompt, whole and with its pane's agent type, to the shared
-// submit and sends no keys of its own.
+// submit on the bound pane and sends no keys of its own.
 func TestPromptInjector_SubmitsThroughSharedProtocol(t *testing.T) {
-	for _, agentType := range []string{"cc", "cod", "muse-code"} {
-		t.Run(agentType, func(t *testing.T) {
-			client := &submitRecordingTmuxClient{screen: "────────\n❯\n────────\n›\n"}
+	for _, tc := range []struct{ agentType, command string }{
+		{"cc", "claude"},
+		{"cod", "codex"},
+		{"muse-code", "muse"},
+	} {
+		t.Run(tc.agentType, func(t *testing.T) {
+			client := &countingPromptInjectionTmuxClient{
+				captureOutput: "────────\n❯\n────────\n›\n",
+				panes:         agentPaneAt12(tc.agentType, tc.command),
+			}
 			injector := NewPromptInjector()
 			injector.tmuxClientOverride = client
 
 			prompt := "first read AGENTS.md\nthen run bv --robot-triage\nthen claim a bead"
-			if err := injector.InjectPrompt("proj:1.2", agentType, prompt); err != nil {
+			if err := injector.InjectPrompt("proj:1.2", tc.agentType, prompt); err != nil {
 				t.Fatalf("InjectPrompt() error = %v", err)
 			}
-			want := []submittedPrompt{{target: "proj:1.2", agentType: tmux.AgentType(agentType), prompt: prompt}}
-			if len(client.submitted) != 1 || client.submitted[0] != want[0] {
-				t.Fatalf("submitted = %+v, want %+v", client.submitted, want)
+			want := submittedPrompt{target: "%2", agentType: tmux.AgentType(tc.agentType).Canonical(), prompt: prompt}
+			if len(client.submitted) != 1 || client.submitted[0] != want {
+				t.Fatalf("submitted = %+v, want [%+v]", client.submitted, want)
+			}
+		})
+	}
+}
+
+func TestPromptInjectorContextDeadlineNeverSendsIntoUnreadyPane(t *testing.T) {
+	client := &countingPromptInjectionTmuxClient{}
+	injector := NewPromptInjector()
+	injector.tmuxClientOverride = client
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	result, err := injector.InjectBatchWithContext(ctx, []InjectionTarget{{SessionPane: "%1", AgentType: "cc"}}, "implement the feature")
+	if !errors.Is(err, context.DeadlineExceeded) || result == nil || result.Successful != 0 || len(result.Results) != 1 || result.Results[0].Success {
+		t.Fatalf("expected retained failed readiness receipt, got %+v, %v", result, err)
+	}
+	if client.submitCount != 0 {
+		t.Fatal("prompt was submitted despite failed readiness")
+	}
+}
+
+func TestPromptInjectorRevalidatesAgentAfterReadiness(t *testing.T) {
+	for _, change := range []string{"shell", "dead", "provider", "disappeared"} {
+		t.Run(change, func(t *testing.T) {
+			client := &countingPromptInjectionTmuxClient{captureOutput: "claude>"}
+			client.afterCapture = func() {
+				pane := tmux.Pane{ID: "%1", Title: "proj__cc_1", Type: tmux.AgentClaude, Command: "claude"}
+				switch change {
+				case "shell":
+					pane.Command = "bash"
+				case "dead":
+					pane.Dead = true
+				case "provider":
+					pane.Type = tmux.AgentCodex
+				case "disappeared":
+					pane.ID = "%99"
+				}
+				client.panes = []tmux.Pane{pane}
+			}
+			injector := NewPromptInjector()
+			injector.tmuxClientOverride = client
+			if err := injector.InjectPromptContext(context.Background(), "%1", "cc", "implement the feature"); err == nil {
+				t.Fatal("changed pane was accepted after a stale ready capture")
+			}
+			if client.submitCount != 0 {
+				t.Fatal("prompt reached a changed pane")
 			}
 		})
 	}
@@ -111,7 +168,11 @@ func TestPromptInjector_SubmitsThroughSharedProtocol(t *testing.T) {
 // marching orders into the shell, and on a plainer prompt it waited out its
 // full 30 s before typing them anyway.
 func TestPromptInjector_FailsFastOnShellPane(t *testing.T) {
-	client := &submitRecordingTmuxClient{screen: "────────\n❯\n────────\n", commands: []string{"zsh"}}
+	client := &countingPromptInjectionTmuxClient{
+		captureOutput: "────────\n❯\n────────\n",
+		commands:      []string{"zsh"},
+		panes:         agentPaneAt12("cc", "zsh"),
+	}
 	injector := NewPromptInjector()
 	injector.tmuxClientOverride = client
 	injector.nonAgentPaneGrace = 300 * time.Millisecond
@@ -119,7 +180,7 @@ func TestPromptInjector_FailsFastOnShellPane(t *testing.T) {
 	start := time.Now()
 	err := injector.InjectPrompt("proj:1.2", "cc", "first read AGENTS.md")
 	elapsed := time.Since(start)
-	if !errors.Is(err, ErrPaneNotAgent) || !strings.Contains(err.Error(), "proj:1.2 has been running zsh") {
+	if !errors.Is(err, ErrPaneNotAgent) || !strings.Contains(err.Error(), "%2 has been running zsh") {
 		t.Fatalf("InjectPrompt() error = %v, want ErrPaneNotAgent naming the pane and its shell", err)
 	}
 	if elapsed > 2*time.Second {
@@ -135,7 +196,11 @@ func TestPromptInjector_FailsFastOnShellPane(t *testing.T) {
 // then the agent. The shell phase is shorter than the grace period, so the
 // prompt goes to the agent once it shows its idle composer.
 func TestPromptInjector_WaitsOutLauncherShell(t *testing.T) {
-	client := &submitRecordingTmuxClient{screen: "────────\n❯\n────────\n", commands: []string{"zsh", "zsh", "zsh", "claude"}}
+	client := &countingPromptInjectionTmuxClient{
+		captureOutput: "────────\n❯\n────────\n",
+		commands:      []string{"zsh", "zsh", "zsh", "claude"},
+		panes:         agentPaneAt12("cc", "claude"),
+	}
 	injector := NewPromptInjector()
 	injector.tmuxClientOverride = client
 	injector.nonAgentPaneGrace = 5 * time.Second
@@ -143,8 +208,8 @@ func TestPromptInjector_WaitsOutLauncherShell(t *testing.T) {
 	if err := injector.InjectPrompt("proj:1.2", "cc", "first read AGENTS.md"); err != nil {
 		t.Fatalf("InjectPrompt() error = %v", err)
 	}
-	if client.commandCalls < 4 {
-		t.Fatalf("prompt sent after %d process checks, want it held until the agent replaced the shell", client.commandCalls)
+	if client.commandCount < 4 {
+		t.Fatalf("prompt sent after %d process checks, want it held until the agent replaced the shell", client.commandCount)
 	}
 	if len(client.submitted) != 1 {
 		t.Fatalf("submitted = %+v, want one prompt", client.submitted)
@@ -153,30 +218,17 @@ func TestPromptInjector_WaitsOutLauncherShell(t *testing.T) {
 
 func TestPromptInjector_SubmitErrorFailsInjection(t *testing.T) {
 	injector := NewPromptInjector()
-	injector.tmuxClientOverride = failingSubmitTmuxClient{}
+	injector.tmuxClientOverride = &countingPromptInjectionTmuxClient{
+		captureOutput: "────────\n❯\n────────\n",
+		commands:      []string{"claude"},
+		panes:         agentPaneAt12("cc", "claude"),
+		submitErr:     errors.New("claude submission unconfirmed: prompt still in composer after rescue"),
+	}
 
 	err := injector.InjectPrompt("proj:1.2", "cc", "continue")
 	if err == nil || !strings.Contains(err.Error(), "claude submission unconfirmed") {
 		t.Fatalf("InjectPrompt() error = %v, want the submit error", err)
 	}
-}
-
-type failingSubmitTmuxClient struct{}
-
-func (failingSubmitTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
-	return "────────\n❯\n────────\n", nil
-}
-
-func (failingSubmitTmuxClient) PaneCurrentCommand(context.Context, string) (string, error) {
-	return "claude", nil
-}
-
-func (failingSubmitTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
-	return nil, nil
-}
-
-func (failingSubmitTmuxClient) SubmitPrompt(context.Context, string, tmux.AgentType, string) error {
-	return errors.New("claude submission unconfirmed: prompt still in composer after rescue")
 }
 
 // TestPromptInjector_SubmitsMultiLinePromptOnItsClient injects a 3-line
@@ -216,13 +268,18 @@ func TestPromptInjector_SubmitsMultiLinePromptOnItsClient(t *testing.T) {
 			if err != nil {
 				t.Fatalf("pane id: %v", err)
 			}
+			paneID = strings.TrimSpace(paneID)
+			// The injector delivers only to a pane that carries the agent's identity.
+			if err := local.SetPaneAgentIdentityContext(context.Background(), paneID, fmt.Sprintf("%s__%s_1", session, agentType), tmux.AgentType(agentType)); err != nil {
+				t.Fatalf("set pane identity: %v", err)
+			}
 
 			defaultClient := tmux.DefaultClient
 			tmux.DefaultClient = tmux.NewClient("ntm-test-unreachable.invalid")
 			t.Cleanup(func() { tmux.DefaultClient = defaultClient })
 
 			prompt := "first read AGENTS.md\nthen run bv --robot-triage\nthen claim a bead"
-			if err := NewPromptInjectorWithClient(local).InjectPrompt(strings.TrimSpace(paneID), agentType, prompt); err != nil {
+			if err := NewPromptInjectorWithClient(local).InjectPrompt(paneID, agentType, prompt); err != nil {
 				t.Fatalf("InjectPrompt() error = %v", err)
 			}
 
@@ -302,39 +359,6 @@ func TestSetTemplate(t *testing.T) {
 	result := injector.GetTemplate("custom")
 	if result != customTemplate {
 		t.Errorf("expected template %q, got %q", customTemplate, result)
-	}
-}
-
-func TestNeedsDoubleEnter(t *testing.T) {
-	tests := []struct {
-		agentType string
-		expected  bool
-	}{
-		{"cc", false},
-		{"claude", false},
-		{"cod", true},
-		{"codex", true},
-		{"gmi", true},
-		{"gemini", true},
-		{"unknown", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.agentType, func(t *testing.T) {
-			result := tmux.AgentType(tt.agentType).NeedsDoubleEnter()
-			if result != tt.expected {
-				t.Errorf("needsDoubleEnter(%q) = %v, want %v", tt.agentType, result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestWithLogger(t *testing.T) {
-	injector := NewPromptInjector()
-	result := injector.WithLogger(nil)
-
-	if result != injector {
-		t.Error("WithLogger should return the same injector for chaining")
 	}
 }
 
@@ -453,34 +477,46 @@ func TestInjectBatchEmpty(t *testing.T) {
 	}
 }
 
-func TestPromptInjector_GrokDirectPathsRejectBeforeTmux(t *testing.T) {
-	client := &countingPromptInjectionTmuxClient{}
+// GH#251 phase 2: grok prompt delivery is first-class — both the public
+// InjectPrompt path and the direct sendToPane helper deliver to the (fake)
+// tmux sender instead of refusing before any tmux call.
+func TestPromptInjector_GrokDirectPathsDeliverViaTmux(t *testing.T) {
+	client := &countingPromptInjectionTmuxClient{captureOutput: "ready>\n"}
 	injector := NewPromptInjector()
 	injector.tmuxClientOverride = client
 
-	for name, inject := range map[string]func() error{
-		"public": func() error {
+	for _, tt := range []struct {
+		name   string
+		inject func() error
+	}{
+		{name: "public", inject: func() error {
 			return injector.InjectPrompt("proj:1.2", "grok-build", "continue")
-		},
-		"direct helper": func() error {
-			return injector.sendToPane("proj:1.2", "xai_grok_build", "continue")
-		},
+		}},
+		{name: "direct helper", inject: func() error {
+			return injector.sendToPane(context.Background(), "proj:1.2", "xai_grok_build", "continue")
+		}},
 	} {
-		t.Run(name, func(t *testing.T) {
-			err := inject()
-			if !errors.Is(err, agent.ErrAutomatedPromptDeliveryNotImplemented) {
-				t.Fatalf("error = %v, want automated prompt delivery sentinel", err)
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.inject(); err != nil {
+				t.Fatalf("error = %v, want grok prompt delivered", err)
 			}
 		})
 	}
 
-	if client.captureCount != 0 || client.commandCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
-		t.Fatalf("tmux calls occurred before Grok rejection: %+v", client)
+	if client.submitCount != 2 {
+		t.Fatalf("SubmitPrompt calls = %d, want 2 (one per grok delivery)", client.submitCount)
+	}
+	for _, send := range client.submitted {
+		if send.target != "%2" {
+			t.Fatalf("delivery pane = %q, want pinned physical pane %%2", send.target)
+		}
 	}
 }
 
-func TestPromptInjector_MixedBatchPreflightIsAtomic(t *testing.T) {
-	client := &countingPromptInjectionTmuxClient{}
+// GH#251 phase 2: a mixed batch containing grok now passes preflight and every
+// pane — grok included — is delivered to, exactly like claude/codex.
+func TestPromptInjector_MixedBatchDeliversToGrok(t *testing.T) {
+	client := &countingPromptInjectionTmuxClient{captureOutput: "ready>\n"}
 	injector := NewPromptInjector().WithStaggerDelay(0)
 	injector.tmuxClientOverride = client
 	targets := []InjectionTarget{
@@ -490,26 +526,26 @@ func TestPromptInjector_MixedBatchPreflightIsAtomic(t *testing.T) {
 	}
 
 	result, err := injector.InjectBatchWithContext(context.Background(), targets, "continue")
-	if !errors.Is(err, agent.ErrAutomatedPromptDeliveryNotImplemented) {
-		t.Fatalf("InjectBatchWithContext() error = %v, want automated prompt delivery sentinel", err)
+	if err != nil {
+		t.Fatalf("InjectBatchWithContext() error = %v, want mixed grok batch accepted", err)
 	}
 	if result == nil {
 		t.Fatal("InjectBatchWithContext() returned nil result")
 	}
-	if result.TotalPanes != len(targets) || result.Successful != 0 || result.Failed != 0 || len(result.Results) != 0 {
-		t.Fatalf("batch result mutated before preflight completed: %+v", result)
+	if result.TotalPanes != len(targets) || result.Successful != len(targets) || result.Failed != 0 || len(result.Results) != len(targets) {
+		t.Fatalf("batch result = %+v, want all %d panes delivered", result, len(targets))
 	}
-	if client.captureCount != 0 || client.commandCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
-		t.Fatalf("mixed batch made tmux calls before Grok rejection: %+v", client)
+	if client.submitCount != len(targets) {
+		t.Fatalf("SubmitPrompt calls = %d, want %d (grok pane must be included)", client.submitCount, len(targets))
 	}
-}
-
-func TestPromptInjectorTmuxClient(t *testing.T) {
-	injector := NewPromptInjector()
-	client := injector.tmuxClient()
-
-	if client == nil {
-		t.Error("expected non-nil client from tmuxClient()")
+	grokDelivered := false
+	for _, send := range client.submitted {
+		if send.target == "%2" {
+			grokDelivered = true
+		}
+	}
+	if !grokDelivered {
+		t.Fatalf("grok pane proj:1.2 never received a send: %+v", client.submitted)
 	}
 }
 
@@ -737,75 +773,6 @@ func TestPromptInjector_StaggeredDeliveryTiming(t *testing.T) {
 	}
 }
 
-// TestPromptInjector_DoubleEnterQuirkHandling tests the double-enter quirk for different agents.
-func TestPromptInjector_DoubleEnterQuirkHandling(t *testing.T) {
-	t.Log("[TEST] Testing double-enter quirk handling for all agent types")
-
-	testCases := []struct {
-		name        string
-		agentType   string
-		needsDouble bool
-		description string
-	}{
-		{
-			name:        "claude_code_single_enter",
-			agentType:   "cc",
-			needsDouble: false,
-			description: "Claude Code should use single Enter",
-		},
-		{
-			name:        "claude_alias_single_enter",
-			agentType:   "claude",
-			needsDouble: false,
-			description: "Claude alias should use single Enter",
-		},
-		{
-			name:        "codex_double_enter",
-			agentType:   "cod",
-			needsDouble: true,
-			description: "Codex needs double Enter to submit",
-		},
-		{
-			name:        "codex_alias_double_enter",
-			agentType:   "codex",
-			needsDouble: true,
-			description: "Codex aliases should preserve double Enter behavior",
-		},
-		{
-			name:        "gemini_double_enter",
-			agentType:   "gmi",
-			needsDouble: true,
-			description: "Gemini may need double Enter",
-		},
-		{
-			name:        "gemini_alias_double_enter",
-			agentType:   "gemini",
-			needsDouble: true,
-			description: "Gemini aliases should preserve double Enter behavior",
-		},
-		{
-			name:        "unknown_single_enter",
-			agentType:   "unknown",
-			needsDouble: false,
-			description: "Unknown agents should default to single Enter",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Logf("[TEST] Agent: %s, Description: %s", tc.agentType, tc.description)
-
-			result := tmux.AgentType(tc.agentType).NeedsDoubleEnter()
-			t.Logf("[TEST] needsDoubleEnter(%q) = %v", tc.agentType, result)
-
-			if result != tc.needsDouble {
-				t.Errorf("[TEST] Expected needsDoubleEnter(%q) = %v, got %v",
-					tc.agentType, tc.needsDouble, result)
-			}
-		})
-	}
-}
-
 // TestPromptInjector_ReviewModePrompts tests the review template content.
 func TestPromptInjector_ReviewModePrompts(t *testing.T) {
 	t.Log("[TEST] Testing review mode prompts")
@@ -1026,35 +993,6 @@ func TestPromptInjector_BatchResultTracking(t *testing.T) {
 	}
 }
 
-// TestPromptInjector_ChainedConfiguration tests method chaining for configuration.
-func TestPromptInjector_ChainedConfiguration(t *testing.T) {
-	t.Log("[TEST] Testing chained configuration methods")
-
-	tracker := ratelimit.NewRateLimitTracker("")
-
-	injector := NewPromptInjector().
-		WithStaggerDelay(250 * time.Millisecond).
-		WithRateLimitTracker(tracker).
-		WithAdaptiveDelay(true).
-		WithLogger(nil)
-
-	t.Log("[TEST] Created injector with chained configuration")
-	t.Logf("[TEST] StaggerDelay: %v", injector.StaggerDelay)
-	t.Logf("[TEST] UseAdaptiveDelay: %v", injector.UseAdaptiveDelay)
-	t.Logf("[TEST] RateLimitTracker set: %v", injector.RateLimitTracker != nil)
-
-	// Verify all configurations were applied
-	if injector.StaggerDelay != 250*time.Millisecond {
-		t.Errorf("[TEST] Expected StaggerDelay of 250ms, got %v", injector.StaggerDelay)
-	}
-	if !injector.UseAdaptiveDelay {
-		t.Error("[TEST] Expected UseAdaptiveDelay to be true")
-	}
-	if injector.RateLimitTracker != tracker {
-		t.Error("[TEST] Expected RateLimitTracker to be set")
-	}
-}
-
 // containsIgnoreCase checks if s contains substr (case-insensitive).
 func containsIgnoreCase(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr ||
@@ -1081,4 +1019,50 @@ func containsLower(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestPromptInjectorTmuxClient(t *testing.T) {
+	injector := NewPromptInjector()
+	client := injector.tmuxClient()
+
+	if client == nil {
+		t.Error("expected non-nil client from tmuxClient()")
+	}
+}
+
+func TestWithLogger(t *testing.T) {
+	injector := NewPromptInjector()
+	result := injector.WithLogger(nil)
+
+	if result != injector {
+		t.Error("WithLogger should return the same injector for chaining")
+	}
+}
+
+func TestPromptInjector_ChainedConfiguration(t *testing.T) {
+	t.Log("[TEST] Testing chained configuration methods")
+
+	tracker := ratelimit.NewRateLimitTracker("")
+
+	injector := NewPromptInjector().
+		WithStaggerDelay(250 * time.Millisecond).
+		WithRateLimitTracker(tracker).
+		WithAdaptiveDelay(true).
+		WithLogger(nil)
+
+	t.Log("[TEST] Created injector with chained configuration")
+	t.Logf("[TEST] StaggerDelay: %v", injector.StaggerDelay)
+	t.Logf("[TEST] UseAdaptiveDelay: %v", injector.UseAdaptiveDelay)
+	t.Logf("[TEST] RateLimitTracker set: %v", injector.RateLimitTracker != nil)
+
+	// Verify all configurations were applied
+	if injector.StaggerDelay != 250*time.Millisecond {
+		t.Errorf("[TEST] Expected StaggerDelay of 250ms, got %v", injector.StaggerDelay)
+	}
+	if !injector.UseAdaptiveDelay {
+		t.Error("[TEST] Expected UseAdaptiveDelay to be true")
+	}
+	if injector.RateLimitTracker != tracker {
+		t.Error("[TEST] Expected RateLimitTracker to be set")
+	}
 }

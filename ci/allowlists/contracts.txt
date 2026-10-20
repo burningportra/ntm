@@ -1,0 +1,16 @@
+# ci/allowlists/contracts.txt — G6 single-definition contracts allowlist (bd-ws0-guards-klz98.7)
+# Format: <entry>\t<bead-id>\t<reason>  (see ci/allowlists/README.md)
+# Entry classes:
+#   label-split:<file>:<func>:<literal>   — raw "__"/"--" delimiter literal inside a label-handling
+#                                           function outside the canonical helper files
+#                                           (internal/config/label.go, internal/session/label.go).
+#   manifest-writer:<file>                — resilience.SpawnManifest composite-literal construction
+#                                           outside internal/resilience/ (one shared writer is the contract).
+#   rollout:<contract>:<surface>          — D1/D2 contract-breadth rollout exceptions. NOT computed by
+#                                           the grep lint (scripts/guards/contracts_lint.sh ignores this
+#                                           class); consumed by the WS3 registry-walk conformance tests,
+#                                           validated here only for format + open bead.
+#
+# B4/B5 current-literal seeds burned by the W1 routing/spawn lane (bd-ws1-truth-safety-l5ddi.7 / .8).
+#
+# D1/D2 rollout exceptions (schema/pagination lane, wave W2):

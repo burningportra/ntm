@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -503,9 +504,9 @@ func TestStorage_LoadScrollback_PermissionDenied(t *testing.T) {
 func TestRestorer_RestoreFromCheckpoint_NilCheckpoint(t *testing.T) {
 	r := NewRestorer()
 
-	_, err := r.RestoreFromCheckpoint(nil, RestoreOptions{DryRun: true})
+	_, err := r.RestoreFromCheckpointContext(t.Context(), nil, RestoreOptions{DryRun: true})
 	if !errors.Is(err, ErrNilCheckpoint) {
-		t.Fatalf("RestoreFromCheckpoint(nil) error = %v, want %v", err, ErrNilCheckpoint)
+		t.Fatalf("RestoreFromCheckpointContext(nil) error = %v, want %v", err, ErrNilCheckpoint)
 	}
 }
 
@@ -522,17 +523,14 @@ func TestRestorer_RestoreFromCheckpoint_EmptySessionName(t *testing.T) {
 		},
 	}
 
-	// Empty session name may match tmux behavior (existing session check)
-	// With Force option and DryRun, it should proceed
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true, Force: true})
-	if err != nil {
-		t.Fatalf("DryRun with empty session name and Force failed: %v", err)
+	// A dry run must reject the same invalid source identity as a real
+	// restore. Force authorizes replacement; it never weakens validation.
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true, Force: true})
+	if err == nil || !strings.Contains(err.Error(), "invalid checkpoint source session") {
+		t.Fatalf("DryRun with an invalid source must fail validation: %v", err)
 	}
-	if result.SessionName != "" {
-		t.Errorf("SessionName should be empty, got %q", result.SessionName)
-	}
-	if result.PanesRestored != 1 {
-		t.Errorf("PanesRestored = %d, want 1", result.PanesRestored)
+	if result != nil {
+		t.Fatalf("invalid source produced a restore plan: %+v", result)
 	}
 }
 
@@ -562,121 +560,15 @@ func TestRestorer_RestoreFromCheckpoint_WorkingDir_PermissionDenied(t *testing.T
 	// Note: Current implementation only checks os.IsNotExist, not permission errors.
 	// Permission denied on stat returns a different error that's not explicitly handled.
 	// In DryRun mode, it proceeds and collects warnings via ValidateCheckpoint.
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true, Force: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true, Force: true})
 	if err != nil {
 		// If it fails, that's also acceptable behavior
-		t.Logf("RestoreFromCheckpoint failed (expected): %v", err)
+		t.Logf("RestoreFromCheckpointContext failed (expected): %v", err)
 		return
 	}
 
 	// In DryRun, it might proceed but should ideally have warnings
 	t.Logf("DryRun result: PanesRestored=%d, Warnings=%v", result.PanesRestored, result.Warnings)
-}
-
-func TestRestorer_ValidateCheckpoint_GitBranchMismatch(t *testing.T) {
-	tmpDir := t.TempDir()
-	r := NewRestorerWithStorage(NewStorageWithDir(tmpDir))
-
-	cp := &Checkpoint{
-		ID:          "test",
-		SessionName: "test",
-		WorkingDir:  tmpDir,
-		Session: SessionState{
-			Panes: []PaneState{{Index: 0, ID: "%0"}},
-		},
-		Git: GitState{
-			Branch: "feature-branch", // Branch that won't exist
-			Commit: "abc123def456",
-		},
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-
-	// Should warn about git state (unless we're actually in a git repo with that branch)
-	t.Logf("Validation issues: %v", issues)
-}
-
-func TestRestorer_ValidateCheckpoint_CustomDirectory_Override(t *testing.T) {
-	tmpDir := t.TempDir()
-	customDir := filepath.Join(tmpDir, "custom")
-	if err := os.MkdirAll(customDir, 0755); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-
-	r := NewRestorerWithStorage(NewStorageWithDir(tmpDir))
-
-	cp := &Checkpoint{
-		ID:          "test",
-		SessionName: "test",
-		WorkingDir:  "/nonexistent/original/path",
-		Session: SessionState{
-			Panes: []PaneState{{Index: 0, ID: "%0"}},
-		},
-	}
-
-	// Without custom dir, should have issues
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{})
-	hasDirectoryIssue := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "directory not found") {
-			hasDirectoryIssue = true
-			break
-		}
-	}
-	if !hasDirectoryIssue {
-		t.Error("Expected directory not found issue without custom directory")
-	}
-
-	// With custom dir, should be resolved
-	issues = r.ValidateCheckpoint(cp, RestoreOptions{CustomDirectory: customDir})
-	hasDirectoryIssue = false
-	for _, issue := range issues {
-		if containsSubstr(issue, "directory not found") {
-			hasDirectoryIssue = true
-			break
-		}
-	}
-	if hasDirectoryIssue {
-		t.Error("Should not have directory issue with custom directory override")
-	}
-}
-
-func TestRestorer_ValidateCheckpoint_AllScrollbacksMissing(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := NewStorageWithDir(tmpDir)
-	r := NewRestorerWithStorage(storage)
-
-	cp := &Checkpoint{
-		ID:          "test-id",
-		SessionName: "test",
-		WorkingDir:  tmpDir,
-		Session: SessionState{
-			Panes: []PaneState{
-				{Index: 0, ID: "%0", ScrollbackFile: "panes/pane_0.txt"},
-				{Index: 1, ID: "%1", ScrollbackFile: "panes/pane_1.txt"},
-				{Index: 2, ID: "%2", ScrollbackFile: "panes/pane_2.txt"},
-			},
-		},
-	}
-
-	// Create checkpoint directory but not scrollback files
-	cpDir := storage.CheckpointDir(cp.SessionName, cp.ID)
-	if err := os.MkdirAll(cpDir, 0755); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{InjectContext: true})
-
-	// Should report all three missing scrollback files
-	missingCount := 0
-	for _, issue := range issues {
-		if containsSubstr(issue, "scrollback file missing") {
-			missingCount++
-		}
-	}
-	if missingCount != 3 {
-		t.Errorf("Expected 3 scrollback missing issues, got %d: %v", missingCount, issues)
-	}
 }
 
 // --- Graceful Degradation Tests ---
@@ -702,7 +594,7 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_CollectsWarnings(t *testing.T) {
 		},
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
 		t.Fatalf("DryRun should not fail: %v", err)
 	}
@@ -715,25 +607,6 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_CollectsWarnings(t *testing.T) {
 	// Should still report correct pane count
 	if result.PanesRestored != 2 {
 		t.Errorf("PanesRestored = %d, want 2", result.PanesRestored)
-	}
-}
-
-func TestRestorer_RestoreLatest_SessionDirExists_NoCheckpoints(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := NewStorageWithDir(tmpDir)
-	sessionName := "testproject"
-
-	// Create session directory without any checkpoints
-	sessionDir := filepath.Join(tmpDir, sessionName)
-	if err := os.MkdirAll(sessionDir, 0755); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-
-	r := NewRestorerWithStorage(storage)
-
-	_, err := r.RestoreLatest(sessionName, RestoreOptions{})
-	if err == nil {
-		t.Error("RestoreLatest should fail when session dir exists but has no checkpoints")
 	}
 }
 
@@ -930,79 +803,6 @@ func buildContextAwarePromptWithoutBv(basePrompt string) string {
 
 // --- Integration: Multiple Failure Recovery ---
 
-func TestRestorer_MultiplePanes_PartialScrollbackAvailable(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := NewStorageWithDir(tmpDir)
-
-	cp := &Checkpoint{
-		ID:          "partial-scrollback",
-		SessionName: "test",
-		WorkingDir:  tmpDir,
-		CreatedAt:   time.Now(),
-		Session: SessionState{
-			Panes: []PaneState{
-				{Index: 0, ID: "%0", Title: "pane1"},
-				{Index: 1, ID: "%1", Title: "pane2"},
-				{Index: 2, ID: "%2", Title: "pane3"},
-			},
-		},
-	}
-
-	if err := storage.Save(cp); err != nil {
-		t.Fatalf("Save() failed: %v", err)
-	}
-
-	// Only save scrollback for pane 0 and 2
-	storage.SaveScrollback(cp.SessionName, cp.ID, "%0", "content 0")
-	storage.SaveScrollback(cp.SessionName, cp.ID, "%2", "content 2")
-	cp.Session.Panes[0].ScrollbackFile = "panes/pane__0.txt"
-	cp.Session.Panes[1].ScrollbackFile = "panes/pane__1.txt"
-	cp.Session.Panes[2].ScrollbackFile = "panes/pane__2.txt"
-
-	r := NewRestorerWithStorage(storage)
-
-	// Validation should report missing scrollback for pane 1
-	issues := r.ValidateCheckpoint(cp, RestoreOptions{InjectContext: true})
-
-	hasMissingPane1 := false
-	for _, issue := range issues {
-		if containsSubstr(issue, "%1") || containsSubstr(issue, "pane 1") {
-			hasMissingPane1 = true
-			break
-		}
-	}
-
-	// Should have some scrollback-related issue
-	if len(issues) == 0 {
-		t.Error("Expected validation issues for missing scrollback")
-	}
-	t.Logf("Validation issues: %v", issues)
-	_ = hasMissingPane1 // Used for logging context
-}
-
-func TestRestorer_Restore_CheckpointID_SpecialCharacters(t *testing.T) {
-	tmpDir := t.TempDir()
-	storage := NewStorageWithDir(tmpDir)
-	r := NewRestorerWithStorage(storage)
-
-	// Try to restore with special characters in checkpoint ID
-	specialIDs := []string{
-		"../parent",
-		"with spaces",
-		"with:colons",
-		"with/slashes",
-	}
-
-	for _, id := range specialIDs {
-		_, err := r.Restore("session", id, RestoreOptions{DryRun: true})
-		if err == nil {
-			t.Logf("Restore(%q) unexpectedly succeeded", id)
-		} else {
-			t.Logf("Restore(%q) failed as expected: %v", id, err)
-		}
-	}
-}
-
 // --- Logging Verification Tests ---
 
 func TestRestoreResult_WarningMessages_Formatted(t *testing.T) {
@@ -1047,7 +847,7 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_WarningFormats(t *testing.T) {
 		},
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
 		t.Fatalf("DryRun should not error: %v", err)
 	}

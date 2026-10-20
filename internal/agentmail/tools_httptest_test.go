@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -689,19 +690,23 @@ func TestSummarizeThread_OmitsIncludeExamplesWhenUnset(t *testing.T) {
 func TestReservePaths(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
-		"file_reservation_paths": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return ReservationResult{
-				Granted: []FileReservation{
-					{ID: 1, PathPattern: "internal/agentmail/*", AgentName: "TestAgent", Exclusive: true},
-				},
-				Conflicts: nil,
-			}, nil
-		},
-	}))
-	defer server.Close()
-
-	c := NewClient(WithBaseURL(server.URL + "/"))
+	lease := FileReservation{
+		ID: 1, ProjectID: 7, PathPattern: "internal/agentmail/*", AgentName: "TestAgent",
+		Exclusive: true, Reason: "testing",
+		ExpiresTS: FlexTime{Time: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	c := reservationReadbackClient(t, func(_ *http.Request, req JSONRPCRequest) (any, *JSONRPCError) {
+		params, _ := req.Params.(map[string]interface{})
+		if req.Method == "tools/call" {
+			return ReservationResult{Granted: []FileReservation{lease}}, nil
+		}
+		uri, _ := params["uri"].(string)
+		if strings.HasPrefix(uri, "resource://project/") {
+			return reservationResourceFixture(`{"id":7,"slug":"test","human_key":"/test"}`), nil
+		}
+		raw, _ := json.Marshal([]FileReservation{lease})
+		return reservationResourceFixture(string(raw)), nil
+	})
 	result, err := c.ReservePaths(context.Background(), FileReservationOptions{
 		ProjectKey: "/test",
 		AgentName:  "TestAgent",
@@ -983,6 +988,166 @@ func TestSendOverseerMessage(t *testing.T) {
 	}
 }
 
+func TestOverseerInterventionContract(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, recipients := range [][]string{{"BlueLake"}, {"BlueLake", "RedStone"}} {
+			t.Run(fmt.Sprintf("legacy=%v/recipients=%d", legacy, len(recipients)), func(t *testing.T) {
+				var calls int
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					if r.URL.Path != "/mail/project/overseer/send" || r.Header.Get("Authorization") != "Bearer operator-token" {
+						t.Errorf("unexpected request: %s, authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
+						http.Error(w, "unauthorized", http.StatusUnauthorized)
+						return
+					}
+					var body map[string]interface{}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					// Old HTTP servers ignore new audit fields; current servers
+					// enforce these before creating the system identity.
+					if !legacy && (body["intent"] != "human_overseer_send" || body["reason"] != DefaultOverseerReason ||
+						body["confirm_multiple"] != (len(recipients) > 1)) {
+						http.Error(w, `{"error":"invalid intervention audit fields"}`, http.StatusBadRequest)
+						return
+					}
+					if _, ok := body["broadcast"]; ok {
+						t.Error("must use explicit recipients, never broadcast")
+					}
+					if body["body_md"] != "operator instructions" || body["thread_id"] != "incident-355" {
+						t.Errorf("message semantics changed: %v", body)
+					}
+					_ = json.NewEncoder(w).Encode(OverseerSendResult{Success: true, MessageID: 355, Recipients: recipients})
+				}))
+				defer server.Close()
+				c := NewClient(WithBaseURL(server.URL+"/mcp/"), WithToken("operator-token"))
+				result, err := c.SendOverseerMessage(t.Context(), OverseerMessageOptions{
+					ProjectKey: "/project", ProjectSlug: "project", Recipients: recipients,
+					Subject: "intervention", BodyMD: "operator instructions", ThreadID: "incident-355",
+				})
+				if err != nil || result.MessageID != 355 || calls != 1 {
+					t.Fatalf("result=%+v, err=%v, calls=%d", result, err, calls)
+				}
+			})
+		}
+	}
+}
+
+func TestOverseerRejectionNeverFallsBack(t *testing.T) {
+	for _, status := range []int{400, 401, 403, 404, 405, 500} {
+		for _, key := range []string{"error", "detail"} {
+			t.Run(fmt.Sprintf("%d/%s", status, key), func(t *testing.T) {
+				var calls int
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					w.WriteHeader(status)
+					_ = json.NewEncoder(w).Encode(map[string]string{key: "operator permission denied"})
+				}))
+				defer server.Close()
+				c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+				_, err := c.SendOverseerMessage(t.Context(), OverseerMessageOptions{
+					ProjectKey: "/project", ProjectSlug: "project", Recipients: []string{"BlueLake"},
+					Subject: "intervention", BodyMD: "instructions",
+				})
+				if err == nil || !strings.Contains(err.Error(), "operator permission denied") || calls != 1 {
+					t.Fatalf("err=%v, calls=%d", err, calls)
+				}
+				if (status == 401 || status == 403) && !IsUnauthorized(err) {
+					t.Errorf("authentication classification lost: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestOverseerAmbiguousReceiptNeverRetries(t *testing.T) {
+	for _, body := range []string{"not json", "null", "{}", `{"success":false,"message_id":1}`} {
+		t.Run(body, func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+			c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+			_, err := c.SendOverseerMessage(t.Context(), OverseerMessageOptions{
+				ProjectKey: "/project", ProjectSlug: "project", Recipients: []string{"BlueLake"},
+				Subject: "intervention", BodyMD: "instructions",
+			})
+			if err == nil || calls != 1 {
+				t.Fatalf("ambiguous receipt must not succeed or retry: err=%v, calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestOverseerStructuredRejectionNeverDowngrades(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"type":"FORBIDDEN","message":"human intervention disabled"}}`,
+		`{"detail":[{"msg":"operator is not authorized"}]}`,
+		`{"error":""}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+			c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+			_, err := c.SendOverseerMessage(t.Context(), OverseerMessageOptions{
+				ProjectKey: "/project", ProjectSlug: "project", Recipients: []string{"BlueLake"},
+				Subject: "intervention", BodyMD: "instructions",
+			})
+			if err == nil || IsNotImplemented(err) || calls != 1 {
+				t.Fatalf("structured rejection downgraded: err=%v, calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestOverseerInvalidInputDoesNotSend(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*OverseerMessageOptions)
+	}{
+		{"missing project", func(o *OverseerMessageOptions) { o.ProjectSlug = "" }},
+		{"no recipients", func(o *OverseerMessageOptions) { o.Recipients = nil }},
+		{"blank recipient", func(o *OverseerMessageOptions) { o.Recipients = []string{" "} }},
+		{"invalid recipient Unicode", func(o *OverseerMessageOptions) { o.Recipients = []string{"\xff"} }},
+		{"too many recipients", func(o *OverseerMessageOptions) {
+			o.Recipients = nil
+			for i := range 101 {
+				o.Recipients = append(o.Recipients, fmt.Sprintf("Agent%d", i))
+			}
+		}},
+		{"blank subject", func(o *OverseerMessageOptions) { o.Subject = " " }},
+		{"long subject", func(o *OverseerMessageOptions) { o.Subject = strings.Repeat("界", 201) }},
+		{"invalid subject Unicode", func(o *OverseerMessageOptions) { o.Subject = "\xff" }},
+		{"blank body", func(o *OverseerMessageOptions) { o.BodyMD = " " }},
+		{"long body", func(o *OverseerMessageOptions) { o.BodyMD = strings.Repeat("界", 50_001) }},
+		{"invalid body Unicode", func(o *OverseerMessageOptions) { o.BodyMD = "\xff" }},
+		{"blank reason", func(o *OverseerMessageOptions) { o.Reason = " " }},
+		{"long reason", func(o *OverseerMessageOptions) { o.Reason = strings.Repeat("界", 501) }},
+		{"invalid reason Unicode", func(o *OverseerMessageOptions) { o.Reason = "\xff" }},
+		{"invalid thread Unicode", func(o *OverseerMessageOptions) { o.ThreadID = "\xff" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("invalid input reached server")
+			}))
+			defer server.Close()
+			c := NewClient(WithBaseURL(server.URL + "/mcp/"))
+			opts := OverseerMessageOptions{ProjectSlug: "project", Recipients: []string{"BlueLake"}, Subject: "subject", BodyMD: "body"}
+			tc.change(&opts)
+			if _, err := c.SendOverseerMessage(t.Context(), opts); !IsInvalidRequest(err) {
+				t.Fatalf("expected invalid request, got %v", err)
+			}
+		})
+	}
+}
+
 func TestSendOverseerMessage_Unauthorized(t *testing.T) {
 	t.Parallel()
 
@@ -1018,7 +1183,7 @@ func TestSendOverseerMessage_BadRequest(t *testing.T) {
 	c := NewClient(WithBaseURL(server.URL + "/mcp/"))
 	_, err := c.SendOverseerMessage(context.Background(), OverseerMessageOptions{
 		ProjectSlug: "ntm",
-		Recipients:  []string{},
+		Recipients:  []string{"UnknownAgent"},
 		Subject:     "test",
 		BodyMD:      "test",
 	})
@@ -1567,11 +1732,9 @@ func pythonTypeName(value interface{}) string {
 // Replies the Python server sent live to calls carrying a valid
 // registration_token; the project path is shortened to /p.
 const (
-	capturedPythonFetchInboxReply    = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[{\"id\":2,\"project_id\":1,\"sender_id\":1,\"thread_id\":\"SEED-1\",\"reply_to\":null,\"topic\":null,\"subject\":\"seed subject\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-10-20T05:07:25.671399+00:00\",\"attachments\":[],\"from\":\"BlueLake\",\"kind\":\"to\",\"read_at\":null}]"}],"structuredContent":{"result":[{"id":2,"project_id":1,"sender_id":1,"thread_id":"SEED-1","reply_to":null,"topic":null,"subject":"seed subject","importance":"normal","ack_required":false,"created_ts":"2026-10-20T05:07:25.671399+00:00","attachments":[],"from":"BlueLake","kind":"to","read_at":null}]},"isError":false}}`
-	capturedPythonWhoisReply         = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"id\":2,\"name\":\"GreenCastle\",\"program\":\"probe\",\"model\":\"probe\",\"task_description\":\"bd-m0gm2 seed\",\"inception_ts\":\"2026-10-20T05:07:25.327443+00:00\",\"last_active_ts\":\"2026-10-20T05:24:42.232976+00:00\",\"project_id\":1,\"attachments_policy\":\"auto\",\"recent_commits\":[]}"}],"structuredContent":{"id":2,"name":"GreenCastle","program":"probe","model":"probe","task_description":"bd-m0gm2 seed","inception_ts":"2026-10-20T05:07:25.327443+00:00","last_active_ts":"2026-10-20T05:24:42.232976+00:00","project_id":1,"attachments_policy":"auto","recent_commits":[]},"isError":false}}`
-	capturedPythonActiveForceReply   = `{"jsonrpc":"2.0","id":38,"result":{"content":[{"type":"text","text":"Error calling tool 'force_release_file_reservation': Reservation still shows recent activity; refusing forced release."}],"isError":true}}`
-	capturedPythonReservationReply   = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"granted\":[{\"id\":4,\"path_pattern\":\"probe/c.txt\",\"exclusive\":true,\"reason\":\"bd-q7kzm capture\",\"expires_ts\":\"2026-10-20T05:26:42.061712+00:00\",\"reused\":false}],\"conflicts\":[],\"warnings\":[\"enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate.\"]}"}],"structuredContent":{"granted":[{"id":4,"path_pattern":"probe/c.txt","exclusive":true,"reason":"bd-q7kzm capture","expires_ts":"2026-10-20T05:26:42.061712+00:00","reused":false}],"conflicts":[],"warnings":["enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate."]},"isError":false}}`
-	capturedRustReservationGrantText = `{"granted":[{"id":14598,"path_pattern":"scratch-bd-m0gm2-probe/does-not-exist.txt","exclusive":true,"reason":"bd-m0gm2 live probe (nonexistent path)","expires_ts":"2026-10-20T04:48:02.649015Z"}],"conflicts":[]}`
+	capturedPythonFetchInboxReply  = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[{\"id\":2,\"project_id\":1,\"sender_id\":1,\"thread_id\":\"SEED-1\",\"reply_to\":null,\"topic\":null,\"subject\":\"seed subject\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-10-20T05:07:25.671399+00:00\",\"attachments\":[],\"from\":\"BlueLake\",\"kind\":\"to\",\"read_at\":null}]"}],"structuredContent":{"result":[{"id":2,"project_id":1,"sender_id":1,"thread_id":"SEED-1","reply_to":null,"topic":null,"subject":"seed subject","importance":"normal","ack_required":false,"created_ts":"2026-10-20T05:07:25.671399+00:00","attachments":[],"from":"BlueLake","kind":"to","read_at":null}]},"isError":false}}`
+	capturedPythonWhoisReply       = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"id\":2,\"name\":\"GreenCastle\",\"program\":\"probe\",\"model\":\"probe\",\"task_description\":\"bd-m0gm2 seed\",\"inception_ts\":\"2026-10-20T05:07:25.327443+00:00\",\"last_active_ts\":\"2026-10-20T05:24:42.232976+00:00\",\"project_id\":1,\"attachments_policy\":\"auto\",\"recent_commits\":[]}"}],"structuredContent":{"id":2,"name":"GreenCastle","program":"probe","model":"probe","task_description":"bd-m0gm2 seed","inception_ts":"2026-10-20T05:07:25.327443+00:00","last_active_ts":"2026-10-20T05:24:42.232976+00:00","project_id":1,"attachments_policy":"auto","recent_commits":[]},"isError":false}}`
+	capturedPythonActiveForceReply = `{"jsonrpc":"2.0","id":38,"result":{"content":[{"type":"text","text":"Error calling tool 'force_release_file_reservation': Reservation still shows recent activity; refusing forced release."}],"isError":true}}`
 )
 
 // TestPeekInboxes_PythonServer: the Python server's fetch_inbox takes no
@@ -1999,107 +2162,6 @@ func TestRefusalsQuotingATokenRedactIt(t *testing.T) {
 			}
 		}
 	})
-}
-
-// TestReservePaths_ReplayedGrants: neither server names the holder, the
-// project or a creation time in a grant, since every grant goes to the agent
-// the call named. The holder is filled in from the call; the project and
-// creation time are left out of the JSON rather than sent as 0 and year 1.
-func TestReservePaths_ReplayedGrants(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		handler   http.Handler
-		agent     string
-		wantID    int
-		wantAgent string
-		wantPath  string
-		wantUntil time.Time
-	}{
-		{
-			name: "rust",
-			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(mcpTextReply(capturedRustReservationGrantText)))
-			}),
-			agent:     "RoseRiver",
-			wantID:    14598,
-			wantAgent: "RoseRiver",
-			wantPath:  "scratch-bd-m0gm2-probe/does-not-exist.txt",
-			wantUntil: time.Date(2026, 10, 20, 4, 48, 2, 649015000, time.UTC),
-		},
-		{
-			name: "python",
-			handler: &pythonToolReplay{
-				tool:   "file_reservation_paths",
-				params: []string{"project_key", "agent_name", "paths", "ttl_seconds", "exclusive", "reason", "registration_token", "format"},
-				issued: "TOK-RED",
-				reply:  capturedPythonReservationReply,
-			},
-			agent:     "RedStone",
-			wantID:    4,
-			wantAgent: "RedStone",
-			wantPath:  "probe/c.txt",
-			wantUntil: time.Date(2026, 10, 20, 5, 26, 42, 61712000, time.UTC),
-		},
-		{
-			// No server sends one today; a holder a grant does name is kept,
-			// so a receipt check can still catch a grant for someone else.
-			name: "a grant naming its holder",
-			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(mcpTextReply(`{"granted":[{"id":7,"agent_name":"OtherAgent","path_pattern":"a.txt","exclusive":true,"reason":"r","expires_ts":"2026-10-20T04:48:02Z"}],"conflicts":[]}`)))
-			}),
-			agent:     "RoseRiver",
-			wantID:    7,
-			wantAgent: "OtherAgent",
-			wantPath:  "a.txt",
-			wantUntil: time.Date(2026, 10, 20, 4, 48, 2, 0, time.UTC),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			server := httptest.NewServer(tt.handler)
-			defer server.Close()
-
-			c := NewClient(WithBaseURL(server.URL + "/"))
-			c.SetRegistrationToken("/p", "RedStone", "TOK-RED")
-			result, err := c.ReservePaths(context.Background(), FileReservationOptions{
-				ProjectKey: "/p", AgentName: tt.agent, Paths: []string{tt.wantPath}, TTLSeconds: 120, Exclusive: true, Reason: "probe",
-			})
-			if err != nil {
-				t.Fatalf("ReservePaths: %v", err)
-			}
-			if len(result.Granted) != 1 {
-				t.Fatalf("granted = %+v, want one", result.Granted)
-			}
-			granted := result.Granted[0]
-			if granted.ID != tt.wantID || granted.AgentName != tt.wantAgent || granted.PathPattern != tt.wantPath ||
-				!granted.Exclusive || !granted.ExpiresTS.Equal(tt.wantUntil) {
-				t.Errorf("granted = %+v, want id %d held by %s on %s until %s", granted, tt.wantID, tt.wantAgent, tt.wantPath, tt.wantUntil)
-			}
-
-			encoded, err := json.Marshal(granted)
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
-			}
-			var fields map[string]interface{}
-			if err := json.Unmarshal(encoded, &fields); err != nil {
-				t.Fatalf("unmarshal: %v", err)
-			}
-			for _, absent := range []string{"project_id", "created_ts"} {
-				if value, present := fields[absent]; present {
-					t.Errorf("granted JSON carries %s = %v, which the server never sent: %s", absent, value, encoded)
-				}
-			}
-			if fields["agent_name"] != tt.wantAgent {
-				t.Errorf("granted JSON agent_name = %v, want %s", fields["agent_name"], tt.wantAgent)
-			}
-		})
-	}
 }
 
 func TestSetContactPolicy(t *testing.T) {
@@ -2649,5 +2711,152 @@ func TestNewClient_EnvURLNoTrailingSlash(t *testing.T) {
 	c := NewClient()
 	if c.baseURL != "http://envhost:9999/mcp/" {
 		t.Errorf("baseURL = %q, want http://envhost:9999/mcp/", c.baseURL)
+	}
+}
+
+// TestRegistrationCarriesBarePaneBinding: a bare %N pane id in
+// RegisterAgentOptions reaches the server as the pane_id tool argument (the
+// contract that makes the server write its pane-binding generation receipt),
+// on both registration surfaces.
+func TestRegistrationCarriesBarePaneBinding(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	seen := map[string]interface{}{}
+	record := func(tool string) func(map[string]interface{}) (interface{}, *JSONRPCError) {
+		return func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			mu.Lock()
+			seen[tool] = args["pane_id"]
+			mu.Unlock()
+			return Agent{ID: 1, Name: "BlueLake", Program: "ntm", Model: "opus"}, nil
+		}
+	}
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(map[string]interface{}) (interface{}, *JSONRPCError){
+		"register_agent":        record("register_agent"),
+		"create_agent_identity": record("create_agent_identity"),
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	if _, err := c.CreateAgentIdentity(context.Background(), RegisterAgentOptions{
+		ProjectKey: "/test", Program: "ntm", Model: "opus", PaneID: "%42",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.RegisterAgent(context.Background(), RegisterAgentOptions{
+		ProjectKey: "/test", Program: "ntm", Model: "opus", Name: "BlueLake", PaneID: "%7",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if seen["create_agent_identity"] != "%42" {
+		t.Errorf("create_agent_identity pane_id = %v, want %%42", seen["create_agent_identity"])
+	}
+	if seen["register_agent"] != "%7" {
+		t.Errorf("register_agent pane_id = %v, want %%7", seen["register_agent"])
+	}
+}
+
+// TestRegistrationOmitsNonBarePaneBinding: composite labels and empty ids are
+// omitted — the registration itself still succeeds, it just carries no
+// pane binding for the server to receipt.
+func TestRegistrationOmitsNonBarePaneBinding(t *testing.T) {
+	t.Parallel()
+
+	for _, paneID := range []string{"", "main:0:2", "%x"} {
+		var mu sync.Mutex
+		var got interface{} = "sentinel-not-set"
+		server := httptest.NewServer(mockMCPHandler(t, map[string]func(map[string]interface{}) (interface{}, *JSONRPCError){
+			"create_agent_identity": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+				mu.Lock()
+				_, got = args["pane_id"], args["pane_id"]
+				mu.Unlock()
+				return Agent{ID: 1, Name: "BlueLake", Program: "ntm", Model: "opus"}, nil
+			},
+		}))
+		c := NewClient(WithBaseURL(server.URL + "/"))
+		_, err := c.CreateAgentIdentity(context.Background(), RegisterAgentOptions{
+			ProjectKey: "/test", Program: "ntm", Model: "opus", PaneID: paneID,
+		})
+		server.Close()
+		if err != nil {
+			t.Fatalf("paneID %q: registration must still succeed: %v", paneID, err)
+		}
+		mu.Lock()
+		if got != nil {
+			t.Errorf("paneID %q: pane_id argument = %v, want absent", paneID, got)
+		}
+		mu.Unlock()
+	}
+}
+
+// GH #333: the Python Agent Mail server has no pane-binding contract and
+// rejects the whole registration over pane_id ("Unexpected keyword
+// argument"). Registration retries once without the optional binding.
+func TestCreateAgentIdentityRetriesWithoutUnsupportedPaneBinding(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var calls []map[string]interface{}
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"create_agent_identity": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			mu.Lock()
+			calls = append(calls, args)
+			mu.Unlock()
+			if _, ok := args["pane_id"]; ok {
+				return MCPToolResult{IsError: true, Content: []MCPContentBlock{{Type: "text", Text: "1 validation error for call[create_agent_identity]\npane_id\n  Unexpected keyword argument [type=unexpected_keyword_argument, input_value='%1', input_type=str]"}}}, nil
+			}
+			return Agent{Name: "SwiftBarn", Program: "opencode", Model: "opencode/big-pickle"}, nil
+		},
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	agent, err := c.CreateAgentIdentity(context.Background(), RegisterAgentOptions{
+		ProjectKey: "/data/projects/proj", Program: "opencode", Model: "opencode/big-pickle", PaneID: "%1",
+	})
+	if err != nil {
+		t.Fatalf("CreateAgentIdentity: %v", err)
+	}
+	if agent.Name != "SwiftBarn" {
+		t.Fatalf("agent = %+v", agent)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("registration calls = %d, want the bound call and one retry", len(calls))
+	}
+	if calls[0]["pane_id"] != "%1" {
+		t.Fatalf("first call did not carry the pane binding: %+v", calls[0])
+	}
+	if _, ok := calls[1]["pane_id"]; ok {
+		t.Fatalf("retry still carried pane_id: %+v", calls[1])
+	}
+}
+
+// Other rejections are not retried: only an unsupported pane_id argument is.
+func TestRegisterAgentDoesNotRetryUnrelatedRejection(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			calls.Add(1)
+			return MCPToolResult{IsError: true, Content: []MCPContentBlock{{Type: "text", Text: "program: unexpected keyword argument"}}}, nil
+		},
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	_, err := c.RegisterAgent(context.Background(), RegisterAgentOptions{
+		ProjectKey: "/data/projects/proj", Program: "opencode", Model: "m", PaneID: "%1",
+	})
+	if err == nil {
+		t.Fatal("RegisterAgent succeeded, want the rejection")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("register_agent calls = %d, want 1", calls.Load())
 	}
 }

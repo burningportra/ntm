@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -113,8 +114,8 @@ func TestBuildSemanticProgress_WedgeTellRequiresAllConditions(t *testing.T) {
 	// in window => advisory wedge fires.
 	wedge := buildSemanticProgress(
 		PaneWorkToken("s", 0, 1), window, true,
-		gitTokenActivity{commitsInWindow: 0, anyTokenCommit: true, lastCommitAt: &stale},
-		claimActivity{}, now,
+		gitTokenActivity{commitsInWindow: 0, anyTokenCommit: true, lastCommitAt: &stale, available: true},
+		claimActivity{available: true}, now,
 	)
 	if wedge.SuspectedWedge == "" {
 		t.Fatalf("expected suspected_wedge to fire (stamped + stale + velocity + no progress)")
@@ -123,8 +124,8 @@ func TestBuildSemanticProgress_WedgeTellRequiresAllConditions(t *testing.T) {
 	// Same, but velocity NEGATIVE => no wedge (defer to velocity signal).
 	noVel := buildSemanticProgress(
 		PaneWorkToken("s", 0, 1), window, false,
-		gitTokenActivity{commitsInWindow: 0, anyTokenCommit: true, lastCommitAt: &stale},
-		claimActivity{}, now,
+		gitTokenActivity{commitsInWindow: 0, anyTokenCommit: true, lastCommitAt: &stale, available: true},
+		claimActivity{available: true}, now,
 	)
 	if noVel.SuspectedWedge != "" {
 		t.Fatalf("velocity-negative pane must never be flagged wedge, got %q", noVel.SuspectedWedge)
@@ -133,8 +134,8 @@ func TestBuildSemanticProgress_WedgeTellRequiresAllConditions(t *testing.T) {
 	// Same, but a claim landed in the window => not a wedge (forward motion).
 	withClaim := buildSemanticProgress(
 		PaneWorkToken("s", 0, 1), window, true,
-		gitTokenActivity{commitsInWindow: 0, anyTokenCommit: true, lastCommitAt: &stale},
-		claimActivity{claimsInWindow: 1, anyLabeledBead: true}, now,
+		gitTokenActivity{commitsInWindow: 0, anyTokenCommit: true, lastCommitAt: &stale, available: true},
+		claimActivity{claimsInWindow: 1, anyLabeledBead: true, available: true}, now,
 	)
 	if withClaim.SuspectedWedge != "" {
 		t.Fatalf("a claim within the window means forward motion; must not be wedge, got %q", withClaim.SuspectedWedge)
@@ -147,6 +148,7 @@ func TestBuildSemanticProgress_WedgeTellRequiresAllConditions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSemanticNeverFlipsIsWorking(t *testing.T) {
+	installUnavailableSemanticBR(t)
 	dir := initTempRepo(t)
 	// One stale token commit -> a wedge scenario, the most "dangerous" case.
 	stale := time.Now().Add(-2 * time.Hour)
@@ -164,8 +166,11 @@ func TestSemanticNeverFlipsIsWorking(t *testing.T) {
 	if status.IsIdle {
 		t.Fatalf("semantic signal flipped IsIdle to true — guardrail violation")
 	}
-	if status.SemanticProgress == nil || status.SemanticProgress.SuspectedWedge == "" {
-		t.Fatalf("expected the wedge advisory to be present in this scenario")
+	if status.SemanticProgress == nil || status.SemanticProgress.Source != "token" {
+		t.Fatalf("expected the positive commit attribution to be preserved")
+	}
+	if status.SemanticProgress.EvidenceComplete || status.SemanticProgress.SuspectedWedge != "" {
+		t.Fatalf("unavailable bead evidence must not produce a wedge advisory")
 	}
 	if status.Recommendation != "" {
 		t.Fatalf("semantic signal must not set a recommendation on its own, got %q", status.Recommendation)
@@ -187,18 +192,18 @@ func TestGitTokenAttributionPerPane(t *testing.T) {
 	commitWithTrailer(t, dir, "pane B work 1", tokenB, now.Add(-3*time.Minute))
 	commitPlain(t, dir, "unattributed work", now.Add(-1*time.Minute))
 
-	a := gatherGitTokenActivity(dir, tokenA, 30*time.Minute, now)
+	a := gatherGitTokenActivityWithContext(context.Background(), dir, tokenA, 30*time.Minute, now)
 	if a.commitsInWindow != 2 || !a.anyTokenCommit {
 		t.Fatalf("pane A: commits=%d any=%v, want 2/true", a.commitsInWindow, a.anyTokenCommit)
 	}
 
-	b := gatherGitTokenActivity(dir, tokenB, 30*time.Minute, now)
+	b := gatherGitTokenActivityWithContext(context.Background(), dir, tokenB, 30*time.Minute, now)
 	if b.commitsInWindow != 1 || !b.anyTokenCommit {
 		t.Fatalf("pane B: commits=%d any=%v, want 1/true (sibling commits must not be miscredited)", b.commitsInWindow, b.anyTokenCommit)
 	}
 
 	// A pane that never committed must get NO attribution (source none).
-	c := gatherGitTokenActivity(dir, PaneWorkToken("sess", 0, 3), 30*time.Minute, now)
+	c := gatherGitTokenActivityWithContext(context.Background(), dir, PaneWorkToken("sess", 0, 3), 30*time.Minute, now)
 	if c.commitsInWindow != 0 || c.anyTokenCommit {
 		t.Fatalf("unstamped pane: commits=%d any=%v, want 0/false", c.commitsInWindow, c.anyTokenCommit)
 	}
@@ -222,24 +227,24 @@ func TestGitTokenAttributionPrefixCollision(t *testing.T) {
 
 	// DANGEROUS DIRECTION: pane 0.1 was never stamped → it must get ZERO
 	// attribution, never the sibling's commits, never source="token".
-	one := gatherGitTokenActivity(dir, token1, 30*time.Minute, now)
+	one := gatherGitTokenActivityWithContext(context.Background(), dir, token1, 30*time.Minute, now)
 	if one.anyTokenCommit || one.commitsInWindow != 0 || one.lastCommitAt != nil {
 		t.Fatalf("pane 0.1 must NOT be credited pane 0.10's commits, got %+v", one)
 	}
 
 	// Pane 0.10 gets exactly its own two commits.
-	ten := gatherGitTokenActivity(dir, token10, 30*time.Minute, now)
+	ten := gatherGitTokenActivityWithContext(context.Background(), dir, token10, 30*time.Minute, now)
 	if ten.commitsInWindow != 2 || !ten.anyTokenCommit {
 		t.Fatalf("pane 0.10: commits=%d any=%v, want 2/true", ten.commitsInWindow, ten.anyTokenCommit)
 	}
 
 	// Stamp pane 0.1 once: it gets exactly its own, and 0.10 is unaffected.
 	commitWithTrailer(t, dir, "pane 1 work", token1, now.Add(-1*time.Minute))
-	one = gatherGitTokenActivity(dir, token1, 30*time.Minute, now)
+	one = gatherGitTokenActivityWithContext(context.Background(), dir, token1, 30*time.Minute, now)
 	if one.commitsInWindow != 1 || !one.anyTokenCommit {
 		t.Fatalf("pane 0.1 after its own commit: commits=%d any=%v, want 1/true", one.commitsInWindow, one.anyTokenCommit)
 	}
-	if ten = gatherGitTokenActivity(dir, token10, 30*time.Minute, now); ten.commitsInWindow != 2 {
+	if ten = gatherGitTokenActivityWithContext(context.Background(), dir, token10, 30*time.Minute, now); ten.commitsInWindow != 2 {
 		t.Fatalf("pane 0.10 must remain 2 (not credited pane 0.1's commit), got %d", ten.commitsInWindow)
 	}
 }
@@ -250,7 +255,7 @@ func TestGitTokenWindowExcludesStale(t *testing.T) {
 	token := PaneWorkToken("sess", 0, 1)
 	commitWithTrailer(t, dir, "stale work", token, now.Add(-2*time.Hour))
 
-	a := gatherGitTokenActivity(dir, token, 30*time.Minute, now)
+	a := gatherGitTokenActivityWithContext(context.Background(), dir, token, 30*time.Minute, now)
 	if a.commitsInWindow != 0 {
 		t.Fatalf("stale commit should be outside the 30m window, got %d", a.commitsInWindow)
 	}
@@ -266,12 +271,12 @@ func TestGitTokenActivityNonRepoDegradesSafely(t *testing.T) {
 	// A directory that is not a git repo must degrade to "no activity", never an
 	// error or a wedge.
 	dir := t.TempDir()
-	a := gatherGitTokenActivity(dir, PaneWorkToken("s", 0, 1), 30*time.Minute, time.Now())
+	a := gatherGitTokenActivityWithContext(context.Background(), dir, PaneWorkToken("s", 0, 1), 30*time.Minute, time.Now())
 	if a.anyTokenCommit || a.commitsInWindow != 0 || a.lastCommitAt != nil {
 		t.Fatalf("non-repo dir should yield zero activity, got %+v", a)
 	}
 	// Empty repoDir likewise.
-	empty := gatherGitTokenActivity("", PaneWorkToken("s", 0, 1), 30*time.Minute, time.Now())
+	empty := gatherGitTokenActivityWithContext(context.Background(), "", PaneWorkToken("s", 0, 1), 30*time.Minute, time.Now())
 	if empty.anyTokenCommit {
 		t.Fatalf("empty repoDir should yield zero activity")
 	}

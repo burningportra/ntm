@@ -2,9 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -318,8 +318,9 @@ func newRotateContextPendingCmd() *cobra.Command {
 		Short: "View pending rotation confirmations",
 		Long: `View pending context rotation confirmations awaiting user action.
 
-When context rotation is configured with require_confirmation=true, rotations
-are queued as pending until confirmed via this CLI or dashboard.
+Rotations triggered by the coordinator ([rotation] usage_percent_threshold) are
+queued as pending until confirmed via this CLI or dashboard, unless [rotation]
+auto_confirm is set.
 
 Examples:
   ntm rotate context pending              # All pending rotations
@@ -348,8 +349,10 @@ type PendingRotationInfo struct {
 	SessionName    string  `json:"session_name"`
 	ContextPercent float64 `json:"context_percent"`
 	TimeoutSeconds int     `json:"timeout_seconds"`
-	DefaultAction  string  `json:"default_action"`
 	CreatedAt      string  `json:"created_at"`
+	SelectedAction string  `json:"selected_action,omitempty"`
+	ExecutionState string  `json:"execution_state,omitempty"`
+	LastError      string  `json:"last_error,omitempty"`
 }
 
 func (r *PendingRotationsResult) Text(w io.Writer) error {
@@ -376,8 +379,14 @@ func (r *PendingRotationsResult) Text(w io.Writer) error {
 		fmt.Fprintf(w, "  Session: %s\n", p.SessionName)
 		fmt.Fprintf(w, "  Context: %.1f%%\n", p.ContextPercent)
 		fmt.Fprintf(w, "  Timeout: %s%ds%s\n", colorize(timeoutColor), p.TimeoutSeconds, colorize(t.Text))
-		fmt.Fprintf(w, "  Default: %s\n", p.DefaultAction)
 		fmt.Fprintf(w, "  Created: %s\n", p.CreatedAt)
+		if p.ExecutionState != "" {
+			fmt.Fprintf(w, "  Confirmation: %s (%s)\n", p.SelectedAction, p.ExecutionState)
+			if p.LastError != "" {
+				fmt.Fprintf(w, "  Last error: %s\n", p.LastError)
+			}
+			fmt.Fprintf(w, "  Inspect the pane before explicitly retrying with --action=%s --retry.\n", p.SelectedAction)
+		}
 	}
 
 	fmt.Fprintf(w, "\n%sUse 'ntm rotate context confirm <agent> --action=<action>' to confirm%s\n",
@@ -411,13 +420,19 @@ func runContextRotationPending(ctx context.Context, sessionFilter string) error 
 
 	var infos []PendingRotationInfo
 	for _, p := range pending {
+		lastError := ""
+		if p.Result != nil {
+			lastError = p.Result.Error
+		}
 		infos = append(infos, PendingRotationInfo{
 			AgentID:        p.AgentID,
 			SessionName:    p.SessionName,
 			ContextPercent: p.ContextPercent,
 			TimeoutSeconds: p.RemainingSeconds(),
-			DefaultAction:  string(p.DefaultAction),
 			CreatedAt:      p.CreatedAt.Local().Format("15:04:05"),
+			SelectedAction: string(p.SelectedAction),
+			ExecutionState: string(p.ExecutionState),
+			LastError:      lastError,
 		})
 	}
 
@@ -433,6 +448,7 @@ func runContextRotationPending(ctx context.Context, sessionFilter string) error 
 func newRotateContextConfirmCmd() *cobra.Command {
 	var action string
 	var postponeMinutes int
+	var retry bool
 
 	cmd := &cobra.Command{
 		Use:   "confirm <agent-id>",
@@ -452,22 +468,25 @@ Examples:
   ntm rotate context confirm myproject__cc_1 --action=postpone --minutes=30`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runContextRotationConfirm(args[0], action, postponeMinutes)
+			return runContextRotationConfirm(cmd, args[0], action, postponeMinutes, retry)
 		},
 	}
 
 	cmd.Flags().StringVarP(&action, "action", "a", "rotate", "Action to take: rotate, compact, ignore, postpone")
 	cmd.Flags().IntVarP(&postponeMinutes, "minutes", "m", 30, "Minutes to postpone (only with --action=postpone)")
+	cmd.Flags().BoolVar(&retry, "retry", false, "Explicitly retry an interrupted or failed confirmation of the same action")
 
 	return cmd
 }
 
 // ConfirmRotationResult contains the confirmation result
 type ConfirmRotationResult struct {
-	AgentID string `json:"agent_id"`
-	Action  string `json:"action"`
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	AgentID       string                 `json:"agent_id"`
+	Action        string                 `json:"action"`
+	Success       bool                   `json:"success"`
+	Message       string                 `json:"message"`
+	Rotation      *ctxmon.RotationResult `json:"rotation,omitempty"`
+	RetryRequired bool                   `json:"retry_required,omitempty"`
 }
 
 func (r *ConfirmRotationResult) Text(w io.Writer) error {
@@ -486,7 +505,7 @@ func (r *ConfirmRotationResult) JSON() interface{} {
 	return r
 }
 
-func runContextRotationConfirm(agentID, action string, postponeMinutes int) error {
+func runContextRotationConfirm(cmd *cobra.Command, agentID, action string, postponeMinutes int, retry bool) error {
 	// Validate action
 	var confirmAction ctxmon.ConfirmAction
 	switch action {
@@ -502,70 +521,48 @@ func runContextRotationConfirm(agentID, action string, postponeMinutes int) erro
 		return fmt.Errorf("invalid action: %s (use: rotate, compact, ignore, postpone)", action)
 	}
 
-	// Get the pending rotation
-	pending, err := ctxmon.GetPendingRotationByID(agentID)
-	if err != nil {
+	if confirmAction == ctxmon.ConfirmPostpone && postponeMinutes <= 0 {
+		return fmt.Errorf("postpone minutes must be positive")
+	}
+	rotation := ctxmon.ConfirmPendingRotationContext(cmd.Context(), agentID, confirmAction, postponeMinutes, retry, cfg)
+	message := rotation.Error
+	if rotation.Success {
+		switch confirmAction {
+		case ctxmon.ConfirmRotate:
+			if rotation.State == ctxmon.RotationStateAborted && rotation.NewPaneID == "" {
+				// A coordinator may have already satisfied this request through
+				// its automatic compaction policy. Report that stored receipt.
+				message = fmt.Sprintf("Context compaction completed for %s; replacement was not needed", agentID)
+			} else {
+				message = fmt.Sprintf("Rotation completed for %s (%s → %s)", agentID, rotation.OldPaneID, rotation.NewPaneID)
+			}
+		case ctxmon.ConfirmCompact:
+			message = fmt.Sprintf("Context compaction completed for %s", agentID)
+		case ctxmon.ConfirmIgnore:
+			message = fmt.Sprintf("Pending rotation for %s cancelled", agentID)
+		case ctxmon.ConfirmPostpone:
+			message = fmt.Sprintf("Pending rotation for %s postponed by %d minutes", agentID, postponeMinutes)
+		}
+	}
+	result := &ConfirmRotationResult{
+		AgentID:  agentID,
+		Action:   action,
+		Success:  rotation.Success,
+		Message:  message,
+		Rotation: &rotation,
+	}
+	if pending, err := ctxmon.GetPendingRotationByID(agentID); err == nil && pending != nil {
+		result.RetryRequired = pending.ExecutionState == ctxmon.RotationStateFailed || pending.ExecutionState == ctxmon.RotationStateInProgress
+	}
+	if IsJSONOutput() {
+		if err := json.NewEncoder(cmd.OutOrStdout()).Encode(result); err != nil {
+			return err
+		}
+	} else if err := result.Text(cmd.OutOrStdout()); err != nil {
 		return err
 	}
-
-	if pending == nil {
-		result := &ConfirmRotationResult{
-			AgentID: agentID,
-			Action:  action,
-			Success: false,
-			Message: fmt.Sprintf("No pending rotation found for agent %s", agentID),
-		}
-		formatter := output.New(output.WithJSON(jsonOutput))
-		if encErr := formatter.Output(result); encErr != nil {
-			return encErr
-		}
-		// bd-usgfy: signal non-zero exit after writing the success:false envelope so
-		// `ntm rotate-context --json` automation can gate on $? (parity with #125).
+	if !result.Success {
 		return jsonFailureExit()
 	}
-
-	var resultMsg string
-
-	switch confirmAction {
-	case ctxmon.ConfirmRotate:
-		// For rotate, we need to actually trigger the rotation
-		// This is complex because we need access to the Rotator
-		// For CLI, we'll remove the pending and let the user know they need to manually rotate
-		if err := ctxmon.RemovePendingRotation(agentID); err != nil {
-			return err
-		}
-		resultMsg = fmt.Sprintf("Pending rotation for %s confirmed for rotation. The agent will be rotated on next check.", agentID)
-
-	case ctxmon.ConfirmCompact:
-		// Remove pending and advise to use compaction
-		if err := ctxmon.RemovePendingRotation(agentID); err != nil {
-			return err
-		}
-		resultMsg = fmt.Sprintf("Pending rotation for %s removed. Compaction will be attempted on next check.", agentID)
-
-	case ctxmon.ConfirmIgnore:
-		// Simply remove the pending rotation
-		if err := ctxmon.RemovePendingRotation(agentID); err != nil {
-			return err
-		}
-		resultMsg = fmt.Sprintf("Pending rotation for %s cancelled", agentID)
-
-	case ctxmon.ConfirmPostpone:
-		// Update the timeout
-		pending.TimeoutAt = pending.TimeoutAt.Add(time.Duration(postponeMinutes) * time.Minute)
-		if err := ctxmon.AddPendingRotation(pending); err != nil {
-			return err
-		}
-		resultMsg = fmt.Sprintf("Pending rotation for %s postponed by %d minutes", agentID, postponeMinutes)
-	}
-
-	result := &ConfirmRotationResult{
-		AgentID: agentID,
-		Action:  action,
-		Success: true,
-		Message: resultMsg,
-	}
-
-	formatter := output.New(output.WithJSON(jsonOutput))
-	return formatter.Output(result)
+	return nil
 }

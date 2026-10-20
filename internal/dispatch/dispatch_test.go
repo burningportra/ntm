@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -368,7 +367,10 @@ func TestPrepareBuildsThenRedactsEveryFinalMessageBeforeDelivery(t *testing.T) {
 	}
 }
 
-func TestPrepareRejectsGrokBeforePromptPipelineForSubmitAndStageOnly(t *testing.T) {
+// TestPrepareAcceptsGrokInMixedBatch replaces the phase-one refusal test:
+// after GH#251 phase 2, a mixed batch containing a Grok Build pane flows
+// through the full prompt pipeline and delivers to every pane, grok included.
+func TestPrepareAcceptsGrokInMixedBatch(t *testing.T) {
 	t.Parallel()
 	panes := []tmux.Pane{
 		testPane("%1", 0, 0, tmux.AgentClaude, ""),
@@ -376,56 +378,54 @@ func TestPrepareRejectsGrokBeforePromptPipelineForSubmitAndStageOnly(t *testing.
 		testPane("%3", 0, 2, tmux.AgentCodex, ""),
 	}
 
-	for _, submit := range []bool{true, false} {
-		submit := submit
-		name := "stage_only"
-		if submit {
-			name = "submit"
-		}
-		t.Run(name, func(t *testing.T) {
-			var built, redacted, planned, delivered int
-			service, err := NewService(Ports{
-				Builder: FinalMessageBuilderFunc(func(_ context.Context, in BuildInput) (string, error) {
-					built++
-					return in.BaseMessage, nil
-				}),
-				Redactor: FinalMessageRedactorFunc(func(_ context.Context, _ Target, message string) (RedactionResult, error) {
-					redacted++
-					return RedactionResult{Message: message}, nil
-				}),
-				Protocols: ProtocolPlannerFunc(func(_ context.Context, _ Target, _ bool) (ProtocolPlan, error) {
-					planned++
-					return ProtocolPlan{Protocol: ProtocolStageOnly}, nil
-				}),
-				Deliverer: DelivererFunc(func(context.Context, Delivery) error {
-					delivered++
-					return nil
-				}),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
+	var built, redacted, planned, delivered int
+	var deliveredTypes []tmux.AgentType
+	service, err := NewService(Ports{
+		Builder: FinalMessageBuilderFunc(func(_ context.Context, in BuildInput) (string, error) {
+			built++
+			return in.BaseMessage, nil
+		}),
+		Redactor: FinalMessageRedactorFunc(func(_ context.Context, _ Target, message string) (RedactionResult, error) {
+			redacted++
+			return RedactionResult{Message: message}, nil
+		}),
+		Protocols: ProtocolPlannerFunc(func(_ context.Context, _ Target, _ bool) (ProtocolPlan, error) {
+			planned++
+			return ProtocolPlan{Protocol: ProtocolStageOnly}, nil
+		}),
+		Deliverer: DelivererFunc(func(_ context.Context, delivery Delivery) error {
+			delivered++
+			deliveredTypes = append(deliveredTypes, delivery.Target.AgentType.Canonical())
+			return nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			result, err := service.Execute(context.Background(), Request{
-				Session: "proj",
-				Panes:   panes,
-				Message: "work",
-				Submit:  submit,
-			})
-			dispatchErr := requireCode(t, err, ErrPromptDeliveryUnsupported)
-			if !errors.Is(err, agent.ErrAutomatedPromptDeliveryNotImplemented) {
-				t.Fatalf("error = %v, want shared prompt-delivery sentinel", err)
-			}
-			if dispatchErr.Target == nil || dispatchErr.Target.AgentType.Canonical() != tmux.AgentGrok || dispatchErr.Target.Address != "1" {
-				t.Fatalf("unsupported target = %+v, want Grok address 1", dispatchErr.Target)
-			}
-			if built != 0 || redacted != 0 || planned != 0 || delivered != 0 {
-				t.Fatalf("prompt pipeline calls = build:%d redact:%d protocol:%d deliver:%d, want all zero", built, redacted, planned, delivered)
-			}
-			if result.Delivered != 0 || len(result.Targets) != 0 || len(result.Receipts) != 0 {
-				t.Fatalf("rejected mixed request result = %+v", result)
-			}
-		})
+	result, err := service.Execute(context.Background(), Request{
+		Session: "proj",
+		Panes:   panes,
+		Message: "work",
+		Submit:  false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want nil (grok delivery supported in phase 2)", err)
+	}
+	if delivered != 3 || built != 3 || redacted != 3 || planned != 3 {
+		t.Fatalf("prompt pipeline calls = build:%d redact:%d protocol:%d deliver:%d, want 3 each", built, redacted, planned, delivered)
+	}
+	grokDelivered := false
+	for _, at := range deliveredTypes {
+		if at == tmux.AgentGrok {
+			grokDelivered = true
+		}
+	}
+	if !grokDelivered {
+		t.Fatalf("delivered agent types = %v, want to include grok", deliveredTypes)
+	}
+	if result.Delivered != 3 {
+		t.Fatalf("result.Delivered = %d, want 3", result.Delivered)
 	}
 }
 
@@ -1164,19 +1164,28 @@ func TestLifecycleFailureAbortsBeforeActuationAndFinishesOnce(t *testing.T) {
 	}
 }
 
-func TestTMUXDelivererRejectsInvalidOrUnrepresentableDoubleEnterPlans(t *testing.T) {
+func TestTMUXDelivererRejectsInvalidOrUnrepresentableProtocols(t *testing.T) {
 	t.Parallel()
 	deliverer := TMUXDeliverer{}
 	target := targetFromPane(testPane("%1", 0, 0, tmux.AgentClaude, ""), false)
-	err := deliverer.Deliver(context.Background(), Delivery{Target: target, Protocol: DeliveryProtocol("triple_enter")})
-	if err == nil || !strings.Contains(err.Error(), "unsupported delivery protocol") {
-		t.Fatalf("invalid protocol error = %v", err)
-	}
-	err = deliverer.Deliver(context.Background(), Delivery{
-		Target: target, Protocol: ProtocolDoubleEnter, EnterDelay: time.Millisecond, SecondEnterDelay: time.Millisecond,
-	})
-	if err == nil || !strings.Contains(err.Error(), "requires delays") {
-		t.Fatalf("custom double-enter timing error = %v", err)
+	for _, tc := range []struct {
+		name     string
+		delivery Delivery
+		want     string
+	}{
+		{name: "unknown protocol", delivery: Delivery{Protocol: DeliveryProtocol("triple_enter")}, want: "unsupported delivery protocol"},
+		{name: "negative delay", delivery: Delivery{Protocol: ProtocolSingleEnter, EnterDelay: -time.Millisecond}, want: "cannot be negative"},
+		{name: "stage-only delay", delivery: Delivery{Protocol: ProtocolStageOnly, EnterDelay: time.Millisecond}, want: "cannot include enter delays"},
+		{name: "single-enter second delay", delivery: Delivery{Protocol: ProtocolSingleEnter, SecondEnterDelay: time.Millisecond}, want: "cannot include a second-enter delay"},
+		{name: "custom double-enter timing", delivery: Delivery{Protocol: ProtocolDoubleEnter, EnterDelay: time.Millisecond, SecondEnterDelay: time.Millisecond}, want: "requires delays"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.delivery.Target = target
+			err := deliverer.Deliver(context.Background(), tc.delivery)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Deliver() error = %v, want substring %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -1231,5 +1240,77 @@ func TestRefuseDeadAgentPane(t *testing.T) {
 	}
 	if err := RefuseDeadAgentPane(tmux.Pane{Type: tmux.AgentUser, Command: "zsh"}); err != nil {
 		t.Fatalf("user pane refused: %v", err)
+	}
+}
+
+// TestPreActuationRefusalsAreMarkedRetryable pins ntm#294: every refusal the
+// tmux deliverer raises before the first keystroke must carry the
+// no-actuation mark, so a caller behind a durable idempotency barrier can
+// retry it instead of permanently failing the assignment.
+func TestPreActuationRefusalsAreMarkedRetryable(t *testing.T) {
+	marked := GuaranteeNoDeliveryActuation(errors.New("composer not ready"))
+	if !IsGuaranteedNoDeliveryActuation(marked) {
+		t.Fatal("marked error did not report as pre-actuation")
+	}
+	if !errors.Is(fmt.Errorf("wrapped: %w", marked), marked) {
+		t.Fatal("the mark must survive wrapping")
+	}
+	if IsGuaranteedNoDeliveryActuation(errors.New("delivery outcome unknown")) {
+		t.Fatal("an unmarked error must stay outcome-unknown")
+	}
+	if GuaranteeNoDeliveryActuation(nil) != nil {
+		t.Fatal("marking nil must stay nil")
+	}
+
+	// A dead agent pane is refused before any keystroke.
+	err := TMUXDeliverer{}.Deliver(context.Background(), Delivery{
+		Protocol: ProtocolSingleEnter,
+		Session:  "s",
+		Target: Target{
+			AgentType: tmux.AgentClaude,
+			Pane:      tmux.Pane{ID: "%1", Type: tmux.AgentClaude, Title: "claude", Command: "zsh"},
+		},
+		Message: "work",
+	})
+	if err == nil {
+		t.Fatal("delivery to a dead agent pane must be refused")
+	}
+	if !IsGuaranteedNoDeliveryActuation(err) {
+		t.Fatalf("dead-agent refusal is pre-actuation but was not marked: %v", err)
+	}
+
+	// An unsupported protocol is rejected before any keystroke too.
+	err = TMUXDeliverer{}.Deliver(context.Background(), Delivery{Protocol: "nonsense", Session: "s"})
+	if err == nil || !IsGuaranteedNoDeliveryActuation(err) {
+		t.Fatalf("protocol validation refusal = %v, want a marked pre-actuation error", err)
+	}
+}
+
+// TestComposerBlockerDetailIsTyped pins the typed reason ntm#300 asked for:
+// "composer still holds text" could not distinguish ordinary stranded input
+// from queued messages from a pane parked on a modal.
+func TestComposerBlockerDetailIsTyped(t *testing.T) {
+	modal := composerBlockerDetail(tmux.ComposerClearResult{Blocker: tmux.ComposerBlockerModal, Rounds: 1})
+	if !strings.Contains(modal, "dialog or picker") {
+		t.Fatalf("modal detail = %q", modal)
+	}
+	queued := composerBlockerDetail(tmux.ComposerClearResult{Blocker: tmux.ComposerBlockerQueued, Rounds: 4})
+	if !strings.Contains(queued, "queued messages") || !strings.Contains(queued, "4 clear rounds") {
+		t.Fatalf("queued detail = %q", queued)
+	}
+	input := composerBlockerDetail(tmux.ComposerClearResult{
+		Blocker: tmux.ComposerBlockerInput, Rounds: 4, Residual: "stranded prompt text",
+	})
+	if !strings.Contains(input, "stranded prompt text") || !strings.Contains(input, "4 clear rounds") {
+		t.Fatalf("input detail = %q", input)
+	}
+	if got := composerBlockerDetail(tmux.ComposerClearResult{Blocker: tmux.ComposerBlockerInput, Rounds: 2}); !strings.Contains(got, "2 clear rounds") {
+		t.Fatalf("input detail without residual = %q", got)
+	}
+	long := composerBlockerDetail(tmux.ComposerClearResult{
+		Blocker: tmux.ComposerBlockerInput, Rounds: 4, Residual: strings.Repeat("x", 400),
+	})
+	if !strings.Contains(long, "…") || len(long) > 260 {
+		t.Fatalf("long residual was not truncated: %d bytes", len(long))
 	}
 }

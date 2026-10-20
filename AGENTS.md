@@ -10,6 +10,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -85,10 +107,19 @@ make build-all
 
 Create releases exclusively with DSR. Do not use or dispatch GitHub Actions for releases, and do not fall back to manual `gh release create` publication.
 
+**Step 0 — release-artifact pre-flight (mandatory, run BEFORE DSR publishes anything):**
+
+```bash
+bash scripts/release_preflight.sh vX.Y.Z
+```
+
+It verifies every deliverable declared in `release_artifacts.toml` is present and version-locked to the tag (binary stamp, install.sh contract, VERSION file, VSCode extension vsix), and FAILS if a buildable deliverable directory (`web/`, `vscode/`) has no manifest entry — finished-but-never-shipped is not allowed (WS0-G4, bd-ws0-guards-klz98.5). Do not publish on a red pre-flight; fix the drift (or register/defer the artifact bead-first in the manifest) and re-run. The vscode-extension probe runs `scripts/build_vsix.sh`, which leaves `vscode/dist/ntm-vscode-<version>.vsix` behind — **attach that file to the DSR release as an asset** (F2, bd-ws5-ship-or-cut-jv0rc.2; marketplace publishing stays deferred per the Q1 ledger entry — install is `code --install-extension`, see `vscode/README.md`).
+
 After creating a new release with DSR:
 
 1. **Verify install script works**: `curl -fsSL ".../install.sh" | bash -s -- --version=vX.Y.Z --dir=/tmp/test --no-shell`
 2. **Check flywheel setup checksums**: If `install.sh` content changed, update the SHA256 in `/dp/agentic_coding_flywheel_setup/checksums.yaml` under the `ntm:` entry. If `install.sh` was not modified, no update is needed (the checksum pins the installer script, not the release binaries).
+3. **Update the Homebrew tap** (`Dicklesworthstone/homebrew-tap`, `Casks/ntm.rb` — hand-maintained since goreleaser retirement): bump `version` and all four `sha256` values (darwin/linux × amd64/arm64, hashes from the release's `SHA256SUMS`). Releases v1.23–v1.26 skipped this step and the advertised `brew install dicklesworthstone/tap/ntm` silently served a 5-release-old binary (bd-o82m7) — do not repeat that.
 
 ### Logging & Console Output
 
@@ -119,6 +150,15 @@ If you want to change something or add a feature, **revise existing code files i
 - `robot_enhanced.go`
 
 New files are reserved for **genuinely new functionality** that makes zero sense to include in any existing file. The bar for creating new files is **incredibly high**.
+
+### ADR: One Reachable Implementation (ORI)
+
+A capability may have **at most one implementation reachable from `cmd/ntm`**.
+
+- Any PR that lands an engine must, **in the same PR**, land the user surface (CLI/robot/serve) and an E2E or behavioral test exercising the feature **through that surface**. Surface-first; engine-only PRs do not merge.
+- A second implementation of an existing capability may only merge if the same PR **deletes or subsumes the first**.
+
+Enforcement is mechanical, not aspirational: the G1 dead-code gate (`scripts/guards/deadcode_gate.sh`, allowlist `ci/allowlists/deadcode.txt`) fails CI on any function unreachable from the `cmd/ntm` call graph — "impressive but unreachable" is a build failure, not an audit finding. (Adopted via WS0-G7, bd-ws0-guards-klz98.8; context: five separate engines were built, unit-tested, and never wired to any user surface.)
 
 ---
 
@@ -224,7 +264,6 @@ ntm/
 │   ├── swarm/              # Swarm coordination
 │   ├── coordinator/        # Agent coordination logic
 │   ├── assign/             # Task assignment engine
-│   ├── scheduler/          # Task scheduling
 │   ├── pipeline/           # Execution pipeline
 │   ├── context/            # Context window tracking
 │   ├── checkpoint/         # Session checkpoint/restore
@@ -246,7 +285,6 @@ ntm/
 │   ├── git/                # Git operations
 │   ├── audit/              # Audit logging
 │   ├── auth/               # Authentication
-│   ├── scoring/            # Agent scoring
 │   ├── watcher/            # File/process watching
 │   ├── webhook/            # Webhook dispatch
 │   ├── workflow/           # Workflow definitions
@@ -322,6 +360,7 @@ Robot command outputs follow consistent semantics for absent, null, and empty fi
 | Flag | Description | Example |
 |------|-------------|---------|
 | `--robot-send=SESSION` | Send message to panes | `ntm --robot-send=proj --msg='Fix auth' --type=claude` |
+| `--robot-send-receipt=OP_ID` | Query durable receipt of an idempotent send | `ntm --robot-send-receipt=deploy-42` |
 | `--robot-ack=SESSION` | Watch for agent responses | `ntm --robot-ack=proj --ack-timeout=30s` |
 | `--robot-spawn=SESSION` | Create session with agents | `ntm --robot-spawn=proj --spawn-cc=2 --spawn-wait` |
 | `--robot-interrupt=SESSION` | Send Ctrl+C, optionally new task | `ntm --robot-interrupt=proj --interrupt-msg='Stop'` |
@@ -335,6 +374,8 @@ Robot command outputs follow consistent semantics for absent, null, and empty fi
 | `--type` | - | `--robot-send`, `--robot-ack`, `--robot-interrupt` | Agent type: claude\|cc, codex\|cod, antigravity\|agy, gemini\|gmi, pi, kimi, muse |
 | `--all` | - | `--robot-send`, `--robot-interrupt` | Include user pane |
 | `--track` | - | `--robot-send` | Combined send+ack mode |
+| `--op-id` | - | `--robot-send` | Durable idempotent operation ID: identical retries replay the recorded outcome; conflicting reuse errors `IDEMPOTENCY_CONFLICT`; receipts queryable via `--robot-send-receipt` |
+| `--with-memory` | - | `--robot-send` | Inject relevant CM (cass-memory) rules above the message before sending; enrichment only, never a gate -- an unavailable cm records a skip on the envelope and still sends. Config: `[memory]` send_injection/send_max_rules/send_budget_tokens |
 | `--lines` | - | `--robot-tail` | Lines per pane (default 20) |
 | `--since` | - | `--robot-snapshot` | RFC3339 timestamp for delta; reads the durable attention feed, so it needs the runtime projection store (errors `NOT_IMPLEMENTED` without one) and only returns events still inside the retention window |
 
@@ -921,3 +962,5 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 ## Note on Built-in TODO Functionality
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
+
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "ntm-agent (+https://github.com/Dicklesworthstone/ntm)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

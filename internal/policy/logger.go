@@ -1,11 +1,11 @@
 package policy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
@@ -24,13 +24,6 @@ type BlockedEntry struct {
 	Action    Action    `json:"action"` // block or approve (for logged approvals)
 }
 
-// BlockedLogger writes blocked command events to a JSONL file.
-type BlockedLogger struct {
-	path string
-	mu   sync.Mutex
-	file *os.File
-}
-
 // defaultBlockedLogPath returns the default blocked log path in the user's home directory.
 func defaultBlockedLogPath() string {
 	home, err := os.UserHomeDir()
@@ -39,81 +32,6 @@ func defaultBlockedLogPath() string {
 		return DefaultBlockedLogSubPath
 	}
 	return filepath.Join(home, DefaultBlockedLogSubPath)
-}
-
-// NewBlockedLogger creates a new blocked command logger.
-func NewBlockedLogger(path string) (*BlockedLogger, error) {
-	if path == "" {
-		path = defaultBlockedLogPath()
-	}
-
-	// Ensure directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("creating log directory: %w", err)
-	}
-
-	// Open file for appending
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("opening log file: %w", err)
-	}
-
-	return &BlockedLogger{
-		path: path,
-		file: f,
-	}, nil
-}
-
-// Log writes a blocked command entry to the log.
-func (l *BlockedLogger) Log(entry *BlockedEntry) error {
-	if l == nil || l.file == nil {
-		return nil
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if entry.Timestamp.IsZero() {
-		entry.Timestamp = time.Now()
-	}
-
-	data, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("marshaling entry: %w", err)
-	}
-
-	if _, err := l.file.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("writing entry: %w", err)
-	}
-
-	return nil
-}
-
-// LogBlocked is a convenience method to log a blocked command.
-func (l *BlockedLogger) LogBlocked(session, agent, command, pattern, reason string) error {
-	return l.Log(&BlockedEntry{
-		Timestamp: time.Now(),
-		Session:   session,
-		Agent:     agent,
-		Command:   command,
-		Pattern:   pattern,
-		Reason:    reason,
-		Action:    ActionBlock,
-	})
-}
-
-// Close closes the log file.
-func (l *BlockedLogger) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.file != nil {
-		err := l.file.Close()
-		l.file = nil
-		return err
-	}
-	return nil
 }
 
 // ReadBlockedLog reads all entries from a blocked log file.
@@ -130,17 +48,35 @@ func ReadBlockedLog(path string) ([]BlockedEntry, error) {
 		return nil, fmt.Errorf("reading log file: %w", err)
 	}
 
+	// Entries are one JSON object per line. The shell hooks that wrote this
+	// log before bd-cl6me used `jq -n` without -c, which pretty-prints one
+	// object over several lines; those are collected until they parse. A line
+	// that parses on its own always starts a fresh entry, so a malformed line
+	// cannot swallow the entries after it.
 	var entries []BlockedEntry
-	lines := splitLines(data)
-	for _, line := range lines {
-		if len(line) == 0 {
+	var pending []byte
+	for _, line := range splitLines(data) {
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var entry BlockedEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
+		if json.Unmarshal(line, &entry) == nil {
+			entries = append(entries, entry)
+			pending = nil
+			continue
+		}
+		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("{")) {
+			pending = append([]byte(nil), line...)
+			continue
+		}
+		if pending == nil {
 			continue // Skip malformed entries
 		}
-		entries = append(entries, entry)
+		pending = append(append(pending, '\n'), line...)
+		if json.Unmarshal(pending, &entry) == nil {
+			entries = append(entries, entry)
+			pending = nil
+		}
 	}
 
 	return entries, nil
@@ -160,6 +96,30 @@ func splitLines(data []byte) [][]byte {
 		lines = append(lines, data[start:])
 	}
 	return lines
+}
+
+// AppendBlocked adds one entry to a blocked log file (the default path when
+// path is empty), creating the file and its directory as needed.
+func AppendBlocked(path string, entry BlockedEntry) error {
+	if path == "" {
+		path = defaultBlockedLogPath()
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("creating log directory: %w", err)
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("encoding blocked entry: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("opening log file: %w", err)
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("writing log file: %w", err)
+	}
+	return f.Close()
 }
 
 // RecentBlocked returns blocked entries from the last n hours.

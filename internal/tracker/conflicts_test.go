@@ -281,6 +281,11 @@ func TestDetectConflicts_DeterministicOrder(t *testing.T) {
 
 func TestDetectConflictsRecent(t *testing.T) {
 	// Not parallel: modifies package-level GlobalFileChanges
+	// These exercise the in-memory fallback: the accessors prefer the durable
+	// cross-process ledger, so a test that seeds only the ring must stand in a
+	// process whose ledger is unreachable.
+	installFakeBackend(t).queryErr = errFakeBackend
+
 	origStore := GlobalFileChanges
 	store := NewFileChangeStore(100)
 	GlobalFileChanges = store
@@ -289,13 +294,13 @@ func TestDetectConflictsRecent(t *testing.T) {
 	now := time.Now()
 
 	// Record changes from two agents within the last 5 minutes
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-3 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a1"},
 		Change:    FileChange{Path: "/src/main.go", Type: FileModified},
 	})
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-2 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a2"},
@@ -313,6 +318,11 @@ func TestDetectConflictsRecent(t *testing.T) {
 }
 
 func TestDetectConflictsRecent_NoConflicts(t *testing.T) {
+	// These exercise the in-memory fallback: the accessors prefer the durable
+	// cross-process ledger, so a test that seeds only the ring must stand in a
+	// process whose ledger is unreachable.
+	installFakeBackend(t).queryErr = errFakeBackend
+
 	origStore := GlobalFileChanges
 	store := NewFileChangeStore(100)
 	GlobalFileChanges = store
@@ -321,7 +331,7 @@ func TestDetectConflictsRecent_NoConflicts(t *testing.T) {
 	now := time.Now()
 
 	// Single agent - no conflict
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-1 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a1"},
@@ -335,6 +345,11 @@ func TestDetectConflictsRecent_NoConflicts(t *testing.T) {
 }
 
 func TestConflictsSince(t *testing.T) {
+	// These exercise the in-memory fallback: the accessors prefer the durable
+	// cross-process ledger, so a test that seeds only the ring must stand in a
+	// process whose ledger is unreachable.
+	installFakeBackend(t).queryErr = errFakeBackend
+
 	origStore := GlobalFileChanges
 	store := NewFileChangeStore(100)
 	GlobalFileChanges = store
@@ -342,19 +357,19 @@ func TestConflictsSince(t *testing.T) {
 
 	now := time.Now()
 
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-5 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a1"},
 		Change:    FileChange{Path: "/src/api.go", Type: FileModified},
 	})
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-3 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a2"},
 		Change:    FileChange{Path: "/src/api.go", Type: FileModified},
 	})
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-2 * time.Minute),
 		Session:   "s2",
 		Agents:    []string{"a3"},
@@ -372,6 +387,11 @@ func TestConflictsSince(t *testing.T) {
 }
 
 func TestConflictsSince_EmptySession(t *testing.T) {
+	// These exercise the in-memory fallback: the accessors prefer the durable
+	// cross-process ledger, so a test that seeds only the ring must stand in a
+	// process whose ledger is unreachable.
+	installFakeBackend(t).queryErr = errFakeBackend
+
 	origStore := GlobalFileChanges
 	store := NewFileChangeStore(100)
 	GlobalFileChanges = store
@@ -379,13 +399,13 @@ func TestConflictsSince_EmptySession(t *testing.T) {
 
 	now := time.Now()
 
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-3 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a1"},
 		Change:    FileChange{Path: "/src/api.go", Type: FileModified},
 	})
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-2 * time.Minute),
 		Session:   "s2",
 		Agents:    []string{"a2"},
@@ -407,6 +427,11 @@ func TestConflictsSince_EmptySession(t *testing.T) {
 // =============================================================================
 
 func TestRecordedChangesSince(t *testing.T) {
+	// These exercise the in-memory fallback: the accessors prefer the durable
+	// cross-process ledger, so a test that seeds only the ring must stand in a
+	// process whose ledger is unreachable.
+	installFakeBackend(t).queryErr = errFakeBackend
+
 	origStore := GlobalFileChanges
 	store := NewFileChangeStore(100)
 	GlobalFileChanges = store
@@ -414,13 +439,13 @@ func TestRecordedChangesSince(t *testing.T) {
 
 	now := time.Now()
 
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-10 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a1"},
 		Change:    FileChange{Path: "/old.go", Type: FileModified},
 	})
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-1 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a2"},
@@ -437,6 +462,11 @@ func TestRecordedChangesSince(t *testing.T) {
 }
 
 func TestRecordedChanges(t *testing.T) {
+	// These exercise the in-memory fallback: the accessors prefer the durable
+	// cross-process ledger, so a test that seeds only the ring must stand in a
+	// process whose ledger is unreachable.
+	installFakeBackend(t).queryErr = errFakeBackend
+
 	origStore := GlobalFileChanges
 	store := NewFileChangeStore(100)
 	GlobalFileChanges = store
@@ -444,13 +474,13 @@ func TestRecordedChanges(t *testing.T) {
 
 	now := time.Now()
 
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-5 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a1"},
 		Change:    FileChange{Path: "/file1.go", Type: FileModified},
 	})
-	store.Add(RecordedFileChange{
+	populateStore(store, RecordedFileChange{
 		Timestamp: now.Add(-1 * time.Minute),
 		Session:   "s1",
 		Agents:    []string{"a2"},
@@ -464,6 +494,11 @@ func TestRecordedChanges(t *testing.T) {
 }
 
 func TestRecordedChanges_Empty(t *testing.T) {
+	// These exercise the in-memory fallback: the accessors prefer the durable
+	// cross-process ledger, so a test that seeds only the ring must stand in a
+	// process whose ledger is unreachable.
+	installFakeBackend(t).queryErr = errFakeBackend
+
 	origStore := GlobalFileChanges
 	store := NewFileChangeStore(100)
 	GlobalFileChanges = store

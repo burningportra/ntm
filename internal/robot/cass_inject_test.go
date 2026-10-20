@@ -297,30 +297,6 @@ func TestQueryCASS_EmptyKeywords(t *testing.T) {
 	}
 }
 
-func TestItoa(t *testing.T) {
-	tests := []struct {
-		input int
-		want  string
-	}{
-		{0, "0"},
-		{1, "1"},
-		{10, "10"},
-		{100, "100"},
-		{-1, "-1"},
-		{-100, "-100"},
-		{12345, "12345"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.want, func(t *testing.T) {
-			got := itoa(tt.input)
-			if got != tt.want {
-				t.Errorf("itoa(%d) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
-	}
-}
-
 // =============================================================================
 // Relevance Filtering Tests
 // =============================================================================
@@ -568,20 +544,34 @@ func TestIsSameProject(t *testing.T) {
 func TestNormalizeScore(t *testing.T) {
 	tests := []struct {
 		input float64
+		best  float64
 		want  float64
 	}{
-		{0.5, 0.5},   // Already 0-1 scale
-		{1.0, 1.0},   // Already 0-1 scale
-		{50.0, 0.5},  // 0-100 scale
-		{100.0, 1.0}, // 0-100 scale
-		{0.0, 0.0},   // Zero
+		{1.0 / 61, 1.0 / 61, 1.0}, // best hybrid hit
+		{50.0, 100.0, 0.5},        // half the best BM25 score
+		{0.25, 0.5, 0.5},          // half the best similarity
+		{0.0, 1.0, 0.0},           // unscored
+		{0.5, 0.0, 0.0},           // no best score
 	}
 
 	for _, tt := range tests {
-		got := normalizeScore(tt.input)
-		if got != tt.want {
-			t.Errorf("normalizeScore(%f) = %f, want %f", tt.input, got, tt.want)
+		got := normalizeScore(tt.input, tt.best)
+		if diff := got - tt.want; diff < -0.001 || diff > 0.001 {
+			t.Errorf("normalizeScore(%f, %f) = %f, want %f", tt.input, tt.best, got, tt.want)
 		}
+	}
+}
+
+// The robot engine's default filter (MinRelevance 0.7) must keep hits from
+// cass's default hybrid search, whose fused scores are ~1/(61+rank).
+func TestFilterResultsKeepsHybridSearchHits(t *testing.T) {
+	hits := []CASSHit{
+		{SourcePath: "/s/a.jsonl", Score: 1.0 / 61},
+		{SourcePath: "/s/b.jsonl", Score: 1.0 / 62},
+	}
+	got := FilterResults(hits, DefaultFilterConfig())
+	if len(got.Hits) != 2 || got.RemovedByScore != 0 {
+		t.Fatalf("kept=%d removed_by_score=%d, want both hybrid hits kept", len(got.Hits), got.RemovedByScore)
 	}
 }
 
@@ -1305,6 +1295,7 @@ func TestInjectContextFromQuery_Disabled(t *testing.T) {
 
 	injectResult, queryResult, filterResult := InjectContextFromQuery(
 		"test prompt",
+		"test prompt",
 		queryConfig,
 		filterConfig,
 		injectConfig,
@@ -1323,6 +1314,17 @@ func TestInjectContextFromQuery_Disabled(t *testing.T) {
 	if injectResult.Metadata.ItemsInjected != 0 {
 		t.Errorf("ItemsInjected = %d, want 0", injectResult.Metadata.ItemsInjected)
 	}
+	// [cass] enabled=false + explicit --with-cass must record the honest
+	// reason: the query never ran, so "no relevant context found" is a lie.
+	if !strings.Contains(injectResult.Metadata.SkippedReason, "cass disabled") {
+		t.Errorf("SkippedReason = %q, want a 'cass disabled' reason", injectResult.Metadata.SkippedReason)
+	}
+	if injectResult.Metadata.Enabled {
+		t.Error("Metadata.Enabled = true, want false when cass is config-disabled")
+	}
+	if injectResult.ModifiedPrompt != "test prompt" {
+		t.Errorf("ModifiedPrompt = %q, want the prompt unchanged", injectResult.ModifiedPrompt)
+	}
 }
 
 func TestInjectContextFromQuery_WithPrompt(t *testing.T) {
@@ -1333,6 +1335,7 @@ func TestInjectContextFromQuery_WithPrompt(t *testing.T) {
 	// This will attempt to query CASS but likely won't find anything
 	// The test verifies the function handles this gracefully
 	injectResult, queryResult, filterResult := InjectContextFromQuery(
+		"how do I implement authentication",
 		"how do I implement authentication",
 		queryConfig,
 		filterConfig,
@@ -1812,26 +1815,5 @@ func TestFilterResults_TopicFiltering_GeneralTopicNoPenalty(t *testing.T) {
 	if len(result.Hits) > 0 && result.Hits[0].ScoreDetail.TopicMultiplier != 1.0 {
 		t.Errorf("TopicMultiplier = %f, want 1.0 (no penalty for general topic)",
 			result.Hits[0].ScoreDetail.TopicMultiplier)
-	}
-}
-
-func TestDefaultTopicFilterConfig(t *testing.T) {
-	config := DefaultTopicFilterConfig()
-
-	// Check defaults
-	if config.Enabled != false {
-		t.Errorf("Enabled = %v, want false (disabled by default)", config.Enabled)
-	}
-	if config.MatchTopics != true {
-		t.Errorf("MatchTopics = %v, want true", config.MatchTopics)
-	}
-	if config.SameTopicBoost != 1.5 {
-		t.Errorf("SameTopicBoost = %f, want 1.5", config.SameTopicBoost)
-	}
-	if config.DifferentTopicPenalty != 0.5 {
-		t.Errorf("DifferentTopicPenalty = %f, want 0.5", config.DifferentTopicPenalty)
-	}
-	if len(config.ExcludeTopics) != 0 {
-		t.Errorf("ExcludeTopics = %v, want empty", config.ExcludeTopics)
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard/panels"
@@ -812,20 +813,6 @@ func formatRelativeTime(d time.Duration) string {
 	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
-func formatDuration(d time.Duration) string {
-	if d <= 0 {
-		return "now"
-	}
-	d = d.Round(time.Second)
-	if d >= time.Hour {
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	}
-	if d >= time.Minute {
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	}
-	return fmt.Sprintf("%ds", int(d.Seconds()))
-}
-
 func (m Model) renderDiagnosticsBar(width int) string {
 	t := m.theme
 
@@ -1291,12 +1278,8 @@ func (m Model) renderHeaderContextWarningLine(width int) string {
 	return strings.Join(rendered, sep)
 }
 
+// formatPaneLabel derives the display label for a pane via the canonical
+// pane-title helper (internal/config/label.go, WS0-G6 single-definition contract).
 func formatPaneLabel(session string, pane tmux.Pane) string {
-	label := strings.TrimSpace(pane.Title)
-	prefix := session + "__"
-	label = strings.TrimPrefix(label, prefix)
-	if label == "" {
-		label = fmt.Sprintf("pane %d", pane.Index)
-	}
-	return label
+	return config.PaneDisplayLabel(session, pane.Title, pane.Index)
 }

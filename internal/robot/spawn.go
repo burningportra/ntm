@@ -4,64 +4,106 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/assign"
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
+	"github.com/Dicklesworthstone/ntm/internal/models"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/process"
+	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/recovery"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
-)
-
-var (
-	errGrokSpawnWaitUnavailable   = errors.New("--spawn-wait is not yet supported for Grok Build because its authenticated TUI readiness protocol has not been verified")
-	errGrokSpawnAssignUnavailable = errors.New("--spawn-assign-work is not yet supported for Grok Build because prompt delivery has not been verified")
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // SpawnOptions configures the robot-spawn operation.
 type SpawnOptions struct {
-	Session            string
-	Label              string        // Session label — constructs "{Session}--{Label}" if set
-	ConfigPath         string        // Selected global config used for authoritative assignment policy
-	RequireConfig      bool          // ConfigPath was explicitly selected and must exist
-	CCCount            int           // Claude agents
-	CodCount           int           // Codex agents
-	GmiCount           int           // Gemini agents
-	PiCount            int           // Pi agents
-	KimiCount          int           // Kimi agents
-	MuseCount          int           // Muse Code agents
-	AgyCount           int           // Antigravity agents
-	GrokCount          int           // Grok Build agents
-	Preset             string        // Recipe/preset name
-	NoUserPane         bool          // Don't create user pane
-	WorkingDir         string        // Override working directory
-	WaitReady          bool          // Wait for agents to be ready
-	ReadyTimeout       time.Duration // Timeout for ready detection
-	DryRun             bool          // Preview mode: show what would happen without executing
-	Safety             bool          // Fail if session already exists
-	AssignWork         bool          // Enable orchestrator work assignment mode
-	AssignStrategy     string        // Assignment strategy: top-n, diverse, dependency-aware, skill-matched
-	CustomNames        []string      // Custom agent names (used in order, then NATO alphabet)
-	RequireReservation bool
-	ReservationPaths   []string
-	AssignmentDeps     *SpawnAssignmentDependencies
-	LifecycleDeps      *SpawnLifecycleDependencies
+	Session       string
+	Label         string // Session label — constructs "{Session}--{Label}" if set
+	ConfigPath    string // Selected global config used for authoritative assignment policy
+	RequireConfig bool   // ConfigPath was explicitly selected and must exist
+	CCCount       int    // Claude agents
+	CodCount      int    // Codex agents
+	GmiCount      int    // Gemini agents
+	PiCount       int    // Pi agents
+	KimiCount     int    // Kimi agents
+	MuseCount     int    // Muse Code agents
+	AgyCount      int    // Antigravity agents
+	GrokCount     int    // Grok Build agents
+	OmpCount      int    // Oh My Pi (omp) agents
+	OcCount       int    // OpenCode (oc) agents
+	// Per-type model/effort overrides parsed from the CLI's
+	// `count[:model[:effort]]` spawn flag grammar (bd-rr8gn). Empty means the
+	// configured default. Efforts exist only for the agent types whose launch
+	// command has a reasoning-effort knob (cc/cod/grok/omp — see
+	// config.agentTypeConsumesReasoningEffort); agy's model is hard-pinned by
+	// config, so it carries no override fields at all.
+	CCModel             string        // Claude model alias/name override
+	CCReasoningEffort   string        // Claude reasoning-effort override
+	CodModel            string        // Codex model alias/name override
+	CodReasoningEffort  string        // Codex reasoning-effort override
+	GmiModel            string        // Gemini model alias/name override
+	GrokModel           string        // Grok Build model alias/name override
+	GrokReasoningEffort string        // Grok Build reasoning-effort override
+	OmpModel            string        // Oh My Pi model override (omp fuzzy-matches it); empty = omp's own default
+	OmpReasoningEffort  string        // Oh My Pi --thinking level override
+	OcModel             string        // OpenCode provider/model override; empty = OpenCode's own default (no effort knob: the TUI has no --variant)
+	Preset              string        // Recipe/preset name
+	NoUserPane          bool          // Don't create user pane
+	WorkingDir          string        // Override working directory
+	WaitReady           bool          // Wait for agents to be ready
+	ReadyTimeout        time.Duration // Timeout for ready detection
+	DryRun              bool          // Preview mode: show what would happen without executing
+	Safety              bool          // Fail if session already exists
+	AssignWork          bool          // Enable orchestrator work assignment mode
+	AssignStrategy      string        // Assignment strategy: top-n, diverse, dependency-aware, skill-matched
+	CustomNames         []string      // Custom agent names (used in order, then NATO alphabet)
+	RequireReservation  bool
+	ReservationPaths    []string
+	// Prompt is delivered to every spawned agent after the readiness wait
+	// (a non-blank Prompt implies WaitReady) through the canonical robot
+	// dispatch port. With AssignWork it prefixes each agent's work prompt
+	// instead: one atomic delivery, because a second back-to-back dispatch
+	// would be refused by the idle gate once the first prompt is running.
+	Prompt string
+	// StaggerMode/StaggerDelay pace prompt delivery (Prompt and AssignWork
+	// prompts) between agents, resolved by ResolveSpawnStagger exactly as
+	// `ntm spawn --stagger-mode/--stagger-delay`. Empty mode means none.
+	StaggerMode  string
+	StaggerDelay time.Duration
+	// PromptContext enriches each fresh AssignWork prompt with CASS history
+	// and CM rules, exactly as --robot-bulk-assign and ntm assign do, before
+	// the durable intent is recorded; a recorded intent is replayed verbatim.
+	PromptContext  PromptContextOptions
+	AssignmentDeps *SpawnAssignmentDependencies
+	LifecycleDeps  *SpawnLifecycleDependencies
 }
 
 // SpawnLifecycleDependencies exposes tmux lifecycle ports for deterministic
 // terminal-contract tests. Production callers leave this nil.
 type SpawnLifecycleDependencies struct {
+	// AcquireAdmission fences local count-capped spawns across processes. The
+	// release must tolerate repeated calls; GetSpawn also wraps injected ports.
+	AcquireAdmission func(context.Context) (func(), error)
 	IsTMUXInstalled  func() bool
 	GetAllPanes      func(context.Context) (map[string][]tmux.Pane, error)
 	SessionExists    func(context.Context, string) (bool, error)
@@ -71,10 +113,24 @@ type SpawnLifecycleDependencies struct {
 	ApplyTiledLayout func(context.Context, string) error
 	LaunchAgent      func(context.Context, tmux.Pane, string, string, int, string, string) (SpawnedAgent, error)
 	WaitForReady     func(context.Context, *SpawnOutput, time.Duration) error
+	// StartSessionMonitor is the shared manifest-writer + monitor-launcher
+	// port (resilience.StartSessionMonitor in production; WS0-G6 single
+	// code path with CLI spawn, bd-ws1-truth-safety-l5ddi.8).
+	StartSessionMonitor func(context.Context, resilience.SpawnMonitorRequest) (*resilience.SpawnMonitorResult, error)
+	// Now and Wait are the prompt-stagger clock: Now anchors and stamps the
+	// delivery schedule and Wait holds a slot until it is due. Tests inject a
+	// fake clock so paced delivery is asserted without real sleeps.
+	Now  func() time.Time
+	Wait func(context.Context, time.Duration) error
+	// LoadRateLimits loads the learned rate-limit history smart stagger reads.
+	LoadRateLimits func(dir string) (*ratelimit.RateLimitTracker, error)
 }
 
 // SpawnAssignmentDependencies exposes assignment side-effect ports for focused
 // tests while production uses the durable Beads, ledger, and dispatch services.
+// Its prompt-dispatch ports (ListPanes, ObserveSession, DispatchDeliverer,
+// DispatchPacer) also carry --spawn-prompt delivery, which uses the same
+// canonical dispatch port as work assignment.
 type SpawnAssignmentDependencies struct {
 	LoadAssignmentPolicy             func(string, string, bool) (*config.Config, error)
 	FetchActionable                  func(context.Context, string, int) ([]bv.TriageRecommendation, error)
@@ -122,9 +178,38 @@ type SpawnOutput struct {
 	Mode                string            `json:"mode,omitempty"`
 	Assignments         []SpawnAssignment `json:"assignments,omitempty"`
 	AssignStrategy      string            `json:"assign_strategy,omitempty"`
-	Recovery            *SpawnRecovery    `json:"recovery,omitempty"`
+	// Stagger is the prompt pacing plan, present whenever prompts are
+	// delivered (--spawn-prompt or --spawn-assign-work), including dry runs.
+	Stagger *SpawnStaggerPlan `json:"stagger,omitempty"`
+	// PromptDeliveries holds one --spawn-prompt outcome per agent in stagger
+	// order. With --spawn-assign-work the prompt rides inside each work
+	// prompt, so assignments[] carries the outcome instead.
+	PromptDeliveries []SpawnPromptDelivery `json:"prompt_deliveries,omitempty"`
+	Recovery         *SpawnRecovery        `json:"recovery,omitempty"`
+	// WorkSourceMismatch is the STALE_WORK_COORDINATION remediation receipt.
+	WorkSourceMismatch *worksource.StaleError `json:"work_source_mismatch,omitempty"`
 	// Admission is the pre-spawn resource-pressure admission result.
 	Admission *pressure.SpawnAdmission `json:"admission,omitempty"`
+	// MonitorStarted reports whether the resilience session monitor was
+	// launched for this spawn (bd-ws1-truth-safety-l5ddi.8). Monitor startup
+	// is best-effort: a false value never fails the spawn; MonitorError
+	// carries the cause and a degraded-event row is recorded.
+	MonitorStarted bool   `json:"monitor_started"`
+	MonitorError   string `json:"monitor_error,omitempty"`
+	MonitorPID     int    `json:"monitor_pid,omitempty"`
+	// ModelHints carries did-you-mean guidance for requested model overrides
+	// that do not resolve in the model registry (e.g. "claude-opus5" →
+	// "claude-opus-5"). Advisory only: unrecognized models still spawn, so
+	// custom/self-hosted model IDs keep working (bd-uh7la item 6).
+	ModelHints []string `json:"model_hints,omitempty"`
+	// AgentMail reports the Agent Mail identity provisioned for each agent
+	// pane immediately before its launch (the same coordinator and status
+	// object as `ntm spawn --json`): availability, project registration,
+	// registered/failed counts, and the %pane_id -> agent name map. Absent
+	// when registration is disabled ([agent_mail] enabled + auto_register)
+	// or no agent was launched. Agent Mail being unavailable never fails the
+	// spawn; it shows up here as available=false with agents_failed.
+	AgentMail *spawnidentity.AgentMailSpawnStatus `json:"agent_mail,omitempty"`
 }
 
 func setSpawnCancellation(output *SpawnOutput, err error) {
@@ -177,20 +262,25 @@ func validateSpawnRequest(opts SpawnOptions) (string, error) {
 		{flag: "--spawn-muse", value: opts.MuseCount},
 		{flag: "--spawn-agy", value: opts.AgyCount},
 		{flag: "--spawn-grok", value: opts.GrokCount},
+		{flag: "--spawn-omp", value: opts.OmpCount},
+		{flag: "--spawn-oc", value: opts.OcCount},
 	}
+	maxAgents := int(^uint(0) >> 1)
+	if !opts.NoUserPane {
+		maxAgents-- // Leave room for the user pane in totalPanes.
+	}
+	total := 0
 	for _, count := range counts {
 		if count.value < 0 {
 			return "", fmt.Errorf("%s must be zero or greater, got %d", count.flag, count.value)
 		}
+		if count.value > maxAgents-total {
+			return "", errors.New("requested agent count exceeds supported pane capacity")
+		}
+		total += count.value
 	}
-	if opts.CCCount+opts.CodCount+opts.GmiCount+opts.PiCount+opts.KimiCount+opts.MuseCount+opts.AgyCount+opts.GrokCount <= 0 {
-		return "", errors.New("no agents specified (use cc, cod, gmi, pi, kimi, muse, agy, or grok counts)")
-	}
-	if opts.GrokCount > 0 && opts.WaitReady {
-		return "", errGrokSpawnWaitUnavailable
-	}
-	if opts.GrokCount > 0 && opts.AssignWork {
-		return "", errGrokSpawnAssignUnavailable
+	if total == 0 {
+		return "", errors.New("no agents specified (use cc, cod, gmi, pi, kimi, muse, agy, grok, omp, or oc counts)")
 	}
 	if !opts.AssignWork {
 		return "", nil
@@ -202,41 +292,86 @@ func validateSpawnRequest(opts SpawnOptions) (string, error) {
 	return strategy, nil
 }
 
-func validateGrokSpawnPaneBaselines(panes []tmux.Pane, opts SpawnOptions) error {
-	if opts.GrokCount <= 0 {
-		return nil
+// validateSpawnStagger rejects an unsupported stagger mode or an out-of-range
+// stagger delay before any lifecycle side effect.
+func validateSpawnStagger(opts SpawnOptions) error {
+	if err := config.ValidateSpawnStaggerMode(opts.StaggerMode); err != nil {
+		return fmt.Errorf("--spawn-stagger-mode %w", err)
 	}
-	start := opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount
+	if err := config.ValidateSpawnStaggerDelay(opts.StaggerDelay); err != nil {
+		return fmt.Errorf("--spawn-stagger-delay %w", err)
+	}
+	return nil
+}
+
+// hasInitialPrompt reports whether a --spawn-prompt should be delivered.
+func (opts SpawnOptions) hasInitialPrompt() bool {
+	return strings.TrimSpace(opts.Prompt) != ""
+}
+
+// deliversPrompts reports whether the spawn delivers any prompt, and so
+// paces deliveries and reports a stagger plan.
+func (opts SpawnOptions) deliversPrompts() bool {
+	return opts.AssignWork || opts.hasInitialPrompt()
+}
+
+// composeSpawnWorkPrompt prefixes a work-assignment prompt with the initial
+// --spawn-prompt so both reach the agent in one paced, atomic delivery.
+func composeSpawnWorkPrompt(initialPrompt, workPrompt string) string {
+	if strings.TrimSpace(initialPrompt) == "" {
+		return workPrompt
+	}
+	return initialPrompt + "\n\n" + workPrompt
+}
+
+// spawnAgentPaneRange returns the first pane index agents occupy and how many
+// agent panes the request needs. Pane 0 is reserved for the user unless
+// NoUserPane is set; agents of every type follow it positionally.
+func spawnAgentPaneRange(opts SpawnOptions) (start, count int) {
 	if !opts.NoUserPane {
-		start++
+		start = 1
 	}
-	for i := 0; i < opts.GrokCount; i++ {
+	count = opts.totalAgentCount()
+	return start, count
+}
+
+// totalAgentCount is the number of agent panes a robot spawn requests across
+// every supported type.
+func (opts SpawnOptions) totalAgentCount() int {
+	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.MuseCount +
+		opts.AgyCount + opts.GrokCount + opts.OmpCount + opts.OcCount
+}
+
+// validateSpawnPaneBaselines preflights every agent pane of the final
+// topology, for every agent type, before any launch. A reused pane that is
+// already running a process would otherwise receive the launch command as
+// keystrokes while send-keys reports success (#291).
+func validateSpawnPaneBaselines(ctx context.Context, panes []tmux.Pane, opts SpawnOptions) error {
+	start, count := spawnAgentPaneRange(opts)
+	for i := 0; i < count; i++ {
 		paneIndex := start + i
 		if paneIndex >= len(panes) {
-			return fmt.Errorf("requested Grok Build pane %d is unavailable", i+1)
+			return fmt.Errorf("requested agent pane %d is unavailable", i+1)
 		}
-		if err := tmux.ValidatePaneLaunchBaseline(panes[paneIndex]); err != nil {
-			return fmt.Errorf("validate Grok Build agent %d: %w", i+1, err)
+		if err := tmux.ValidatePaneLaunchBaselineSettledContext(ctx, opts.Session, panes[paneIndex]); err != nil {
+			return fmt.Errorf("agent pane %d: %w", i+1, err)
 		}
 	}
 	return nil
 }
 
-func validateExistingGrokSpawnPaneBaselines(panes []tmux.Pane, opts SpawnOptions) error {
-	if opts.GrokCount <= 0 {
-		return nil
-	}
-	start := opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount
-	if !opts.NoUserPane {
-		start++
-	}
-	for i := 0; i < opts.GrokCount; i++ {
+// validateExistingSpawnPaneBaselines checks the panes an existing session
+// already has before any new panes are split, so an occupied target refuses
+// the spawn before the topology is mutated.
+func validateExistingSpawnPaneBaselines(ctx context.Context, panes []tmux.Pane, opts SpawnOptions) error {
+	start, count := spawnAgentPaneRange(opts)
+	for i := 0; i < count; i++ {
 		paneIndex := start + i
 		if paneIndex >= len(panes) {
 			break
 		}
-		if err := tmux.ValidatePaneLaunchBaseline(panes[paneIndex]); err != nil {
-			return fmt.Errorf("validate Grok Build agent %d: %w", i+1, err)
+		if err := tmux.ValidatePaneLaunchBaselineSettledContext(ctx, opts.Session, panes[paneIndex]); err != nil {
+			return fmt.Errorf("agent pane %d: %w", i+1, err)
 		}
 	}
 	return nil
@@ -244,18 +379,28 @@ func validateExistingGrokSpawnPaneBaselines(panes []tmux.Pane, opts SpawnOptions
 
 func spawnLifecycleDeps(custom *SpawnLifecycleDependencies) SpawnLifecycleDependencies {
 	deps := SpawnLifecycleDependencies{
-		IsTMUXInstalled:  tmux.IsInstalled,
-		GetAllPanes:      tmux.GetAllPanesContext,
-		SessionExists:    tmux.SessionExistsContext,
-		CreateSession:    tmux.CreateSessionWithHistoryLimitContext,
-		GetPanes:         tmux.GetPanesContext,
-		SplitWindow:      tmux.SplitWindowContext,
-		ApplyTiledLayout: tmux.ApplyTiledLayoutContext,
-		LaunchAgent:      launchAgent,
-		WaitForReady:     waitForAgentsReady,
+		AcquireAdmission:    acquireLocalSpawnAdmission,
+		IsTMUXInstalled:     tmux.IsInstalled,
+		GetAllPanes:         tmux.GetAllPanesContext,
+		SessionExists:       tmux.SessionExistsContext,
+		CreateSession:       tmux.CreateSessionWithHistoryLimitContext,
+		GetPanes:            tmux.GetPanesContext,
+		SplitWindow:         tmux.SplitWindowContext,
+		ApplyTiledLayout:    tmux.ApplyTiledLayoutContext,
+		LaunchAgent:         launchAgent,
+		WaitForReady:        waitForAgentsReady,
+		StartSessionMonitor: resilience.StartSessionMonitor,
+		Now:                 time.Now,
+		Wait: func(ctx context.Context, delay time.Duration) error {
+			return dispatchsvc.TimerPacer{}.Wait(ctx, dispatchsvc.Pace{Delay: delay})
+		},
+		LoadRateLimits: loadSpawnRateLimits,
 	}
 	if custom == nil {
 		return deps
+	}
+	if custom.AcquireAdmission != nil {
+		deps.AcquireAdmission = custom.AcquireAdmission
 	}
 	if custom.IsTMUXInstalled != nil {
 		deps.IsTMUXInstalled = custom.IsTMUXInstalled
@@ -284,6 +429,18 @@ func spawnLifecycleDeps(custom *SpawnLifecycleDependencies) SpawnLifecycleDepend
 	if custom.WaitForReady != nil {
 		deps.WaitForReady = custom.WaitForReady
 	}
+	if custom.StartSessionMonitor != nil {
+		deps.StartSessionMonitor = custom.StartSessionMonitor
+	}
+	if custom.Now != nil {
+		deps.Now = custom.Now
+	}
+	if custom.Wait != nil {
+		deps.Wait = custom.Wait
+	}
+	if custom.LoadRateLimits != nil {
+		deps.LoadRateLimits = custom.LoadRateLimits
+	}
 	return deps
 }
 
@@ -311,24 +468,42 @@ type SpawnAssignment struct {
 	IdempotencyKey    string `json:"idempotency_key,omitempty"`
 	DispatchReceiptID string `json:"dispatch_receipt_id,omitempty"`
 	ReservationIDs    []int  `json:"reservation_ids,omitempty"`
-	ClaimError        string `json:"claim_error,omitempty"`  // Error during claim, if any
-	PromptError       string `json:"prompt_error,omitempty"` // Error sending prompt, if any
+	ClaimError        string `json:"claim_error,omitempty"`   // Error during claim, if any
+	PromptError       string `json:"prompt_error,omitempty"`  // Error sending prompt, if any
+	AssignReason      string `json:"assign_reason,omitempty"` // Strategy rationale for this pairing (e.g. skill-matched capability score)
+	DeliveredAt       string `json:"delivered_at,omitempty"`  // When this run delivered the work prompt (RFC3339Nano); see stagger.schedule
+	// CASSInjection and MemoryInjection report the work prompt's enrichment,
+	// as on --robot-bulk-assign. Absent when enrichment was not requested or
+	// a recorded intent was replayed without re-querying.
+	CASSInjection   *CASSInjectionInfo `json:"cass_injection,omitempty"`
+	MemoryInjection *CMInjectionInfo   `json:"memory_injection,omitempty"`
+}
+
+// SpawnPromptDelivery is one agent's --spawn-prompt delivery outcome.
+type SpawnPromptDelivery struct {
+	Pane        string `json:"pane"`
+	AgentType   string `json:"agent_type"`
+	Order       int    `json:"order"` // 1-based position in stagger.schedule
+	PromptSent  bool   `json:"prompt_sent"`
+	DeliveredAt string `json:"delivered_at,omitempty"` // RFC3339Nano, present when prompt_sent
+	Error       string `json:"error,omitempty"`
 }
 
 // SpawnedAgent represents an agent created during spawn.
 type SpawnedAgent struct {
-	Pane      string `json:"pane"`
-	Name      string `json:"name,omitempty"`
-	Type      string `json:"type"`
-	Variant   string `json:"variant,omitempty"`
-	Title     string `json:"title"`
-	Ready     bool   `json:"ready"`
-	StartupMs int64  `json:"startup_ms"`
-	Error     string `json:"error,omitempty"`
-}
-
-func collectSpawnAdmissionInput(ctx context.Context, opts SpawnOptions, cfg *config.Config, totalAgents, totalPanes int) pressure.SpawnAdmissionInput {
-	return collectSpawnAdmissionInputWithPanes(ctx, opts, cfg, totalAgents, totalPanes, tmux.GetAllPanesContext)
+	Pane string `json:"pane"`
+	// PaneID is the stable tmux pane id (%N), the key of agent_mail.agent_map.
+	PaneID string `json:"pane_id,omitempty"`
+	// AgentMailName is the canonical Agent Mail identity published for the
+	// pane before launch; absent when registration is disabled or failed.
+	AgentMailName string `json:"agent_mail_name,omitempty"`
+	Name          string `json:"name,omitempty"`
+	Type          string `json:"type"`
+	Variant       string `json:"variant,omitempty"`
+	Title         string `json:"title"`
+	Ready         bool   `json:"ready"`
+	StartupMs     int64  `json:"startup_ms"`
+	Error         string `json:"error,omitempty"`
 }
 
 func collectSpawnAdmissionInputWithPanes(
@@ -342,6 +517,13 @@ func collectSpawnAdmissionInputWithPanes(
 		Session:         opts.Session,
 		RequestedAgents: totalAgents,
 		RequestedPanes:  totalPanes,
+		RequestedByType: map[string]int{
+			"claude": opts.CCCount, "codex": opts.CodCount,
+			"gemini": opts.GmiCount, "antigravity": opts.AgyCount,
+			"grok": opts.GrokCount, "omp": opts.OmpCount, "opencode": opts.OcCount,
+			"pi": opts.PiCount, "kimi": opts.KimiCount, "muse": opts.MuseCount,
+		},
+		RunningByType: make(map[string]int),
 	}
 
 	if cfg == nil || cfg.SpawnPacing.Enabled {
@@ -351,12 +533,14 @@ func collectSpawnAdmissionInputWithPanes(
 				input.LargeSpawnThreshold = cfg.SpawnPacing.MaxConcurrentSpawns
 			}
 			input.MaxAgents = spawnAdmissionAgentLimit(cfg)
+			input.MaxAgentsByType = spawnAdmissionAgentTypeLimits(cfg)
 		}
 		input.Pressure = collectSystemPressureSnapshot(ctx)
 	}
 
 	panesBySession, err := getAllPanes(ctx)
 	if err != nil {
+		input.InventoryError = "enumerate tmux fleet: " + err.Error()
 		return input
 	}
 	input.RunningSessions = len(panesBySession)
@@ -368,6 +552,7 @@ func collectSpawnAdmissionInputWithPanes(
 		for _, pane := range panes {
 			if isSpawnAdmissionAgentPane(pane) {
 				input.RunningAgents++
+				input.RunningByType[spawnAdmissionAgentType(pane.Type)]++
 			}
 		}
 	}
@@ -380,12 +565,120 @@ func spawnAdmissionAgentLimit(cfg *config.Config) int {
 	}
 	caps := cfg.SpawnPacing.AgentCaps
 	total := 0
-	for _, cap := range []int{caps.ClaudeMaxConcurrent, caps.CodexMaxConcurrent, caps.GeminiMaxConcurrent} {
+	for _, cap := range []int{caps.ClaudeMaxConcurrent, caps.CodexMaxConcurrent, caps.GeminiMaxConcurrent, caps.OmpMaxConcurrent} {
 		if cap > 0 {
+			if total > int(^uint(0)>>1)-cap {
+				return int(^uint(0) >> 1)
+			}
 			total += cap
 		}
 	}
 	return total
+}
+
+func spawnAdmissionAgentTypeLimits(cfg *config.Config) map[string]int {
+	if cfg == nil || len(cfg.SpawnPacing.AgentTypeLimits) == 0 {
+		return nil
+	}
+	limits := make(map[string]int, len(cfg.SpawnPacing.AgentTypeLimits))
+	for kind, count := range cfg.SpawnPacing.AgentTypeLimits {
+		limits[kind] = count
+	}
+	return limits
+}
+
+// needsSpawnAdmissionFence uses the final policy (including assignment policy)
+// and expanded recipe counts. Previews never acquire or create a lock file.
+func needsSpawnAdmissionFence(opts SpawnOptions, cfg *config.Config) bool {
+	if opts.DryRun || cfg == nil || !cfg.SpawnPacing.Enabled {
+		return false
+	}
+	if spawnAdmissionAgentLimit(cfg) > 0 {
+		return true
+	}
+	for _, limit := range cfg.SpawnPacing.AgentTypeLimits {
+		if limit > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func acquireLocalSpawnAdmission(ctx context.Context) (func(), error) {
+	if tmux.DefaultClient.Remote != "" {
+		return nil, errors.New("remote tmux requires host-side admission; a local fence cannot protect a remote fleet")
+	}
+	return pressure.AcquireSpawnAdmission(ctx)
+}
+
+func beginSpawnAdmission(ctx context.Context, opts SpawnOptions, cfg *config.Config,
+	deps SpawnLifecycleDependencies, output *SpawnOutput, totalAgents, totalPanes int,
+) (func(), bool) {
+	if !needsSpawnAdmissionFence(opts, cfg) {
+		return func() {}, true
+	}
+	var release func()
+	var err error
+	if deps.AcquireAdmission == nil {
+		err = errors.New("spawn admission ownership port is unavailable")
+	} else {
+		release, err = deps.AcquireAdmission(ctx)
+	}
+	if release != nil {
+		// Even a defective injected port must not cause a double unlock or
+		// leave an acquired fence behind when it returns an error.
+		release = sync.OnceFunc(release)
+	}
+	if err == nil && release == nil {
+		err = errors.New("spawn admission returned no ownership release")
+	}
+	if cancelErr := spawnCancellationError(ctx, err); cancelErr != nil {
+		if release != nil {
+			release()
+		}
+		setSpawnCancellation(output, cancelErr)
+		return nil, false
+	}
+	if err != nil {
+		if release != nil {
+			release()
+		}
+		reason := "spawn_admission_unavailable"
+		hint := "Restore local admission locking in the shared user cache directory before retrying"
+		if errors.Is(err, pressure.ErrSpawnAdmissionBusy) {
+			reason = "spawn_admission_busy"
+			hint = "Another local spawn is still launching; retry after it finishes"
+		}
+		output.Admission = &pressure.SpawnAdmission{
+			Decision: pressure.SpawnAdmissionDefer, Reason: reason, Hint: hint,
+			Session: opts.Session, RequestedAgents: totalAgents, RequestedPanes: totalPanes,
+			AgentInventoryAvailable: false, AgentInventoryError: "fleet was not read because admission ownership was not acquired",
+		}
+		output.Error = fmt.Sprintf("spawn admission unavailable: %v", err)
+		output.RobotResponse = NewErrorResponse(err, ErrCodeResourceBusy, hint)
+		return nil, false
+	}
+	return release, true
+}
+
+// spawnAdmissionAgentType translates tmux's canonical short identifiers into
+// the public configuration vocabulary. Keep all live/requested count keys in
+// that vocabulary so aliases cannot hide existing agents from their limits.
+func spawnAdmissionAgentType(kind tmux.AgentType) string {
+	switch kind.Canonical() {
+	case tmux.AgentClaude:
+		return "claude"
+	case tmux.AgentCodex:
+		return "codex"
+	case tmux.AgentGemini:
+		return "gemini"
+	case tmux.AgentAntigravity:
+		return "antigravity"
+	case tmux.AgentOpencode:
+		return "opencode"
+	default:
+		return string(kind.Canonical())
+	}
 }
 
 func collectSystemPressureSnapshot(ctx context.Context) pressure.Snapshot {
@@ -436,16 +729,49 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		output.Session = opts.Session
 	}
 
+	expanded, selectedRecipe, recipeErr := loadSpawnRecipe(opts, cfg)
+	if recipeErr != nil {
+		output.Error = recipeErr.Error()
+		output.RobotResponse = NewErrorResponse(recipeErr, ErrCodeInvalidFlag,
+			"Choose a valid recipe without explicit counts; inspect ntm recipes show <name>")
+		return output, nil
+	}
+	opts = expanded
+	output.PresetUsed = opts.Preset
+
+	if staggerErr := validateSpawnStagger(opts); staggerErr != nil {
+		output.Error = staggerErr.Error()
+		output.RobotResponse = NewErrorResponse(staggerErr, ErrCodeInvalidFlag,
+			"Use --spawn-stagger-mode=none|fixed|smart and a --spawn-stagger-delay between 0 and 5m (e.g. 20s)")
+		return output, nil
+	}
 	assignStrategy, validationErr := validateSpawnRequest(opts)
 	if validationErr != nil {
 		output.Error = validationErr.Error()
-		errorCode := ErrCodeInvalidFlag
-		hint := "Use non-negative agent counts and a supported assignment strategy"
-		if errors.Is(validationErr, errGrokSpawnWaitUnavailable) || errors.Is(validationErr, errGrokSpawnAssignUnavailable) {
-			errorCode = ErrCodeNotImplemented
-			hint = agentpkg.GrokPhaseOneCapabilityHint
-		}
-		output.RobotResponse = NewErrorResponse(validationErr, errorCode, hint)
+		output.RobotResponse = NewErrorResponse(validationErr, ErrCodeInvalidFlag, "Use non-negative agent counts and a supported assignment strategy")
+		return output, nil
+	}
+	// Advisory model did-you-mean: a requested model override that resolves
+	// to an ID unknown to the model registry but a small edit away from a
+	// known one is almost always a typo (field evidence: near-miss IDs on
+	// spawn). The spawn still proceeds so custom model IDs keep working.
+	output.ModelHints = spawnModelHints(cfg, opts)
+
+	// Render launch commands up front so a model/effort override that the
+	// configured launch template cannot honor fails before any tmux session or
+	// pane is created (bd-rr8gn).
+	commandConfig := cfg
+	if selectedRecipe != nil && commandConfig == nil {
+		commandConfig = config.Default()
+	}
+	agentCommands, agentCommandsErr := getAgentCommandsWithOverrides(commandConfig, opts)
+	if agentCommandsErr != nil {
+		output.Error = agentCommandsErr.Error()
+		output.RobotResponse = NewErrorResponse(
+			agentCommandsErr,
+			ErrCodeInvalidFlag,
+			"Fix the [agents] launch command template or drop the model/effort override",
+		)
 		return output, nil
 	}
 	deps := spawnLifecycleDeps(opts.LifecycleDeps)
@@ -456,13 +782,15 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	_ = audit.LogEvent(opts.Session, audit.EventTypeSpawn, audit.ActorSystem, "robot.spawn", map[string]interface{}{
 		"phase":           "start",
 		"session":         opts.Session,
-		"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.MuseCount + opts.AgyCount + opts.GrokCount,
+		"total_agents":    opts.totalAgentCount(),
 		"preset":          opts.Preset,
 		"no_user_pane":    opts.NoUserPane,
 		"dry_run":         opts.DryRun,
 		"safety":          opts.Safety,
 		"assign_work":     opts.AssignWork,
 		"assign_strategy": opts.AssignStrategy,
+		"initial_prompt":  opts.hasInitialPrompt(),
+		"stagger_mode":    opts.StaggerMode,
 		"correlation_id":  correlationID,
 	}, nil)
 	defer func() {
@@ -474,7 +802,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		payload := map[string]interface{}{
 			"phase":           "finish",
 			"session":         opts.Session,
-			"total_agents":    opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.MuseCount + opts.AgyCount + opts.GrokCount,
+			"total_agents":    opts.totalAgentCount(),
 			"preset":          opts.Preset,
 			"no_user_pane":    opts.NoUserPane,
 			"dry_run":         opts.DryRun,
@@ -528,18 +856,11 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	}
 
 	// Get working directory
-	dir := opts.WorkingDir
-	if dir == "" && cfg != nil {
-		dir = cfg.GetProjectDir(opts.Session)
-	}
-	if dir == "" {
-		var err error
-		dir, err = os.Getwd()
-		if err != nil {
-			output.Error = fmt.Sprintf("could not determine working directory: %v", err)
-			output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Check working directory permissions")
-			return output, nil
-		}
+	dir, dirErr := spawnWorkingDirectory(opts, cfg)
+	if dirErr != nil {
+		output.Error = fmt.Sprintf("could not determine working directory: %v", dirErr)
+		output.RobotResponse = NewErrorResponse(dirErr, ErrCodeInternalError, "Check working directory permissions")
+		return output, nil
 	}
 	output.WorkingDir = dir
 	// Surface the key Agent Mail will actually register under whenever it
@@ -564,11 +885,31 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			return output, nil
 		}
 		cfg = effectiveConfig
+		// The authoritative assignment policy replaces cfg (the serve path
+		// passes cfg=nil), so launch commands must be re-rendered from the
+		// merged config — otherwise serve-spawned AssignWork panes fall back
+		// to hardcoded agent commands and ignore the user's [agents]/[models].
+		agentCommands, agentCommandsErr = getAgentCommandsWithOverrides(cfg, opts)
+		if agentCommandsErr != nil {
+			output.Error = agentCommandsErr.Error()
+			output.RobotResponse = NewErrorResponse(
+				agentCommandsErr,
+				ErrCodeInvalidFlag,
+				"Fix the [agents] launch command template or drop the model/effort override",
+			)
+			return output, nil
+		}
 		operatorGatedLabels := []string(nil)
+		var workSourcePolicy worksource.ProjectPolicy
 		if effectiveConfig != nil {
 			operatorGatedLabels = effectiveConfig.Assign.OperatorGatedLabels
+			workSourcePolicy = effectiveConfig.Assign.WorkSource.Policy()
 		}
-		if policyErr := bv.ConfigureProjectOperatorGatedLabels(dir, operatorGatedLabels); policyErr != nil {
+		policyErr = bv.ConfigureProjectOperatorGatedLabels(dir, operatorGatedLabels)
+		if policyErr == nil {
+			policyErr = bv.ConfigureProjectWorkSourcePolicy(dir, workSourcePolicy)
+		}
+		if policyErr != nil {
 			output.Error = fmt.Sprintf("register spawn assignment safety policy: %v", policyErr)
 			output.RobotResponse = NewErrorResponse(
 				fmt.Errorf("%s", output.Error),
@@ -584,16 +925,25 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 				setSpawnCancellation(output, cancelErr)
 			} else {
 				output.Error = fmt.Sprintf("verify actionable spawn work: %v", actionableErr)
-				output.RobotResponse = NewErrorResponse(
-					fmt.Errorf("%s", output.Error),
-					ErrCodeInternalError,
-					"Ensure bv plan output and live br labels are complete and valid",
-				)
+				code, hint := ErrCodeInternalError, "Ensure bv plan output and live br labels are complete and valid"
+				if staleCode, staleHint, ok := staleWorkError(actionableErr); ok {
+					code, hint = staleCode, staleHint
+				}
+				output.RobotResponse = NewErrorResponse(fmt.Errorf("%s", output.Error), code, hint)
+				output.WorkSourceMismatch = staleWorkReceipt(actionableErr)
 			}
 			return output, nil
 		}
 		actionable = filterAssignableActionableRecommendationsForProject(dir, actionable, 0)
 		verifiedAssignmentPlan = restrictTriageToAssignable(nil, actionable)
+	}
+
+	recipeLaunches, recipeErr := renderSpawnRecipe(opts, selectedRecipe, cfg)
+	if recipeErr != nil {
+		output.Error = recipeErr.Error()
+		output.RobotResponse = NewErrorResponse(recipeErr, ErrCodeInvalidFlag,
+			"Fix the recipe's model/effort or the selected agent command templates")
+		return output, nil
 	}
 
 	// Load handoff context for session recovery (non-fatal if not found)
@@ -604,13 +954,21 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	// handoffCtx is available for use in work prompts below
 	_ = handoffCtx // silence unused warning when not in orchestrator mode
 
-	totalAgents := opts.CCCount + opts.CodCount + opts.GmiCount + opts.PiCount + opts.KimiCount + opts.MuseCount + opts.AgyCount + opts.GrokCount
+	totalAgents := opts.totalAgentCount()
 
 	// Calculate total panes needed
 	totalPanes := totalAgents
 	if !opts.NoUserPane {
 		totalPanes++
 	}
+
+	// Count and launch under ONE cross-process fence. Acquiring after the
+	// inventory read would still let concurrent requests spend the same seats.
+	releaseAdmission, admitted := beginSpawnAdmission(ctx, opts, cfg, deps, output, totalAgents, totalPanes)
+	if !admitted {
+		return output, nil
+	}
+	defer releaseAdmission()
 
 	var admissionTopologyErr error
 	admissionInput := collectSpawnAdmissionInputWithPanes(
@@ -626,6 +984,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		return output, nil
 	}
 	admission := pressure.EvaluateSpawnAdmission(admissionInput)
+	admission.Serialized = needsSpawnAdmissionFence(opts, cfg)
 	output.Admission = &admission
 	if err := ctx.Err(); err != nil {
 		setSpawnCancellation(output, err)
@@ -723,6 +1082,28 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			paneIdx++
 		}
 
+		for i := 0; i < opts.OmpCount; i++ {
+			ompPane := fmt.Sprintf("0.%d", paneIdx)
+			output.WouldCreate = append(output.WouldCreate, SpawnedAgent{
+				Pane:  ompPane,
+				Name:  dryRunNameMap.AssignNew("omp", ompPane),
+				Type:  "omp",
+				Title: fmt.Sprintf("%s__omp_%d", opts.Session, i+1),
+			})
+			paneIdx++
+		}
+
+		for i := 0; i < opts.OcCount; i++ {
+			ocPane := fmt.Sprintf("0.%d", paneIdx)
+			output.WouldCreate = append(output.WouldCreate, SpawnedAgent{
+				Pane:  ocPane,
+				Name:  dryRunNameMap.AssignNew(string(tmux.AgentOpencode), ocPane),
+				Type:  string(tmux.AgentOpencode),
+				Title: fmt.Sprintf("%s__oc_%d", opts.Session, i+1),
+			})
+			paneIdx++
+		}
+
 		for i := 0; i < opts.PiCount; i++ {
 			piPane := fmt.Sprintf("0.%d", paneIdx)
 			output.WouldCreate = append(output.WouldCreate, SpawnedAgent{
@@ -756,6 +1137,12 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			paneIdx++
 		}
 
+		applySpawnRecipePreview(output.WouldCreate, recipeLaunches)
+		if opts.deliversPrompts() {
+			// Preview the per-agent delays; scheduled_at stays absent because
+			// nothing is delivered.
+			_, output.Stagger = planSpawnStagger(opts, dir, output.WouldCreate, deps)
+		}
 		output.Layout = "tiled"
 		return output, nil
 	}
@@ -823,12 +1210,12 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		}
 		return output, nil
 	}
-	if err := validateExistingGrokSpawnPaneBaselines(panes, opts); err != nil {
-		output.Error = fmt.Sprintf("validating existing Grok Build launch panes: %v", err)
+	if err := validateExistingSpawnPaneBaselines(ctx, panes, opts); err != nil {
+		output.Error = fmt.Sprintf("validating existing agent launch panes: %v", err)
 		output.RobotResponse = NewErrorResponse(
 			err,
 			ErrCodeInternalError,
-			"Use an idle shell pane before launching Grok Build",
+			"Agents only launch into idle shell panes; free the occupied pane or add agents with `ntm add <session>`",
 		)
 		return output, nil
 	}
@@ -878,12 +1265,12 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		)
 		return output, nil
 	}
-	if err := validateGrokSpawnPaneBaselines(panes, opts); err != nil {
-		output.Error = fmt.Sprintf("validating Grok Build launch panes: %v", err)
+	if err := validateSpawnPaneBaselines(ctx, panes, opts); err != nil {
+		output.Error = fmt.Sprintf("validating agent launch panes: %v", err)
 		output.RobotResponse = NewErrorResponse(
 			err,
 			ErrCodeInternalError,
-			"Use an idle shell pane before launching Grok Build",
+			"Agents only launch into idle shell panes; free the occupied pane or add agents with `ntm add <session>`",
 		)
 		return output, nil
 	}
@@ -917,6 +1304,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			userName := nameMap.AssignNew("user", userPaneRef)
 			output.Agents = append(output.Agents, SpawnedAgent{
 				Pane:      userPaneRef,
+				PaneID:    panes[0].ID,
 				Name:      userName,
 				Type:      "user",
 				Title:     panes[0].Title,
@@ -926,7 +1314,6 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		}
 	}
 
-	agentCommands := getAgentCommands(cfg)
 	type launchRequest struct {
 		agentType string
 		number    int
@@ -941,6 +1328,8 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		{agentType: "gemini", count: opts.GmiCount},
 		{agentType: "antigravity", count: opts.AgyCount},
 		{agentType: "grok", count: opts.GrokCount},
+		{agentType: "omp", count: opts.OmpCount},
+		{agentType: string(tmux.AgentOpencode), count: opts.OcCount},
 		{agentType: "pi", count: opts.PiCount},
 		{agentType: "kimi", count: opts.KimiCount},
 		{agentType: "muse", count: opts.MuseCount},
@@ -951,14 +1340,53 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	}
 
 	launchErrors := make([]error, 0)
+	// Map each launched agent's envelope pane address ("w.p") to the tmux
+	// pane ID ("%N"). The resilience monitor matches manifest entries against
+	// live pane IDs, so the manifest must carry "%N", never the physical
+	// address (W1 gate finding on bd-ws1-truth-safety-l5ddi.8).
+	monitorPaneIDs := make(map[string]string, len(launchRequests))
+	monitorCommands := make(map[string]string, len(launchRequests))
+	launchModels := spawnLaunchModels(cfg, opts)
+	launch := deps.LaunchAgent
+	// Spawn-scoped Agent Mail identity coordinator — the same implementation
+	// `ntm spawn` uses (internal/spawnidentity). Lazily initialized: no Agent
+	// Mail traffic when registration is disabled or nothing launches.
+	identityOpts := spawnidentity.ConfigOptions(cfg)
+	identityOpts.PreLaunch = true
+	identityOpts.Reporter = spawnIdentityLog{session: opts.Session}
+	identityOpts.ListPanes = deps.GetPanes
+	identity := spawnidentity.New(dir, opts.Session, identityOpts)
 	for i, request := range launchRequests {
 		if err := ctx.Err(); err != nil {
 			setSpawnCancellation(output, err)
 			return output, nil
 		}
 		pane := panes[startIdx+i]
-		agent, launchErr := deps.LaunchAgent(
-			ctx, pane, opts.Session, request.agentType, request.number, dir, agentCommands[request.agentType],
+		command, model := agentCommands[request.agentType], launchModels[request.agentType]
+		if spec, ok := recipeLaunches[spawnRecipeKey(request)]; ok {
+			command, model = spec.command, spec.model
+		}
+		title := fmt.Sprintf("%s__%s_%d", opts.Session, agentTypeShort(request.agentType), request.number)
+		// Publish this pane's Agent Mail identity BEFORE its agent command is
+		// sent, exactly as `ntm spawn` does (gh#255): a process resolving its
+		// identity during startup reads its assigned name, and reservation-
+		// bearing assignment finds a canonical identity for the pane. The
+		// identity is keyed by tmux pane id, so a pane without one has none.
+		// Failures degrade gracefully and never block the launch.
+		if pane.ID != "" {
+			identity.PrepareAgent(ctx, spawnidentity.Agent{
+				PaneIndex:     pane.Index,
+				PaneID:        pane.ID,
+				PaneTitle:     title,
+				AgentType:     agentTypeShort(request.agentType),
+				Model:         model.ModelAlias,
+				ResolvedModel: model.Model,
+			})
+			output.AgentMail = identity.Status()
+		}
+		launchCtx := context.WithValue(ctx, spawnLaunchModelContextKey{}, model)
+		agent, launchErr := launch(
+			launchCtx, pane, opts.Session, request.agentType, request.number, dir, command,
 		)
 		if agent.Pane == "" {
 			agent.Pane = fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index)
@@ -967,9 +1395,20 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			agent.Type = request.agentType
 		}
 		if agent.Title == "" {
-			agent.Title = fmt.Sprintf("%s__%s_%d", opts.Session, agentTypeShort(request.agentType), request.number)
+			agent.Title = title
 		}
+		if agent.Variant == "" {
+			agent.Variant = model.ModelAlias
+		}
+		monitorCommands[agent.Pane] = command
 		agent.Name = nameMap.AssignNew(request.agentType, agent.Pane)
+		if pane.ID != "" {
+			monitorPaneIDs[agent.Pane] = pane.ID
+			agent.PaneID = pane.ID
+			if output.AgentMail != nil {
+				agent.AgentMailName = output.AgentMail.AgentMap[pane.ID]
+			}
+		}
 		if launchErr != nil && agent.Error == "" {
 			agent.Error = launchErr.Error()
 		}
@@ -982,6 +1421,34 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			launchErrors = append(launchErrors, fmt.Errorf("%s agent %d: %w", request.agentType, request.number, launchErr))
 		}
 	}
+
+	// Launched panes now carry durable agent identities. Later contenders
+	// recount them, including a partially successful batch. Readiness and
+	// assignment do not create capacity and must not hold the fleet fence.
+	releaseAdmission()
+
+	// Every launch has been attempted: re-derive the pane badges published
+	// as "starting" from the running panes (ntm#312), as `ntm spawn` does.
+	// Best-effort by contract; a no-op unless badges are enabled.
+	identity.ReconcileBadges(ctx)
+
+	// Register the session-level identity `ntm lock`/`unlock`/`locks` and the
+	// session coordinator act as, as `ntm spawn` does; without it a
+	// robot-spawned session has no Agent Mail sender. Best-effort.
+	if len(launchRequests) > 0 {
+		if sessionAgent := spawnidentity.RegisterSession(ctx, dir, opts.Session, identityOpts); sessionAgent != "" && output.AgentMail != nil {
+			output.AgentMail.SessionAgent = sessionAgent
+		}
+	}
+
+	// Start the resilience session monitor through the shared spawn code path
+	// (same manifest writer + monitor launcher as CLI spawn; WS0-G6,
+	// bd-ws1-truth-safety-l5ddi.8). BEST-EFFORT: a monitor/manifest failure
+	// must never fail the spawn itself — on failure the envelope carries
+	// monitor_started:false plus the error, and a degraded-event row is
+	// recorded so the degradation stays visible.
+	startSpawnSessionMonitor(ctx, deps, output, opts, cfg, dir, monitorCommands, monitorPaneIDs)
+
 	if len(launchErrors) > 0 {
 		launchErr := errors.Join(launchErrors...)
 		output.Error = fmt.Sprintf("%d of %d agent launches failed: %v", len(launchErrors), totalAgents, launchErr)
@@ -993,8 +1460,9 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		return output, nil
 	}
 
-	// Wait for agents to be ready if requested
-	if opts.WaitReady {
+	// Wait for agents to be ready if requested. A --spawn-prompt is only ever
+	// delivered after this readiness wait, so it implies the wait.
+	if opts.WaitReady || opts.hasInitialPrompt() {
 		timeout := opts.ReadyTimeout
 		if timeout <= 0 {
 			timeout = 30 * time.Second
@@ -1010,6 +1478,15 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		}
 	}
 
+	// Prompt deliveries (initial prompts and work assignments) are paced on
+	// one shared stagger schedule in agent launch order.
+	var pacer *spawnStaggerPacer
+	if opts.deliversPrompts() {
+		stagger, plan := planSpawnStagger(opts, dir, output.Agents, deps)
+		output.Stagger = plan
+		pacer = newSpawnStaggerPacer(stagger, plan, deps)
+	}
+
 	// Orchestrator work assignment mode
 	if opts.AssignWork {
 		output.Mode = "orchestrator"
@@ -1017,6 +1494,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		assignments, assignmentErr := assignWorkToAgentsWithError(
 			ctx, output, dir, opts.Session, output.AssignStrategy, cfg,
 			opts.RequireReservation, opts.ReservationPaths, opts.AssignmentDeps, verifiedAssignmentPlan,
+			opts.Prompt, opts.PromptContext, pacer,
 		)
 		output.Assignments = assignments
 		ensureSpawnAssignmentCoverage(output)
@@ -1029,6 +1507,16 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			setSpawnCancellation(output, err)
 			return output, nil
 		}
+	} else if opts.hasInitialPrompt() {
+		deliveries, deliveryErr := deliverSpawnInitialPrompts(
+			ctx, output, opts.Session, opts.Prompt, cfg, spawnAssignmentDeps(opts.AssignmentDeps), pacer,
+		)
+		output.PromptDeliveries = deliveries
+		if cancelErr := spawnCancellationError(ctx, deliveryErr); cancelErr != nil {
+			setSpawnCancellation(output, cancelErr)
+			return output, nil
+		}
+		finalizeSpawnPromptDeliveries(output)
 	}
 	if err := ctx.Err(); err != nil {
 		setSpawnCancellation(output, err)
@@ -1045,6 +1533,124 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	return output, nil
 }
 
+// startSpawnSessionMonitor runs the shared manifest+monitor path for a robot
+// spawn and records the outcome on the envelope. Best-effort by contract: it
+// never returns an error to the spawn flow. On failure (other than the
+// explicit disabled guard) it writes a degraded-event row to the state DB so
+// the missing monitoring is operator-visible (same posture as A1's visible
+// fail-open).
+func startSpawnSessionMonitor(
+	ctx context.Context,
+	deps SpawnLifecycleDependencies,
+	output *SpawnOutput,
+	opts SpawnOptions,
+	cfg *config.Config,
+	dir string,
+	commandsByPane map[string]string,
+	monitorPaneIDs map[string]string,
+) {
+	if deps.StartSessionMonitor == nil {
+		return
+	}
+	autoRestart := cfg != nil && cfg.Resilience.AutoRestart
+	agents := make([]resilience.AgentConfig, 0, len(output.Agents))
+	for _, agent := range output.Agents {
+		if agent.Type == "user" || agent.Error != "" {
+			continue
+		}
+		paneIndex := 0
+		if idx := strings.LastIndex(agent.Pane, "."); idx >= 0 {
+			if n, convErr := strconv.Atoi(agent.Pane[idx+1:]); convErr == nil {
+				paneIndex = n
+			}
+		}
+		// The monitor matches manifest entries against live tmux pane IDs
+		// ("%N"); the envelope's physical "w.p" address never matches and
+		// would make every robot-spawned agent read as crashed.
+		paneID := monitorPaneIDs[agent.Pane]
+		if paneID == "" {
+			paneID = agent.Pane
+		}
+		agents = append(agents, resilience.AgentConfig{
+			PaneID:    paneID,
+			PaneIndex: paneIndex,
+			Type:      agent.Type,
+			Model:     agent.Variant,
+			Command:   commandsByPane[agent.Pane],
+		})
+	}
+
+	result, err := deps.StartSessionMonitor(ctx, resilience.SpawnMonitorRequest{
+		Session:     opts.Session,
+		ProjectDir:  dir,
+		AutoRestart: autoRestart,
+		Agents:      agents,
+	})
+	if err == nil && result != nil {
+		output.MonitorStarted = result.MonitorStarted
+		output.MonitorPID = result.MonitorPID
+		slog.Info("[robot.spawn] session monitor started",
+			"session", opts.Session, "pid", result.MonitorPID, "agents", len(agents))
+		return
+	}
+	output.MonitorStarted = false
+	if err == nil {
+		err = errors.New("session monitor did not start")
+	}
+	output.MonitorError = err.Error()
+	if errors.Is(err, resilience.ErrInternalMonitorDisabled) {
+		// Explicitly disabled (test binary or NTM_DISABLE_INTERNAL_MONITOR):
+		// not a degradation, just report it on the envelope.
+		slog.Info("[robot.spawn] session monitor disabled", "session", opts.Session)
+		return
+	}
+	slog.Warn("[robot.spawn] session monitor unavailable (spawn still succeeded)",
+		"session", opts.Session, "error", err)
+	recordSpawnMonitorDegraded(opts.Session, err)
+}
+
+// recordSpawnMonitorDegraded writes the visible-degradation row for a robot
+// spawn whose resilience monitor could not be started.
+func recordSpawnMonitorDegraded(session string, cause error) {
+	store, err := state.Open("")
+	if err != nil {
+		slog.Warn("[robot.spawn] cannot record monitor degradation", "session", session, "error", err)
+		return
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		slog.Warn("[robot.spawn] cannot record monitor degradation", "session", session, "error", err)
+		return
+	}
+	if _, err := store.AppendAttentionEvent(&state.StoredAttentionEvent{
+		Ts:            time.Now().UTC(),
+		SessionName:   session,
+		Category:      "alert",
+		EventType:     "spawn_monitor_unavailable",
+		Source:        "robot_spawn",
+		Actionability: state.ActionabilityActionRequired,
+		Severity:      state.SeverityWarning,
+		ReasonCode:    "spawn_monitor_unavailable",
+		Summary:       fmt.Sprintf("robot spawn %q has NO resilience monitoring: %v", session, cause),
+		DedupKey:      "robot_spawn:monitor_unavailable:" + session,
+	}); err != nil {
+		slog.Warn("[robot.spawn] cannot record monitor degradation", "session", session, "error", err)
+	}
+}
+
+// spawnIdentityLog routes the shared identity coordinator's diagnostics to
+// the structured log: robot stdout carries only the JSON envelope, whose
+// agent_mail object reports the outcome.
+type spawnIdentityLog struct{ session string }
+
+func (l spawnIdentityLog) Infof(format string, args ...any) {
+	slog.Info("[robot.spawn] agent mail identity", "session", l.session, "detail", fmt.Sprintf(format, args...))
+}
+
+func (l spawnIdentityLog) Warnf(format string, args ...any) {
+	slog.Warn("[robot.spawn] agent mail identity", "session", l.session, "detail", fmt.Sprintf(format, args...))
+}
+
 // PrintSpawn creates a session with agents and outputs structured JSON.
 // This is a thin wrapper around GetSpawn() for CLI output.
 func PrintSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) error {
@@ -1055,34 +1661,52 @@ func PrintSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) erro
 	return encodeTerminalRobotOutput(output, output.RobotResponse, "robot spawn failed")
 }
 
-// launchAgent launches a single agent and returns its info.
+// launchAgent launches a single agent using the final model resolved by
+// GetSpawn. Lifecycle decorators preserve that per-call context, so paced and
+// journaled launches record the same specification as undecorated launches.
 func launchAgent(ctx context.Context, pane tmux.Pane, session, agentType string, num int, dir, command string) (SpawnedAgent, error) {
+	return launchAgentWithModel(ctx, pane, session, agentType, num, dir, command, spawnLaunchModelFromContext(ctx))
+}
+
+// launchAgentWithModel launches a single agent, recording model in the pane's
+// launch specification.
+func launchAgentWithModel(ctx context.Context, pane tmux.Pane, session, agentType string, num int, dir, command string, model spawnLaunchModel) (SpawnedAgent, error) {
 	startTime := time.Now()
 
 	title := fmt.Sprintf("%s__%s_%d", session, agentTypeShort(agentType), num)
 	agent := SpawnedAgent{
-		Pane:  fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
-		Type:  agentType,
-		Title: title,
-		Ready: false,
+		Pane:    fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
+		Type:    agentType,
+		Variant: model.ModelAlias,
+		Title:   title,
+		Ready:   false,
 	}
 	if err := ctx.Err(); err != nil {
 		agent.Error = fmt.Sprintf("launch canceled: %v", err)
 		return agent, fmt.Errorf("launch canceled: %w", err)
 	}
-	if agentTypeShort(agentType) == "grok" {
-		if err := tmux.ValidatePaneLaunchBaseline(pane); err != nil {
-			agent.Error = fmt.Sprintf("launching: %v", err)
-			agent.StartupMs = time.Since(startTime).Milliseconds()
-			return agent, fmt.Errorf("launching Grok Build: %w", err)
-		}
+	// Every agent type launches by typing into the pane, so every launch
+	// must prove the target is an idle shell: first from the snapshot the
+	// caller planned with (settle-aware, so a pane created moments ago is not
+	// refused for its shell's startup children), then from a fresh tmux read
+	// taken right before the pane is mutated (#291).
+	if err := tmux.ValidatePaneLaunchBaselineSettledContext(ctx, session, pane); err != nil {
+		agent.Error = fmt.Sprintf("launching: %v", err)
+		agent.StartupMs = time.Since(startTime).Milliseconds()
+		return agent, fmt.Errorf("launching %s: %w", agentType, err)
+	}
+	if err := tmux.ValidatePaneLaunchBaselineLiveContext(ctx, session, pane.ID); err != nil {
+		agent.Error = fmt.Sprintf("launching: %v", err)
+		agent.StartupMs = time.Since(startTime).Milliseconds()
+		return agent, fmt.Errorf("launching %s: %w", agentType, err)
 	}
 
-	// Set pane title
-	if err := tmux.SetPaneTitleContext(ctx, pane.ID, title); err != nil {
-		agent.Error = fmt.Sprintf("setting title: %v", err)
+	// Persist the type before launch so wrappers and self-managed TUI titles
+	// cannot downgrade this known agent pane to a user shell (GH#268).
+	if err := tmux.SetPaneAgentIdentityContext(ctx, pane.ID, title, tmux.AgentType(agentType)); err != nil {
+		agent.Error = fmt.Sprintf("setting identity: %v", err)
 		agent.StartupMs = time.Since(startTime).Milliseconds()
-		return agent, fmt.Errorf("setting title: %w", err)
+		return agent, fmt.Errorf("setting identity: %w", err)
 	}
 
 	// Launch agent command
@@ -1104,6 +1728,22 @@ func launchAgent(ctx context.Context, pane tmux.Pane, session, agentType string,
 		agent.StartupMs = time.Since(startTime).Milliseconds()
 		return agent, fmt.Errorf("launch canceled: %w", err)
 	}
+	launchSpec := tmux.AgentLaunchSpec{
+		Version:         tmux.AgentLaunchSpecVersion,
+		AgentType:       tmux.AgentType(agentType).Canonical(),
+		Command:         safeCommand,
+		Model:           model.Model,
+		ModelAlias:      model.ModelAlias,
+		ReasoningEffort: model.ReasoningEffort,
+	}
+	if binding := resilience.CaptureLaunchBinding(agentType); binding != nil {
+		launchSpec.CAAMProfile = binding.Identifier
+	}
+	if err := tmux.SetPaneLaunchSpecContext(ctx, pane.ID, launchSpec); err != nil {
+		agent.Error = fmt.Sprintf("recording launch specification: %v", err)
+		agent.StartupMs = time.Since(startTime).Milliseconds()
+		return agent, fmt.Errorf("recording launch specification: %w", err)
+	}
 
 	// Use the agent-aware context path so cancellation covers staging and Enter.
 	if err := tmux.SendKeysForAgentContext(ctx, pane.ID, cmd, true, tmux.AgentType(agentTypeShort(agentType))); err != nil {
@@ -1111,12 +1751,13 @@ func launchAgent(ctx context.Context, pane tmux.Pane, session, agentType string,
 		agent.StartupMs = time.Since(startTime).Milliseconds()
 		return agent, fmt.Errorf("launching: %w", err)
 	}
-	if agentTypeShort(agentType) == "grok" {
-		if _, err := tmux.WaitForPaneProcessStartContext(ctx, session, pane.ID); err != nil {
-			agent.Error = fmt.Sprintf("launching: stable process did not start: %v", err)
-			agent.StartupMs = time.Since(startTime).Milliseconds()
-			return agent, fmt.Errorf("launching Grok Build: stable process did not start: %w", err)
-		}
+	// Every agent type: the launch only counts once a stable non-shell process
+	// owns the pane, because the prompt that follows is refused while the
+	// foreground is still a bare shell (PANE_AGENT_DEAD).
+	if _, err := tmux.WaitForPaneProcessStartContext(ctx, session, pane.ID); err != nil {
+		agent.Error = fmt.Sprintf("launching: stable process did not start: %v", err)
+		agent.StartupMs = time.Since(startTime).Milliseconds()
+		return agent, fmt.Errorf("launching %s: stable process did not start: %w", agentType, err)
 	}
 
 	agent.StartupMs = time.Since(startTime).Milliseconds()
@@ -1266,6 +1907,10 @@ func agentTypeShort(agentType string) string {
 		return "windsurf"
 	case tmux.AgentAider:
 		return "aider"
+	case tmux.AgentOpencode:
+		return "oc"
+	case tmux.AgentOmp:
+		return "omp"
 	case tmux.AgentOllama:
 		return "ollama"
 	case tmux.AgentUser:
@@ -1275,8 +1920,45 @@ func agentTypeShort(agentType string) string {
 	}
 }
 
-// getAgentCommands returns the commands to launch each agent type.
-func getAgentCommands(cfg *config.Config) map[string]string {
+// getAgentCommandsWithOverrides returns the commands to launch each agent
+// type, applying the spawn request's per-type model/effort overrides
+// (`--spawn-cod=8:gpt-5.3-codex:high` style specs, bd-rr8gn). It returns an
+// error only when an explicitly requested override cannot be honored — e.g.
+// the configured launch command never references {{.Model}} or
+// {{.ReasoningEffort}}, so the override would be silently dropped. Rendering
+// problems without an override keep the raw configured command, as before.
+// spawnModelHints returns did-you-mean hints for explicit model overrides
+// that resolve (through config aliases) to IDs unknown to the model registry
+// but within a small edit distance of a known registry ID. Advisory only —
+// callers must not fail the spawn on these.
+func spawnModelHints(cfg *config.Config, opts SpawnOptions) []string {
+	requested := []struct{ agentType, model string }{
+		{"claude", opts.CCModel},
+		{"codex", opts.CodModel},
+		{"gemini", opts.GmiModel},
+		{"grok", opts.GrokModel},
+		{"omp", opts.OmpModel},
+		{"oc", opts.OcModel},
+	}
+	var hints []string
+	for _, req := range requested {
+		if req.model == "" {
+			continue
+		}
+		resolved := req.model
+		if cfg != nil {
+			if r := cfg.Models.GetModelName(req.agentType, req.model); r != "" {
+				resolved = r
+			}
+		}
+		if suggestion := models.SuggestModel(resolved); suggestion != "" {
+			hints = append(hints, fmt.Sprintf("model %q (%s) is not in the model registry; did you mean %q? Spawning with the requested model anyway", resolved, req.agentType, suggestion))
+		}
+	}
+	return hints
+}
+
+func getAgentCommandsWithOverrides(cfg *config.Config, opts SpawnOptions) (map[string]string, error) {
 	defaults := map[string]string{
 		"claude":      "claude",
 		"codex":       "codex",
@@ -1286,6 +1968,8 @@ func getAgentCommands(cfg *config.Config) map[string]string {
 		"muse":        "muse --yolo",
 		"antigravity": "agy",
 		"grok":        "grok --always-approve",
+		"omp":         config.DefaultOmpCommand,
+		"oc":          config.DefaultOpencodeCommand,
 	}
 
 	if cfg != nil && cfg.Agents.Claude != "" {
@@ -1312,25 +1996,98 @@ func getAgentCommands(cfg *config.Config) map[string]string {
 	if cfg != nil && cfg.Agents.Grok != "" {
 		defaults["grok"] = cfg.Agents.Grok
 	}
-
-	for agentType, cmdTemplate := range defaults {
-		vars := config.AgentTemplateVars{AgentType: agentType}
-		if cfg != nil {
-			// Resolve the default model for every agent type, exactly as the
-			// interactive spawn path does via ResolveModel. Limiting this to grok
-			// left the others rendering with an empty Model: harmless for the
-			// templates that guard with {{if .Model}}, but agy's template injects
-			// --model unconditionally because its model is hard-pinned, so a
-			// robot-spawned agy pane launched as `--model ''` and never started.
-			vars.Model = cfg.Models.GetModelName(agentType, "")
-		}
-		if rendered, err := config.GenerateAgentCommand(cmdTemplate, vars); err == nil {
-			defaults[agentType] = rendered
-		}
-		// On error, keep original command (non-template or invalid template)
+	if cfg != nil {
+		defaults["omp"] = config.OmpCommandOrDefault(cfg.Agents.Omp)
+	}
+	if cfg != nil && cfg.Agents.Opencode != "" {
+		defaults["oc"] = cfg.Agents.Opencode
 	}
 
-	return defaults
+	launchModels := spawnLaunchModels(cfg, opts)
+	// Claude agents carry ntm's PreToolUse hooks (safety policy, dcg, rch)
+	// as --settings, the only way Claude Code accepts hooks at launch.
+	var claudeSettings string
+	if opts.CCCount > 0 {
+		claudeSettings = policy.ClaudeAgentLaunchSettings(cfg).Settings
+	}
+	for agentType, cmdTemplate := range defaults {
+		launch := launchModels[agentType]
+		vars := config.AgentTemplateVars{
+			AgentType:       agentType,
+			Model:           launch.Model,
+			ModelAlias:      launch.ModelAlias,
+			ModelRequested:  launch.ModelAlias != "",
+			ReasoningEffort: launch.ReasoningEffort,
+		}
+		if agentType == "claude" {
+			vars.ClaudeSettings = claudeSettings
+		}
+		rendered, err := config.GenerateAgentCommand(cmdTemplate, vars)
+		if err == nil {
+			policy.LogClaudeHooksNotApplied("robot-spawn", rendered, vars.ClaudeSettings)
+		}
+		if err != nil {
+			if launch.ModelAlias != "" || launch.ReasoningEffort != "" {
+				// An explicit override must not be silently dropped
+				// (GenerateAgentCommand's guard errors describe exactly that).
+				return nil, fmt.Errorf("rendering %s launch command: %w", agentType, err)
+			}
+			// On error without an override, keep the original command
+			// (non-template or invalid template).
+			continue
+		}
+		defaults[agentType] = rendered
+	}
+
+	return defaults, nil
+}
+
+// spawnLaunchModel is the model a robot-spawned agent type launches with:
+// the resolved model name, the alias the request named (empty when the
+// configured default applies), and the requested reasoning effort.
+type spawnLaunchModel struct {
+	Model           string
+	ModelAlias      string
+	ReasoningEffort string
+}
+
+// spawnLaunchModels resolves the launch model of every robot-spawnable agent
+// type from the request's per-type overrides. The launch command is rendered
+// from it and the pane's launch specification records it, so a robot-spawned
+// pane reports the same model as an `ntm spawn` pane (--robot-context, GH #333).
+func spawnLaunchModels(cfg *config.Config, opts SpawnOptions) map[string]spawnLaunchModel {
+	overrides := map[string]struct{ model, effort string }{
+		"claude":      {opts.CCModel, opts.CCReasoningEffort},
+		"codex":       {opts.CodModel, opts.CodReasoningEffort},
+		"gemini":      {opts.GmiModel, ""},
+		"antigravity": {"", ""},
+		"grok":        {opts.GrokModel, opts.GrokReasoningEffort},
+		"omp":         {opts.OmpModel, opts.OmpReasoningEffort},
+		"oc":          {opts.OcModel, ""},
+		// No spawn-flag model grammar yet; they launch with the configured
+		// default model.
+		"pi":   {"", ""},
+		"kimi": {"", ""},
+		"muse": {"", ""},
+	}
+	launches := make(map[string]spawnLaunchModel, len(overrides))
+	for agentType, override := range overrides {
+		launch := spawnLaunchModel{ModelAlias: override.model, ReasoningEffort: override.effort}
+		if cfg != nil {
+			// Resolve the requested (or default) model for every agent type,
+			// exactly as the interactive spawn path does via ResolveModel.
+			// Limiting this to grok left the others rendering with an empty
+			// Model: harmless for the templates that guard with {{if .Model}},
+			// but agy's template injects --model unconditionally because its
+			// model is hard-pinned, so a robot-spawned agy pane launched as
+			// `--model ''` and never started.
+			launch.Model = cfg.Models.GetModelName(agentType, override.model)
+		} else if override.model != "" {
+			launch.Model = override.model
+		}
+		launches[agentType] = launch
+	}
+	return launches
 }
 
 // loadLatestHandoff loads the most recent handoff for a session and returns recovery context.
@@ -1383,15 +2140,11 @@ func normalizeAssignStrategyStrict(strategy string) (string, error) {
 	}
 }
 
-// assignWorkToAgents gets triage recommendations, claims beads, and sends work prompts.
-func assignWorkToAgents(ctx context.Context, output *SpawnOutput, workDir, session, strategy string, cfg *config.Config, requireReservation bool, reservationPaths []string, customDeps *SpawnAssignmentDependencies) []SpawnAssignment {
-	assignments, _ := assignWorkToAgentsWithError(
-		ctx, output, workDir, session, strategy, cfg, requireReservation, reservationPaths, customDeps, nil,
-	)
-	return assignments
-}
-
-func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workDir, session, strategy string, cfg *config.Config, requireReservation bool, reservationPaths []string, customDeps *SpawnAssignmentDependencies, verifiedPlan *bv.TriageResponse) ([]SpawnAssignment, error) {
+// assignWorkToAgentsWithError claims and dispatches one work item per agent.
+// Each agent's atomic claim+dispatch waits for its stagger slot (pacer; nil
+// never waits) so work prompts reach agents paced like `ntm spawn` prompts,
+// and initialPrompt, when set, prefixes every work prompt.
+func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workDir, session, strategy string, cfg *config.Config, requireReservation bool, reservationPaths []string, customDeps *SpawnAssignmentDependencies, verifiedPlan *bv.TriageResponse, initialPrompt string, promptContext PromptContextOptions, pacer *spawnStaggerPacer) ([]SpawnAssignment, error) {
 	var assignments []SpawnAssignment
 	if ctx == nil {
 		return []SpawnAssignment{{ClaimError: "spawn assignment context is required"}}, nil
@@ -1434,7 +2187,7 @@ func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workD
 	}
 
 	// Get work items based on strategy
-	workItems := getWorkItemsForStrategy(triage, strategy, len(readyAgents))
+	workItems := getWorkItemsForStrategy(triage, strategy, readyAgents)
 	if len(workItems) == 0 {
 		ledgerExists, err := deps.AssignmentLedgerExists(session)
 		if err != nil {
@@ -1519,14 +2272,23 @@ func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workD
 			terminalErr = err
 			break
 		}
+		// Hold the whole claim+dispatch until this agent's stagger slot, so the
+		// claim is never held across the wait and the dispatch-time observation
+		// below is fresh.
+		if err := pacer.await(ctx, i); err != nil {
+			assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i:], fmt.Errorf("spawn assignment stagger wait: %w", err))...)
+			terminalErr = spawnCancellationError(ctx, err)
+			break
+		}
 
 		item := workItems[i]
 		spawnAssignment := SpawnAssignment{
-			Pane:      agent.Pane,
-			AgentType: agent.Type,
-			BeadID:    item.ID,
-			BeadTitle: item.Title,
-			Priority:  fmt.Sprintf("P%d", item.Priority),
+			Pane:         agent.Pane,
+			AgentType:    agent.Type,
+			BeadID:       item.ID,
+			BeadTitle:    item.Title,
+			Priority:     fmt.Sprintf("P%d", item.Priority),
+			AssignReason: item.MatchReason,
 		}
 		resolved, resolveErr := tmux.ResolvePaneSelectors(panes, []string{agent.Pane}, true)
 		if resolveErr != nil {
@@ -1540,10 +2302,31 @@ func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workD
 		if target == "" {
 			target = pane.Ref().Physical()
 		}
-		prompt := generateWorkPrompt(item)
+		basePrompt := composeSpawnWorkPrompt(initialPrompt, generateWorkPrompt(item))
+		prompt := basePrompt
 		agentName := ""
 		idempotencyKey := ""
-		if replay := robotAtomicReplayIntent(store, item.ID, target, pane.Index, agent.Type, prompt, requireReservation, reservationPaths); replay != nil {
+		baseIntentSHA256 := ""
+		recoveredIntentSHA256 := ""
+		// A live row recorded from this same template intent with an enriched
+		// prompt is replayed or recovered with its exact recorded prompt;
+		// cass and cm are never queried again for it.
+		recorded := robotAtomicContextIntent(store, item.ID, target, agent.Type, basePrompt, requireReservation, reservationPaths)
+		if recorded != nil {
+			prompt = bulkRecoveryPrompt(recorded)
+			recoveredIntentSHA256 = strings.TrimSpace(recorded.IntentSHA256)
+			if recoveredIntentSHA256 == "" {
+				recoveredIntentSHA256 = strings.TrimSpace(recorded.PromptSHA256)
+			}
+		}
+		var replay *assignment.Assignment
+		switch {
+		case recorded != nil && recorded.DispatchState == assignment.DispatchSent:
+			replay = recorded
+		case recorded == nil:
+			replay = robotAtomicReplayIntent(store, item.ID, target, pane.Index, agent.Type, prompt, requireReservation, reservationPaths)
+		}
+		if replay != nil {
 			agentName = replay.AgentName
 			idempotencyKey = replay.IdempotencyKey
 		} else {
@@ -1570,66 +2353,78 @@ func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workD
 				continue
 			}
 
-			agentName = strings.TrimSpace(agent.Name)
-			if requireReservation {
-				if reservationPort == nil {
-					mailRuntime, runtimeErr := newRobotAgentMailReservationRuntime(ctx, workDir, session, nil)
-					if runtimeErr != nil {
-						spawnAssignment.ClaimError = runtimeErr.Error()
+			if recorded != nil {
+				// Recover the recorded, not yet delivered, enriched intent
+				// under its own identity and key.
+				agentName = recorded.AgentName
+				idempotencyKey = recorded.IdempotencyKey
+			} else {
+				agentName = strings.TrimSpace(agent.Name)
+				if requireReservation {
+					if reservationPort == nil {
+						mailRuntime, runtimeErr := newRobotAgentMailReservationRuntime(ctx, workDir, session, nil)
+						if runtimeErr != nil {
+							spawnAssignment.ClaimError = runtimeErr.Error()
+							assignments = append(assignments, spawnAssignment)
+							if stopForTerminalError(runtimeErr) {
+								assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], runtimeErr)...)
+								break
+							}
+							continue
+						}
+						reservationPort = mailRuntime
+						if resolveAgentName == nil {
+							resolveAgentName = mailRuntime.ResolveRecipient
+						}
+					}
+					if resolveAgentName == nil {
+						spawnAssignment.ClaimError = "required reservation has no exact Agent Mail pane-identity resolver"
 						assignments = append(assignments, spawnAssignment)
-						if stopForTerminalError(runtimeErr) {
-							assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], runtimeErr)...)
+						continue
+					}
+					agentName, resolveErr = resolveAgentName(ctx, workDir, session, target, pane.Title)
+					if resolveErr != nil {
+						spawnAssignment.ClaimError = resolveErr.Error()
+						assignments = append(assignments, spawnAssignment)
+						if stopForTerminalError(resolveErr) {
+							assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], resolveErr)...)
 							break
 						}
 						continue
 					}
-					reservationPort = mailRuntime
-					if resolveAgentName == nil {
-						resolveAgentName = mailRuntime.ResolveRecipient
+					if err := ctx.Err(); err != nil {
+						spawnAssignment.ClaimError = fmt.Sprintf("spawn assignment canceled after reservation identity resolution: %v", err)
+						assignments = append(assignments, spawnAssignment)
+						assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], err)...)
+						terminalErr = err
+						break
 					}
+					agentName = strings.TrimSpace(agentName)
 				}
-				if resolveAgentName == nil {
-					spawnAssignment.ClaimError = "required reservation has no exact Agent Mail pane-identity resolver"
+				if agentName == "" {
+					spawnAssignment.ClaimError = fmt.Sprintf("pane %s (%s) has no canonical assignment identity", spawnAssignment.Pane, target)
 					assignments = append(assignments, spawnAssignment)
 					continue
 				}
-				agentName, resolveErr = resolveAgentName(ctx, workDir, session, target, pane.Title)
-				if resolveErr != nil {
-					spawnAssignment.ClaimError = resolveErr.Error()
+				var keyErr error
+				idempotencyKey, keyErr = robotAtomicIdempotencyKey(
+					store, item.ID, target, pane.Index, agent.Type, agentName, prompt,
+					requireReservation, reservationPaths, deps.NewIdempotencyKey,
+				)
+				if keyErr != nil {
+					spawnAssignment.ClaimError = keyErr.Error()
 					assignments = append(assignments, spawnAssignment)
-					if stopForTerminalError(resolveErr) {
-						assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], resolveErr)...)
+					if stopForTerminalError(keyErr) {
+						assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], keyErr)...)
 						break
 					}
 					continue
 				}
-				if err := ctx.Err(); err != nil {
-					spawnAssignment.ClaimError = fmt.Sprintf("spawn assignment canceled after reservation identity resolution: %v", err)
-					assignments = append(assignments, spawnAssignment)
-					assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], err)...)
-					terminalErr = err
-					break
+				if promptContext.Enabled() && !robotAtomicLiveKey(store, item.ID, idempotencyKey) {
+					// A fresh intent: enrich now, before Execute records it, so
+					// the ledger hashes and persists exactly what the agent gets.
+					prompt, baseIntentSHA256 = enrichSpawnWorkPrompt(ctx, deps.GetBeadDetails, workDir, session, item, agent.Type, prompt, promptContext, &spawnAssignment)
 				}
-				agentName = strings.TrimSpace(agentName)
-			}
-			if agentName == "" {
-				spawnAssignment.ClaimError = fmt.Sprintf("pane %s (%s) has no canonical assignment identity", spawnAssignment.Pane, target)
-				assignments = append(assignments, spawnAssignment)
-				continue
-			}
-			var keyErr error
-			idempotencyKey, keyErr = robotAtomicIdempotencyKey(
-				store, item.ID, target, pane.Index, agent.Type, agentName, prompt,
-				requireReservation, reservationPaths, deps.NewIdempotencyKey,
-			)
-			if keyErr != nil {
-				spawnAssignment.ClaimError = keyErr.Error()
-				assignments = append(assignments, spawnAssignment)
-				if stopForTerminalError(keyErr) {
-					assignments = append(assignments, spawnAgentPlanErrors(readyAgents[i+1:], keyErr)...)
-					break
-				}
-				continue
 			}
 		}
 		spawnAssignment.IdempotencyKey = idempotencyKey
@@ -1655,9 +2450,12 @@ func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workD
 		coordinator = coordinator.WithAssignmentEligibilityAuthorizationPort(
 			newRobotAtomicEligibilityAuthorizationPort(workDir, operatorGatedLabels, deps.GetBeadDetails),
 		)
-		result, executeErr := coordinator.Execute(ctx, spawnAtomicRequest(
+		request := spawnAtomicRequest(
 			item, target, pane.Index, agent.Type, agentName, prompt, idempotencyKey, requireReservation, reservationPaths,
-		))
+		)
+		request.BaseIntentSHA256 = baseIntentSHA256
+		request.RecoveredIntentSHA256 = recoveredIntentSHA256
+		result, executeErr := coordinator.Execute(ctx, request)
 		if result.Assignment != nil && result.Assignment.IdempotencyKey == idempotencyKey {
 			spawnAssignment.Claimed = result.Assignment.ClaimState == assignment.ClaimClaimed
 			spawnAssignment.ClaimActor = result.Assignment.ClaimActor
@@ -1672,6 +2470,9 @@ func assignWorkToAgentsWithError(ctx context.Context, output *SpawnOutput, workD
 			}
 		} else {
 			spawnAssignment.PromptSent = result.Sent
+			if result.Sent && !result.Replayed {
+				spawnAssignment.DeliveredAt = pacer.stamp()
+			}
 		}
 
 		assignments = append(assignments, spawnAssignment)
@@ -1790,12 +2591,141 @@ func finalizeSpawnAssignmentOutput(output *SpawnOutput) {
 	)
 }
 
+// deliverSpawnInitialPrompts sends prompt to every launched agent in stagger
+// order through the canonical robot dispatch port shared with work
+// assignment: robot send's final-message redaction and delivery-protocol
+// planning, plus a dispatch-time re-observation that refuses any pane not
+// freshly idle. It never types into a pane outside that gate; a refused pane
+// is reported, and later agents still get their slot.
+func deliverSpawnInitialPrompts(
+	ctx context.Context,
+	output *SpawnOutput,
+	session, prompt string,
+	cfg *config.Config,
+	deps SpawnAssignmentDependencies,
+	pacer *spawnStaggerPacer,
+) ([]SpawnPromptDelivery, error) {
+	agents := make([]SpawnedAgent, 0, len(output.Agents))
+	for _, agent := range output.Agents {
+		if agent.Type != "user" {
+			agents = append(agents, agent)
+		}
+	}
+	deliveries := make([]SpawnPromptDelivery, len(agents))
+	for i, agent := range agents {
+		deliveries[i] = SpawnPromptDelivery{Pane: agent.Pane, AgentType: agent.Type, Order: i + 1}
+	}
+	failFrom := func(start int, err error) {
+		for i := start; i < len(deliveries); i++ {
+			deliveries[i].Error = err.Error()
+		}
+	}
+	if deps.ListPanes == nil {
+		failFrom(0, errors.New("spawn prompt topology reader is unavailable"))
+		return deliveries, nil
+	}
+	panes, err := deps.ListPanes(ctx, session)
+	if err != nil {
+		wrapped := fmt.Errorf("load pane topology for spawn prompt: %w", err)
+		failFrom(0, wrapped)
+		return deliveries, spawnCancellationError(ctx, wrapped)
+	}
+	redactionConfig := config.Default().Redaction.ToRedactionLibConfig()
+	if cfg != nil {
+		redactionConfig = cfg.Redaction.ToRedactionLibConfig()
+	}
+	port := newRobotAtomicPaneDispatchPort(session, deps.ListPanes, deps.ObserveSession, redactionConfig, deps.DispatchDeliverer, deps.DispatchPacer)
+	for i, agent := range agents {
+		if err := pacer.await(ctx, i); err != nil {
+			wrapped := fmt.Errorf("spawn prompt stagger wait: %w", err)
+			failFrom(i, wrapped)
+			return deliveries, spawnCancellationError(ctx, wrapped)
+		}
+		resolved, resolveErr := tmux.ResolvePaneSelectors(panes, []string{agent.Pane}, true)
+		if resolveErr != nil {
+			deliveries[i].Error = fmt.Sprintf("resolve pane %s: %v", agent.Pane, resolveErr)
+			continue
+		}
+		pane := resolved[0]
+		target := pane.ID
+		if target == "" {
+			target = pane.Ref().Physical()
+		}
+		if _, dispatchErr := port.Dispatch(ctx, assignment.DispatchRequest{
+			Target: target, Pane: pane.Index, AgentType: agent.Type, Prompt: prompt,
+		}); dispatchErr != nil {
+			deliveries[i].Error = dispatchErr.Error()
+			if cancelErr := spawnCancellationError(ctx, dispatchErr); cancelErr != nil {
+				failFrom(i+1, cancelErr)
+				return deliveries, cancelErr
+			}
+			continue
+		}
+		deliveries[i].PromptSent = true
+		deliveries[i].DeliveredAt = pacer.stamp()
+	}
+	return deliveries, nil
+}
+
+// finalizeSpawnPromptDeliveries fails the envelope when any agent did not
+// receive its --spawn-prompt; the session and every launched pane remain.
+func finalizeSpawnPromptDeliveries(output *SpawnOutput) {
+	if output == nil {
+		return
+	}
+	failed := 0
+	for _, delivery := range output.PromptDeliveries {
+		if !delivery.PromptSent {
+			failed++
+		}
+	}
+	if failed == 0 {
+		return
+	}
+	output.Error = fmt.Sprintf("%d of %d spawn prompt deliveries failed", failed, len(output.PromptDeliveries))
+	output.RobotResponse = NewErrorResponse(
+		fmt.Errorf("%s", output.Error),
+		ErrCodePromptSendFailed,
+		"Inspect prompt_deliveries[].error; agents with prompt_sent=false did not receive the prompt and remain running (resend with --robot-send)",
+	)
+}
+
+// enrichSpawnWorkPrompt enriches one fresh work prompt with CASS history and
+// CM rules through the shared EnrichAssignmentPrompt (queried by the bead's
+// title, labels and description), records what happened on out, and returns
+// the enriched prompt with the base prompt's checksum for the ledger.
+func enrichSpawnWorkPrompt(
+	ctx context.Context,
+	readBead func(context.Context, string, string) (*bv.BeadAssignmentDetails, error),
+	workDir, session string,
+	item workItem,
+	agentType, prompt string,
+	promptContext PromptContextOptions,
+	out *SpawnAssignment,
+) (string, string) {
+	request := AssignmentPrompt{
+		Prompt: prompt, Title: item.Title, AgentType: agentType,
+		Session: session, ProjectDir: workDir,
+	}
+	if readBead != nil {
+		if details, err := readBead(ctx, workDir, item.ID); err == nil && details != nil {
+			request.Labels, request.Description = details.Labels, details.Description
+		}
+	}
+	enriched, cassInjection, memoryInjection := EnrichAssignmentPrompt(ctx, request, promptContext)
+	out.CASSInjection, out.MemoryInjection = cassInjection, memoryInjection
+	return enriched, assignment.PromptSHA256(prompt)
+}
+
 func spawnAtomicRequest(item workItem, target string, pane int, agentType, agentName, prompt, key string, requireReservation bool, reservationPaths []string) assignment.AtomicRequest {
 	return assignment.AtomicRequest{
 		BeadID: item.ID, BeadTitle: item.Title, Target: target, OccupancyKey: target, Pane: pane,
 		AgentType: agentType, AgentName: agentName, Actor: agentName, Prompt: prompt,
 		IdempotencyKey: key, RequireReservation: requireReservation, ReservationTTL: time.Hour,
 		RequestedPaths: append([]string(nil), reservationPaths...),
+		// Without explicit paths the shared Agent Mail port discovers the
+		// bead's file scope, as --robot-bulk-assign and ntm assign do.
+		AllowReservationDiscovery: requireReservation && len(reservationPaths) == 0,
 	}
 }
 
@@ -2074,34 +3004,126 @@ func spawnAssignmentDeps(custom *SpawnAssignmentDependencies) SpawnAssignmentDep
 
 // workItem represents a work item from triage for assignment.
 type workItem struct {
-	ID       string
-	Title    string
-	Priority int
-	Score    float64
-	Type     string
-	Reasons  []string
+	ID          string
+	Title       string
+	Priority    int
+	Score       float64
+	Type        string
+	Reasons     []string
+	MatchReason string // How the strategy paired this item with its agent slot (recorded in the envelope)
 }
 
 // getWorkItemsForStrategy returns work items based on the selected strategy.
-func getWorkItemsForStrategy(triage *bv.TriageResponse, strategy string, count int) []workItem {
-	var items []workItem
+// The returned slice is positional: workItems[i] is assigned to agents[i].
+func getWorkItemsForStrategy(triage *bv.TriageResponse, strategy string, agents []SpawnedAgent) []workItem {
+	count := len(agents)
 
 	switch strategy {
 	case "diverse":
 		// Get a mix of different task types
-		items = getDiverseWorkItems(triage, count)
+		return getDiverseWorkItems(triage, count)
 	case "dependency-aware":
 		// Prioritize items that unblock others
-		items = getDependencyAwareItems(triage, count)
+		return getDependencyAwareItems(triage, count)
 	case "skill-matched":
-		// This would ideally match agent types to task types
-		// For now, fall through to top-n
-		fallthrough
+		// Match agent capabilities (capability matrix) to bead task types.
+		return getSkillMatchedWorkItems(triage, agents)
 	case "top-n":
-		fallthrough
-	default:
 		// Get top N recommendations by score
-		items = getTopNWorkItems(triage, count)
+		return getTopNWorkItems(triage, count)
+	default:
+		// Strict normalization upstream should make this unreachable. If a new
+		// strategy value ever leaks through, fall back loudly instead of
+		// silently pretending it ran.
+		items := getTopNWorkItems(triage, count)
+		for i := range items {
+			items[i].MatchReason = fmt.Sprintf("strategy %q not implemented at dispatch; fell back to top-n", strategy)
+		}
+		return items
+	}
+}
+
+// spawnTaskTypeForRecommendation resolves the capability-matrix task type for
+// a triage recommendation. An explicit bead type wins unless it is the
+// generic "task"; then a label naming a specific type; then title keyword
+// inference (same ladder the C4 assign planners use).
+func spawnTaskTypeForRecommendation(rec bv.TriageRecommendation) assign.TaskType {
+	if t := strings.ToLower(strings.TrimSpace(rec.Type)); t != "" && t != "task" {
+		return assign.ParseTaskType(t)
+	}
+	for _, label := range rec.Labels {
+		if tt := assign.ParseTaskType(label); tt != assign.TaskTask {
+			return tt
+		}
+	}
+	return assign.ParseTaskType(inferTaskType(bv.BeadPreview{ID: rec.ID, Title: rec.Title, Type: rec.Type}))
+}
+
+// getSkillMatchedWorkItems pairs each agent slot with the unassigned
+// recommendation its agent type scores highest on in the capability matrix.
+// Triage order (best score first) is the tie-break, so identical capability
+// scores degrade to top-n order — and that degenerate case is recorded
+// loudly in MatchReason rather than hidden.
+func getSkillMatchedWorkItems(triage *bv.TriageResponse, agents []SpawnedAgent) []workItem {
+	recs := triage.Triage.Recommendations
+	if len(recs) == 0 || len(agents) == 0 {
+		return nil
+	}
+
+	taskTypes := make([]assign.TaskType, len(recs))
+	for j, rec := range recs {
+		taskTypes[j] = spawnTaskTypeForRecommendation(rec)
+	}
+
+	used := make([]bool, len(recs))
+	items := make([]workItem, 0, len(agents))
+	for _, agent := range agents {
+		best := -1
+		bestScore := -1.0
+		minScore, maxScore := 2.0, -1.0
+		for j := range recs {
+			if used[j] {
+				continue
+			}
+			score := assign.GetAgentScoreByString(agent.Type, string(taskTypes[j]))
+			if score < minScore {
+				minScore = score
+			}
+			if score > maxScore {
+				maxScore = score
+			}
+			// Strictly greater keeps triage score order as the tie-break:
+			// recommendations arrive sorted best-first.
+			if score > bestScore {
+				best = j
+				bestScore = score
+			}
+		}
+		if best < 0 {
+			break
+		}
+		used[best] = true
+		rec := recs[best]
+
+		matchReason := fmt.Sprintf("skill-matched: %s capability %.2f for %s tasks", agent.Type, bestScore, taskTypes[best])
+		if minScore == maxScore {
+			// No capability signal discriminated between the remaining beads
+			// (e.g. unknown agent type, or uniform task types): the pick is
+			// triage order. Say so instead of silently looking matched.
+			matchReason = fmt.Sprintf("skill-matched: no discriminating capability signal for agent type %q (uniform score %.2f); kept triage order", agent.Type, bestScore)
+		}
+
+		reasons := append([]string(nil), rec.Reasons...)
+		reasons = append(reasons, matchReason)
+		items = append(items, workItem{
+			ID:          rec.ID,
+			Title:       rec.Title,
+			Priority:    rec.Priority,
+			Score:       rec.Score,
+			Type:        rec.Type,
+			Reasons:     reasons,
+			MatchReason: matchReason,
+		})
 	}
 
 	return items

@@ -2,15 +2,10 @@
 package cost
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/tokens"
 )
@@ -65,286 +60,55 @@ var modelPricing = map[string]ModelPricing{
 
 var modelDateSuffixRegex = regexp.MustCompile(`-\d{8}$`)
 
-// AgentCost tracks token usage for a single agent.
-type AgentCost struct {
-	InputTokens  int       `json:"input_tokens"`
-	OutputTokens int       `json:"output_tokens"`
-	Model        string    `json:"model"`
-	LastUpdated  time.Time `json:"last_updated"`
-}
-
-// Cost calculates the USD cost for this agent.
-func (a *AgentCost) Cost() float64 {
-	pricing := GetModelPricing(a.Model)
-	inputCost := float64(a.InputTokens) / 1000 * pricing.InputPer1K
-	outputCost := float64(a.OutputTokens) / 1000 * pricing.OutputPer1K
-	return inputCost + outputCost
-}
-
-// SessionCost tracks costs for all agents in a session.
-type SessionCost struct {
-	Agents    map[string]*AgentCost `json:"agents"`
-	StartTime time.Time             `json:"start_time"`
-}
-
-// TotalCost calculates the total USD cost for this session.
-func (s *SessionCost) TotalCost() float64 {
-	var total float64
-	for _, agent := range s.Agents {
-		total += agent.Cost()
-	}
-	return total
-}
-
-// TotalTokens returns total input and output tokens for this session.
-func (s *SessionCost) TotalTokens() (input, output int) {
-	for _, agent := range s.Agents {
-		input += agent.InputTokens
-		output += agent.OutputTokens
-	}
-	return
-}
-
-// CostTracker manages cost tracking across multiple sessions.
-type CostTracker struct {
-	mu       sync.RWMutex
-	sessions map[string]*SessionCost
-	dataDir  string
-}
-
-// NewCostTracker creates a new CostTracker instance.
-// If dataDir is empty, persistence is disabled.
-func NewCostTracker(dataDir string) *CostTracker {
-	return &CostTracker{
-		sessions: make(map[string]*SessionCost),
-		dataDir:  dataDir,
-	}
-}
-
-// LoadFromDir loads cost data from the .ntm directory.
-func (t *CostTracker) LoadFromDir(dir string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	costPath := filepath.Join(dir, ".ntm", "costs.json")
-	data, err := os.ReadFile(costPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // No cost file yet, that's fine
-		}
-		return fmt.Errorf("read costs file: %w", err)
-	}
-
-	var sessions map[string]*SessionCost
-	if err := json.Unmarshal(data, &sessions); err != nil {
-		return fmt.Errorf("parse costs file: %w", err)
-	}
-	if sessions == nil {
-		sessions = make(map[string]*SessionCost)
-	}
-
-	t.sessions = sessions
-	return nil
-}
-
-// SaveToDir saves cost data to the .ntm directory.
-func (t *CostTracker) SaveToDir(dir string) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	ntmDir := filepath.Join(dir, ".ntm")
-	if err := os.MkdirAll(ntmDir, 0755); err != nil {
-		return fmt.Errorf("create .ntm dir: %w", err)
-	}
-
-	costPath := filepath.Join(ntmDir, "costs.json")
-
-	// Create atomic temp file
-	tmpFile, err := os.CreateTemp(ntmDir, "costs-*.json")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer func() {
-		if tmpPath != "" {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	data, err := json.MarshalIndent(t.sessions, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal costs: %w", err)
-	}
-
-	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("write temp file: %w", err)
-	}
-
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, costPath); err != nil {
-		return fmt.Errorf("rename temp file: %w", err)
-	}
-	tmpPath = "" // Prevent defer from removing successfully renamed file
-
-	return nil
-}
-
-// getOrCreateSession returns the session cost, creating it if needed.
-func (t *CostTracker) getOrCreateSession(session string) *SessionCost {
-	if s, ok := t.sessions[session]; ok {
-		return s
-	}
-	s := &SessionCost{
-		Agents:    make(map[string]*AgentCost),
-		StartTime: time.Now(),
-	}
-	t.sessions[session] = s
-	return s
-}
-
-// getOrCreateAgent returns the agent cost, creating it if needed.
-func (s *SessionCost) getOrCreateAgent(pane, model string) *AgentCost {
-	if a, ok := s.Agents[pane]; ok {
-		return a
-	}
-	a := &AgentCost{
-		Model:       model,
-		LastUpdated: time.Now(),
-	}
-	s.Agents[pane] = a
-	return a
-}
-
-// RecordPrompt records input tokens from a prompt.
-func (t *CostTracker) RecordPrompt(session, pane, model, prompt string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	tokens := EstimateTokens(prompt)
-	s := t.getOrCreateSession(session)
-	a := s.getOrCreateAgent(pane, model)
-	a.InputTokens += tokens
-	a.LastUpdated = time.Now()
-	if model != "" && a.Model == "" {
-		a.Model = model
-	}
-}
-
-// RecordResponse records output tokens from a response.
-func (t *CostTracker) RecordResponse(session, pane, model, response string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	tokens := EstimateTokens(response)
-	s := t.getOrCreateSession(session)
-	a := s.getOrCreateAgent(pane, model)
-	a.OutputTokens += tokens
-	a.LastUpdated = time.Now()
-	if model != "" && a.Model == "" {
-		a.Model = model
-	}
-}
-
-// RecordTokens records token counts directly (for when exact counts are known).
-func (t *CostTracker) RecordTokens(session, pane, model string, inputTokens, outputTokens int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	s := t.getOrCreateSession(session)
-	a := s.getOrCreateAgent(pane, model)
-	a.InputTokens += inputTokens
-	a.OutputTokens += outputTokens
-	a.LastUpdated = time.Now()
-	if model != "" {
-		a.Model = model
-	}
-}
-
-// GetSessionCost returns the total USD cost for a session.
-func (t *CostTracker) GetSessionCost(session string) float64 {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	s, ok := t.sessions[session]
-	if !ok {
-		return 0
-	}
-	return s.TotalCost()
-}
-
-// GetSession returns the session cost data (nil if not found).
-func (t *CostTracker) GetSession(session string) *SessionCost {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	s, ok := t.sessions[session]
-	if !ok {
-		return nil
-	}
-	// Return a copy to avoid race conditions
-	copy := &SessionCost{
-		StartTime: s.StartTime,
-		Agents:    make(map[string]*AgentCost, len(s.Agents)),
-	}
-	for k, v := range s.Agents {
-		agentCopy := *v
-		copy.Agents[k] = &agentCopy
-	}
-	return copy
-}
-
-// GetAllSessions returns all session names.
-func (t *CostTracker) GetAllSessions() []string {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	names := make([]string, 0, len(t.sessions))
-	for name := range t.sessions {
-		names = append(names, name)
-	}
-	return names
-}
-
-// GetTotalCost returns the total cost across all sessions.
-func (t *CostTracker) GetTotalCost() float64 {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	var total float64
-	for _, s := range t.sessions {
-		total += s.TotalCost()
-	}
-	return total
-}
-
-// ClearSession removes cost data for a session.
-func (t *CostTracker) ClearSession(session string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.sessions, session)
-}
-
 func normalizeModelName(model string) string {
 	model = strings.TrimSpace(strings.ToLower(model))
 	model = modelDateSuffixRegex.ReplaceAllString(model, "")
 	return model
 }
 
-// GetModelPricing returns the pricing for a model.
-// If the model is not found, returns default pricing.
-func GetModelPricing(model string) ModelPricing {
-	if pricing, ok := modelPricing[model]; ok {
-		return pricing
+// PricingMatch describes how a price was resolved, because "we have a number"
+// and "we know this model's price" are different claims.
+type PricingMatch int
+
+const (
+	// PricingUnknown means nothing matched and the default row was used. The
+	// amount is a guessed rate, not this model's price.
+	PricingUnknown PricingMatch = iota
+	// PricingFamily means a shorter family prefix matched — claude-opus-5
+	// priced from the claude-opus row. The family's rate is a reasonable
+	// stand-in but was never verified for this model, and a new generation
+	// routinely reprices.
+	PricingFamily
+	// PricingExact means this model is in the table by name.
+	PricingExact
+)
+
+// Known reports whether the price came from an entry for this model or its
+// family, as opposed to the default row.
+func (m PricingMatch) Known() bool { return m != PricingUnknown }
+
+// PricingTableVintage is when the price table below was last revised. Surface
+// it anywhere prices are shown: it is over a year old, and models released
+// since are priced by family prefix or by the default row rather than by any
+// figure anyone checked.
+const PricingTableVintage = "May 2025"
+
+// GetModelPricingInfo returns the pricing for a model and how it was resolved.
+//
+// Anything other than PricingExact means the caller is holding a rate that was
+// never verified for this model: gpt-6-astra and gemini-3.1-pro-preview fall to
+// the default row (which overstates Gemini severalfold), and claude-opus-5 is
+// priced from the claude-opus family entry. Callers that show money must
+// surface the difference rather than presenting any of it as this model's
+// price.
+func GetModelPricingInfo(model string) (ModelPricing, PricingMatch) {
+	if pricing, ok := modelPricing[model]; ok && model != "default" {
+		return pricing, PricingExact
 	}
 
 	normalized := normalizeModelName(model)
-	if pricing, ok := modelPricing[normalized]; ok {
-		return pricing
+	if pricing, ok := modelPricing[normalized]; ok && normalized != "default" {
+		return pricing, PricingExact
 	}
 
 	// Prefix match for variants (longest key first).
@@ -360,14 +124,14 @@ func GetModelPricing(model string) ModelPricing {
 	})
 	for _, key := range keys {
 		if strings.HasPrefix(normalized, key) {
-			return modelPricing[key]
+			return modelPricing[key], PricingFamily
 		}
 	}
 
 	if pricing, ok := modelPricing["default"]; ok {
-		return pricing
+		return pricing, PricingUnknown
 	}
-	return ModelPricing{}
+	return ModelPricing{}, PricingUnknown
 }
 
 // EstimateTokens estimates the token count for text.
@@ -376,7 +140,8 @@ func EstimateTokens(text string) int {
 	return tokens.EstimateTokens(text)
 }
 
-// FormatCost formats a USD amount as a string.
+// FormatCost formats a USD amount as a string. Use it for amounts that came
+// from a provider; for locally estimated amounts use FormatCostEstimate.
 func FormatCost(usd float64) string {
 	if usd < 0.01 {
 		return fmt.Sprintf("$%.4f", usd)
@@ -385,4 +150,21 @@ func FormatCost(usd float64) string {
 		return fmt.Sprintf("$%.3f", usd)
 	}
 	return fmt.Sprintf("$%.2f", usd)
+}
+
+// FormatCostEstimate formats a locally estimated USD amount.
+//
+// Estimates come from a ~3.5-chars-per-token count of scraped pane output
+// multiplied by a price table, so the input is accurate to roughly a factor of
+// two. Rendering that as "$0.0137" claims precision to a hundredth of a cent
+// that the number does not have, so estimates carry a "~" and stop at cents,
+// and anything under a cent says so rather than inventing digits.
+func FormatCostEstimate(usd float64) string {
+	if usd <= 0 {
+		return "~$0"
+	}
+	if usd < 0.01 {
+		return "<$0.01"
+	}
+	return fmt.Sprintf("~$%.2f", usd)
 }

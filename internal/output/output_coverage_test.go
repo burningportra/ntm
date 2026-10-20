@@ -34,7 +34,8 @@ func TestFormatterOutput_JSONMode(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	f := New(WithJSON(true), WithWriter(&buf))
+	f := New(WithJSON(true))
+	f.writer = &buf
 
 	r := &mockResult{jsonOut: map[string]string{"status": "ok"}}
 	if err := f.Output(r); err != nil {
@@ -54,7 +55,8 @@ func TestFormatterOutput_TextMode(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	f := New(WithWriter(&buf))
+	f := New()
+	f.writer = &buf
 
 	r := &mockResult{textOut: "hello world"}
 	if err := f.Output(r); err != nil {
@@ -70,7 +72,8 @@ func TestFormatterOutput_TextError(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	f := New(WithWriter(&buf))
+	f := New()
+	f.writer = &buf
 
 	r := &mockResult{textErr: fmt.Errorf("render failed")}
 	err := f.Output(r)
@@ -83,60 +86,9 @@ func TestFormatterOutput_TextError(t *testing.T) {
 // Formatter.ErrorWithHint (JSON branch only; text branch writes to stderr)
 // ---------------------------------------------------------------------------
 
-func TestFormatterErrorWithHint_JSONMode(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	f := New(WithJSON(true), WithWriter(&buf))
-
-	err := f.ErrorWithHint("something broke", "try again later")
-	// JSON mode returns the result of f.JSON(), which is nil on success
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var decoded map[string]interface{}
-	if jsonErr := json.Unmarshal(buf.Bytes(), &decoded); jsonErr != nil {
-		t.Fatalf("invalid JSON: %v", jsonErr)
-	}
-
-	if decoded["error"] != "something broke" {
-		t.Errorf("expected error='something broke', got %v", decoded["error"])
-	}
-	if decoded["hint"] != "try again later" {
-		t.Errorf("expected hint='try again later', got %v", decoded["hint"])
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Formatter.Print (text.go:31)
 // ---------------------------------------------------------------------------
-
-func TestFormatterPrint(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	f := New(WithWriter(&buf))
-
-	f.Print("alpha", " ", "beta")
-
-	if buf.String() != "alpha beta" {
-		t.Errorf("expected 'alpha beta', got %q", buf.String())
-	}
-}
-
-func TestFormatterPrint_Empty(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	f := New(WithWriter(&buf))
-
-	f.Print()
-
-	if buf.Len() != 0 {
-		t.Errorf("expected empty output, got %q", buf.String())
-	}
-}
 
 // ---------------------------------------------------------------------------
 // ProgressMsg format helpers: Warningf, Errorf, Infof, Printf
@@ -159,23 +111,6 @@ func TestProgressMsg_Warningf(t *testing.T) {
 	}
 }
 
-func TestProgressMsg_Errorf(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf)
-
-	p.Errorf("failed after %d retries", 5)
-
-	out := buf.String()
-	if !strings.Contains(out, "✗") {
-		t.Error("expected error icon ✗")
-	}
-	if !strings.Contains(out, "failed after 5 retries") {
-		t.Errorf("expected formatted message, got %q", out)
-	}
-}
-
 func TestProgressMsg_Infof(t *testing.T) {
 	t.Parallel()
 
@@ -193,98 +128,13 @@ func TestProgressMsg_Infof(t *testing.T) {
 	}
 }
 
-func TestProgressMsg_Printf(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf)
-
-	p.Printf("step %d of %d", 3, 7)
-
-	out := buf.String()
-	if !strings.Contains(out, "step 3 of 7") {
-		t.Errorf("expected formatted message, got %q", out)
-	}
-	// Printf should NOT have an icon
-	if strings.Contains(out, "✓") || strings.Contains(out, "✗") || strings.Contains(out, "⚠") || strings.Contains(out, "ℹ") {
-		t.Errorf("Printf should not include an icon, got %q", out)
-	}
-}
-
-func TestProgressMsg_Printf_NoArgs(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf)
-
-	p.Printf("plain message")
-
-	if !strings.Contains(buf.String(), "plain message") {
-		t.Errorf("expected 'plain message', got %q", buf.String())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // ProgressMsg format helpers with indent
 // ---------------------------------------------------------------------------
 
-func TestProgressMsg_WarningfWithIndent(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf).SetIndent("  ")
-
-	p.Warningf("warn %d", 1)
-
-	if !strings.HasPrefix(buf.String(), "  ") {
-		t.Errorf("expected indented output, got %q", buf.String())
-	}
-}
-
-func TestProgressMsg_ErrorfWithIndent(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf).SetIndent(">> ")
-
-	p.Errorf("err %s", "timeout")
-
-	if !strings.HasPrefix(buf.String(), ">> ") {
-		t.Errorf("expected indented output, got %q", buf.String())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Operation.Start and Operation.Summary (captures stdout)
 // ---------------------------------------------------------------------------
-
-func TestOperationStart(t *testing.T) {
-	t.Parallel()
-
-	op := NewOperation("Test")
-	steps := op.Start("step-1")
-
-	if steps == nil {
-		t.Fatal("expected non-nil Steps from Operation.Start")
-	}
-}
-
-func TestOperationStart_MultipleSteps(t *testing.T) {
-	t.Parallel()
-
-	op := NewOperation("Build")
-
-	s1 := op.Start("compile")
-	s1.Done()
-
-	s2 := op.Start("link")
-	s2.Done()
-
-	// Verify no panics and operation state is clean
-	if op.HasErrors() {
-		t.Error("expected no errors")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // PrintSuccessCheck with non-terminal writer (covers non-color branch)
@@ -453,7 +303,8 @@ func TestFormatterOutput_JSONComplex(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	f := New(WithJSON(true), WithWriter(&buf))
+	f := New(WithJSON(true))
+	f.writer = &buf
 
 	r := &mockResult{jsonOut: map[string]interface{}{
 		"items": []string{"a", "b"},
@@ -599,60 +450,6 @@ func TestPrintInfof_Stdout(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Operation.Summary (captures stdout)
 // ---------------------------------------------------------------------------
-
-func TestOperationSummary_Success(t *testing.T) {
-	op := NewOperation("Build")
-
-	out := captureStdout(t, func() {
-		op.Summary()
-	})
-
-	if !strings.Contains(out, "✓") {
-		t.Error("expected success icon for clean operation")
-	}
-	if !strings.Contains(out, "Build completed successfully") {
-		t.Errorf("expected success message, got %q", out)
-	}
-}
-
-func TestOperationSummary_WithErrors(t *testing.T) {
-	op := NewOperation("Deploy")
-	op.AddError("connection timeout")
-	op.AddError("auth failed")
-
-	out := captureStdout(t, func() {
-		op.Summary()
-	})
-
-	if !strings.Contains(out, "✗") {
-		t.Error("expected error icon")
-	}
-	if !strings.Contains(out, "Deploy completed with 2 error(s)") {
-		t.Errorf("expected error summary, got %q", out)
-	}
-	if !strings.Contains(out, "connection timeout") {
-		t.Errorf("expected error detail, got %q", out)
-	}
-}
-
-func TestOperationSummary_WithWarnings(t *testing.T) {
-	op := NewOperation("Setup")
-	op.AddWarning("deprecated config format")
-
-	out := captureStdout(t, func() {
-		op.Summary()
-	})
-
-	if !strings.Contains(out, "⚠") {
-		t.Error("expected warning icon")
-	}
-	if !strings.Contains(out, "Setup completed with 1 warning(s)") {
-		t.Errorf("expected warning summary, got %q", out)
-	}
-	if !strings.Contains(out, "deprecated config format") {
-		t.Errorf("expected warning detail, got %q", out)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // SuccessFooter convenience (stdout wrapper)

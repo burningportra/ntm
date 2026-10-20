@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/policy"
 )
@@ -164,68 +165,229 @@ exit 0
 	}
 }
 
-func TestClaudeHookScriptReadsCurrentStdinPayload(t *testing.T) {
-	for _, want := range []string{
-		"HOOK_INPUT=\"$(cat)\"",
-		"'.tool_name // empty'",
-		"'.tool_input.command // empty'",
-		"exit 2",
-	} {
-		if !strings.Contains(claudeHookScript, want) {
-			t.Fatalf("claude hook script missing %q", want)
-		}
+// The installed hook script hands Claude Code's stdin payload to `ntm safety
+// claude-hook` and passes its exit status through; without ntm on PATH it
+// refuses (exit 2) instead of letting the command run unchecked.
+func TestClaudeHookScriptDelegatesStdinAndFailsClosed(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
 	}
-	if strings.Contains(claudeHookScript, "exit 1\nfi\n\nexit 0") {
-		t.Fatal("claude hook script still uses non-blocking exit 1 for denied commands")
+	dir := t.TempDir()
+	hookPath := filepath.Join(dir, "ntm-safety.sh")
+	if err := os.WriteFile(hookPath, []byte(policy.ClaudeHookScript), 0o755); err != nil {
+		t.Fatalf("write hook script: %v", err)
+	}
+	payload := `{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git reset --hard"}}`
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeNTM := `#!/bin/sh
+printf '%s\n' "$*" > "$HOME/ntm-args"
+cat > "$HOME/ntm-stdin"
+echo "BLOCKED: fake refusal" >&2
+exit 2
+`
+	if err := os.WriteFile(filepath.Join(binDir, "ntm"), []byte(fakeNTM), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", hookPath)
+	cmd.Env = []string{"HOME=" + dir, "PATH=" + binDir + string(os.PathListSeparator) + "/usr/bin:/bin"}
+	cmd.Stdin = strings.NewReader(payload)
+	out, err := cmd.CombinedOutput()
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("hook with ntm: err = %v, want exit 2; output=%s", err, out)
+	}
+	if args, _ := os.ReadFile(filepath.Join(dir, "ntm-args")); strings.TrimSpace(string(args)) != "safety claude-hook" {
+		t.Fatalf("hook ran ntm with %q, want `safety claude-hook`", args)
+	}
+	if stdin, _ := os.ReadFile(filepath.Join(dir, "ntm-stdin")); string(stdin) != payload {
+		t.Fatalf("ntm received stdin %q, want the hook payload", stdin)
+	}
+
+	cmd = exec.Command("sh", hookPath)
+	cmd.Env = []string{"HOME=" + dir, "PATH=/nonexistent"}
+	cmd.Stdin = strings.NewReader(payload)
+	out, err = cmd.CombinedOutput()
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("hook without ntm: err = %v, want exit 2 (refuse); output=%s", err, out)
+	}
+	if !strings.Contains(string(out), "could not find ntm") || !strings.Contains(string(out), "settings.json") {
+		t.Fatalf("hook without ntm said %q, want how to fix or remove it", out)
 	}
 }
 
-func TestClaudeHookScriptBlocksCurrentStdinPayload(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not available")
-	}
-	if _, err := exec.LookPath("jq"); err != nil {
-		t.Skip("jq not available")
+// runSafetyClaudeHook is what Claude Code's PreToolUse hook runs: a blocked
+// Bash command exits 2 with the reason on stderr and is recorded; allowed
+// commands and other tools pass; an unreadable payload is refused.
+func TestRunSafetyClaudeHook(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("NTM_CONFIG", filepath.Join(root, "cfg", "config.toml"))
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("PATH", "/nonexistent") // no dcg: the policy alone decides
+
+	run := func(payload string) (int, string) {
+		var stderr strings.Builder
+		code := runSafetyClaudeHook(strings.NewReader(payload), &stderr)
+		return code, stderr.String()
 	}
 
-	dir := t.TempDir()
-	fakeNTM := filepath.Join(dir, "ntm")
-	fakeScript := `#!/bin/sh
-if [ "${1:-}" = "safety" ] && [ "${2:-}" = "check" ]; then
-  echo '{"action":"block","reason":"blocked by fake safety"}'
-  exit 1
-fi
-exit 0
-`
-	if err := os.WriteFile(fakeNTM, []byte(fakeScript), 0o755); err != nil {
-		t.Fatalf("write fake ntm: %v", err)
+	code, msg := run(`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~3"}}`)
+	if code != claudeHookRefuse || !strings.Contains(msg, "BLOCKED: Hard reset loses uncommitted changes") {
+		t.Fatalf("blocked command: code=%d stderr=%q, want 2 and the policy reason", code, msg)
+	}
+	entries, err := policy.ReadBlockedLog(filepath.Join(root, ".ntm", "logs", "blocked.jsonl"))
+	if err != nil || len(entries) != 1 || entries[0].Command != "git reset --hard HEAD~3" {
+		t.Fatalf("blocked log = %+v (err %v), want the refusal recorded", entries, err)
 	}
 
-	hookPath := filepath.Join(dir, "ntm-safety.sh")
-	if err := os.WriteFile(hookPath, []byte(claudeHookScript), 0o755); err != nil {
-		t.Fatalf("write hook script: %v", err)
+	for name, payload := range map[string]string{
+		"allowed command": `{"tool_name":"Bash","tool_input":{"command":"git status"}}`,
+		"other tool":      `{"tool_name":"Edit","tool_input":{"file_path":"x.go"}}`,
+		"empty command":   `{"tool_name":"Bash","tool_input":{"command":"  "}}`,
+	} {
+		if code, msg := run(payload); code != 0 || msg != "" {
+			t.Errorf("%s: code=%d stderr=%q, want 0 and silence", name, code, msg)
+		}
 	}
 
-	cmd := exec.Command("bash", hookPath)
-	cmd.Env = append(os.Environ(),
-		"HOME="+dir,
-		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
-	)
-	cmd.Stdin = strings.NewReader(`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo ok"}}`)
+	if code, msg := run(`{not json`); code != claudeHookRefuse || !strings.Contains(msg, "not checked") {
+		t.Fatalf("malformed payload: code=%d stderr=%q, want a refusal", code, msg)
+	}
+}
 
-	output, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("hook script allowed fake blocked command; output=%s", output)
+// `ntm safety install` registers the hook in ~/.claude/settings.json (Claude
+// Code never runs unregistered scripts), status reports it only when both the
+// script and the registration exist, and uninstall removes both.
+func TestSafetyInstallRegistersClaudeHookAndUninstallRemovesIt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NTM_CONFIG", filepath.Join(home, "cfg", "config.toml"))
+	settings := policy.ClaudeUserSettingsPath(home)
+	if err := os.MkdirAll(filepath.Dir(settings), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	exitErr, ok := err.(*exec.ExitError)
-	if !ok {
-		t.Fatalf("hook script error has type %T: %v", err, err)
+	if err := os.WriteFile(settings, []byte(`{"model":"opus"}`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if exitErr.ExitCode() != 2 {
-		t.Fatalf("hook script exit code = %d, want 2; output=%s", exitErr.ExitCode(), output)
+
+	oldJSON := jsonOutput
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = oldJSON })
+
+	if _, err := captureStdout(t, func() error { return runSafetyInstall(false) }); err != nil {
+		t.Fatalf("install: %v", err)
 	}
-	if !strings.Contains(string(output), "BLOCKED: blocked by fake safety") {
-		t.Fatalf("hook script output = %q, want blocked reason", output)
+	script := policy.ClaudeHookScriptPath(home)
+	if registered, err := policy.ClaudeHookRegistered(settings, script); err != nil || !registered {
+		t.Fatalf("after install registered = %v, %v; want true", registered, err)
+	}
+	if data, _ := os.ReadFile(settings); !strings.Contains(string(data), `"model": "opus"`) {
+		t.Fatalf("install lost the user's settings: %s", data)
+	}
+
+	out, err := captureStdout(t, func() error { return runSafetyStatus(nil, nil) })
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out, `"hook_installed": true`) || !strings.Contains(out, `"hook_registered": true`) {
+		t.Fatalf("status after install = %s, want the hook installed and registered", out)
+	}
+
+	if _, err := captureStdout(t, func() error { return runSafetyUninstall(nil, nil) }); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if registered, _ := policy.ClaudeHookRegistered(settings, script); registered {
+		t.Fatal("uninstall left the hook registered")
+	}
+	if _, err := os.Stat(script); !os.IsNotExist(err) {
+		t.Fatalf("uninstall left the hook script (stat err %v)", err)
+	}
+	if data, _ := os.ReadFile(settings); strings.TrimSpace(string(data)) != "{\n  \"model\": \"opus\"\n}" {
+		t.Fatalf("settings after uninstall = %q, want only the user's key", data)
+	}
+
+	// A script nobody registered is reported, not counted as protection.
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte(policy.ClaudeHookScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err = captureStdout(t, func() error { return runSafetyStatus(nil, nil) })
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out, `"hook_installed": false`) || !strings.Contains(out, `"hook_script_present": true`) || !strings.Contains(out, `"hook_registered": false`) {
+		t.Fatalf("status with an unregistered script = %s", out)
+	}
+}
+
+// recordHookRefusal runs inside an agent's tool-call hook, so a tmux server
+// that does not answer must not hang it: the refusal is still logged, without
+// a session.
+func TestRecordHookRefusalDoesNotHangOnStuckTmux(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("NTM_CONFIG", filepath.Join(root, "cfg", "config.toml"))
+	fakeTmux := filepath.Join(root, "tmux")
+	if err := os.WriteFile(fakeTmux, []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", fakeTmux)
+	t.Setenv("TMUX", "/tmp/fake-tmux-socket,1,0")
+	t.Setenv("TMUX_PANE", "%7")
+
+	start := time.Now()
+	recordHookRefusal(CheckResponse{Command: "rm -rf build", Action: "block", Reason: "recursive delete"})
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("recordHookRefusal took %v with an unresponsive tmux", elapsed)
+	}
+	entries, err := policy.ReadBlockedLog(filepath.Join(root, ".ntm", "logs", "blocked.jsonl"))
+	if err != nil || len(entries) != 1 || entries[0].Session != "" || entries[0].Command != "rm -rf build" {
+		t.Fatalf("blocked log entries = %+v (err %v), want the refusal logged without a session", entries, err)
+	}
+}
+
+// A refusal checked in hook mode lands in the blocked log with the tmux session
+// and pane it came from, and in that session's blocked_commands metric. The
+// scripts used to log session "unknown" and the metric never saw these.
+func TestRecordHookRefusalAttributesSessionAndCountsMetric(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("NTM_CONFIG", filepath.Join(root, "cfg", "config.toml"))
+	fakeTmux := filepath.Join(root, "tmux")
+	if err := os.WriteFile(fakeTmux, []byte("#!/bin/sh\necho hooksess\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", fakeTmux)
+	t.Setenv("TMUX", "/tmp/fake-tmux-socket,1,0")
+	t.Setenv("TMUX_PANE", "%7")
+
+	recordHookRefusal(CheckResponse{Command: `git reset --hard "HEAD~1"`, Action: "block", Pattern: `git\s+reset\s+--hard`, Reason: "destroys uncommitted work"})
+
+	entries, err := policy.ReadBlockedLog(filepath.Join(root, ".ntm", "logs", "blocked.jsonl"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("blocked log entries = %+v (err %v), want one", entries, err)
+	}
+	if got := entries[0]; got.Session != "hooksess" || got.Agent != "%7" || got.Command != `git reset --hard "HEAD~1"` || got.Action != policy.ActionBlock {
+		t.Fatalf("blocked log entry = %+v, want session hooksess, pane %%7, the exact command, action block", got)
+	}
+
+	store, collector, err := getMetricsCollector("hooksess")
+	if err != nil || store == nil {
+		t.Fatalf("getMetricsCollector: store=%v err=%v", store, err)
+	}
+	defer store.Close()
+	report, err := collector.GenerateReport()
+	if err != nil {
+		t.Fatalf("GenerateReport: %v", err)
+	}
+	if report.BlockedCommands != 1 {
+		t.Fatalf("BlockedCommands = %d, want the one hook refusal", report.BlockedCommands)
 	}
 }
 

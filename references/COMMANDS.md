@@ -54,10 +54,12 @@ ntm send myproject --base-prompt-file ./common-instructions.txt --file ./task.tx
 ntm send myproject -c internal/auth/service.go "Refactor this safely"
 ntm send myproject -c a.go -c b.go "Compare these implementations"
 ntm send myproject -t fix --var issue="nil pointer" --file internal/auth/service.go
+ntm send myproject --cc -t marching_orders --bead bd-123   # per-pane {{agent_num}}/{{agent_type}}, bead from br show
 
 # Smart routing and automated distribution
 ntm send myproject --smart "Take the next auth follow-up"
-ntm send myproject --smart --route=affinity "Continue the migration work"
+ntm send myproject --cc --route=least-loaded "Take the next auth follow-up"   # --route implies --smart
+ntm send myproject --route=affinity "Continue the migration in internal/db/migrate.go"   # agent holding that file
 ntm send myproject --distribute --dist-strategy=dependency
 ntm send myproject --distribute --dist-auto --dist-strategy=balanced
 
@@ -133,7 +135,7 @@ ntm mail send myproject --all "Report blockers and current file focus."
 ntm mail inbox myproject
 ntm locks list myproject --all-agents
 ntm locks renew myproject
-ntm locks force-release myproject 42 --note "agent inactive"
+ntm locks force-release myproject 42 --note "agent inactive"  # approval-gated by default: files an approval, needs `ntm approve <id>` by a second operator
 ntm coordinator status myproject
 ntm coordinator digest myproject
 ntm coordinator conflicts myproject
@@ -145,7 +147,7 @@ ntm timeline list
 ntm timeline show <session-id>
 ntm history search "authentication error"
 ntm audit show myproject
-ntm changes conflicts myproject
+ntm conflicts myproject
 ntm resume myproject
 ```
 

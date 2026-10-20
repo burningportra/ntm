@@ -360,18 +360,6 @@ func clearScreen() {
 	fmt.Print("\033[H\033[2J")
 }
 
-// filterHealthResult applies pane and status filters to the result
-func filterHealthResult(result *health.SessionHealth) *health.SessionHealth {
-	if healthPane == "" {
-		return filterHealthResultWithOptions(result, -1, healthStatus)
-	}
-	paneIDs, err := resolveHealthPaneIDs(result.Session, healthPane)
-	if err != nil {
-		return filterHealthResultWithOptions(result, -1, healthStatus)
-	}
-	return filterHealthResultWithPaneIDs(result, paneIDs, healthStatus)
-}
-
 func resolveHealthPaneIDs(session, selector string) (map[string]struct{}, error) {
 	panes, err := tmux.GetPanes(session)
 	if err != nil {
@@ -480,44 +468,26 @@ func statusSeverity(s health.Status) int {
 	}
 }
 
-// enrichHealthResult adds uptime and restart data from the health tracker
+// enrichHealthResult adds each agent's uptime and recent restarts, read
+// through the same sources --robot-metrics and the dashboard use: the pane
+// shell's start time and the session monitor's restart records. (These came
+// from an in-memory tracker nothing ever wrote to, so ntm health never showed
+// an uptime or a restart.)
 func enrichHealthResult(session string, result *health.SessionHealth) {
-	enrichHealthResultWithOptions(session, result, healthVerbose)
-}
-
-func enrichHealthResultWithOptions(session string, result *health.SessionHealth, verbose bool) {
-	tracker := robot.GetHealthTracker(session)
-
+	now := time.Now()
+	restarts := robot.RecentAgentRestarts(session, time.Hour, now)
 	for i := range result.Agents {
 		agent := &result.Agents[i]
-		metrics, ok := tracker.GetHealth(agent.PaneID)
-		if !ok {
-			continue
-		}
-
-		// Add uptime info to issues for display
-		uptime := tracker.GetUptime(agent.PaneID)
-		restarts := tracker.GetRestartsInWindow(agent.PaneID)
-
-		if restarts > 0 {
+		if n := restarts[agent.PaneID]; n > 0 {
 			agent.Issues = append(agent.Issues, health.Issue{
 				Type:    "restart_count",
-				Message: fmt.Sprintf("%d restarts in last hour", restarts),
+				Message: fmt.Sprintf("%d restarts in last hour", n),
 			})
 		}
-
-		// Store uptime in IdleSeconds as a secondary metric if not already set
-		if agent.IdleSeconds == 0 && uptime > 0 {
-			// Use a special indicator - this is a bit of a hack but keeps compatibility
-			agent.IdleSeconds = -int(uptime.Seconds()) // Negative = uptime, positive = idle
-		}
-
-		// Add last error info if verbose and there's an error
-		if verbose && metrics.LastError != nil {
-			agent.Issues = append(agent.Issues, health.Issue{
-				Type:    metrics.LastError.Type,
-				Message: metrics.LastError.Message,
-			})
+		if startedAt, ok := robot.PaneStartedAt(agent.ShellPID); ok {
+			if uptime := int(now.Sub(startedAt).Seconds()); uptime > 0 {
+				agent.UptimeSeconds = uptime
+			}
 		}
 	}
 }
@@ -570,7 +540,7 @@ func buildHealthOutput(ctx context.Context, input SessionHealthInput) (HealthOut
 		}
 		result = filterHealthResultWithPaneIDs(result, paneIDs, statusFilter)
 	}
-	enrichHealthResultWithOptions(input.Session, result, input.Verbose)
+	enrichHealthResult(input.Session, result)
 
 	return HealthOutput{SessionHealth: result}, nil
 }
@@ -682,27 +652,24 @@ func renderHealthTUI(result *health.SessionHealth) error {
 		}
 	}
 
-	// Format uptime/idle duration
-	formatDuration := func(seconds int) string {
-		if seconds == 0 {
-			return "-"
-		}
-		// Negative means uptime (encoded in enrichHealthResult)
-		if seconds < 0 {
-			seconds = -seconds
-			hours := seconds / 3600
-			mins := (seconds % 3600) / 60
+	// Uptime column: the pane incarnation's age when known, else idle time.
+	formatDuration := func(uptimeSeconds, idleSeconds int) string {
+		if uptimeSeconds > 0 {
+			hours := uptimeSeconds / 3600
+			mins := (uptimeSeconds % 3600) / 60
 			if hours > 0 {
 				return fmt.Sprintf("up %dh%dm", hours, mins)
 			}
 			return fmt.Sprintf("up %dm", mins)
 		}
-		// Positive means idle time
-		mins := seconds / 60
+		if idleSeconds <= 0 {
+			return "-"
+		}
+		mins := idleSeconds / 60
 		if mins > 0 {
 			return fmt.Sprintf("idle %dm", mins)
 		}
-		return fmt.Sprintf("idle %ds", seconds)
+		return fmt.Sprintf("idle %ds", idleSeconds)
 	}
 
 	// Build header
@@ -749,7 +716,7 @@ func renderHealthTUI(result *health.SessionHealth) error {
 		}
 
 		// Format uptime/idle
-		uptimeStr := formatDuration(agent.IdleSeconds)
+		uptimeStr := formatDuration(agent.UptimeSeconds, agent.IdleSeconds)
 
 		// Check for restart count in issues
 		for _, issue := range agent.Issues {

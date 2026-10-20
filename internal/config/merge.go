@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,16 +125,32 @@ func MergeConfig(global *Config, project *ProjectConfig, projectDir string) *Con
 		)
 	}
 
-	// Merge project-scoped integration toggles that have direct runtime equivalents.
-	if project.Integrations.AgentMail != nil {
-		global.AgentMail.Enabled = *project.Integrations.AgentMail
+	// Likewise a repository may tighten its work-source policy but never
+	// loosen the user's: require_clean only turns on, and a project's
+	// required_ref or program_labels apply only where the user set none.
+	if project.Assign.WorkSource.RequireClean {
+		global.Assign.WorkSource.RequireClean = true
 	}
-	if project.Integrations.CASS != nil {
-		global.CASS.Enabled = *project.Integrations.CASS
+	if strings.TrimSpace(global.Assign.WorkSource.RequiredRef) == "" {
+		global.Assign.WorkSource.RequiredRef = strings.TrimSpace(project.Assign.WorkSource.RequiredRef)
 	}
-	if project.Integrations.CM != nil {
-		global.Memory.Enabled = *project.Integrations.CM
+	if len(global.Assign.WorkSource.ProgramLabels) == 0 {
+		global.Assign.WorkSource.ProgramLabels = append([]string(nil), project.Assign.WorkSource.ProgramLabels...)
 	}
+
+	// Project-scoped integration toggles are a one-way ratchet: a repository
+	// overlay may DISABLE an integration for its own project, but it can never
+	// ENABLE one the user turned off globally. Letting the overlay flip a
+	// disabled integration on would allow repository content to opt the user
+	// into network-facing behavior (Agent Mail registration, CASS, CM) without
+	// any reapproval — the same reasoning that keeps operator gates
+	// additive-only above and the Agents command merge disabled entirely.
+	global.AgentMail.Enabled = ratchetIntegrationToggle(
+		"agent_mail", global.AgentMail.Enabled, project.Integrations.AgentMail)
+	global.CASS.Enabled = ratchetIntegrationToggle(
+		"cass", global.CASS.Enabled, project.Integrations.CASS)
+	global.Memory.Enabled = ratchetIntegrationToggle(
+		"cm", global.Memory.Enabled, project.Integrations.CM)
 
 	// Merge Alerts
 	if project.Alerts != nil {
@@ -145,6 +162,9 @@ func MergeConfig(global *Config, project *ProjectConfig, projectDir string) *Con
 		}
 		if project.Alerts.DiskLowThresholdGB != nil {
 			global.Alerts.DiskLowThresholdGB = *project.Alerts.DiskLowThresholdGB
+		}
+		if project.Alerts.DiskFullHorizonHours != nil {
+			global.Alerts.DiskFullHorizonHours = *project.Alerts.DiskFullHorizonHours
 		}
 		if project.Alerts.MailBacklogThreshold != nil {
 			global.Alerts.MailBacklogThreshold = *project.Alerts.MailBacklogThreshold
@@ -190,6 +210,28 @@ func MergeConfig(global *Config, project *ProjectConfig, projectDir string) *Con
 	global.PaletteState.Pinned = mergeStringListPreferFirst(project.PaletteState.Pinned, global.PaletteState.Pinned)
 	global.PaletteState.Favorites = mergeStringListPreferFirst(project.PaletteState.Favorites, global.PaletteState.Favorites)
 
+	return global
+}
+
+// ratchetIntegrationToggle applies a project integration toggle to the global
+// value with enable-suppression: false always wins, true only holds when the
+// user already enabled the integration globally. An ignored enable attempt is
+// recorded at debug level; enabling globally is the intended remedy when the
+// project setting appears to have no effect.
+func ratchetIntegrationToggle(name string, global bool, project *bool) bool {
+	if project == nil {
+		return global
+	}
+	if !*project {
+		return false
+	}
+	if !global {
+		// Debug, not warning: the default project template enables every
+		// integration, so a user with a global disable would otherwise see
+		// this on every command in every default-templated project.
+		slog.Debug("project config cannot enable a globally disabled integration; ignoring",
+			"integration", name)
+	}
 	return global
 }
 

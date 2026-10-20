@@ -27,7 +27,7 @@ import (
 
 func TestIdempotencyStoreStop(t *testing.T) {
 	store := NewIdempotencyStore(time.Hour)
-	store.Set("key1", []byte(`{"ok":true}`), 200, nil)
+	store.SetWithFingerprint("key1", "", []byte(`{"ok":true}`), 200, nil)
 
 	// Stop should be safe to call multiple times
 	store.Stop()
@@ -35,7 +35,7 @@ func TestIdempotencyStoreStop(t *testing.T) {
 	store.Stop()
 
 	// After stop, Get should still work (just no cleanup goroutine)
-	data, code, _, ok := store.Get("key1")
+	data, code, _, _, ok := store.GetWithFingerprint("key1")
 	if !ok {
 		t.Fatal("expected key1 to still be available after Stop")
 	}
@@ -51,10 +51,10 @@ func TestIdempotencyStoreExpiry(t *testing.T) {
 	store := NewIdempotencyStore(10 * time.Millisecond)
 	defer store.Stop()
 
-	store.Set("ephemeral", []byte(`{}`), 200, nil)
+	store.SetWithFingerprint("ephemeral", "", []byte(`{}`), 200, nil)
 	time.Sleep(20 * time.Millisecond)
 
-	_, _, _, ok := store.Get("ephemeral")
+	_, _, _, _, ok := store.GetWithFingerprint("ephemeral")
 	if ok {
 		t.Error("expected expired entry to not be found")
 	}
@@ -195,39 +195,6 @@ func TestBuildMTLSConfigValid(t *testing.T) {
 // ---------------------------------------------------------------------------
 // requestIDMiddleware (deprecated package-level version) tests
 // ---------------------------------------------------------------------------
-
-func TestRequestIDMiddlewareDeprecated(t *testing.T) {
-
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := requestIDFromContext(r.Context())
-		w.Write([]byte(reqID))
-	})
-	handler := requestIDMiddleware(inner)
-
-	t.Run("generates ID when missing", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-
-		if rec.Header().Get(requestIDHeader) == "" {
-			t.Error("expected request ID in response header")
-		}
-		if rec.Body.Len() == 0 {
-			t.Error("expected request ID in body")
-		}
-	})
-
-	t.Run("preserves existing ID", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		req.Header.Set(requestIDHeader, "test-req-123")
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-
-		if got := rec.Header().Get(requestIDHeader); got != "test-req-123" {
-			t.Errorf("request ID = %q, want test-req-123", got)
-		}
-	})
-}
 
 // ---------------------------------------------------------------------------
 // idempotencyMiddleware tests
@@ -393,14 +360,20 @@ func TestIdempotencyMiddlewarePreservesReplayRequestID(t *testing.T) {
 	if rec2.Header().Get("X-Idempotent-Replay") != "true" {
 		t.Fatal("expected replay header on second request")
 	}
-	if got := rec2.Header().Get(requestIDHeader); got != "req-original" {
-		t.Fatalf("replay %s = %q, want req-original", requestIDHeader, got)
+	// bd-vq37v: the replay keeps the CURRENT request's X-Request-ID for audit
+	// correlation; the originating request's ID is surfaced separately.
+	if got := rec2.Header().Get(requestIDHeader); got != "req-second" {
+		t.Fatalf("replay %s = %q, want req-second", requestIDHeader, got)
+	}
+	if got := rec2.Header().Get(idempotencyOriginalRequestIDHeader); got != "req-original" {
+		t.Fatalf("replay %s = %q, want req-original", idempotencyOriginalRequestIDHeader, got)
 	}
 
 	var replayBody map[string]interface{}
 	if err := json.NewDecoder(rec2.Body).Decode(&replayBody); err != nil {
 		t.Fatalf("decode replay body: %v", err)
 	}
+	// The cached body is replayed verbatim, so it still carries the original ID.
 	if got := replayBody["request_id"]; got != "req-original" {
 		t.Fatalf("replay body request_id = %v, want req-original", got)
 	}
@@ -582,22 +555,6 @@ func TestHandleSessionV1EmptyID(t *testing.T) {
 	}
 }
 
-func TestHandleSessionAgentsV1(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/test/agents", nil)
-	rec := httptest.NewRecorder()
-
-	srv.handleSessionAgentsV1(rec, req, "test-session")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var resp map[string]interface{}
-	json.NewDecoder(rec.Body).Decode(&resp)
-	if resp["count"] == nil {
-		t.Error("expected count field")
-	}
-}
-
 func TestHandleSessionEventsV1(t *testing.T) {
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/test/events", nil)
@@ -765,6 +722,16 @@ func TestHandleCASSStatus(t *testing.T) {
 	// "installed" field should be present regardless
 	if _, ok := resp["installed"]; !ok {
 		t.Error("expected 'installed' field")
+	}
+	// cass status carries no version and no index byte size: the version comes
+	// from `cass --version` and the size from database.db_bytes.
+	if resp["installed"] == true {
+		if v, _ := resp["version"].(string); v == "" {
+			t.Errorf("version = %v, want the installed cass version", resp["version"])
+		}
+		if size, _ := resp["database_size"].(float64); size <= 0 {
+			t.Errorf("database_size = %v, want cass's database.db_bytes", resp["database_size"])
+		}
 	}
 }
 
@@ -1477,17 +1444,7 @@ func TestHandlePolicyAutomationUpdateV1_InvalidForceRelease(t *testing.T) {
 // Approval handler tests
 // ---------------------------------------------------------------------------
 
-func resetApprovalsForTest() {
-	approvalsLock.Lock()
-	defer approvalsLock.Unlock()
-	for k := range approvals {
-		delete(approvals, k)
-	}
-	approvalIDSeq = 0
-}
-
 func TestHandleApprovalsListV1(t *testing.T) {
-	resetApprovalsForTest()
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/approvals?status=pending", nil)
 	rec := httptest.NewRecorder()
@@ -1498,7 +1455,6 @@ func TestHandleApprovalsListV1(t *testing.T) {
 }
 
 func TestHandleApprovalsHistoryV1(t *testing.T) {
-	resetApprovalsForTest()
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/approvals/history?limit=5", nil)
 	rec := httptest.NewRecorder()
@@ -1522,7 +1478,6 @@ func TestHandleApprovalGetV1_EmptyID(t *testing.T) {
 }
 
 func TestHandleApprovalGetV1_NotFound(t *testing.T) {
-	resetApprovalsForTest()
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/approvals/apr-999", nil)
 	rctx := chi.NewRouteContext()
@@ -1549,7 +1504,6 @@ func TestHandleApprovalApproveV1_EmptyID(t *testing.T) {
 }
 
 func TestHandleApprovalApproveV1_NotFound(t *testing.T) {
-	resetApprovalsForTest()
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/apr-999/approve", nil)
 	rctx := chi.NewRouteContext()
@@ -1576,7 +1530,6 @@ func TestHandleApprovalDenyV1_EmptyID(t *testing.T) {
 }
 
 func TestHandleApprovalDenyV1_NotFound(t *testing.T) {
-	resetApprovalsForTest()
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/apr-999/deny", nil)
 	rctx := chi.NewRouteContext()
@@ -1612,7 +1565,6 @@ func TestHandleApprovalRequestV1_EmptyAction(t *testing.T) {
 }
 
 func TestHandleApprovalRequestV1_Valid(t *testing.T) {
-	resetApprovalsForTest()
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/request",
 		strings.NewReader(`{"action":"rm -rf /tmp/test","resource":"/tmp/test","reason":"cleanup","ttl_seconds":60}`))
@@ -2390,7 +2342,6 @@ func TestHandleMemoryOutcome_InvalidStatus(t *testing.T) {
 // ===========================================================================
 
 func TestApprovalEndToEnd(t *testing.T) {
-	resetApprovalsForTest()
 	srv, _ := setupTestServer(t)
 
 	// 1. Create an approval request
@@ -2482,6 +2433,7 @@ func TestApprovalEndToEnd(t *testing.T) {
 
 func TestHandleSafetyInstallV1(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/install",
 		strings.NewReader(`{"force":true}`))
 	req.Header.Set("Content-Length", "15")
@@ -2495,6 +2447,7 @@ func TestHandleSafetyInstallV1(t *testing.T) {
 
 func TestHandleSafetyUninstallV1(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/uninstall", nil)
 	rec := httptest.NewRecorder()
 	srv.handleSafetyUninstallV1(rec, req)

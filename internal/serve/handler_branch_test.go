@@ -36,10 +36,12 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/pipeline"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/scanner"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tools"
 )
 
@@ -277,33 +279,6 @@ func TestRequirePermission_NilRoleContext(t *testing.T) {
 	}
 }
 
-func TestRequireRole_NilRoleContext(t *testing.T) {
-	s := &Server{}
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	handler := s.RequireRole(RoleAdmin)(inner)
-
-	// Request WITHOUT a RoleContext
-	req := httptest.NewRequest("GET", "/test", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", rec.Code)
-	}
-
-	var resp map[string]interface{}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	errMsg, _ := resp["error"].(string)
-	if !strings.Contains(errMsg, "no role context") {
-		t.Errorf("error = %v, want substring 'no role context'", errMsg)
-	}
-}
-
 // =============================================================================
 // handleSessionsV1 — nil stateStore branch
 // =============================================================================
@@ -446,10 +421,10 @@ func TestIdempotencyStore_CleanupExpiry(t *testing.T) {
 	store := NewIdempotencyStore(50 * time.Millisecond)
 	defer store.Stop()
 
-	store.Set("ephemeral", []byte(`{"ok":true}`), 200, nil)
+	store.SetWithFingerprint("ephemeral", "", []byte(`{"ok":true}`), 200, nil)
 
 	// Verify it's there
-	_, _, _, ok := store.Get("ephemeral")
+	_, _, _, _, ok := store.GetWithFingerprint("ephemeral")
 	if !ok {
 		t.Fatal("expected ephemeral key to be present initially")
 	}
@@ -459,7 +434,7 @@ func TestIdempotencyStore_CleanupExpiry(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Get should now return false due to TTL check
-	_, _, _, ok = store.Get("ephemeral")
+	_, _, _, _, ok = store.GetWithFingerprint("ephemeral")
 	if ok {
 		t.Error("expected ephemeral key to have expired")
 	}
@@ -533,7 +508,7 @@ func TestWSHub_BroadcastEvent_WithRedaction(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// Set a redaction config to exercise the redaction branch
-	hub.SetRedactionConfig(&RedactionConfig{
+	hub.setRedactionCfgForTest(&RedactionConfig{
 		Enabled: true,
 	})
 
@@ -813,6 +788,7 @@ func TestHandleSession_Success(t *testing.T) {
 // handleSession — sub-resource routing (agents)
 func TestHandleSession_SubResourceAgents(t *testing.T) {
 	srv, store := setupTestServer(t)
+	installFakeListPanesTmux(t, fakeTmuxNoServer)
 	createTestSessionForServe(t, store, "sub-agents")
 
 	rec := httptest.NewRecorder()
@@ -950,7 +926,9 @@ func TestHandlePaneInputV1_EmptyText(t *testing.T) {
 	}
 }
 
-func TestHandlePaneInputV1_GrokReturnsNotImplementedBeforeSendKeys(t *testing.T) {
+// GH#251 phase 2: grok panes are now valid automated prompt-delivery targets,
+// so pane input flows through send-keys exactly like claude/codex panes.
+func TestHandlePaneInputV1_GrokDeliversViaSendKeys(t *testing.T) {
 	srv, _ := setupTestServer(t)
 	resolveCalls := 0
 	sendCalls := 0
@@ -961,8 +939,11 @@ func TestHandlePaneInputV1_GrokReturnsNotImplementedBeforeSendKeys(t *testing.T)
 		}
 		return tmux.Pane{ID: "%7", Index: paneIdx, Type: tmux.AgentType(" XAI_GROK_BUILD ")}, nil
 	}
-	srv.sendPaneKeys = func(string, string, bool) error {
+	srv.sendPaneKeys = func(target, text string, enter bool) error {
 		sendCalls++
+		if target != "%7" || text != "review this" || !enter {
+			t.Fatalf("send-keys called with target=%q text=%q enter=%v", target, text, enter)
+		}
 		return nil
 	}
 
@@ -975,18 +956,22 @@ func TestHandlePaneInputV1_GrokReturnsNotImplementedBeforeSendKeys(t *testing.T)
 
 	srv.handlePaneInputV1(rec, req)
 
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501; body: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 	}
-	var response APIError
+	var response struct {
+		Success bool   `json:"success"`
+		Sent    bool   `json:"sent"`
+		Pane    string `json:"pane"`
+	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if response.Success || response.ErrorCode != ErrCodeNotImplemented {
-		t.Fatalf("response = %+v, want NOT_IMPLEMENTED", response)
+	if !response.Success || !response.Sent || response.Pane != "%7" {
+		t.Fatalf("response = %+v, want successful send to %%7", response)
 	}
-	if resolveCalls != 1 || sendCalls != 0 {
-		t.Fatalf("resolve calls = %d, send calls = %d; want 1 and 0", resolveCalls, sendCalls)
+	if resolveCalls != 1 || sendCalls != 1 {
+		t.Fatalf("resolve calls = %d, send calls = %d; want 1 and 1", resolveCalls, sendCalls)
 	}
 }
 
@@ -1414,6 +1399,7 @@ func TestHandleSafetyInstallV1_InvalidBody(t *testing.T) {
 
 func TestHandleSafetyUninstallV1_NothingInstalled(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/uninstall", nil)
@@ -2028,23 +2014,6 @@ func TestHandleListAgentsV1_EmptySession_Branch(t *testing.T) {
 }
 
 // =============================================================================
-// handleSessionAgentsV1 — nil stateStore
-// =============================================================================
-
-func TestHandleSessionAgentsV1_NilStore_Branch(t *testing.T) {
-	srv := New(Config{})
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/test/agents-v1", nil)
-
-	srv.handleSessionAgentsV1(rec, req, "test")
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", rec.Code)
-	}
-}
-
-// =============================================================================
 // handlePaneOutputV1 — default lines (no lines param)
 // =============================================================================
 
@@ -2287,8 +2256,10 @@ func TestHandleCreateJob_InvalidType(t *testing.T) {
 
 	srv.handleCreateJob(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	// D5b: non-allow-listed job types are honestly NOT_IMPLEMENTED, never a
+	// fake acceptance.
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501; body: %s", rec.Code, rec.Body.String())
 	}
 
 	var resp map[string]interface{}
@@ -2296,8 +2267,11 @@ func TestHandleCreateJob_InvalidType(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	errMsg, _ := resp["error"].(string)
-	if !strings.Contains(errMsg, "invalid job type") {
-		t.Errorf("error = %q, want substring 'invalid job type'", errMsg)
+	if !strings.Contains(errMsg, "not implemented") {
+		t.Errorf("error = %q, want substring 'not implemented'", errMsg)
+	}
+	if code, _ := resp["error_code"].(string); code != ErrCodeNotImplemented {
+		t.Errorf("error_code = %q, want %q", code, ErrCodeNotImplemented)
 	}
 }
 
@@ -2305,7 +2279,7 @@ func TestHandleCreateJob_ValidType(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
 	rec := httptest.NewRecorder()
-	body := `{"type":"scan","session":"test"}`
+	body := `{"type":"pipeline_run","params":{"workflow_file":"missing.yaml","session":"branchjob1"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", strings.NewReader(body))
 
 	srv.handleCreateJob(rec, req)
@@ -3033,6 +3007,7 @@ func TestHandlePatchAutoRotateConfigV1_CooldownTooLow(t *testing.T) {
 }
 
 func TestHandlePatchAutoRotateConfigV1_ValidUpdate(t *testing.T) {
+	restoreAccountStateAfter(t)
 	srv, _ := setupTestServer(t)
 
 	rec := httptest.NewRecorder()
@@ -3298,17 +3273,6 @@ func TestWSEventStore_RecordDroppedNilDB(t *testing.T) {
 	store := &WSEventStore{db: nil}
 	if err := store.RecordDropped("c1", "t", "r", 1, 5); err != nil {
 		t.Errorf("RecordDropped with nil db should return nil, got %v", err)
-	}
-}
-
-func TestWSEventStore_GetDroppedStatsNilDB(t *testing.T) {
-	store := &WSEventStore{db: nil}
-	stats, err := store.GetDroppedStats("c1", time.Now())
-	if err != nil {
-		t.Errorf("GetDroppedStats nil db: %v", err)
-	}
-	if stats != nil {
-		t.Errorf("expected nil stats from nil db, got %v", stats)
 	}
 }
 
@@ -4235,6 +4199,7 @@ func TestMailAndReservationHandlers_ClientUnavailable(t *testing.T) {
 	})
 
 	t.Run("ForceReleaseReservation", func(t *testing.T) {
+		setForceReleasePolicy(t, "auto")
 		srv := New(Config{})
 		rec := httptest.NewRecorder()
 		body := `{"agent_name":"a"}`
@@ -4783,63 +4748,6 @@ func TestCheckWSOrigin_ExternalDomain(t *testing.T) {
 
 // --- AuditStore record + query with data ---
 
-func TestAuditStore_RecordAndQuery(t *testing.T) {
-	tmpDir := t.TempDir()
-	store, err := NewAuditStore(AuditStoreConfig{
-		DBPath:    filepath.Join(tmpDir, "audit.db"),
-		JSONLPath: filepath.Join(tmpDir, "audit.jsonl"),
-		Retention: 24 * time.Hour,
-	})
-	if err != nil {
-		t.Fatalf("NewAuditStore: %v", err)
-	}
-	defer store.Close()
-
-	// Record an entry
-	err = store.Record(&AuditRecord{
-		RequestID:  "req-001",
-		UserID:     "user1",
-		Role:       RoleAdmin,
-		Action:     AuditActionCreate,
-		Resource:   "session",
-		Method:     "POST",
-		Path:       "/api/v1/sessions",
-		StatusCode: 201,
-		Duration:   50,
-		RemoteAddr: "127.0.0.1",
-	})
-	if err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-
-	// Query for the record
-	records, err := store.Query(AuditFilter{UserID: "user1", Limit: 10})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if len(records) != 1 {
-		t.Errorf("expected 1 record, got %d", len(records))
-	}
-}
-
-func TestAuditStore_QueryNoDb(t *testing.T) {
-	tmpDir := t.TempDir()
-	// Create store with only JSONL, no DB
-	store, err := NewAuditStore(AuditStoreConfig{
-		JSONLPath: filepath.Join(tmpDir, "audit.jsonl"),
-	})
-	if err != nil {
-		t.Fatalf("NewAuditStore: %v", err)
-	}
-	defer store.Close()
-
-	// Query without DB should fail
-	_, err = store.Query(AuditFilter{Limit: 10})
-	if err == nil {
-		t.Error("expected error querying without db")
-	}
-}
-
 // --- handleSetPaneTitleV1 bad JSON ---
 
 func TestHandleSetPaneTitleV1_BadJSON(t *testing.T) {
@@ -4951,7 +4859,12 @@ func TestHandleRunScan_SuccessWithPath(t *testing.T) {
 	resetScannerStoreForTest()
 	s, _ := setupTestServer(t)
 
-	customPath := t.TempDir()
+	// A custom scan path must stay inside the project directory (the handler
+	// refuses anything else with 400), so scan a subdirectory of it.
+	customPath := filepath.Join(s.projectDirSnapshot(), "scan-target")
+	if err := os.MkdirAll(customPath, 0o755); err != nil {
+		t.Fatalf("mkdir custom path: %v", err)
+	}
 	body := fmt.Sprintf(`{"path":%q}`, customPath)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/scanner/run", strings.NewReader(body))
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -4997,176 +4910,7 @@ func TestHandleScannerStatus_Available(t *testing.T) {
 
 // --- AuditStore Query: exercise all filter branches ---
 
-func TestAuditStore_QueryFilterBranches(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "audit.db")
-	jsonlPath := filepath.Join(dir, "audit.jsonl")
-
-	store, err := NewAuditStore(AuditStoreConfig{
-		DBPath:          dbPath,
-		JSONLPath:       jsonlPath,
-		Retention:       24 * time.Hour,
-		CleanupInterval: time.Hour,
-	})
-	if err != nil {
-		t.Fatalf("NewAuditStore: %v", err)
-	}
-	defer store.Close()
-
-	now := time.Now()
-
-	// Insert a record with all fields populated
-	rec := &AuditRecord{
-		Timestamp:  now,
-		RequestID:  "req-filter-001",
-		UserID:     "user-alice",
-		Role:       "admin",
-		Action:     AuditActionCreate,
-		Resource:   "session",
-		Method:     "POST",
-		Path:       "/api/v1/sessions",
-		StatusCode: 201,
-		SessionID:  "sess-abc",
-		ApprovalID: "approval-xyz",
-	}
-	if err := store.Record(rec); err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-
-	// Insert a second record with different fields
-	rec2 := &AuditRecord{
-		Timestamp:  now.Add(-time.Minute),
-		RequestID:  "req-filter-002",
-		UserID:     "user-bob",
-		Role:       "viewer",
-		Action:     AuditActionExecute,
-		Resource:   "pane",
-		Method:     "GET",
-		Path:       "/api/v1/panes",
-		StatusCode: 200,
-		SessionID:  "sess-def",
-	}
-	if err := store.Record(rec2); err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-
-	// Filter by Action
-	results, err := store.Query(AuditFilter{Action: AuditActionCreate})
-	if err != nil {
-		t.Fatalf("Query(action): %v", err)
-	}
-	if len(results) != 1 || results[0].RequestID != "req-filter-001" {
-		t.Errorf("action filter: got %d results, want 1 with req-filter-001", len(results))
-	}
-
-	// Filter by Resource
-	results, err = store.Query(AuditFilter{Resource: "pane"})
-	if err != nil {
-		t.Fatalf("Query(resource): %v", err)
-	}
-	if len(results) != 1 || results[0].RequestID != "req-filter-002" {
-		t.Errorf("resource filter: got %d results", len(results))
-	}
-
-	// Filter by SessionID
-	results, err = store.Query(AuditFilter{SessionID: "sess-abc"})
-	if err != nil {
-		t.Fatalf("Query(session): %v", err)
-	}
-	if len(results) != 1 {
-		t.Errorf("session filter: got %d results, want 1", len(results))
-	}
-
-	// Filter by ApprovalID
-	results, err = store.Query(AuditFilter{ApprovalID: "approval-xyz"})
-	if err != nil {
-		t.Fatalf("Query(approval): %v", err)
-	}
-	if len(results) != 1 {
-		t.Errorf("approval filter: got %d results, want 1", len(results))
-	}
-
-	// Filter by Since
-	results, err = store.Query(AuditFilter{Since: now.Add(-30 * time.Second)})
-	if err != nil {
-		t.Fatalf("Query(since): %v", err)
-	}
-	if len(results) != 1 || results[0].RequestID != "req-filter-001" {
-		t.Errorf("since filter: got %d results, want 1 (recent only)", len(results))
-	}
-
-	// Filter by Until
-	results, err = store.Query(AuditFilter{Until: now.Add(-30 * time.Second)})
-	if err != nil {
-		t.Fatalf("Query(until): %v", err)
-	}
-	if len(results) != 1 || results[0].RequestID != "req-filter-002" {
-		t.Errorf("until filter: got %d results, want 1 (old only)", len(results))
-	}
-
-	// Filter by Limit + Offset
-	results, err = store.Query(AuditFilter{Limit: 10, Offset: 1})
-	if err != nil {
-		t.Fatalf("Query(offset): %v", err)
-	}
-	if len(results) != 1 {
-		t.Errorf("offset filter: got %d results, want 1 (second record)", len(results))
-	}
-}
-
 // --- AuditStore.cleanup: actually removes old records ---
-
-func TestAuditStore_CleanupRemovesOldRecords(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "audit.db")
-
-	store, err := NewAuditStore(AuditStoreConfig{
-		DBPath:          dbPath,
-		Retention:       1 * time.Millisecond, // Very short retention
-		CleanupInterval: time.Hour,            // We'll call cleanup manually
-	})
-	if err != nil {
-		t.Fatalf("NewAuditStore: %v", err)
-	}
-	defer store.Close()
-
-	// Insert a record
-	rec := &AuditRecord{
-		Timestamp:  time.Now().Add(-time.Hour), // Old record
-		RequestID:  "req-old-001",
-		UserID:     "user-test",
-		Action:     AuditActionCreate,
-		Resource:   "test",
-		Method:     "POST",
-		Path:       "/test",
-		StatusCode: 200,
-	}
-	if err := store.Record(rec); err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-
-	// Verify record exists
-	results, err := store.Query(AuditFilter{})
-	if err != nil {
-		t.Fatalf("Query before cleanup: %v", err)
-	}
-	if len(results) == 0 {
-		t.Fatal("expected at least 1 record before cleanup")
-	}
-
-	// Wait for retention to expire and run cleanup
-	time.Sleep(5 * time.Millisecond)
-	store.cleanup()
-
-	// Verify record is gone
-	results, err = store.Query(AuditFilter{})
-	if err != nil {
-		t.Fatalf("Query after cleanup: %v", err)
-	}
-	if len(results) != 0 {
-		t.Errorf("expected 0 records after cleanup, got %d", len(results))
-	}
-}
 
 // --- handleAgentWaitV1: custom timeout_ms and poll_ms ---
 
@@ -5192,7 +4936,7 @@ func TestHandleAgentWaitV1_CustomTimeoutAndPoll(t *testing.T) {
 
 func TestScannerStore_GetScans_OffsetBeyondRange(t *testing.T) {
 	store := NewScannerStore()
-	store.AddScan(&ScanRecord{ID: "scan-1", State: ScanStateCompleted, StartedAt: time.Now()})
+	seedScan(store, &ScanRecord{ID: "scan-1", State: ScanStateCompleted, StartedAt: time.Now()})
 
 	result := store.GetScans(10, 100) // offset=100 but only 1 scan
 	if len(result) != 0 {
@@ -5257,25 +5001,6 @@ func TestScannerStore_GetFindings_FilterAndPaginate(t *testing.T) {
 
 // --- ScannerStore.GetFindingsByScan ---
 
-func TestScannerStore_GetFindingsByScan(t *testing.T) {
-	store := NewScannerStore()
-	store.AddFinding(&FindingRecord{
-		ID: "f1", ScanID: "scan-x",
-		Finding:   scanner.Finding{File: "a.go"},
-		CreatedAt: time.Now(),
-	})
-	store.AddFinding(&FindingRecord{
-		ID: "f2", ScanID: "scan-y",
-		Finding:   scanner.Finding{File: "b.go"},
-		CreatedAt: time.Now(),
-	})
-
-	results := store.GetFindingsByScan("scan-x")
-	if len(results) != 1 || results[0].ID != "f1" {
-		t.Errorf("GetFindingsByScan: got %d results, want 1 with f1", len(results))
-	}
-}
-
 // --- NewIdempotencyStore: default TTL for zero/negative ---
 
 func TestNewIdempotencyStore_DefaultTTL(t *testing.T) {
@@ -5283,8 +5008,8 @@ func TestNewIdempotencyStore_DefaultTTL(t *testing.T) {
 	defer store.Stop()
 
 	// Should not panic; TTL defaults to 24h
-	store.Set("key1", []byte(`{"ok":true}`), 200, nil)
-	data, code, _, ok := store.Get("key1")
+	store.SetWithFingerprint("key1", "", []byte(`{"ok":true}`), 200, nil)
+	data, code, _, _, ok := store.GetWithFingerprint("key1")
 	if !ok {
 		t.Fatal("expected key1 to be found")
 	}
@@ -5302,8 +5027,8 @@ func TestNewIdempotencyStore_NegativeTTL(t *testing.T) {
 	store := NewIdempotencyStore(-5 * time.Second)
 	defer store.Stop()
 
-	store.Set("k", []byte("v"), 201, nil)
-	_, code, _, ok := store.Get("k")
+	store.SetWithFingerprint("k", "", []byte("v"), 201, nil)
+	_, code, _, _, ok := store.GetWithFingerprint("k")
 	if !ok || code != 201 {
 		t.Errorf("expected key found with code 201, got ok=%v code=%d", ok, code)
 	}
@@ -5315,10 +5040,10 @@ func TestIdempotencyStore_Get_Expired(t *testing.T) {
 	store := NewIdempotencyStore(1 * time.Millisecond)
 	defer store.Stop()
 
-	store.Set("ephemeral", []byte("data"), 200, nil)
+	store.SetWithFingerprint("ephemeral", "", []byte("data"), 200, nil)
 	time.Sleep(5 * time.Millisecond) // Wait for TTL to expire
 
-	_, _, _, ok := store.Get("ephemeral")
+	_, _, _, _, ok := store.GetWithFingerprint("ephemeral")
 	if ok {
 		t.Error("expected expired entry to not be found")
 	}
@@ -5459,6 +5184,115 @@ func TestHandleBeadsStats_BrInstalledBadDir(t *testing.T) {
 	// br stats will fail in temp dir → 500
 	if w.Code == http.StatusServiceUnavailable {
 		t.Fatal("should not get 503 when br is installed")
+	}
+}
+
+// installFakeBeadsTools puts br and bv first on PATH. Uninitialized, they
+// answer like br 0.2 and bv in a project with no .beads (output captured
+// verbatim); otherwise they fail like a damaged workspace.
+func installFakeBeadsTools(t *testing.T, uninitialized bool) {
+	t.Helper()
+	bin := t.TempDir()
+	br := "#!/bin/sh\necho 'Error: database is unreadable: permission denied' >&2\nexit 1\n"
+	bvScript := "#!/bin/sh\necho \"Error loading beads: failed to inspect redirect file $PWD/.beads/redirect: stat $PWD/.beads/redirect: permission denied\" >&2\n" +
+		"echo \"Make sure you are in a project initialized with 'br init'.\" >&2\nexit 1\n"
+	if uninitialized {
+		br = "#!/bin/sh\ncat <<'EOF'\n{\"error\":{\"code\":\"NOT_INITIALIZED\",\"message\":\"Beads not initialized: run 'br init' first\",\"hint\":\"Run: br init\",\"retryable\":false,\"context\":null}}\nEOF\nexit 2\n"
+		bvScript = "#!/bin/sh\necho \"Error loading beads: failed to read beads directory: open $PWD/.beads: no such file or directory\" >&2\n" +
+			"echo \"Make sure you are in a project initialized with 'br init'.\" >&2\nexit 1\n"
+	}
+	for name, script := range map[string]string{"br": br, "bv": bvScript} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	bv.InvalidateTriageCache()
+	t.Cleanup(bv.InvalidateTriageCache)
+}
+
+// TestBeadsEndpointsWithoutWorkspace: in a project with no beads workspace,
+// br- and bv-backed endpoints answer 404 BEADS_NOT_INITIALIZED with a br init
+// message instead of a 500; a damaged workspace is still a 500.
+func TestBeadsEndpointsWithoutWorkspace(t *testing.T) {
+	endpoints := []struct {
+		path    string
+		handler func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{"/api/v1/beads/", (*Server).handleListBeads},
+		{"/api/v1/beads/stats", (*Server).handleBeadsStats},
+		{"/api/v1/beads/ready", (*Server).handleBeadsReady},
+		{"/api/v1/beads/insights", (*Server).handleBeadsInsights},
+		{"/api/v1/beads/triage", (*Server).handleBeadsTriage},
+	}
+	for _, uninitialized := range []bool{true, false} {
+		installFakeBeadsTools(t, uninitialized)
+		s, _ := setupTestServer(t)
+		s.projectDir = t.TempDir()
+		for _, ep := range endpoints {
+			w := httptest.NewRecorder()
+			ep.handler(s, w, httptest.NewRequest(http.MethodGet, ep.path, nil))
+			var body struct {
+				ErrorCode string `json:"error_code"`
+				Error     string `json:"error"`
+			}
+			_ = json.Unmarshal(w.Body.Bytes(), &body)
+			if uninitialized {
+				if w.Code != http.StatusNotFound || body.ErrorCode != ErrCodeBeadsNotInit || !strings.Contains(body.Error, "br init") {
+					t.Errorf("%s without a workspace: %d %s %q, want 404 %s with a br init hint", ep.path, w.Code, body.ErrorCode, body.Error, ErrCodeBeadsNotInit)
+				}
+			} else if w.Code != http.StatusInternalServerError || body.ErrorCode != ErrCodeInternalError {
+				t.Errorf("%s with a damaged workspace: %d %s, want 500 %s", ep.path, w.Code, body.ErrorCode, ErrCodeInternalError)
+			}
+		}
+	}
+}
+
+// TestCASSEndpointsWithoutIndex: an installed cass that has never indexed
+// (exit 3) makes timeline and search answer 503 CASS_UNAVAILABLE naming
+// `cass index --full`; any other cass failure stays a 500.
+func TestCASSEndpointsWithoutIndex(t *testing.T) {
+	for _, tc := range []struct {
+		exitCode   int
+		wantStatus int
+	}{
+		{3, http.StatusServiceUnavailable},
+		{1, http.StatusInternalServerError},
+	} {
+		bin := t.TempDir()
+		script := fmt.Sprintf("#!/bin/sh\necho '{\"error\":{\"code\":3,\"kind\":\"missing-index\",\"message\":\"cass has not been initialized yet\"}}'\nexit %d\n", tc.exitCode)
+		if err := os.WriteFile(filepath.Join(bin, "cass"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		s, _ := setupTestServer(t)
+
+		requests := map[string]func() *httptest.ResponseRecorder{
+			"timeline": func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				s.handleCASSTimeline(w, httptest.NewRequest(http.MethodGet, "/api/v1/cass/timeline", nil))
+				return w
+			},
+			"search": func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				s.handleCASSSearch(w, httptest.NewRequest(http.MethodPost, "/api/v1/cass/search", strings.NewReader(`{"query":"auth"}`)))
+				return w
+			},
+		}
+		for name, do := range requests {
+			w := do()
+			var body struct {
+				ErrorCode string `json:"error_code"`
+				Error     string `json:"error"`
+			}
+			_ = json.Unmarshal(w.Body.Bytes(), &body)
+			if w.Code != tc.wantStatus {
+				t.Errorf("cass exit %d, %s: status %d (%s %q), want %d", tc.exitCode, name, w.Code, body.ErrorCode, body.Error, tc.wantStatus)
+			}
+			if indexHint := strings.Contains(body.Error, "cass index --full"); indexHint != (tc.exitCode == 3) {
+				t.Errorf("cass exit %d, %s: error %q, index hint wanted=%v", tc.exitCode, name, body.Error, tc.exitCode == 3)
+			}
+		}
 	}
 }
 
@@ -5810,7 +5644,11 @@ func TestStartMemoryDaemonAsync_KeepsDaemonAliveAfterStartup(t *testing.T) {
 	oldTimeout := memoryDaemonStartupTimeout
 	oldStore := memoryStore
 	memoryStore = NewMemoryStore()
-	memoryDaemonStartupTimeout = 2 * time.Second
+	// Generous startup ceiling: the helper re-execs this (race-instrumented)
+	// test binary, whose cold start can exceed 2s while the full suite runs.
+	// The passing path is still paced by the helper's 150ms pid-write delay,
+	// so the longer timeout only adds headroom on failure, not test latency.
+	memoryDaemonStartupTimeout = 15 * time.Second
 	pidPath := filepath.Join(pidsDir, "cm-test-session.pid")
 	memoryDaemonCommand = func(projectDir string, port int) *exec.Cmd {
 		cmd := exec.Command(os.Args[0], "-test.run=TestServeMemoryDaemonHelperProcess")
@@ -6226,6 +6064,7 @@ func TestHandlePolicyAutomationUpdateV1_NoChanges(t *testing.T) {
 // --- handleAccountHistoryV1: limit truncation + reverse order ---
 
 func TestHandleAccountHistoryV1_LimitTruncation(t *testing.T) {
+	restoreAccountStateAfter(t)
 	// Pre-fill history with 5 events
 	accountState.mu.Lock()
 	accountState.history = []AccountRotationEvent{
@@ -6815,6 +6654,7 @@ func TestHandleRotateProviderAccountV1_DependencyMissing(t *testing.T) {
 // --- handleForceReleaseReservation: valid body exercises getMailClient ---
 
 func TestHandleForceReleaseReservation_ValidBody_Branch(t *testing.T) {
+	setForceReleasePolicy(t, "auto")
 	s, _ := setupTestServer(t)
 	s.projectDir = t.TempDir()
 
@@ -7637,6 +7477,7 @@ func TestHandlePolicyValidateV1_FileBased(t *testing.T) {
 
 func TestHandleSafetyInstallV1_Force(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 
 	body := `{"force":true}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/install", strings.NewReader(body))
@@ -7652,6 +7493,7 @@ func TestHandleSafetyInstallV1_Force(t *testing.T) {
 
 func TestHandleSafetyUninstallV1_Branch(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/uninstall", nil)
 	rec := httptest.NewRecorder()
@@ -8104,19 +7946,19 @@ func TestWSClient_SendAck_FullBuffer(t *testing.T) {
 	c.sendAck("req-full", map[string]interface{}{"dropped": true})
 }
 
-// --- handleSessionAgents exercises stateStore success path ---
+// --- handleSessionAgents: a session neither tmux nor the store knows ---
 
-func TestHandleSessionAgents_Success(t *testing.T) {
+func TestHandleSessionAgents_UnknownSessionNotFound(t *testing.T) {
 	s, _ := setupTestServer(t)
+	installFakeListPanesTmux(t, fakeTmuxNoSession)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/api/sessions/test-session/agents", nil)
 
 	s.handleSessionAgents(rec, req, "test-session")
 
-	// stateStore is set from setupTestServer, so should succeed
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -8787,8 +8629,28 @@ func TestHandleCASSInsights_WithRealCass(t *testing.T) {
 
 	s.handleCASSInsights(rec, req)
 
-	if rec.Code == http.StatusServiceUnavailable {
-		t.Fatal("cass is installed but got 503")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		TotalDocuments int                      `json:"total_documents"`
+		Agents         []cass.AggregationBucket `json:"agents"`
+		Workspaces     []cass.AggregationBucket `json:"workspaces"`
+		Warnings       []string                 `json:"warnings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Warnings) != 0 {
+		t.Fatalf("insights degraded: %v", body.Warnings)
+	}
+	if body.TotalDocuments > 0 && len(body.Agents) == 0 {
+		t.Fatalf("total_documents=%d but no agent buckets (aggregations not decoded)", body.TotalDocuments)
+	}
+	for _, b := range body.Agents {
+		if b.Key == "" || b.Count <= 0 {
+			t.Fatalf("bad agent bucket %+v", b)
+		}
 	}
 }
 
@@ -8802,13 +8664,41 @@ func TestHandleCASSTimeline_WithRealCass(t *testing.T) {
 	}
 	s, _ := setupTestServer(t)
 
-	req := httptest.NewRequest("GET", "/api/v1/memory/cass/timeline?limit=5", nil)
+	req := httptest.NewRequest("GET", "/api/v1/memory/cass/timeline?limit=3&since=30d", nil)
 	rec := httptest.NewRecorder()
 
 	s.handleCASSTimeline(rec, req)
 
-	if rec.Code == http.StatusServiceUnavailable {
-		t.Fatal("cass is installed but got 503")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Entries []struct {
+			Agent     string `json:"agent"`
+			Path      string `json:"path"`
+			Timestamp string `json:"timestamp"`
+		} `json:"entries"`
+		Count         int `json:"count"`
+		TotalSessions int `json:"total_sessions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Count != len(body.Entries) || body.Count > 3 || body.TotalSessions < body.Count {
+		t.Fatalf("count=%d entries=%d total=%d", body.Count, len(body.Entries), body.TotalSessions)
+	}
+	for _, e := range body.Entries {
+		if e.Agent == "" || e.Path == "" || e.Timestamp == "" {
+			t.Fatalf("timeline entry missing agent/path/timestamp: %+v", e)
+		}
+	}
+
+	// cass timeline has no workspace filter; refusing beats ignoring it.
+	req = httptest.NewRequest("GET", "/api/v1/memory/cass/timeline?workspace=/data/projects/ntm", nil)
+	rec = httptest.NewRecorder()
+	s.handleCASSTimeline(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("workspace filter status = %d, want 400", rec.Code)
 	}
 }
 
@@ -8835,20 +8725,19 @@ func TestHandleMemoryRules_WithRealCM(t *testing.T) {
 // --- Approval approve with expired approval ---
 
 func TestApprovalApproveV1_Expired(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	// Directly insert an expired approval into the map
-	approvalsLock.Lock()
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-%d", approvalIDSeq)
-	approvals[id] = &Approval{
+	// Seed an expired pending approval directly in the durable store.
+	id := "apr-expired-approve"
+	if err := store.CreateApproval(&state.Approval{
 		ID:        id,
 		Action:    "test-action",
-		Status:    "pending",
+		Status:    state.ApprovalPending,
 		CreatedAt: time.Now().Add(-2 * time.Hour),
 		ExpiresAt: time.Now().Add(-1 * time.Hour), // expired 1 hour ago
+	}); err != nil {
+		t.Fatalf("seed approval: %v", err)
 	}
-	approvalsLock.Unlock()
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", id)
@@ -10870,81 +10759,7 @@ func TestHandleEventStream_NoFlusher(t *testing.T) {
 
 // --- RedactJSON: ModeOff early return ---
 
-func TestRedactJSON_ModeOff(t *testing.T) {
-
-	cfg := redaction.Config{Mode: redaction.ModeOff}
-	input := map[string]interface{}{
-		"secret":   "sample redaction input",
-		"api_key":  "sample api key input",
-		"harmless": "hello",
-	}
-
-	result, findings := RedactJSON(input, cfg)
-	if findings != 0 {
-		t.Fatalf("expected 0 findings in ModeOff, got %d", findings)
-	}
-
-	// Result should be unchanged (same reference)
-	resultMap, ok := result.(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected map result, got %T", result)
-	}
-	if resultMap["secret"] != "sample redaction input" {
-		t.Fatalf("expected secret unchanged, got %v", resultMap["secret"])
-	}
-}
-
 // --- AuditStore: Record with both DB and JSONL active ---
-
-func TestAuditStore_RecordBothDBAndJSONL(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "audit.db")
-	jsonlPath := filepath.Join(tmpDir, "audit.jsonl")
-
-	store, err := NewAuditStore(AuditStoreConfig{
-		DBPath:    dbPath,
-		JSONLPath: jsonlPath,
-	})
-	if err != nil {
-		t.Fatalf("failed to create audit store: %v", err)
-	}
-	defer store.Close()
-
-	rec := &AuditRecord{
-		RequestID:  "req-both-1",
-		UserID:     "test-user",
-		Role:       RoleAdmin,
-		Action:     AuditActionCreate,
-		Resource:   "session",
-		Method:     "POST",
-		Path:       "/api/v1/sessions",
-		StatusCode: 200,
-		Duration:   42,
-		RemoteAddr: "127.0.0.1",
-	}
-
-	if err := store.Record(rec); err != nil {
-		t.Fatalf("Record failed: %v", err)
-	}
-
-	// Verify JSONL file was written
-	jsonlData, err := os.ReadFile(jsonlPath)
-	if err != nil {
-		t.Fatalf("failed to read JSONL: %v", err)
-	}
-	if !strings.Contains(string(jsonlData), "req-both-1") {
-		t.Fatalf("JSONL missing request_id, got: %s", string(jsonlData))
-	}
-
-	// Verify DB was written
-	records, err := store.Query(AuditFilter{Limit: 10})
-	if err != nil {
-		t.Fatalf("Query failed: %v", err)
-	}
-	if len(records) != 1 {
-		t.Fatalf("expected 1 record in DB, got %d", len(records))
-	}
-}
 
 // --- AuditStore: Close with both DB and JSONL ---
 
@@ -11904,23 +11719,21 @@ func TestHandleSwaggerUI_TLS(t *testing.T) {
 }
 
 // TestHandleListPipelines_WithFinishedAt exercises the FinishedAt != nil branch
-// in handleListPipelines (line 115-117 of pipelines.go).
+// in handleListPipelines. The list reads the configured project's durable run
+// state (02d7356f removed the unscoped process-registry fallback), so the run
+// is seeded as a persisted checkpoint rather than a registry entry.
 func TestHandleListPipelines_WithFinishedAt(t *testing.T) {
 	s, _ := setupTestServer(t)
 
-	// Register a pipeline with FinishedAt set
 	now := time.Now()
-	finished := now.Add(10 * time.Second)
-	exec := &pipeline.PipelineExecution{
+	exec := savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:      "test-run-finished-" + fmt.Sprintf("%d", now.UnixNano()),
 		WorkflowID: "test-workflow",
 		Session:    "test-session",
-		Status:     "completed",
+		Status:     pipeline.StatusCompleted,
 		StartedAt:  now,
-		FinishedAt: &finished,
-		Progress:   pipeline.PipelineProgress{Total: 3, Completed: 3, Percent: 100},
-	}
-	pipeline.RegisterPipeline(exec)
+		FinishedAt: now.Add(10 * time.Second),
+	})
 
 	req := httptest.NewRequest("GET", "/api/v1/pipelines", nil)
 	rec := httptest.NewRecorder()
@@ -12061,64 +11874,28 @@ func TestRoleHierarchy_UnknownRole(t *testing.T) {
 	}
 }
 
-// TestWriteApprovalRequired_FullResponse exercises the writeApprovalRequired function
-// output format including approval_id and error_code (lines 388-410 of rbac.go).
-func TestWriteApprovalRequired_FullResponse(t *testing.T) {
-	rec := httptest.NewRecorder()
-
-	ar := &ApprovalRequired{
-		ApprovalID: "apr-123",
-		Action:     "delete",
-		Resource:   "session",
-		ExpiresAt:  "2025-12-31T23:59:59Z",
-		Message:    "Approval needed for destructive operation",
-	}
-
-	writeApprovalRequired(rec, ar, "req-456")
-
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("expected 409, got %d", rec.Code)
-	}
-
-	var resp map[string]interface{}
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-
-	if resp["success"] != false {
-		t.Error("expected success=false")
-	}
-	if resp["error_code"] != "APPROVAL_REQUIRED" {
-		t.Errorf("error_code = %v", resp["error_code"])
-	}
-	approval, _ := resp["approval"].(map[string]interface{})
-	if approval["approval_id"] != "apr-123" {
-		t.Errorf("approval_id = %v", approval["approval_id"])
-	}
-}
-
 // =============================================================================
 // Batch 32 — Pipeline GET/Cancel/Resume, discoverPipelineTemplates, Safety Install
 // =============================================================================
 
 // TestHandleGetPipeline_FoundWithFinishedAt exercises the success path
-// with FinishedAt and Error fields populated (lines 258-276 of pipelines.go).
+// with FinishedAt and Error fields populated, read from the project's durable
+// run state.
 func TestHandleGetPipeline_FoundWithFinishedAt(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	now := time.Now()
-	finished := now.Add(5 * time.Second)
 	runID := fmt.Sprintf("get-test-%d", now.UnixNano())
-	exec := &pipeline.PipelineExecution{
+	savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:       runID,
 		WorkflowID:  "wf-1",
 		Session:     "sess-1",
-		Status:      "failed",
+		Status:      pipeline.StatusFailed,
 		StartedAt:   now,
-		FinishedAt:  &finished,
+		FinishedAt:  now.Add(5 * time.Second),
 		CurrentStep: "step-2",
-		Error:       "step-2 timed out",
-		Progress:    pipeline.PipelineProgress{Total: 3, Completed: 1, Failed: 1},
-	}
-	pipeline.RegisterPipeline(exec)
+		Errors:      []pipeline.ExecutionError{{StepID: "step-2", Message: "step-2 timed out", Fatal: true, Timestamp: now}},
+	})
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID)
@@ -12163,20 +11940,20 @@ func TestHandleGetPipeline_NotFoundBranch(t *testing.T) {
 }
 
 // TestHandleCancelPipeline_CompletedConflict exercises the conflict path
-// in handleCancelPipeline (lines 300-306 of pipelines.go) — can't cancel completed.
+// in handleCancelPipeline — a completed run can't be cancelled.
 func TestHandleCancelPipeline_CompletedConflict(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	now := time.Now()
 	runID := fmt.Sprintf("cancel-conflict-%d", now.UnixNano())
-	exec := &pipeline.PipelineExecution{
+	savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:      runID,
 		WorkflowID: "wf-1",
 		Session:    "sess-1",
-		Status:     "completed",
+		Status:     pipeline.StatusCompleted,
 		StartedAt:  now,
-	}
-	pipeline.RegisterPipeline(exec)
+		FinishedAt: now,
+	})
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID)
@@ -12191,21 +11968,24 @@ func TestHandleCancelPipeline_CompletedConflict(t *testing.T) {
 	}
 }
 
-// TestHandleCancelPipeline_RunningSuccess exercises the success path
-// in handleCancelPipeline (lines 308-315 of pipelines.go) — cancel a running pipeline.
-func TestHandleCancelPipeline_RunningSuccess(t *testing.T) {
+// TestHandleCancelPipeline_RunningWithoutOwnerConflicts exercises the
+// cancellation path for a running checkpoint that no live owner acknowledges.
+// Cancellation is only reported after the owning process acknowledges it
+// (02d7356f); an orphaned "running" checkpoint must answer 409, never a
+// fabricated "cancelled". The acknowledged path is covered by
+// TestPipelineCancelRequiresAcknowledgingOwner.
+func TestHandleCancelPipeline_RunningWithoutOwnerConflicts(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	now := time.Now()
 	runID := fmt.Sprintf("cancel-ok-%d", now.UnixNano())
-	exec := &pipeline.PipelineExecution{
+	savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:      runID,
 		WorkflowID: "wf-1",
 		Session:    "sess-1",
-		Status:     "running",
+		Status:     pipeline.StatusRunning,
 		StartedAt:  now,
-	}
-	pipeline.RegisterPipeline(exec)
+	})
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID)
@@ -12215,14 +11995,34 @@ func TestHandleCancelPipeline_RunningSuccess(t *testing.T) {
 
 	s.handleCancelPipeline(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 without an acknowledging owner, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var resp map[string]interface{}
 	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp["status"] != "cancelled" {
-		t.Errorf("status = %v, want cancelled", resp["status"])
+	if resp["status"] == "cancelled" || resp["status"] == "cancellation_requested" {
+		t.Errorf("unacknowledged cancellation reported status %v", resp["status"])
 	}
+	final, err := pipeline.LoadState(s.pipelineProjectDir(), runID)
+	if err != nil || final.Status != pipeline.StatusRunning {
+		t.Fatalf("rejected cancellation rewrote the checkpoint: %+v %v", final, err)
+	}
+}
+
+// savePipelineStateForHandlerTest persists a run checkpoint under the
+// server's configured project and returns the snapshot the handlers serve.
+func savePipelineStateForHandlerTest(t *testing.T, s *Server, state *pipeline.ExecutionState) *pipeline.ExecutionState {
+	t.Helper()
+	if state.Steps == nil {
+		state.Steps = map[string]pipeline.StepResult{}
+	}
+	if state.Variables == nil {
+		state.Variables = map[string]interface{}{}
+	}
+	if err := pipeline.SaveState(s.pipelineProjectDir(), state); err != nil {
+		t.Fatalf("save pipeline state: %v", err)
+	}
+	return state
 }
 
 // TestHandleResumePipeline_NoState exercises the 404 path when
@@ -12549,6 +12349,21 @@ func TestHandleSafetyStatusV1_FullPath(t *testing.T) {
 	os.MkdirAll(hookDir, 0755)
 	os.WriteFile(filepath.Join(hookDir, "ntm-safety.sh"), []byte("#!/bin/sh\n"), 0755)
 
+	// A hook script Claude Code's settings do not list never runs, so it is
+	// present but not installed.
+	reqUnregistered := httptest.NewRequest("GET", "/api/v1/safety/status", nil)
+	recUnregistered := httptest.NewRecorder()
+	s.handleSafetyStatusV1(recUnregistered, reqUnregistered)
+	var respUnregistered map[string]interface{}
+	json.Unmarshal(recUnregistered.Body.Bytes(), &respUnregistered)
+	if respUnregistered["hook_script_present"] != true || respUnregistered["hook_registered"] != false || respUnregistered["hook_installed"] != false {
+		t.Fatalf("unregistered hook script: present=%v registered=%v installed=%v, want true/false/false",
+			respUnregistered["hook_script_present"], respUnregistered["hook_registered"], respUnregistered["hook_installed"])
+	}
+	if _, err := policy.RegisterClaudeHook(policy.ClaudeUserSettingsPath(tmpDir), policy.ClaudeHookScriptPath(tmpDir)); err != nil {
+		t.Fatalf("register hook: %v", err)
+	}
+
 	req2 := httptest.NewRequest("GET", "/api/v1/safety/status", nil)
 	rec2 := httptest.NewRecorder()
 	s.handleSafetyStatusV1(rec2, req2)
@@ -12679,29 +12494,21 @@ func TestHandlePolicyResetV1_WriteFileError(t *testing.T) {
 // in handleApprovalApproveV1 (line 1103). When SLBRequired=true and the approver
 // is the same as the requestor, it should return 403 Forbidden.
 func TestApprovalApproveV1_SLBSelfApproval(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	// Insert an SLB-requiring approval with a known requestor
-	approvalsLock.Lock()
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-slb-%d", approvalIDSeq)
-	approvals[id] = &Approval{
+	// Seed an SLB-requiring durable approval with a known requestor.
+	id := "apr-slb-self"
+	if err := store.CreateApproval(&state.Approval{
 		ID:          id,
 		Action:      "force_release lock-xyz",
-		Requestor:   "agent-1",
-		SLBRequired: true,
-		Status:      "pending",
+		RequestedBy: "agent-1",
+		RequiresSLB: true,
+		Status:      state.ApprovalPending,
 		CreatedAt:   time.Now(),
 		ExpiresAt:   time.Now().Add(1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed approval: %v", err)
 	}
-	approvalsLock.Unlock()
-
-	// Clean up after test
-	defer func() {
-		approvalsLock.Lock()
-		delete(approvals, id)
-		approvalsLock.Unlock()
-	}()
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", id)
@@ -12730,26 +12537,19 @@ func TestApprovalApproveV1_SLBSelfApproval(t *testing.T) {
 // in handleApprovalsListV1 (line 943). When listing, pending approvals that have
 // expired should auto-transition to "expired" status.
 func TestApprovalsListV1_ExpiredTransition(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	// Insert an expired pending approval
-	approvalsLock.Lock()
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-exp-%d", approvalIDSeq)
-	approvals[id] = &Approval{
+	// Seed an expired pending approval in the durable store.
+	id := "apr-exp-list"
+	if err := store.CreateApproval(&state.Approval{
 		ID:        id,
 		Action:    "test-expired-action",
-		Status:    "pending",
+		Status:    state.ApprovalPending,
 		CreatedAt: time.Now().Add(-2 * time.Hour),
 		ExpiresAt: time.Now().Add(-1 * time.Hour), // expired
+	}); err != nil {
+		t.Fatalf("seed approval: %v", err)
 	}
-	approvalsLock.Unlock()
-
-	defer func() {
-		approvalsLock.Lock()
-		delete(approvals, id)
-		approvalsLock.Unlock()
-	}()
 
 	req := httptest.NewRequest("GET", "/api/v1/approvals?status=expired", nil)
 	rec := httptest.NewRecorder()
@@ -12785,7 +12585,7 @@ func TestApprovalsListV1_ExpiredTransition(t *testing.T) {
 // TestApprovalsListV1_SortsNewestFirst ensures the approvals list is returned
 // in descending created_at order so the dashboard selection is deterministic.
 func TestApprovalsListV1_SortsNewestFirst(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
 	type approvalSeed struct {
 		id        string
@@ -12794,31 +12594,22 @@ func TestApprovalsListV1_SortsNewestFirst(t *testing.T) {
 
 	now := time.Now()
 	seeds := []approvalSeed{
-		{id: fmt.Sprintf("apr-sort-oldest-%d", approvalIDSeq+1), createdAt: now.Add(-4 * time.Minute)},
-		{id: fmt.Sprintf("apr-sort-middle-%d", approvalIDSeq+2), createdAt: now.Add(-2 * time.Minute)},
-		{id: fmt.Sprintf("apr-sort-newest-%d", approvalIDSeq+3), createdAt: now.Add(-1 * time.Minute)},
+		{id: "apr-sort-oldest", createdAt: now.Add(-4 * time.Minute)},
+		{id: "apr-sort-middle", createdAt: now.Add(-2 * time.Minute)},
+		{id: "apr-sort-newest", createdAt: now.Add(-1 * time.Minute)},
 	}
 
-	approvalsLock.Lock()
-	approvalIDSeq += int64(len(seeds))
 	for _, seed := range seeds {
-		approvals[seed.id] = &Approval{
+		if err := store.CreateApproval(&state.Approval{
 			ID:        seed.id,
 			Action:    seed.id,
-			Status:    "pending",
+			Status:    state.ApprovalPending,
 			CreatedAt: seed.createdAt,
 			ExpiresAt: now.Add(1 * time.Hour),
+		}); err != nil {
+			t.Fatalf("seed approval %s: %v", seed.id, err)
 		}
 	}
-	approvalsLock.Unlock()
-
-	defer func() {
-		approvalsLock.Lock()
-		for _, seed := range seeds {
-			delete(approvals, seed.id)
-		}
-		approvalsLock.Unlock()
-	}()
 
 	req := httptest.NewRequest("GET", "/api/v1/approvals?status=pending", nil)
 	rec := httptest.NewRecorder()
@@ -12855,32 +12646,20 @@ func TestApprovalsListV1_SortsNewestFirst(t *testing.T) {
 // in handleApprovalsHistoryV1 (lines 997-998). Creates many resolved approvals
 // and verifies limit parameter caps the results.
 func TestApprovalsHistoryV1_LimitTruncation(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	// Insert 5 resolved approvals
-	var ids []string
-	approvalsLock.Lock()
+	// Seed 5 resolved approvals in the durable store.
 	for i := 0; i < 5; i++ {
-		approvalIDSeq++
-		id := fmt.Sprintf("apr-hist-%d", approvalIDSeq)
-		approvals[id] = &Approval{
-			ID:        id,
+		if err := store.CreateApproval(&state.Approval{
+			ID:        fmt.Sprintf("apr-hist-%d", i),
 			Action:    fmt.Sprintf("action-%d", i),
-			Status:    "approved",
+			Status:    state.ApprovalApproved,
 			CreatedAt: time.Now().Add(-time.Duration(i) * time.Minute),
 			ExpiresAt: time.Now().Add(1 * time.Hour),
+		}); err != nil {
+			t.Fatalf("seed approval %d: %v", i, err)
 		}
-		ids = append(ids, id)
 	}
-	approvalsLock.Unlock()
-
-	defer func() {
-		approvalsLock.Lock()
-		for _, id := range ids {
-			delete(approvals, id)
-		}
-		approvalsLock.Unlock()
-	}()
 
 	req := httptest.NewRequest("GET", "/api/v1/approvals/history?limit=2", nil)
 	rec := httptest.NewRecorder()
@@ -12904,25 +12683,18 @@ func TestApprovalsHistoryV1_LimitTruncation(t *testing.T) {
 // in handleApprovalGetV1 (line 1036). Getting a pending approval that has expired
 // should auto-transition its status to "expired".
 func TestApprovalGetV1_ExpiredAutoTransition(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	approvalsLock.Lock()
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-getexp-%d", approvalIDSeq)
-	approvals[id] = &Approval{
+	id := "apr-getexp"
+	if err := store.CreateApproval(&state.Approval{
 		ID:        id,
 		Action:    "test-get-expired",
-		Status:    "pending",
+		Status:    state.ApprovalPending,
 		CreatedAt: time.Now().Add(-2 * time.Hour),
 		ExpiresAt: time.Now().Add(-30 * time.Minute), // expired
+	}); err != nil {
+		t.Fatalf("seed approval: %v", err)
 	}
-	approvalsLock.Unlock()
-
-	defer func() {
-		approvalsLock.Lock()
-		delete(approvals, id)
-		approvalsLock.Unlock()
-	}()
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", id)
@@ -12947,27 +12719,19 @@ func TestApprovalGetV1_ExpiredAutoTransition(t *testing.T) {
 // in handleApprovalApproveV1 (line 1073). When rc != nil, the approver
 // should be set to rc.UserID instead of "unknown".
 func TestApprovalApproveV1_WithRBACContext(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	// Create approval request
-	approvalsLock.Lock()
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-rbac-%d", approvalIDSeq)
-	approvals[id] = &Approval{
-		ID:        id,
-		Action:    "deploy-v2",
-		Requestor: "agent-req",
-		Status:    "pending",
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(1 * time.Hour),
+	id := "apr-rbac-approve"
+	if err := store.CreateApproval(&state.Approval{
+		ID:          id,
+		Action:      "deploy-v2",
+		RequestedBy: "agent-req",
+		Status:      state.ApprovalPending,
+		CreatedAt:   time.Now(),
+		ExpiresAt:   time.Now().Add(1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed approval: %v", err)
 	}
-	approvalsLock.Unlock()
-
-	defer func() {
-		approvalsLock.Lock()
-		delete(approvals, id)
-		approvalsLock.Unlock()
-	}()
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", id)
@@ -12985,10 +12749,11 @@ func TestApprovalApproveV1_WithRBACContext(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Verify the approval was set with correct approver
-	approvalsLock.RLock()
-	a := approvals[id]
-	approvalsLock.RUnlock()
+	// Verify the durable record carries the RBAC approver identity
+	a, err := store.GetApproval(id)
+	if err != nil || a == nil {
+		t.Fatalf("reload approval: %v (record=%v)", err, a)
+	}
 	if a.ApprovedBy != "admin-approver" {
 		t.Errorf("expected approved_by=admin-approver, got %s", a.ApprovedBy)
 	}
@@ -13256,38 +13021,25 @@ func TestApprovalRequestV1_WithRBACAndSLBAction(t *testing.T) {
 	if resp["slb_required"] != true {
 		t.Errorf("expected slb_required=true for force_release action, got %v", resp["slb_required"])
 	}
-	// Clean up
-	if id, ok := resp["id"].(string); ok {
-		approvalsLock.Lock()
-		delete(approvals, id)
-		approvalsLock.Unlock()
-	}
 }
 
 // TestApprovalDenyV1_WithRBACContext exercises the RBAC context branch
 // in handleApprovalDenyV1 (line 1151). When rc != nil, the denier should
 // be set to rc.UserID.
 func TestApprovalDenyV1_WithRBACContext(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	approvalsLock.Lock()
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-deny-rbac-%d", approvalIDSeq)
-	approvals[id] = &Approval{
-		ID:        id,
-		Action:    "dangerous-action",
-		Requestor: "agent-req",
-		Status:    "pending",
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(1 * time.Hour),
+	id := "apr-deny-rbac"
+	if err := store.CreateApproval(&state.Approval{
+		ID:          id,
+		Action:      "dangerous-action",
+		RequestedBy: "agent-req",
+		Status:      state.ApprovalPending,
+		CreatedAt:   time.Now(),
+		ExpiresAt:   time.Now().Add(1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed approval: %v", err)
 	}
-	approvalsLock.Unlock()
-
-	defer func() {
-		approvalsLock.Lock()
-		delete(approvals, id)
-		approvalsLock.Unlock()
-	}()
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", id)
@@ -13305,10 +13057,11 @@ func TestApprovalDenyV1_WithRBACContext(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Verify the denier was recorded
-	approvalsLock.RLock()
-	a := approvals[id]
-	approvalsLock.RUnlock()
+	// Verify the denier was recorded on the durable record
+	a, err := store.GetApproval(id)
+	if err != nil || a == nil {
+		t.Fatalf("reload approval: %v (record=%v)", err, a)
+	}
 	if a.ApprovedBy != "admin-denier" {
 		t.Errorf("expected approved_by=admin-denier, got %s", a.ApprovedBy)
 	}
@@ -13317,26 +13070,19 @@ func TestApprovalDenyV1_WithRBACContext(t *testing.T) {
 // TestApprovalDenyV1_ExpiredApproval ensures deny mirrors approve semantics and
 // rejects approvals that have already expired.
 func TestApprovalDenyV1_ExpiredApproval(t *testing.T) {
-	s, _ := setupTestServer(t)
+	s, store := setupTestServer(t)
 
-	approvalsLock.Lock()
-	approvalIDSeq++
-	id := fmt.Sprintf("apr-deny-expired-%d", approvalIDSeq)
-	approvals[id] = &Approval{
-		ID:        id,
-		Action:    "dangerous-action",
-		Requestor: "agent-req",
-		Status:    "pending",
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		ExpiresAt: time.Now().Add(-5 * time.Minute),
+	id := "apr-deny-expired"
+	if err := store.CreateApproval(&state.Approval{
+		ID:          id,
+		Action:      "dangerous-action",
+		RequestedBy: "agent-req",
+		Status:      state.ApprovalPending,
+		CreatedAt:   time.Now().Add(-2 * time.Hour),
+		ExpiresAt:   time.Now().Add(-5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("seed approval: %v", err)
 	}
-	approvalsLock.Unlock()
-
-	defer func() {
-		approvalsLock.Lock()
-		delete(approvals, id)
-		approvalsLock.Unlock()
-	}()
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", id)
@@ -13358,11 +13104,13 @@ func TestApprovalDenyV1_ExpiredApproval(t *testing.T) {
 		t.Fatalf("expected expired error, got %v", resp["error"])
 	}
 
-	approvalsLock.RLock()
-	status := approvals[id].Status
-	approvalsLock.RUnlock()
-	if status != "expired" {
-		t.Fatalf("expected approval status=expired, got %s", status)
+	// The lazy expiry transition must have been persisted durably.
+	a, err := store.GetApproval(id)
+	if err != nil || a == nil {
+		t.Fatalf("reload approval: %v (record=%v)", err, a)
+	}
+	if a.Status != state.ApprovalExpired {
+		t.Fatalf("expected approval status=expired, got %s", a.Status)
 	}
 }
 
@@ -13464,10 +13212,7 @@ func TestWSEventStore_RecordDroppedMinCount(t *testing.T) {
 	}
 
 	// Verify it was recorded with count=1
-	stats, err := store.GetDroppedStats("c1", time.Now().Add(-1*time.Minute))
-	if err != nil {
-		t.Fatalf("GetDroppedStats failed: %v", err)
-	}
+	stats := droppedStatsForTest(t, store, "c1", time.Now().Add(-1*time.Minute))
 	if len(stats) != 1 {
 		t.Fatalf("expected 1 stat entry, got %d", len(stats))
 	}
@@ -13746,57 +13491,6 @@ func TestAuditStore_RecordDBExecError(t *testing.T) {
 	}
 }
 
-// TestAuditMiddleware_WithRBACContext exercises the rc != nil branch
-// in AuditMiddleware (lines 565-568 of audit.go) to extract non-anonymous user.
-func TestAuditMiddleware_WithRBACContext(t *testing.T) {
-
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "audit_rbac.db")
-
-	store, err := NewAuditStore(AuditStoreConfig{
-		DBPath:          dbPath,
-		CleanupInterval: time.Hour,
-	})
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	s, _ := setupTestServer(t)
-	middleware := s.AuditMiddleware(store)
-
-	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	// Create a POST request with RBAC context
-	req := httptest.NewRequest("POST", "/api/v1/test", nil)
-	ctx := withRoleContext(req.Context(), &RoleContext{
-		Role:   RoleAdmin,
-		UserID: "admin-user-42",
-	})
-	req = req.WithContext(ctx)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-
-	// Verify the audit record was created with the RBAC user
-	records, err := store.Query(AuditFilter{UserID: "admin-user-42"})
-	if err != nil {
-		t.Fatalf("query failed: %v", err)
-	}
-	if len(records) != 1 {
-		t.Fatalf("expected 1 audit record for admin-user-42, got %d", len(records))
-	}
-	if records[0].Role != RoleAdmin {
-		t.Errorf("expected role=admin, got %v", records[0].Role)
-	}
-}
-
 // TestAuditMiddleware_RecordError exercises the store.Record error log path
 // in AuditMiddleware (lines 595-597 of audit.go) by using a closed-DB store.
 func TestAuditMiddleware_RecordError(t *testing.T) {
@@ -14068,30 +13762,6 @@ func TestWSEventStore_GetFromDBCursorTooOldReset(t *testing.T) {
 }
 
 // --- WSEventStore.GetDroppedStats — query error (88.9%) ---
-
-func TestWSEventStore_GetDroppedStatsQueryError(t *testing.T) {
-	db, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	cfg := WSEventStoreConfig{
-		BufferSize:       10,
-		RetentionSeconds: 3600,
-		CleanupInterval:  time.Hour,
-	}
-	store := NewWSEventStore(db, cfg)
-	defer store.Stop()
-
-	// Close DB to trigger query error
-	db.Close()
-
-	_, err := store.GetDroppedStats("client-1", time.Now().Add(-time.Hour))
-	if err == nil {
-		t.Fatal("expected error from GetDroppedStats with closed DB")
-	}
-	if !strings.Contains(err.Error(), "query dropped stats") {
-		t.Errorf("expected 'query dropped stats' in error, got: %v", err)
-	}
-}
 
 // --- redactingResponseWriter.finalize — double-call early return (94.7%) ---
 

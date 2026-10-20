@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	assignmentstore "github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
@@ -22,14 +24,8 @@ import (
 )
 
 var (
-	getPanesWithActivity         = tmux.GetPanesWithActivity
+	getPanesWithActivity         = tmux.GetPanesWithActivityContext
 	captureForHealthCheckWithCtx = tmux.CaptureForHealthCheckContext
-	sendKeysForAgentContext      = tmux.SendKeysForAgentContext
-)
-
-const (
-	mailNudgeCooldown = 5 * time.Minute
-	mailNudgeMessage  = "You have unread Agent Mail. Please check your inbox when ready."
 )
 
 // SessionCoordinator manages agent coordination for a tmux session.
@@ -53,20 +49,76 @@ type SessionCoordinator struct {
 	workItemDetailsFn           func(context.Context, string) (*bv.BeadAssignmentDetails, error)
 	claimBeadForAssignmentFn    func(context.Context, string, string, string, []string) (bv.BeadClaimResult, error)
 	releaseWorkItemClaimFn      func(context.Context, string, string, string) (bool, error)
-	fetchInboxFn                func(context.Context, agentmail.FetchInboxOptions) ([]agentmail.InboxMessage, error)
-	sendNudgeFn                 func(ctx context.Context, paneID, agentType string) error
+	allPanesForRecoveryFn       func(context.Context) (map[string][]tmux.Pane, error)
 	operatorGatedLabels         []string
 
+	// dispatchDeliveryProbeFn is the test seam for the mailbox probe that
+	// decides whether a stranded dispatch actually landed (ntm#304). Nil uses
+	// the real Agent Mail inbox probe.
+	dispatchDeliveryProbeFn dispatchDeliveryProbe
+
 	// Agent tracking
-	agents        map[string]*AgentState
-	lastMailNudge map[string]time.Time
-	lastUpdate    time.Time
+	agents     map[string]*AgentState
+	lastUpdate time.Time
+
+	// Physical pane topology from the most recent *successful* whole-session
+	// observation: every pane tmux listed, including panes carrying no agent
+	// and panes whose agent type could not be identified. This is deliberately
+	// a different set from `agents`, which drops user/unknown panes and so
+	// cannot answer "does this pane still exist?" (ntm#304).
+	//
+	// livePaneTopologyValid is false until the first successful observation and
+	// is cleared again whenever a whole-session observation fails, so an
+	// absence is never inferred from a snapshot we could not take.
+	// deadPaneIDs records explicit pane_dead evidence from that same observation.
+	// Retained dead panes remain in physical topology but cannot receive work.
+	livePaneIDs           map[string]struct{}
+	deadPaneIDs           map[string]struct{}
+	livePaneTopologyAt    time.Time
+	livePaneTopologyValid bool
 
 	// Monitors
 	monitor *AgentMonitor
 
+	// Context rotation trigger (bd-rpmg8). Nil unless
+	// config.RotationUsageThreshold > 0; created lazily on the first cycle.
+	rotation *rotationChecker
+
+	// CAAM auto-failover trigger (bd-um3uy). Nil unless
+	// [integrations.caam] auto_failover is true; created lazily on the
+	// first cycle.
+	caamFailover *failoverChecker
+
+	// Agent Mail idle-pane nudge trigger (GH#231). Nil unless [coordinator]
+	// mail_nudge is true AND an Agent Mail client exists; created lazily on
+	// the first cycle.
+	mailNudge *mailNudgeChecker
+
+	// Conflict handling (bd-ws2-wire-or-delete-ykmcz.1). The detector is
+	// created lazily on the first cycle where a conflict flag is enabled;
+	// detectConflictsFn is a test seam. lastConflictOutcome implements the
+	// per-conflicting-pair cooldown.
+	conflictDetector    *ConflictDetector
+	detectConflictsFn   func(context.Context) ([]Conflict, error)
+	lastConflictOutcome map[string]time.Time
+
 	// Configuration
 	config CoordinatorConfig
+	// completionEvents is enabled only by a caller with a durable event
+	// consumer, such as assign --watch. Standalone coordination has no such
+	// consumer and must not leave unacknowledgeable completion barriers.
+	completionEvents bool
+
+	// Full NTM config, when the caller has one loaded. Only used by the
+	// context rotation trigger (replacement launch commands and
+	// [context_rotation] tunables); nil is fine.
+	ntmConfig *config.Config
+
+	// promptContext enriches each fresh auto-assignment with CASS history
+	// and CM rules before its durable intent is recorded. The caller
+	// resolves it from [cass.context] and [memory] send_injection; the zero
+	// value disables enrichment.
+	promptContext robot.PromptContextOptions
 
 	// Event channel for coordination actions
 	events chan CoordinatorEvent
@@ -125,6 +177,22 @@ type CoordinatorConfig struct {
 	SendDigests bool   `toml:"send_digests"` // Send periodic digests to human
 	HumanAgent  string `toml:"human_agent"`  // Agent name to send digests to (default: "Human")
 	MailNudge   bool   `toml:"mail_nudge"`   // Prompt idle panes that have unread Agent Mail
+
+	// Mail nudge tunables (GH#231). These mirror the [coordinator]
+	// nudge_cooldown_seconds / nudge_message config keys; the CLI populates
+	// them from config.Coordinator when starting a coordinator. A
+	// non-positive cooldown falls back to the fixed 60s default; an empty
+	// message uses the built-in nudge prompt.
+	NudgeCooldown time.Duration `toml:"-"`
+	NudgeMessage  string        `toml:"-"`
+
+	// Context rotation trigger (bd-rpmg8). These mirror the [rotation]
+	// usage_percent_threshold / auto_confirm config keys (NOT [coordinator]);
+	// the CLI populates them from config.Rotation when starting a coordinator.
+	// Zero threshold (the default) keeps the trigger fully off: no transcript
+	// probing, no new subprocess calls, no behavior change.
+	RotationUsageThreshold float64 `toml:"-"`
+	RotationAutoConfirm    bool    `toml:"-"`
 }
 
 // MinPollInterval is the minimum allowed poll interval to prevent ticker panics.
@@ -134,7 +202,12 @@ const MinPollInterval = 100 * time.Millisecond
 // MinDigestInterval is the minimum allowed digest interval.
 const MinDigestInterval = 10 * time.Second
 
-// DefaultCoordinatorConfig returns sensible defaults.
+// DefaultCoordinatorConfig returns sensible defaults. Every action that
+// messages agents or admits work is opt-in: each session monitor hosts a
+// coordinator, so a default-on action would run in every spawned session.
+// ConflictNotify in particular mails every holder of overlapping reservations
+// project-wide (other sessions' agents included) at high importance, again
+// per persisting pair after each cooldown.
 func DefaultCoordinatorConfig() CoordinatorConfig {
 	return CoordinatorConfig{
 		PollInterval:      5 * time.Second,
@@ -142,11 +215,12 @@ func DefaultCoordinatorConfig() CoordinatorConfig {
 		AutoAssign:        false, // Disabled by default - opt-in
 		IdleThreshold:     30.0,
 		AssignOnlyIdle:    true,
-		ConflictNotify:    true,
+		ConflictNotify:    false, // Disabled by default - opt-in
 		ConflictNegotiate: false, // Manual resolution by default
 		SendDigests:       false, // Disabled by default
 		HumanAgent:        "Human",
 		MailNudge:         false, // Disabled by default - prompts a pane
+		NudgeCooldown:     defaultMailNudgeCooldown,
 	}
 }
 
@@ -159,10 +233,16 @@ const (
 	EventAgentError       CoordinatorEventType = "agent_error"
 	EventAgentRecovered   CoordinatorEventType = "agent_recovered"
 	EventConflictDetected CoordinatorEventType = "conflict_detected"
-	EventConflictResolved CoordinatorEventType = "conflict_resolved"
-	EventWorkAssigned     CoordinatorEventType = "work_assigned"
-	EventDigestSent       CoordinatorEventType = "digest_sent"
-	EventDigestFailed     CoordinatorEventType = "digest_failed"
+	// EventConflictReleaseRequested marks a negotiation request SENT: the
+	// engine asked the losing holder to release. It is NOT proof the holder
+	// complied — the reservation may stay held. The old name for this event
+	// ("conflict_resolved") over-claimed exactly that, so it was renamed
+	// (bd-izuqq.2); nothing currently verifies an actual release, and no
+	// event asserts one.
+	EventConflictReleaseRequested CoordinatorEventType = "conflict_release_requested"
+	EventWorkAssigned             CoordinatorEventType = "work_assigned"
+	EventDigestSent               CoordinatorEventType = "digest_sent"
+	EventDigestFailed             CoordinatorEventType = "digest_failed"
 )
 
 // CoordinatorEvent represents an event from the coordinator.
@@ -191,19 +271,9 @@ func New(session, projectKey string, mailClient *agentmail.Client, agentName str
 		reservationClient:   mailClient,
 		operatorGatedLabels: append([]string(nil), bv.OperatorGatedLabelsForProject(projectKey)...),
 		agents:              make(map[string]*AgentState),
-		lastMailNudge:       make(map[string]time.Time),
 		config:              DefaultCoordinatorConfig(),
 		events:              make(chan CoordinatorEvent, 100),
 		stopCh:              make(chan struct{}),
-	}
-	if mailClient != nil {
-		c.fetchInboxFn = mailClient.FetchInbox
-	}
-	// The nudge goes through the agent-aware send so a Muse Code pane gets
-	// its 300 ms Enter floor: typed with the plain 100 ms Enter, the nudge
-	// stayed an unsent draft in Muse's composer in 6 of 6 live trials.
-	c.sendNudgeFn = func(ctx context.Context, paneID, agentType string) error {
-		return sendKeysForAgentContext(ctx, paneID, mailNudgeMessage, true, tmux.AgentType(agentType))
 	}
 	return c
 }
@@ -211,6 +281,31 @@ func New(session, projectKey string, mailClient *agentmail.Client, agentName str
 // WithConfig sets the coordinator configuration.
 func (c *SessionCoordinator) WithConfig(cfg CoordinatorConfig) *SessionCoordinator {
 	c.config = cfg
+	return c
+}
+
+// WithNTMConfig provides the loaded NTM config for subsystems that need more
+// than CoordinatorConfig (currently only the context rotation trigger). Nil
+// is accepted and keeps built-in defaults.
+func (c *SessionCoordinator) WithNTMConfig(cfg *config.Config) *SessionCoordinator {
+	c.ntmConfig = cfg
+	return c
+}
+
+// WithPromptContext enables CASS history and CM rule enrichment of fresh
+// auto-assignment prompts, using the same resolved options as --robot-send.
+// Recovery of a recorded intent always replays its recorded prompt.
+func (c *SessionCoordinator) WithPromptContext(opts robot.PromptContextOptions) *SessionCoordinator {
+	c.promptContext = opts
+	return c
+}
+
+// WithCompletionEvents preserves task completion in the assignment outbox
+// before maintenance releases its leases. Only callers that consume and
+// acknowledge those events may enable this option. Set it before maintenance
+// starts; ordinary coordinator commands leave it disabled.
+func (c *SessionCoordinator) WithCompletionEvents() *SessionCoordinator {
+	c.completionEvents = true
 	return c
 }
 
@@ -244,12 +339,9 @@ func (c *SessionCoordinator) Start(ctx context.Context) error {
 	c.stopping = false
 	c.mu.Unlock()
 
-	// Initialize monitor
-	c.monitor = NewAgentMonitor(c.session, c.mailClient, c.projectKey)
-
 	// Perform initial update synchronously to ensure state is ready. A coordinator
 	// that cannot observe its target session must not announce a healthy runtime.
-	if err := c.updateAgentStatesContext(ctx); err != nil {
+	if err := c.Observe(ctx); err != nil {
 		c.mu.Lock()
 		c.started = false
 		c.stopCh = nil
@@ -296,11 +388,6 @@ func (c *SessionCoordinator) Stop() {
 	c.mu.Unlock()
 }
 
-// Events returns the event channel for external listeners.
-func (c *SessionCoordinator) Events() <-chan CoordinatorEvent {
-	return c.events
-}
-
 // GetAgents returns the current state of all tracked agents.
 func (c *SessionCoordinator) GetAgents() map[string]*AgentState {
 	c.mu.RLock()
@@ -312,18 +399,6 @@ func (c *SessionCoordinator) GetAgents() map[string]*AgentState {
 		result[k] = &agentCopy
 	}
 	return result
-}
-
-// GetAgentByPaneID returns the state of a specific agent.
-func (c *SessionCoordinator) GetAgentByPaneID(paneID string) *AgentState {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if agent, ok := c.agents[paneID]; ok {
-		agentCopy := *agent
-		return &agentCopy
-	}
-	return nil
 }
 
 // GetIdleAgents returns agents that are idle and available for work.
@@ -391,19 +466,61 @@ func (c *SessionCoordinator) monitorLoop(ctx context.Context, stopCh <-chan stru
 	}
 }
 
-// RunCycle refreshes the canonical session observation and, when enabled,
-// performs one auto-assignment pass from that exact fresh snapshot.
+// Observe refreshes agent state once without starting background coordination,
+// sending messages, or changing assignments and reservations. Inspection
+// surfaces can use it even when automatic actions are enabled in the config.
+func (c *SessionCoordinator) Observe(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	if c.monitor == nil {
+		c.monitor = NewAgentMonitor(c.session, c.mailClient, c.projectKey)
+	}
+	c.mu.Unlock()
+	return c.updateAgentStatesContext(ctx)
+}
+
+// MaintainAssignments observes the session and maintains only existing durable
+// assignments. A failed pane observation does not prevent terminal cleanup or
+// renewal for independently verified healthy panes. Missing or stale target
+// evidence never authorizes renewal. Observation and maintenance failures are
+// returned together so callers can report degraded protection without stopping
+// unrelated cleanup. This entry point never starts background coordination,
+// sends digests or nudges, rotates agents, or admits new work.
+func (c *SessionCoordinator) MaintainAssignments(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	observationErr := c.Observe(ctx)
+	if err := ctx.Err(); err != nil {
+		return errors.Join(observationErr, err)
+	}
+	return errors.Join(observationErr, c.maintainAssignments(ctx))
+}
+
+// RunCycle refreshes the canonical session observation, maintains existing
+// assignments, and, when enabled, performs one auto-assignment pass.
 func (c *SessionCoordinator) RunCycle(ctx context.Context) ([]AssignmentResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if c.monitor == nil {
-		c.monitor = NewAgentMonitor(c.session, c.mailClient, c.projectKey)
-	}
-	if err := c.updateAgentStatesContext(ctx); err != nil {
+	// Protect existing work before potentially slow agent recovery and before
+	// admitting new work. Degraded observation still permits independently
+	// authorized maintenance, but blocks the other automatic actions below.
+	if err := c.MaintainAssignments(ctx); err != nil {
 		return nil, err
 	}
-	c.nudgeUnreadMail(ctx)
+	c.maybeCheckMailNudge(ctx)
+	c.maybeCheckContextRotation(ctx)
+	c.maybeCheckCaamFailover(ctx)
+	// Conflict detection + negotiation behind the persisted flags
+	// (bd-ws2-wire-or-delete-ykmcz.1): runs before the AutoAssign early
+	// return so notify/negotiate work even when auto-assignment is off.
+	c.runConflictCycle(ctx)
 	if !c.config.AutoAssign {
 		return nil, nil
 	}
@@ -414,51 +531,67 @@ func (c *SessionCoordinator) RunCycle(ctx context.Context) ([]AssignmentResult, 
 	return assignWork(ctx)
 }
 
-// nudgeUnreadMail prompts only healthy, freshly observed waiting panes. It
-// reads mail headers only and never interrupts a pane that is working.
-func (c *SessionCoordinator) nudgeUnreadMail(ctx context.Context) {
-	c.mu.RLock()
-	if !c.config.MailNudge || c.fetchInboxFn == nil || c.sendNudgeFn == nil {
-		c.mu.RUnlock()
+// maybeCheckContextRotation runs the transcript-usage rotation trigger for
+// this cycle (bd-rpmg8). DEFAULT-OFF GUARANTEE: with no [rotation]
+// usage_percent_threshold configured (> 0), this returns before constructing
+// the checker — zero new subprocess calls and zero behavior change.
+func (c *SessionCoordinator) maybeCheckContextRotation(ctx context.Context) {
+	c.mu.Lock()
+	if c.config.RotationUsageThreshold <= 0 {
+		c.mu.Unlock()
 		return
 	}
-	now := time.Now()
-	agents := make([]AgentState, 0, len(c.agents))
-	for _, agent := range c.agents {
-		if agent.Status != robot.StateWaiting || agent.ObservationFreshness != status.FreshnessFresh || !agent.Healthy || agent.AgentMailName == "" || now.Sub(c.lastMailNudge[agent.PaneID]) < mailNudgeCooldown {
-			continue
-		}
-		agents = append(agents, *agent)
+	if c.rotation == nil {
+		c.rotation = newRotationChecker(c.session, c.projectKey, c.config, c.ntmConfig)
 	}
-	fetchInbox := c.fetchInboxFn
-	sendNudge := c.sendNudgeFn
-	projectKey := c.projectKey
-	c.mu.RUnlock()
+	checker := c.rotation
+	c.mu.Unlock()
 
-	for _, agent := range agents {
-		inbox, err := fetchInbox(ctx, agentmail.FetchInboxOptions{ProjectKey: projectKey, AgentName: agent.AgentMailName, Limit: 1})
-		if err != nil {
-			slog.Warn("coordinator could not inspect Agent Mail inbox", "session", c.session, "pane", agent.PaneID, "agent", agent.AgentMailName, "error", err)
-			continue
-		}
-		hasUnread := false
-		for _, message := range inbox {
-			if message.ReadAt == nil {
-				hasUnread = true
-				break
-			}
-		}
-		if !hasUnread {
-			continue
-		}
-		if err := sendNudge(ctx, agent.PaneID, agent.AgentType); err != nil {
-			slog.Warn("coordinator could not nudge pane for unread Agent Mail", "session", c.session, "pane", agent.PaneID, "error", err)
-			continue
-		}
-		c.mu.Lock()
-		c.lastMailNudge[agent.PaneID] = now
+	checker.runOnce(ctx)
+}
+
+// maybeCheckCaamFailover runs the CAAM auto-failover trigger for this cycle
+// (bd-um3uy). DEFAULT-OFF GUARANTEE: with [integrations.caam] auto_failover
+// unset (false) — or no loaded NTM config at all — this returns before
+// constructing the checker: zero caam probing, zero new subprocess calls,
+// zero behavior change.
+func (c *SessionCoordinator) maybeCheckCaamFailover(ctx context.Context) {
+	c.mu.Lock()
+	if c.ntmConfig == nil || !c.ntmConfig.Integrations.CAAM.AutoFailover {
 		c.mu.Unlock()
+		return
 	}
+	if c.caamFailover == nil {
+		c.caamFailover = newFailoverChecker(c.session, c.projectKey, c.ntmConfig.Integrations.CAAM)
+		if c.caamFailover != nil {
+			c.caamFailover.config = c.ntmConfig
+			c.caamFailover.forceGlobal = c.ntmConfig.Swarm.ForceGlobalAuthClobber
+		}
+	}
+	checker := c.caamFailover
+	c.mu.Unlock()
+
+	checker.runOnce(ctx)
+}
+
+// maybeCheckMailNudge runs the Agent Mail idle-pane nudge trigger for this
+// cycle (GH#231). DEFAULT-OFF GUARANTEE: with [coordinator] mail_nudge unset
+// (false) — or no Agent Mail client at all — this returns before
+// constructing the checker: zero inbox probing, zero new subprocess calls,
+// zero behavior change.
+func (c *SessionCoordinator) maybeCheckMailNudge(ctx context.Context) {
+	c.mu.Lock()
+	if !c.config.MailNudge || c.mailClient == nil {
+		c.mu.Unlock()
+		return
+	}
+	if c.mailNudge == nil {
+		c.mailNudge = newMailNudgeChecker(c.session, c.projectKey, c.config, c.mailClient)
+	}
+	checker := c.mailNudge
+	c.mu.Unlock()
+
+	checker.runOnce(ctx)
 }
 
 func (c *SessionCoordinator) reportAssignmentCycle(results []AssignmentResult, err error) {
@@ -514,11 +647,6 @@ func coordinatorPaneObservationError(paneID, message string) error {
 	return fmt.Errorf("pane %s: %w", paneID, cause)
 }
 
-// updateAgentStates refreshes the state of all agents.
-func (c *SessionCoordinator) updateAgentStates() {
-	_ = c.updateAgentStatesContext(context.Background())
-}
-
 func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error {
 	if c.monitor == nil {
 		return errors.New("agent monitor is not configured")
@@ -537,9 +665,28 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 		status    AgentStatusResult
 	}
 	updates := make([]agentUpdate, 0, len(observation.Panes))
+	// Physical topology is captured from every listed pane, before the
+	// agent-type filter below drops user/unknown panes. A pane whose agent
+	// went unrecognized still exists, and treating it as gone would be a
+	// license to re-dispatch work that may already be sitting in it (ntm#304).
+	livePaneIDs := make(map[string]struct{}, len(observation.Panes))
+	deadPaneIDs := make(map[string]struct{})
+	topologyComplete := true
 	var observationErrors []error
 	for _, pane := range observation.Panes {
-		if pane.AgentType == string(tmux.AgentUser) || pane.AgentType == string(tmux.AgentUnknown) {
+		paneID := strings.TrimSpace(pane.Pane.ID)
+		if _, duplicate := livePaneIDs[paneID]; paneID == "" || duplicate {
+			topologyComplete = false
+			observationErrors = append(observationErrors, fmt.Errorf("incomplete physical pane topology: empty or repeated pane ID %q", paneID))
+			continue
+		}
+		livePaneIDs[paneID] = struct{}{}
+		if pane.Metadata.Dead {
+			deadPaneIDs[paneID] = struct{}{}
+		}
+	}
+	for _, pane := range observation.Panes {
+		if pane.Metadata.Dead || pane.AgentType == string(tmux.AgentUser) || pane.AgentType == string(tmux.AgentUnknown) {
 			continue
 		}
 		state := c.monitor.resultFromPaneObservation(pane)
@@ -640,6 +787,10 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 	}
 
 	c.lastUpdate = observation.ObservedAt
+	c.livePaneIDs = livePaneIDs
+	c.deadPaneIDs = deadPaneIDs
+	c.livePaneTopologyAt = observation.ObservedAt
+	c.livePaneTopologyValid = topologyComplete
 	c.mu.Unlock()
 
 	// Emit events outside the lock to prevent deadlocks if the event bus
@@ -659,6 +810,13 @@ func (c *SessionCoordinator) markAgentObservationsUnavailable(observedAt time.Ti
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The observation failed, so we know nothing about the current pane set.
+	// Retaining the previous snapshot would let a pane that merely became
+	// unobservable be read as a pane that no longer exists.
+	c.livePaneIDs = nil
+	c.deadPaneIDs = nil
+	c.livePaneTopologyAt = time.Time{}
+	c.livePaneTopologyValid = false
 	for _, agent := range c.agents {
 		if agent.ObservationFreshness == status.FreshnessFresh && agent.Status != robot.StateUnknown {
 			agent.LastKnownStatus = agent.Status

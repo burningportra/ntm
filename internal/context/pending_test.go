@@ -2,14 +2,152 @@ package context
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
+	"errors"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestPendingConfirmationRetainsChoiceAndReplaysReceipt(t *testing.T) {
+	store := NewPendingRotationStoreWithPath(filepath.Join(t.TempDir(), "pending.jsonl"))
+	pending := makePending("demo__cc_1", "demo", "%3", time.Now().Add(time.Hour))
+	pending.PanePID = 123
+	pending.PaneType = "cc"
+	if err := store.Add(pending); err != nil {
+		t.Fatal(err)
+	}
+	claimed, release, err := store.BeginConfirmation(t.Context(), pending.AgentID, ConfirmRotate, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.SelectedAction != ConfirmRotate || claimed.ExecutionState != RotationStateInProgress || claimed.PanePID != 123 {
+		t.Fatalf("claim did not preserve request identity and choice: %+v", claimed)
+	}
+	if err := store.Remove(pending.AgentID); err == nil {
+		t.Fatal("ordinary removal consumed owned execution")
+	}
+	if err := store.Add(pending); err == nil {
+		t.Fatal("re-enqueue overwrote owned execution")
+	}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	failure := RotationResult{OldAgentID: pending.AgentID, OldPaneID: "%3", State: RotationStateFailed, Error: "handoff delivery canceled; original preserved"}
+	if err := store.FinishConfirmation(canceled, claimed, failure); err != nil {
+		t.Fatalf("cancellation lost outcome: %v", err)
+	}
+	release()
+	stored, err := store.Get(pending.AgentID)
+	if err != nil || stored == nil || stored.SelectedAction != ConfirmRotate || stored.Result == nil || stored.Result.Error != failure.Error {
+		t.Fatalf("failure receipt = %+v, %v", stored, err)
+	}
+	if _, _, err := store.BeginConfirmation(t.Context(), pending.AgentID, ConfirmRotate, false); err == nil {
+		t.Fatal("failed operation silently repeated")
+	}
+	if _, _, err := store.BeginConfirmation(t.Context(), pending.AgentID, ConfirmCompact, true); err == nil {
+		t.Fatal("retry changed the selected action")
+	}
+	retried, release, err := store.BeginConfirmation(t.Context(), pending.AgentID, ConfirmRotate, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.ExecutionID == claimed.ExecutionID {
+		t.Fatal("retry reused execution ownership")
+	}
+	success := RotationResult{Success: true, OldAgentID: pending.AgentID, OldPaneID: "%3", NewPaneID: "%9", State: RotationStateCompleted}
+	if err := store.FinishConfirmation(t.Context(), retried, success); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if pending, err := store.Get(pending.AgentID); err != nil || pending != nil {
+		t.Fatalf("completed receipt remained actionable: %+v, %v", pending, err)
+	}
+	replay, release, err := store.BeginConfirmation(t.Context(), retried.AgentID, ConfirmRotate, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if replay.Result == nil || !replay.Result.Success || replay.Result.NewPaneID != "%9" || replay.ExecutionID != retried.ExecutionID {
+		t.Fatalf("duplicate confirmation did not replay durable outcome: %+v", replay)
+	}
+}
+
+func TestPendingConfirmationInterruptedClaimSurvivesTimeout(t *testing.T) {
+	store := NewPendingRotationStoreWithPath(filepath.Join(t.TempDir(), "pending.jsonl"))
+	pending := makePending("demo__cc_1", "demo", "%3", time.Now().Add(-time.Hour))
+	pending.SelectedAction = ConfirmCompact
+	pending.ExecutionState = RotationStateInProgress
+	pending.ExecutionID = "interrupted-owner"
+	if err := store.Add(pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(makePending("other__cc_1", "other", "%4", time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(pending.AgentID)
+	if err != nil || stored == nil || stored.IsExpired() {
+		t.Fatalf("interrupted choice expired: %+v, %v", stored, err)
+	}
+	if _, _, err := store.BeginConfirmation(t.Context(), pending.AgentID, ConfirmCompact, false); err == nil || !strings.Contains(err.Error(), "--retry") {
+		t.Fatalf("interrupted attempt was not diagnosed: %v", err)
+	}
+}
+
+// TestPendingConfirmationLapsesWithoutAction: a pending rotation request that
+// passed its timeout simply lapses (bd-fka4c). It is no longer visible, it
+// cannot be confirmed without an explicit retry, and nothing ran on its own.
+func TestPendingConfirmationLapsesWithoutAction(t *testing.T) {
+	store := NewPendingRotationStoreWithPath(filepath.Join(t.TempDir(), "pending.jsonl"))
+	pending := makePending("lapsed__cc_1", "lapsed", "%3", time.Now().Add(-time.Minute))
+	if err := store.Add(pending); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.Get(pending.AgentID); err != nil || got != nil {
+		t.Fatalf("lapsed request still visible: %+v (err %v)", got, err)
+	}
+	if _, _, err := store.BeginConfirmation(t.Context(), pending.AgentID, ConfirmRotate, false); err == nil || !strings.Contains(err.Error(), "has expired") {
+		t.Fatalf("confirming a lapsed request = %v, want an expiry error", err)
+	}
+}
+
+func TestPendingConfirmationProcessHelper(t *testing.T) {
+	path := os.Getenv("NTM_PENDING_CLAIM_TEST")
+	if path == "" {
+		return
+	}
+	store := NewPendingRotationStoreWithPath(path)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	_, release, err := store.BeginConfirmation(ctx, "demo__cc_1", ConfirmRotate, false)
+	if release != nil {
+		release()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("independent process acquired live confirmation: %v", err)
+	}
+}
+
+func TestPendingConfirmationExcludesAnotherProcess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pending.jsonl")
+	store := NewPendingRotationStoreWithPath(path)
+	if err := store.Add(makePending("demo__cc_1", "demo", "%3", time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	_, release, err := store.BeginConfirmation(t.Context(), "demo__cc_1", ConfirmRotate, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	child := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestPendingConfirmationProcessHelper$")
+	child.Env = append(os.Environ(), "NTM_PENDING_CLAIM_TEST="+path)
+	if output, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("independent process claim check: %v\n%s", err, output)
+	}
+}
 
 func makePending(agentID, session, pane string, timeout time.Time) *PendingRotation {
 	return &PendingRotation{
@@ -19,7 +157,6 @@ func makePending(agentID, session, pane string, timeout time.Time) *PendingRotat
 		ContextPercent: 85.5,
 		CreatedAt:      time.Now(),
 		TimeoutAt:      timeout,
-		DefaultAction:  ConfirmRotate,
 		WorkDir:        "/tmp/test",
 	}
 }
@@ -27,8 +164,8 @@ func makePending(agentID, session, pane string, timeout time.Time) *PendingRotat
 func TestNewPendingRotationStoreWithPath(t *testing.T) {
 	t.Parallel()
 	store := NewPendingRotationStoreWithPath("/tmp/test.jsonl")
-	if store.StoragePath() != "/tmp/test.jsonl" {
-		t.Errorf("StoragePath() = %q, want /tmp/test.jsonl", store.StoragePath())
+	if store.storagePath != "/tmp/test.jsonl" {
+		t.Errorf("StoragePath() = %q, want /tmp/test.jsonl", store.storagePath)
 	}
 }
 
@@ -66,9 +203,6 @@ func TestPendingRotationStore_AddAndGet(t *testing.T) {
 	}
 	if got.SessionName != "sess-1" {
 		t.Errorf("SessionName = %q, want sess-1", got.SessionName)
-	}
-	if got.DefaultAction != ConfirmRotate {
-		t.Errorf("DefaultAction = %q, want rotate", got.DefaultAction)
 	}
 }
 
@@ -208,117 +342,6 @@ func TestPendingRotationStore_GetForSession(t *testing.T) {
 	}
 }
 
-func TestPendingRotationStore_GetExpired(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	store := NewPendingRotationStoreWithPath(filepath.Join(dir, "pending.jsonl"))
-
-	future := time.Now().Add(10 * time.Minute)
-	past := time.Now().Add(-1 * time.Minute)
-
-	_ = store.Add(makePending("agent-1", "sess-1", "1.1", future))
-	_ = store.Add(makePending("agent-2", "sess-1", "1.2", past))
-
-	expired, err := store.GetExpired()
-	if err != nil {
-		t.Fatalf("GetExpired: %v", err)
-	}
-	if len(expired) != 1 {
-		t.Fatalf("expected 1 expired entry, got %d", len(expired))
-	}
-	if expired[0].AgentID != "agent-2" {
-		t.Errorf("expected agent-2, got %q", expired[0].AgentID)
-	}
-}
-
-func TestPendingRotationStore_CleanExpired(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "pending.jsonl")
-	store := NewPendingRotationStoreWithPath(path)
-
-	future := time.Now().Add(10 * time.Minute)
-	past := time.Now().Add(-1 * time.Minute)
-
-	// Write entries directly to bypass Add's expired-entry filtering.
-	entries := []StoredPendingRotation{
-		*FromPendingRotation(makePending("agent-1", "sess-1", "1.1", future)),
-		*FromPendingRotation(makePending("agent-2", "sess-1", "1.2", past)),
-		*FromPendingRotation(makePending("agent-3", "sess-1", "1.3", past)),
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("create file: %v", err)
-	}
-	for _, e := range entries {
-		b, _ := json.Marshal(e)
-		_, _ = f.Write(b)
-		_, _ = f.Write([]byte("\n"))
-	}
-	f.Close()
-
-	removed, err := store.CleanExpired()
-	if err != nil {
-		t.Fatalf("CleanExpired: %v", err)
-	}
-	if removed != 2 {
-		t.Errorf("removed = %d, want 2", removed)
-	}
-
-	all, err := store.GetAll()
-	if err != nil {
-		t.Fatalf("GetAll after clean: %v", err)
-	}
-	if len(all) != 1 {
-		t.Fatalf("expected 1 entry after clean, got %d", len(all))
-	}
-}
-
-func TestPendingRotationStore_CleanExpired_NothingToClean(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	store := NewPendingRotationStoreWithPath(filepath.Join(dir, "pending.jsonl"))
-
-	future := time.Now().Add(10 * time.Minute)
-	_ = store.Add(makePending("agent-1", "sess-1", "1.1", future))
-
-	removed, err := store.CleanExpired()
-	if err != nil {
-		t.Fatalf("CleanExpired: %v", err)
-	}
-	if removed != 0 {
-		t.Errorf("removed = %d, want 0", removed)
-	}
-}
-
-func TestPendingRotationStore_Count(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	store := NewPendingRotationStoreWithPath(filepath.Join(dir, "pending.jsonl"))
-
-	// Empty store
-	count, err := store.Count()
-	if err != nil {
-		t.Fatalf("Count empty: %v", err)
-	}
-	if count != 0 {
-		t.Errorf("count = %d, want 0", count)
-	}
-
-	// Add entries
-	timeout := time.Now().Add(10 * time.Minute)
-	_ = store.Add(makePending("agent-1", "sess-1", "1.1", timeout))
-	_ = store.Add(makePending("agent-2", "sess-1", "1.2", timeout))
-
-	count, err = store.Count()
-	if err != nil {
-		t.Fatalf("Count: %v", err)
-	}
-	if count != 2 {
-		t.Errorf("count = %d, want 2", count)
-	}
-}
-
 func TestPendingRotationStore_Clear(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -387,16 +410,14 @@ func TestPendingRotationStore_MalformedLines(t *testing.T) {
 	}
 
 	store := NewPendingRotationStoreWithPath(path)
-	all, err := store.GetAll()
-	if err != nil {
-		t.Fatalf("GetAll with malformed: %v", err)
+	if _, err := store.GetAll(); err == nil {
+		t.Fatal("malformed durable state was accepted as an incomplete pending list")
 	}
-	// Should skip malformed lines and return the valid one
-	if len(all) != 1 {
-		t.Fatalf("expected 1 valid entry, got %d", len(all))
+	if _, _, err := store.BeginConfirmation(t.Context(), "agent-1", ConfirmRotate, false); err == nil {
+		t.Fatal("confirmation proceeded despite unobservable durable ownership")
 	}
-	if all[0].AgentID != "agent-1" {
-		t.Errorf("AgentID = %q, want agent-1", all[0].AgentID)
+	if data, err := os.ReadFile(path); err != nil || string(data) != content {
+		t.Fatalf("malformed durable state changed: %q, %v", data, err)
 	}
 }
 
@@ -501,7 +522,6 @@ func TestStoredPendingRotation_ToPendingRotation(t *testing.T) {
 		ContextPercent: 90.0,
 		CreatedAt:      now,
 		TimeoutAt:      timeout,
-		DefaultAction:  ConfirmCompact,
 		WorkDir:        "/projects/test",
 	}
 
@@ -509,8 +529,8 @@ func TestStoredPendingRotation_ToPendingRotation(t *testing.T) {
 	if p.AgentID != "agent-1" {
 		t.Errorf("AgentID = %q, want agent-1", p.AgentID)
 	}
-	if p.DefaultAction != ConfirmCompact {
-		t.Errorf("DefaultAction = %q, want compact", p.DefaultAction)
+	if !p.TimeoutAt.Equal(timeout) {
+		t.Errorf("TimeoutAt = %v, want %v", p.TimeoutAt, timeout)
 	}
 	if p.WorkDir != "/projects/test" {
 		t.Errorf("WorkDir = %q, want /projects/test", p.WorkDir)
@@ -529,7 +549,6 @@ func TestFromPendingRotation_Fields(t *testing.T) {
 		ContextPercent: 75.5,
 		CreatedAt:      now,
 		TimeoutAt:      timeout,
-		DefaultAction:  ConfirmIgnore,
 		WorkDir:        "/projects/other",
 	}
 
@@ -537,8 +556,8 @@ func TestFromPendingRotation_Fields(t *testing.T) {
 	if stored.AgentID != "agent-2" {
 		t.Errorf("AgentID = %q, want agent-2", stored.AgentID)
 	}
-	if stored.DefaultAction != ConfirmIgnore {
-		t.Errorf("DefaultAction = %q, want ignore", stored.DefaultAction)
+	if !stored.TimeoutAt.Equal(timeout) {
+		t.Errorf("TimeoutAt = %v, want %v", stored.TimeoutAt, timeout)
 	}
 	if stored.WorkDir != "/projects/other" {
 		t.Errorf("WorkDir = %q, want /projects/other", stored.WorkDir)
@@ -636,19 +655,5 @@ func TestGetPendingRotationsForSession_Global(t *testing.T) {
 	}
 	if len(forSession) != 2 {
 		t.Errorf("expected 2 rotations for target-sess, got %d", len(forSession))
-	}
-}
-
-func TestPendingRotationStoragePath_Global(t *testing.T) {
-	origStore := DefaultPendingRotationStore
-	tmpDir := t.TempDir()
-	storagePath := filepath.Join(tmpDir, "pending.jsonl")
-	tmpStore := NewPendingRotationStoreWithPath(storagePath)
-	DefaultPendingRotationStore = tmpStore
-	t.Cleanup(func() { DefaultPendingRotationStore = origStore })
-
-	got := PendingRotationStoragePath()
-	if got != storagePath {
-		t.Errorf("PendingRotationStoragePath() = %q, want %q", got, storagePath)
 	}
 }

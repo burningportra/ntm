@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,11 +73,11 @@ const (
 
 // Info describes a discovered agent CLI session for a pane.
 type Info struct {
-	// AgentType is the canonical ntm agent type ("cc", "cod", "gmi", "agy").
+	// AgentType is the canonical ntm agent type ("cc", "cod", "gmi", "agy", "omp").
 	AgentType string `json:"agent_type"`
 	// SessionID is the provider session id (e.g. the Claude Code UUID).
 	SessionID string `json:"session_id"`
-	// Provider is the casr/native provider name ("claude", "codex", "gemini", "antigravity").
+	// Provider is the casr/native provider name ("claude", "codex", "gemini", "antigravity", "omp").
 	Provider string `json:"provider"`
 	// SourcePath is the on-disk session file the id was discovered from.
 	SourcePath string `json:"-"`
@@ -120,6 +121,8 @@ func ResumeProvider(agentType string) string {
 		return "gemini"
 	case "agy", "antigravity", "antigravity-cli":
 		return "antigravity"
+	case "omp", "oh-my-pi", "oh_my_pi", "ohmypi":
+		return "omp"
 	default:
 		return ""
 	}
@@ -283,6 +286,8 @@ func (d *Discoverer) DiscoverContext(ctx context.Context, agentType, workDir str
 		info = discoverGeminiContext(ctx, home, cleanWorkDir, processStartedAt, d.claimedSessions)
 	case "antigravity":
 		info = discoverAntigravityContext(ctx, home, cleanWorkDir)
+	case "omp":
+		info = discoverOmpContext(ctx, home, cleanWorkDir, d.claimedSessions)
 	}
 	if ctx.Err() != nil {
 		return nil
@@ -502,6 +507,8 @@ func canonicalAgentType(agentType, provider string) string {
 		return "gmi"
 	case "antigravity":
 		return "agy"
+	case "omp":
+		return "omp"
 	default:
 		return strings.ToLower(strings.TrimSpace(agentType))
 	}
@@ -525,12 +532,28 @@ func providerCommandMarkers(provider string) []string {
 		return []string{provider}
 	case "antigravity":
 		return []string{"agy", "antigravity"}
+	case "omp":
+		return []string{"omp"}
 	default:
 		return nil
 	}
 }
 
 func argvMatchesProvider(provider string, argv []string) bool {
+	if provider == "omp" {
+		// "omp" is a substring of unrelated commands (compiler, libomp,
+		// component): only the exact executable basename identifies it.
+		limit := len(argv)
+		if limit > 4 {
+			limit = 4
+		}
+		for _, arg := range argv[:limit] {
+			if filepath.Base(strings.TrimSpace(arg)) == "omp" {
+				return true
+			}
+		}
+		return false
+	}
 	markers := providerCommandMarkers(provider)
 	limit := len(argv)
 	if limit > 4 {
@@ -587,7 +610,102 @@ func agentProcessStartMillis(panePID int, provider string) int64 {
 // inspected in numeric fd order, with Codex subagent thread files excluded.
 // Linux uses /proc, macOS uses lsof, and other platforms fall through to
 // CASR/native discovery.
-func discoverProcessSession(agentType, provider, _ string, panePID int) *Info {
+// claudeSessionIDPattern is the shape of a Claude Code session id (a UUID); it
+// also keeps the id safe to use as a file name.
+var claudeSessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]{8,128}$`)
+
+// claudeProcessSession binds a running Claude Code process to the session it
+// is writing. Claude Code records each interactive process in
+// ~/.claude/sessions/<pid>.json with its session id, working directory and
+// kernel start time. Requiring that start time to match the live process
+// rejects a record left behind by an earlier process with the same PID. Panes
+// sharing one directory each resolve to their own session this way, where the
+// newest transcript in the directory cannot tell them apart. Off Linux the
+// start time cannot be checked, so no binding is made.
+func claudeProcessSession(agentType, home string, pid int) *Info {
+	if home == "" || pid <= 0 {
+		return nil
+	}
+	start, ok := linuxProcessStartTicks(pid)
+	if !ok {
+		return nil
+	}
+	file, err := os.Open(filepath.Join(home, ".claude", "sessions", strconv.Itoa(pid)+".json"))
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	var record struct {
+		PID       int    `json:"pid"`
+		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd"`
+		ProcStart string `json:"procStart"`
+	}
+	if err := json.NewDecoder(io.LimitReader(file, 64<<10)).Decode(&record); err != nil {
+		return nil
+	}
+	id := strings.TrimSpace(record.SessionID)
+	if record.PID != pid || strings.TrimSpace(record.ProcStart) != start || !claudeSessionIDPattern.MatchString(id) {
+		return nil
+	}
+	info := &Info{
+		AgentType: canonicalAgentType(agentType, "claude"),
+		SessionID: id,
+		Provider:  "claude",
+		Source:    DiscoverySourceProcessTree,
+	}
+	if cwd := strings.TrimSpace(record.Cwd); filepath.IsAbs(cwd) {
+		path := filepath.Join(home, ".claude", "projects", encodeClaudeProjectDir(cwd), id+".jsonl")
+		if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() {
+			info.SourcePath, info.UpdatedAt = path, st.ModTime()
+		}
+	}
+	return info
+}
+
+// linuxProcessStartTicks returns a process's start time in clock ticks since
+// boot (field 22 of /proc/<pid>/stat), the value Claude Code records as
+// procStart. It reports false off Linux or once the process is gone.
+func linuxProcessStartTicks(pid int) (string, bool) {
+	if runtime.GOOS != "linux" || pid <= 0 {
+		return "", false
+	}
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", false
+	}
+	// The command name (field 2) may contain spaces and parentheses, so the
+	// remaining fields are counted from the last ')': index 0 is field 3.
+	end := bytes.LastIndexByte(data, ')')
+	if end < 0 {
+		return "", false
+	}
+	fields := strings.Fields(string(data[end+1:]))
+	if len(fields) < 20 {
+		return "", false
+	}
+	return fields[19], true
+}
+
+// DiscoverProcessSession binds a pane to its agent's session through the
+// pane's process tree only: a session record or resumed session id of the
+// agent process itself. Unlike Discoverer.DiscoverContext it never falls back
+// to the newest session in the working directory, so a nil result means "no
+// exact binding", never another pane's session.
+func DiscoverProcessSession(agentType string, panePID int) *Info {
+	provider := ResumeProvider(agentType)
+	if provider == "" || panePID <= 0 {
+		return nil
+	}
+	home, _ := os.UserHomeDir()
+	info := discoverProcessSession(agentType, provider, home, panePID)
+	if info != nil && info.Source == "" {
+		info.Source = DiscoverySourceProcessTree
+	}
+	return info
+}
+
+func discoverProcessSession(agentType, provider, home string, panePID int) *Info {
 	if (runtime.GOOS != "linux" && runtime.GOOS != "darwin") || panePID <= 0 {
 		return nil
 	}
@@ -601,7 +719,15 @@ func discoverProcessSession(agentType, provider, _ string, panePID int) *Info {
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
-		if info := processNodeSession(agentType, provider, processutil.GetCmdline(node.pid), func() []string {
+		argv := processutil.GetCmdline(node.pid)
+		// Claude Code's own session record names the session the process is
+		// writing now, which outlives a --resume argument after /clear.
+		if provider == "claude" && argvMatchesProvider(provider, argv) {
+			if info := claudeProcessSession(agentType, home, node.pid); info != nil {
+				return info
+			}
+		}
+		if info := processNodeSession(agentType, provider, argv, func() []string {
 			return openSessionFiles(node.pid, provider)
 		}); info != nil {
 			return info
@@ -654,6 +780,11 @@ func resumedSessionID(provider string, argv []string) string {
 		flag = "resume"
 	case "antigravity":
 		flag = "--conversation"
+	case "omp":
+		if !argvMatchesProvider(provider, argv) {
+			return ""
+		}
+		return ompResumedSessionID(argv)
 	default:
 		return ""
 	}
@@ -784,6 +915,10 @@ func isProviderSessionFile(provider, path string) bool {
 			(strings.HasSuffix(base, ".json") || strings.HasSuffix(base, ".jsonl"))
 	case "antigravity":
 		return strings.HasSuffix(base, ".db") && filepath.Base(filepath.Dir(path)) == "conversations"
+	case "omp":
+		// omp holds its main transcript open for append; sub-agent
+		// transcripts (<AgentName>.jsonl) are open too but never match.
+		return OmpSessionID(path) != ""
 	default:
 		return false
 	}
@@ -814,6 +949,8 @@ func infoFromSessionFile(agentType, provider, path string) *Info {
 		id = geminiSessionID(path)
 	case "antigravity":
 		id = strings.TrimSuffix(filepath.Base(path), ".db")
+	case "omp":
+		id = OmpSessionID(path)
 	}
 	if id == "" {
 		return nil
@@ -847,12 +984,6 @@ func encodeClaudeProjectDir(workDir string) string {
 	return claudeNonAlnumPattern.ReplaceAllString(cleaned, "-")
 }
 
-// discoverClaude locates the newest *.jsonl under
-// ~/.claude/projects/<encoded-cwd>/ and treats the filename stem as the id.
-func discoverClaude(home, workDir string) *Info {
-	return discoverClaudeContext(context.Background(), home, workDir)
-}
-
 func discoverClaudeContext(ctx context.Context, home, workDir string) *Info {
 	if ctx.Err() != nil {
 		return nil
@@ -873,13 +1004,6 @@ func discoverClaudeContext(ctx context.Context, home, workDir string) *Info {
 		SourcePath: path,
 		UpdatedAt:  mod,
 	}
-}
-
-// discoverCodex is the native fallback when CASR is unavailable. It parses the
-// structured session_meta record instead of matching an arbitrary cwd
-// substring in the rollout body.
-func discoverCodex(home, workDir string, claimed map[string]bool) *Info {
-	return discoverCodexContext(context.Background(), home, workDir, claimed)
 }
 
 func discoverCodexContext(ctx context.Context, home, workDir string, claimed map[string]bool) *Info {
@@ -904,13 +1028,6 @@ func discoverCodexContext(ctx context.Context, home, workDir string, claimed map
 	}
 }
 
-// discoverGemini is the native fallback when CASR is unavailable. It resolves
-// both the current projects.json workspace slug and the legacy SHA256 directory
-// instead of scanning chat bodies for a cwd substring.
-func discoverGemini(home, workDir string, processStartedAt int64, claimed map[string]bool) *Info {
-	return discoverGeminiContext(context.Background(), home, workDir, processStartedAt, claimed)
-}
-
 func discoverGeminiContext(ctx context.Context, home, workDir string, processStartedAt int64, claimed map[string]bool) *Info {
 	if ctx.Err() != nil {
 		return nil
@@ -931,21 +1048,6 @@ func discoverGeminiContext(ctx context.Context, home, workDir string, processSta
 		SourcePath: path,
 		UpdatedAt:  mod,
 	}
-}
-
-// discoverAntigravity locates the newest agy conversation database under
-// ~/.gemini/antigravity-cli/conversations/<uuid>.db whose embedded cwd matches
-// workDir. agy stores one stock-SQLite database per conversation and records
-// the working directory inside it; the <uuid> filename stem is exactly the id
-// accepted by `agy --conversation <uuid>`.
-//
-// This path is kept strictly disjoint from discoverGemini: gmi lives in
-// ~/.gemini/tmp/<project>/chats/session-*.{json,jsonl}, agy lives in
-// ~/.gemini/antigravity-cli/conversations/<uuid>.db. The two scans never look in
-// each other's directory, so a gmi session is never reported as agy and vice
-// versa even though both hang off the shared ~/.gemini parent.
-func discoverAntigravity(home, workDir string) *Info {
-	return discoverAntigravityContext(context.Background(), home, workDir)
 }
 
 func discoverAntigravityContext(ctx context.Context, home, workDir string) *Info {
@@ -970,10 +1072,231 @@ func discoverAntigravityContext(ctx context.Context, home, workDir string) *Info
 	}
 }
 
-// newestFileWithExt returns the path and modtime of the most-recently-modified
-// file with the given extension directly inside dir.
-func newestFileWithExt(dir, ext string) (string, time.Time) {
-	return newestFileWithExtContext(context.Background(), dir, ext)
+// ompTranscriptNamePattern matches an Oh My Pi main transcript name,
+// <ISO-timestamp>_<uuid>.jsonl (omp v18.2.3:
+// 2026-09-17T05-08-51-899Z_01a0adc4-823b-70d0-aa1d-80adef4fd1b1.jsonl).
+// Sub-agent transcripts (<timestamp>_<uuid>/<AgentName>.jsonl) never match.
+var ompTranscriptNamePattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T[0-9-]+Z_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$`)
+
+// ompSessionProbeLimit bounds how many of a store directory's newest-named
+// transcripts are stat'ed. Names sort by creation time, so a live pane's
+// session is among the newest without statting a project's whole history.
+const ompSessionProbeLimit = 8
+
+// OmpSessionID returns the session id (the uuid `omp --resume` accepts) of an
+// omp main transcript path, or "" for any other path.
+func OmpSessionID(path string) string {
+	m := ompTranscriptNamePattern.FindStringSubmatch(filepath.Base(path))
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// OmpSessionRoots returns the omp session stores a pane launched with this
+// environment can write to, most specific first, following omp v18's
+// directory resolver: PI_CODING_AGENT_SESSION_DIR; then, for the default
+// profile, PI_CODING_AGENT_DIR/sessions, <home>/<PI_CONFIG_DIR|.omp>/agent/
+// sessions and $XDG_DATA_HOME/omp/sessions; for a named profile (OMP_PROFILE,
+// legacy PI_PROFILE) the profile's agent/sessions and XDG profile sessions.
+// Missing directories are tolerated by the scanners.
+func OmpSessionRoots(home string, getenv func(string) string) []string {
+	env := func(key string) string {
+		if getenv == nil {
+			return ""
+		}
+		return strings.TrimSpace(getenv(key))
+	}
+	var roots []string
+	if dir := env("PI_CODING_AGENT_SESSION_DIR"); dir != "" {
+		roots = append(roots, dir)
+	}
+	profile := env("OMP_PROFILE")
+	if profile == "" {
+		profile = env("PI_PROFILE")
+	}
+	if profile == "default" {
+		profile = ""
+	}
+	cfgName := strings.TrimLeft(env("PI_CONFIG_DIR"), `/\`)
+	if cfgName == "" {
+		cfgName = ".omp"
+	}
+	xdg := env("XDG_DATA_HOME")
+	if profile == "" {
+		if dir := env("PI_CODING_AGENT_DIR"); dir != "" {
+			roots = append(roots, filepath.Join(dir, "sessions"))
+		}
+		if home != "" {
+			roots = append(roots, filepath.Join(home, cfgName, "agent", "sessions"))
+		}
+		if xdg != "" {
+			roots = append(roots, filepath.Join(xdg, "omp", "sessions"))
+		}
+		return roots
+	}
+	if home != "" {
+		roots = append(roots, filepath.Join(home, cfgName, "profiles", profile, "agent", "sessions"))
+	}
+	if xdg != "" {
+		roots = append(roots, filepath.Join(xdg, "omp", "profiles", profile, "sessions"))
+	}
+	return roots
+}
+
+// ompResumedSessionID extracts the session an omp process was resumed into:
+// `--resume <id|prefix|path>`, `-r <…>`, or `--resume=<…>`. A transcript path
+// resolves to its id; a bare --resume (omp's interactive picker) yields "".
+func ompResumedSessionID(argv []string) string {
+	for i, arg := range argv {
+		var candidate string
+		switch {
+		case strings.HasPrefix(arg, "--resume="):
+			candidate = strings.TrimPrefix(arg, "--resume=")
+		case arg == "--resume" || arg == "-r":
+			if i+1 < len(argv) {
+				candidate = argv[i+1]
+			}
+		default:
+			continue
+		}
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || strings.HasPrefix(candidate, "-") {
+			return ""
+		}
+		if id := OmpSessionID(candidate); id != "" {
+			return id
+		}
+		return candidate
+	}
+	return ""
+}
+
+// NewestOmpTranscriptForCwd locates the omp main transcript most likely
+// belonging to a pane working in workDir. Each store holds one <safe-path>
+// directory per working directory (PI_CODING_AGENT_SESSION_DIR may also hold
+// flat files), so each directory is gated by the session-header cwd of its
+// newest-named transcript instead of re-deriving omp's path encoding. Within
+// matching directories, unclaimed transcripts compete by mtime: the newest
+// modified after newerThan wins, else the newest overall.
+func NewestOmpTranscriptForCwd(roots []string, workDir string, newerThan time.Time, claimed map[string]bool) (string, time.Time) {
+	if workDir == "" {
+		return "", time.Time{}
+	}
+	workDir = filepath.Clean(workDir)
+	var newest, newestFresh string
+	var newestT, newestFreshT time.Time
+	seen := make(map[string]bool)
+	consider := func(dir string) {
+		dir = filepath.Clean(dir)
+		if seen[dir] {
+			return
+		}
+		seen[dir] = true
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if !e.IsDir() && ompTranscriptNamePattern.MatchString(e.Name()) {
+				names = append(names, e.Name())
+			}
+		}
+		if len(names) == 0 {
+			return
+		}
+		sort.Sort(sort.Reverse(sort.StringSlice(names)))
+		if len(names) > ompSessionProbeLimit {
+			names = names[:ompSessionProbeLimit]
+		}
+		if cwd, ok := ompTranscriptCwd(filepath.Join(dir, names[0])); !ok || cwd != workDir {
+			return
+		}
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			if claimed[sessionClaimKey("omp", OmpSessionID(path))] {
+				continue
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			mt := info.ModTime()
+			if mt.After(newestT) {
+				newest, newestT = path, mt
+			}
+			if mt.After(newerThan) && mt.After(newestFreshT) {
+				newestFresh, newestFreshT = path, mt
+			}
+		}
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		consider(root)
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				consider(filepath.Join(root, e.Name()))
+			}
+		}
+	}
+	if newestFresh != "" {
+		return newestFresh, newestFreshT
+	}
+	return newest, newestT
+}
+
+// ompTranscriptCwd reads the cwd recorded by an omp transcript's "session"
+// header. The header follows a space-padded "title" line (omp rewrites the
+// title in place), so a bounded head is scanned line by line.
+func ompTranscriptCwd(path string) (string, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	head := make([]byte, 64*1024)
+	n, _ := io.ReadFull(file, head)
+	for _, line := range bytes.Split(head[:n], []byte("\n")) {
+		if !bytes.Contains(line, []byte(`"session"`)) {
+			continue
+		}
+		var header struct {
+			Type string `json:"type"`
+			Cwd  string `json:"cwd"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(line), &header); err != nil || header.Type != "session" {
+			continue
+		}
+		if header.Cwd == "" {
+			return "", false
+		}
+		return filepath.Clean(header.Cwd), true
+	}
+	return "", false
+}
+
+func discoverOmpContext(ctx context.Context, home, workDir string, claimed map[string]bool) *Info {
+	if ctx.Err() != nil {
+		return nil
+	}
+	path, mod := NewestOmpTranscriptForCwd(OmpSessionRoots(home, os.Getenv), workDir, time.Time{}, claimed)
+	if path == "" || ctx.Err() != nil {
+		return nil
+	}
+	return &Info{
+		AgentType:  "omp",
+		SessionID:  OmpSessionID(path),
+		Provider:   "omp",
+		SourcePath: path,
+		UpdatedAt:  mod,
+	}
 }
 
 func newestFileWithExtContext(ctx context.Context, dir, ext string) (string, time.Time) {
@@ -1003,12 +1326,6 @@ func newestFileWithExtContext(ctx context.Context, dir, ext string) (string, tim
 		}
 	}
 	return bestPath, bestMod
-}
-
-// newestCodexRolloutForCwd walks the date-sharded codex session tree and
-// returns the newest rollout whose session_meta workspace belongs to workDir.
-func newestCodexRolloutForCwd(root, workDir string, claimed map[string]bool) (string, time.Time) {
-	return newestCodexRolloutForCwdContext(context.Background(), root, workDir, claimed)
 }
 
 func newestCodexRolloutForCwdContext(ctx context.Context, root, workDir string, claimed map[string]bool) (string, time.Time) {
@@ -1074,14 +1391,6 @@ func readCodexSessionMeta(path string) (codexSessionMeta, bool) {
 		return codexSessionMeta{}, false
 	}
 	return meta, true
-}
-
-func codexSessionWorkspace(path string) string {
-	meta, ok := readCodexSessionMeta(path)
-	if !ok {
-		return ""
-	}
-	return codexMetaWorkspace(meta)
 }
 
 func codexMetaWorkspace(meta codexSessionMeta) string {
@@ -1169,10 +1478,6 @@ func geminiSessionStartedAtMillis(path string) int64 {
 	return startedAt.UnixMilli()
 }
 
-func geminiWorkspaceChatDirs(root, workDir string) []string {
-	return geminiWorkspaceChatDirsContext(context.Background(), root, workDir)
-}
-
 func geminiWorkspaceChatDirsContext(ctx context.Context, root, workDir string) []string {
 	if ctx.Err() != nil {
 		return nil
@@ -1201,14 +1506,6 @@ func geminiWorkspaceChatDirsContext(ctx context.Context, root, workDir string) [
 		dirs = append(dirs, legacy)
 	}
 	return dirs
-}
-
-// newestGeminiSessionForCwd resolves the current projects.json workspace slug
-// and the legacy SHA256 directory. When a provider-process start time is known,
-// it correlates the pane to the closest newly-started chat instead of assigning
-// every same-workspace pane the globally newest session.
-func newestGeminiSessionForCwd(root, workDir string, processStartedAt int64, claimed map[string]bool) (string, time.Time) {
-	return newestGeminiSessionForCwdContext(context.Background(), root, workDir, processStartedAt, claimed)
 }
 
 func newestGeminiSessionForCwdContext(ctx context.Context, root, workDir string, processStartedAt int64, claimed map[string]bool) (string, time.Time) {
@@ -1263,17 +1560,6 @@ func newestGeminiSessionForCwdContext(ctx context.Context, root, workDir string,
 	return bestPath, bestMod
 }
 
-// newestAntigravityConversationForCwd returns the newest *.db directly inside
-// ~/.gemini/antigravity-cli/conversations whose contents reference workDir. agy
-// conversation databases are stock SQLite files that embed the working directory
-// as plain text; we match on that substring as a cheap cwd-affinity check
-// rather than opening the SQLite file. The
-// embedded cwd can appear well past the first few KB, so the whole (small) file
-// is scanned instead of a capped prefix.
-func newestAntigravityConversationForCwd(root, workDir string) (string, time.Time) {
-	return newestAntigravityConversationForCwdContext(context.Background(), root, workDir)
-}
-
 func newestAntigravityConversationForCwdContext(ctx context.Context, root, workDir string) (string, time.Time) {
 	if ctx.Err() != nil {
 		return "", time.Time{}
@@ -1306,14 +1592,6 @@ func newestAntigravityConversationForCwdContext(ctx context.Context, root, workD
 		bestMod = info.ModTime()
 	}
 	return bestPath, bestMod
-}
-
-// fileContainsCwd reports whether the entire file contains the workDir string.
-// Used for agy conversation databases, where the embedded cwd may live past any
-// reasonable fixed prefix limit. agy conversation DBs are small (sub-MB), so
-// reading the whole file is cheap and avoids missing a deep match.
-func fileContainsCwd(path, workDir string) bool {
-	return fileContainsCwdContext(context.Background(), path, workDir)
 }
 
 func fileContainsCwdContext(ctx context.Context, path, workDir string) bool {

@@ -13,8 +13,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/integrations/pt"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
-	"github.com/Dicklesworthstone/ntm/internal/tracker"
-	"github.com/Dicklesworthstone/ntm/internal/watcher"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func newTestAttentionFeed(t *testing.T) *AttentionFeed {
@@ -27,26 +26,6 @@ func newTestAttentionFeed(t *testing.T) *AttentionFeed {
 	})
 	t.Cleanup(feed.Stop)
 	return feed
-}
-
-func mustLoggedAttentionEvent(t *testing.T, event ntmevents.Event) AttentionEvent {
-	t.Helper()
-
-	normalized, ok := NewLoggedAttentionEvent(event)
-	if !ok {
-		t.Fatalf("expected logged event %q to normalize", event.Type)
-	}
-	return normalized
-}
-
-func mustBusAttentionEvent(t *testing.T, event ntmevents.BusEvent) AttentionEvent {
-	t.Helper()
-
-	normalized, ok := NewBusAttentionEvent(event)
-	if !ok {
-		t.Fatalf("expected bus event %T to normalize", event)
-	}
-	return normalized
 }
 
 func digestTestEvent(cursor int64, category EventCategory, eventType EventType, actionability Actionability, severity Severity, summary string) AttentionEvent {
@@ -850,68 +829,6 @@ func TestAttentionFeed_QueuedFollowOnEventUsesStableSnapshot(t *testing.T) {
 	}
 }
 
-func TestAttentionFeed_PublishTrackerChange(t *testing.T) {
-	feed := newTestAttentionFeed(t)
-
-	change := tracker.StateChange{
-		Timestamp: time.Date(2026, 3, 21, 3, 5, 0, 0, time.UTC),
-		Type:      tracker.ChangeAgentOutput,
-		Session:   "proj",
-		Pane:      "2",
-		Details: map[string]interface{}{
-			"line_count": 3,
-		},
-	}
-
-	published := feed.PublishTrackerChange(change)
-	t.Logf("published tracker event cursor=%d type=%s summary=%q", published.Cursor, published.Type, published.Summary)
-
-	if published.Cursor == 0 {
-		t.Fatal("tracker change was not assigned a cursor")
-	}
-	if published.Type != EventTypePaneOutput {
-		t.Fatalf("tracker change type = %q, want %q", published.Type, EventTypePaneOutput)
-	}
-	if published.Pane != 2 {
-		t.Fatalf("tracker change pane = %d, want 2", published.Pane)
-	}
-	if published.Details["pane_ref"] != "2" {
-		t.Fatalf("tracker change pane_ref = %#v, want %q", published.Details["pane_ref"], "2")
-	}
-
-	replayed, _, err := feed.Replay(0, 10)
-	if err != nil {
-		t.Fatalf("Replay error: %v", err)
-	}
-	if len(replayed) != 1 {
-		t.Fatalf("replayed %d tracker events, want 1", len(replayed))
-	}
-	if replayed[0].Summary != published.Summary {
-		t.Fatalf("replayed summary = %q, want %q", replayed[0].Summary, published.Summary)
-	}
-}
-
-func TestAttentionFeed_PublishLoggedEvent_Suppressed(t *testing.T) {
-	feed := newTestAttentionFeed(t)
-
-	published, ok := feed.PublishLoggedEvent(ntmevents.Event{
-		Timestamp: time.Date(2026, 3, 21, 3, 6, 0, 0, time.UTC),
-		Type:      ntmevents.EventPromptSend,
-		Session:   "proj",
-		Data: map[string]interface{}{
-			"pane_index": 1,
-		},
-	})
-	t.Logf("suppressed logged event ok=%v published=%+v", ok, published)
-
-	if ok {
-		t.Fatal("prompt_send should be suppressed from the attention feed")
-	}
-	if stats := feed.Stats(); stats.TotalAppended != 0 {
-		t.Fatalf("TotalAppended = %d, want 0 for suppressed logged event", stats.TotalAppended)
-	}
-}
-
 func TestAttentionFeed_PublishActuationOutcome(t *testing.T) {
 	feed := newTestAttentionFeed(t)
 
@@ -1013,48 +930,15 @@ func TestAttentionFeed_PublishActuationVerificationTimeout(t *testing.T) {
 	}
 }
 
-func TestAttentionFeed_PublishBusHistoryOrdersOldestFirst(t *testing.T) {
-	feed := newTestAttentionFeed(t)
-	bus := ntmevents.NewEventBus(10)
-
-	first := ntmevents.AlertEvent{
-		BaseEvent: ntmevents.BaseEvent{
-			Type:      "alert",
-			Timestamp: time.Date(2026, 3, 21, 3, 7, 0, 0, time.UTC),
-			Session:   "proj",
-		},
-		AlertID:   "alert-1",
-		AlertType: "health",
-		Severity:  "warning",
-		Message:   "first warning",
+// A kill emits session_killed and the legacy session_ended; the feed keeps one
+// record of it (bd-zp9su).
+func TestNewBusAttentionEvent_KillRecordedOnce(t *testing.T) {
+	if _, ok := NewBusAttentionEvent(ntmevents.NewWebhookEvent(ntmevents.WebhookSessionKilled, "proj", "", "", "Killed session 'proj'", nil)); ok {
+		t.Fatal("session_killed must not add a second record next to session_ended")
 	}
-	second := ntmevents.AgentStallEvent{
-		BaseEvent: ntmevents.BaseEvent{
-			Type:      "agent_stall",
-			Timestamp: time.Date(2026, 3, 21, 3, 8, 0, 0, time.UTC),
-			Session:   "proj",
-		},
-		AgentID:       "cod-1",
-		StallDuration: 45,
-		LastActivity:  "waiting",
-	}
-
-	bus.PublishSync(first)
-	bus.PublishSync(second)
-
-	published := feed.PublishBusHistory(bus, 10)
-	if len(published) != 2 {
-		t.Fatalf("published %d bus history events, want 2", len(published))
-	}
-	t.Logf("published bus history summaries=%q then %q", published[0].Summary, published[1].Summary)
-	if published[0].Details["alert_id"] != "alert-1" {
-		t.Fatalf("first published history event = %#v, want alert-1 first", published[0].Details["alert_id"])
-	}
-	if published[1].Type != EventTypeAgentStalled {
-		t.Fatalf("second published history type = %q, want %q", published[1].Type, EventTypeAgentStalled)
-	}
-	if published[0].Cursor >= published[1].Cursor {
-		t.Fatalf("history cursors not increasing oldest-first: %d then %d", published[0].Cursor, published[1].Cursor)
+	ended, ok := NewBusAttentionEvent(ntmevents.NewWebhookEvent(ntmevents.WebhookSessionEnded, "proj", "", "", "Killed session 'proj'", nil))
+	if !ok || ended.Type != EventTypeSessionDestroyed {
+		t.Fatalf("session_ended = %+v ok=%v, want one session destroyed record", ended, ok)
 	}
 }
 
@@ -1065,7 +949,7 @@ func TestAttentionFeed_SubscribeEventBus(t *testing.T) {
 	unsubscribeBus := feed.SubscribeEventBus(bus)
 	defer unsubscribeBus()
 
-	bus.PublishSync(ntmevents.NewAgentErrorEvent("proj", "cc-1", "auth", "token expired"))
+	bus.PublishSync(ntmevents.NewWebhookEvent(ntmevents.WebhookAgentCrashed, "proj", "%3", "claude", "Agent claude crashed: Pane no longer exists", nil))
 
 	replayed, _, err := feed.Replay(0, 10)
 	if err != nil {
@@ -1074,12 +958,12 @@ func TestAttentionFeed_SubscribeEventBus(t *testing.T) {
 	if len(replayed) != 1 {
 		t.Fatalf("replayed %d events after unsubscribe, want 1", len(replayed))
 	}
-	if replayed[0].Type != EventTypeAgentError {
-		t.Fatalf("live bus event type = %q, want %q", replayed[0].Type, EventTypeAgentError)
+	if replayed[0].Type != EventTypeAgentError || replayed[0].Actionability != ActionabilityActionRequired {
+		t.Fatalf("live bus event = %q/%q, want %q/%q", replayed[0].Type, replayed[0].Actionability, EventTypeAgentError, ActionabilityActionRequired)
 	}
 
 	unsubscribeBus()
-	bus.PublishSync(ntmevents.NewAlertEvent("proj", "alert-2", "health", "warning", "after unsubscribe"))
+	bus.PublishSync(ntmevents.NewWebhookEvent(ntmevents.WebhookAgentRateLimit, "proj", "%3", "claude", "after unsubscribe", nil))
 
 	replayed, _, err = feed.Replay(0, 10)
 	if err != nil {
@@ -2842,219 +2726,6 @@ func (s *stubAttentionStore) GCExpiredEvents() (int64, error) {
 // Event Builder Tests
 // =============================================================================
 
-func TestNewTrackerEvent_MailReceived(t *testing.T) {
-	change := tracker.StateChange{
-		Timestamp: time.Date(2026, 3, 21, 3, 9, 0, 0, time.UTC),
-		Type:      tracker.ChangeMailReceived,
-		Session:   "proj",
-		Pane:      "1",
-		Details: map[string]interface{}{
-			"subject": "Need ack",
-		},
-	}
-
-	event := NewTrackerEvent(change)
-	if event.Category != EventCategoryMail {
-		t.Fatalf("tracker mail category = %q, want %q", event.Category, EventCategoryMail)
-	}
-	if event.Type != EventTypeMailReceived {
-		t.Fatalf("tracker mail type = %q, want %q", event.Type, EventTypeMailReceived)
-	}
-	if event.Pane != 1 {
-		t.Fatalf("tracker mail pane = %d, want 1", event.Pane)
-	}
-}
-
-func TestNewLoggedAttentionEvent_SessionCreate(t *testing.T) {
-	event, ok := NewLoggedAttentionEvent(ntmevents.Event{
-		Timestamp: time.Date(2026, 3, 21, 3, 10, 0, 0, time.UTC),
-		Type:      ntmevents.EventSessionCreate,
-		Session:   "proj",
-	})
-	if !ok {
-		t.Fatal("session_create should map into the attention feed")
-	}
-	if event.Category != EventCategorySession {
-		t.Fatalf("logged event category = %q, want %q", event.Category, EventCategorySession)
-	}
-	if event.Type != EventTypeSessionCreated {
-		t.Fatalf("logged event type = %q, want %q", event.Type, EventTypeSessionCreated)
-	}
-	if len(event.NextActions) != 1 || event.NextActions[0].Action != "robot-status" {
-		t.Fatalf("logged event next actions = %+v, want robot-status follow-up", event.NextActions)
-	}
-}
-
-func TestNewBusAttentionEvent_AlertCritical(t *testing.T) {
-	event, ok := NewBusAttentionEvent(ntmevents.NewAlertEvent("proj", "alert-3", "health", "critical", "disk full"))
-	if !ok {
-		t.Fatal("alert bus event should map into the attention feed")
-	}
-	if event.Category != EventCategoryAlert {
-		t.Fatalf("bus alert category = %q, want %q", event.Category, EventCategoryAlert)
-	}
-	if event.Type != EventTypeAlertAttentionRequired {
-		t.Fatalf("bus alert type = %q, want %q", event.Type, EventTypeAlertAttentionRequired)
-	}
-	if event.Severity != SeverityCritical {
-		t.Fatalf("bus alert severity = %q, want %q", event.Severity, SeverityCritical)
-	}
-	if event.Actionability != ActionabilityActionRequired {
-		t.Fatalf("bus alert actionability = %q, want %q", event.Actionability, ActionabilityActionRequired)
-	}
-}
-
-func TestAttentionSignalAnnotations_Table(t *testing.T) {
-	timeline := time.Date(2026, 3, 21, 3, 20, 0, 0, time.UTC)
-
-	tests := []struct {
-		name               string
-		event              AttentionEvent
-		wantSignal         string
-		wantReasonContains string
-		wantMetadataKey    string
-		wantActionability  Actionability
-	}{
-		{
-			name: "session changed",
-			event: mustLoggedAttentionEvent(t, ntmevents.Event{
-				Timestamp: timeline,
-				Type:      ntmevents.EventSessionCreate,
-				Session:   "proj",
-			}),
-			wantSignal:         attentionSignalSessionChanged,
-			wantReasonContains: "session lifecycle",
-			wantActionability:  ActionabilityInteresting,
-		},
-		{
-			name: "pane changed",
-			event: NewTrackerEvent(tracker.StateChange{
-				Timestamp: timeline,
-				Type:      tracker.ChangePaneCreated,
-				Session:   "proj",
-				Pane:      "4",
-			}),
-			wantSignal:         attentionSignalPaneChanged,
-			wantReasonContains: "pane lifecycle",
-			wantActionability:  ActionabilityInteresting,
-		},
-		{
-			name:               "agent state changed",
-			event:              NewAgentStateChangeEvent("proj", 2, "cc-2", "working", "idle", "activity_tracker"),
-			wantSignal:         attentionSignalAgentStateChanged,
-			wantReasonContains: "agent lifecycle",
-			wantActionability:  ActionabilityInteresting,
-		},
-		{
-			name:               "stalled",
-			event:              mustBusAttentionEvent(t, ntmevents.NewAgentStallEvent("proj", "cod-1", 45, "waiting")),
-			wantSignal:         attentionSignalStalled,
-			wantReasonContains: "stall heuristic",
-			wantMetadataKey:    "signal_threshold_seconds",
-			wantActionability:  ActionabilityActionRequired,
-		},
-		{
-			name:               "context hot",
-			event:              mustBusAttentionEvent(t, ntmevents.NewContextWarningEvent("proj", "cc-1", 92.5, 1200)),
-			wantSignal:         attentionSignalContextHot,
-			wantReasonContains: "90%",
-			wantMetadataKey:    "signal_threshold_percent",
-			wantActionability:  ActionabilityActionRequired,
-		},
-		{
-			name:               "rate limited",
-			event:              mustBusAttentionEvent(t, ntmevents.NewWebhookEvent(ntmevents.WebhookAgentRateLimit, "proj", "2", "cc-1", "429 Too Many Requests", nil)),
-			wantSignal:         attentionSignalRateLimited,
-			wantReasonContains: "rate-limit",
-			wantMetadataKey:    "signal_threshold_rationale",
-			wantActionability:  ActionabilityActionRequired,
-		},
-		{
-			name:               "alert raised",
-			event:              mustBusAttentionEvent(t, ntmevents.NewAlertEvent("proj", "alert-4", "health", "warning", "disk warm")),
-			wantSignal:         attentionSignalAlertRaised,
-			wantReasonContains: "alert emitted",
-			wantActionability:  ActionabilityActionRequired,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			signal, _ := tt.event.Details["signal"].(string)
-			reason, _ := tt.event.Details["signal_reason"].(string)
-			t.Logf("signal=%q reason=%q summary=%q actionability=%q details=%v", signal, reason, tt.event.Summary, tt.event.Actionability, tt.event.Details)
-
-			if signal != tt.wantSignal {
-				t.Fatalf("signal = %q, want %q", signal, tt.wantSignal)
-			}
-			if !strings.Contains(reason, tt.wantReasonContains) {
-				t.Fatalf("signal_reason = %q, want substring %q", reason, tt.wantReasonContains)
-			}
-			if tt.wantMetadataKey != "" {
-				if _, ok := tt.event.Details[tt.wantMetadataKey]; !ok {
-					t.Fatalf("missing metadata key %q in details=%v", tt.wantMetadataKey, tt.event.Details)
-				}
-			}
-			if tt.wantActionability != "" && tt.event.Actionability != tt.wantActionability {
-				t.Fatalf("actionability = %q, want %q", tt.event.Actionability, tt.wantActionability)
-			}
-		})
-	}
-}
-
-func TestAttentionSignal_NormalizesLifecycleActionabilityAndActions(t *testing.T) {
-	tests := []struct {
-		name       string
-		event      AttentionEvent
-		wantSignal string
-	}{
-		{
-			name: "session created from tracker",
-			event: NewTrackerEvent(tracker.StateChange{
-				Timestamp: time.Date(2026, 3, 21, 3, 23, 0, 0, time.UTC),
-				Type:      tracker.ChangeSessionCreated,
-				Session:   "proj",
-			}),
-			wantSignal: attentionSignalSessionChanged,
-		},
-		{
-			name: "pane created from tracker",
-			event: NewTrackerEvent(tracker.StateChange{
-				Timestamp: time.Date(2026, 3, 21, 3, 23, 30, 0, time.UTC),
-				Type:      tracker.ChangePaneCreated,
-				Session:   "proj",
-				Pane:      "7",
-			}),
-			wantSignal: attentionSignalPaneChanged,
-		},
-		{
-			name:       "agent state change from helper",
-			event:      NewAgentStateChangeEvent("proj", 3, "cod-3", "idle", "working", "activity_tracker"),
-			wantSignal: attentionSignalAgentStateChanged,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.event.Details["signal"]; got != tt.wantSignal {
-				t.Fatalf("signal = %#v, want %q", got, tt.wantSignal)
-			}
-			if tt.event.Actionability != ActionabilityInteresting {
-				t.Fatalf("actionability = %q, want %q", tt.event.Actionability, ActionabilityInteresting)
-			}
-			if tt.event.Severity != SeverityInfo {
-				t.Fatalf("severity = %q, want %q", tt.event.Severity, SeverityInfo)
-			}
-			if len(tt.event.NextActions) == 0 {
-				t.Error("NextActions must suggest follow-up commands")
-			}
-			if tt.event.NextActions[0].Action != "robot-status" {
-				t.Fatalf("next action = %q, want robot-status", tt.event.NextActions[0].Action)
-			}
-		})
-	}
-}
-
 func TestAttentionSignal_ContextHotThresholdBoundary(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -3075,7 +2746,7 @@ func TestAttentionSignal_ContextHotThresholdBoundary(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			event := mustBusAttentionEvent(t, ntmevents.NewContextWarningEvent("proj", "cc-1", tt.usagePercent, 1200))
+			event := NewContextPressureAttentionEvent("proj", tmux.Pane{ID: "%1", Index: 1, Title: "proj__cc_1"}, tt.usagePercent, 75)
 			t.Logf("usage=%.1f signal=%v reason=%v actionability=%q next_actions=%v", tt.usagePercent, event.Details["signal"], event.Details["signal_reason"], event.Actionability, event.NextActions)
 
 			if event.Details["signal"] != attentionSignalContextHot {
@@ -3091,15 +2762,42 @@ func TestAttentionSignal_ContextHotThresholdBoundary(t *testing.T) {
 	}
 }
 
+// The monitor publishes context pressure every minute with a ten-minute dedup
+// window. A repeat in the same band is suppressed, but crossing into the
+// action band must surface at once, not wait out the window.
+func TestPublishContextPressureSurfacesEscalationDespiteDedup(t *testing.T) {
+	feed := newTestAttentionFeed(t)
+	usage := 80.0
+	oldUsage := contextPressureUsage
+	contextPressureUsage = func(string, []tmux.Pane) map[string]float64 {
+		return map[string]float64{"%1": usage}
+	}
+	t.Cleanup(func() { contextPressureUsage = oldUsage })
+	panes := []tmux.Pane{{ID: "%1", Index: 1, Title: "proj__cc_1"}}
+
+	if got := feed.PublishContextPressure("proj", panes, 75); len(got) != 1 || got[0].Actionability != ActionabilityInteresting {
+		t.Fatalf("first warning = %+v, want one interesting event", got)
+	}
+	if got := feed.PublishContextPressure("proj", panes, 75); len(got) != 0 {
+		t.Fatalf("repeat in the warning band = %+v, want it deduplicated", got)
+	}
+	usage = 95
+	got := feed.PublishContextPressure("proj", panes, 75)
+	if len(got) != 1 || got[0].Actionability != ActionabilityActionRequired {
+		t.Fatalf("escalation to %.0f%% = %+v, want one action_required event now", usage, got)
+	}
+}
+
 func TestAttentionSignal_DoesNotPromotePaneOutput(t *testing.T) {
-	event := NewTrackerEvent(tracker.StateChange{
-		Timestamp: time.Date(2026, 3, 21, 3, 21, 0, 0, time.UTC),
-		Type:      tracker.ChangeAgentOutput,
-		Session:   "proj",
-		Pane:      "5",
-		Details: map[string]interface{}{
-			"line_count": 12,
-		},
+	event := annotateAttentionSignal(AttentionEvent{
+		Session:       "proj",
+		Pane:          5,
+		Category:      EventCategoryPane,
+		Type:          EventTypePaneOutput,
+		Actionability: ActionabilityInteresting,
+		Severity:      SeverityInfo,
+		Summary:       "agent output detected in proj pane 5",
+		Details:       map[string]any{"line_count": 12},
 	})
 	t.Logf("pane output summary=%q actionability=%q details=%v", event.Summary, event.Actionability, event.Details)
 
@@ -3111,28 +2809,33 @@ func TestAttentionSignal_DoesNotPromotePaneOutput(t *testing.T) {
 	}
 }
 
-func TestAttentionSignal_RateLimitedFromLoggedError(t *testing.T) {
-	event := mustLoggedAttentionEvent(t, ntmevents.Event{
-		Timestamp: time.Date(2026, 3, 21, 3, 22, 0, 0, time.UTC),
-		Type:      ntmevents.EventError,
-		Session:   "proj",
-		Data: map[string]interface{}{
-			"error_type": "rate_limit",
-			"message":    "429 Too Many Requests",
-		},
-	})
-	t.Logf("logged error signal=%v details=%v", event.Details["signal"], event.Details)
+// The resilience monitor's rate-limit webhook event is the live rate-limit
+// producer; it must carry the rate_limited signal.
+func TestAttentionSignal_RateLimitedFromMonitorWebhook(t *testing.T) {
+	event, ok := NewBusAttentionEvent(ntmevents.NewWebhookEvent(ntmevents.WebhookAgentRateLimit, "proj", "%2", "codex",
+		"Agent codex rate limited", map[string]string{"wait_seconds": "60"}))
+	if !ok {
+		t.Fatal("rate-limit webhook event did not normalize")
+	}
+	t.Logf("rate limit signal=%v details=%v", event.Details["signal"], event.Details)
 
 	if event.Details["signal"] != attentionSignalRateLimited {
-		t.Fatalf("logged error signal = %#v, want %q", event.Details["signal"], attentionSignalRateLimited)
+		t.Fatalf("rate limit signal = %#v, want %q", event.Details["signal"], attentionSignalRateLimited)
 	}
 	if event.Actionability != ActionabilityActionRequired {
-		t.Fatalf("logged error actionability = %q, want %q", event.Actionability, ActionabilityActionRequired)
+		t.Fatalf("rate limit actionability = %q, want %q", event.Actionability, ActionabilityActionRequired)
 	}
 }
 
 func TestAttentionSignal_AlertInfoPreservesSeverity(t *testing.T) {
-	event := mustBusAttentionEvent(t, ntmevents.NewAlertEvent("proj", "alert-5", "health", "info", "background sync complete"))
+	event := annotateAttentionSignal(AttentionEvent{
+		Session:       "proj",
+		Category:      EventCategoryAlert,
+		Type:          EventTypeAlertInfo,
+		Actionability: ActionabilityBackground,
+		Severity:      SeverityInfo,
+		Summary:       "background sync complete",
+	})
 	t.Logf("alert info signal=%v severity=%q actionability=%q next_actions=%v", event.Details["signal"], event.Severity, event.Actionability, event.NextActions)
 
 	if event.Details["signal"] != attentionSignalAlertRaised {
@@ -3146,45 +2849,6 @@ func TestAttentionSignal_AlertInfoPreservesSeverity(t *testing.T) {
 	}
 	if len(event.NextActions) != 1 || event.NextActions[0].Action != "robot-status" {
 		t.Fatalf("next_actions = %v, want single robot-status action", event.NextActions)
-	}
-}
-
-func TestNewAgentStateChangeEvent(t *testing.T) {
-	event := NewAgentStateChangeEvent("myproject", 2, "cc_1", "generating", "idle", "activity_tracker")
-
-	if event.Session != "myproject" {
-		t.Errorf("Session = %q, want %q", event.Session, "myproject")
-	}
-	if event.Pane != 2 {
-		t.Errorf("Pane = %d, want 2", event.Pane)
-	}
-	if event.Category != EventCategoryAgent {
-		t.Errorf("Category = %q, want %q", event.Category, EventCategoryAgent)
-	}
-	if event.Type != EventTypeAgentStateChange {
-		t.Errorf("Type = %q, want %q", event.Type, EventTypeAgentStateChange)
-	}
-	if event.Actionability != ActionabilityInteresting {
-		t.Errorf("Actionability = %q, want %q (idle state)", event.Actionability, ActionabilityInteresting)
-	}
-
-	// Check details
-	if event.Details["agent_id"] != "cc_1" {
-		t.Errorf("details.agent_id = %v, want cc_1", event.Details["agent_id"])
-	}
-}
-
-func TestNewFileConflictEvent(t *testing.T) {
-	event := NewFileConflictEvent("myproject", "internal/robot/types.go", []string{"cc_1", "cc_2"})
-
-	if event.Actionability != ActionabilityActionRequired {
-		t.Errorf("Actionability = %q, want %q", event.Actionability, ActionabilityActionRequired)
-	}
-	if event.Severity != SeverityError {
-		t.Errorf("Severity = %q, want %q", event.Severity, SeverityError)
-	}
-	if len(event.NextActions) == 0 {
-		t.Error("NextActions should not be empty for file conflicts")
 	}
 }
 
@@ -3691,257 +3355,34 @@ func BenchmarkAttentionFeed_Append(b *testing.B) {
 // Conflict Event Tests (br-vdfjr)
 // =============================================================================
 
-func TestNewBusAttentionEvent_ReservationConflict(t *testing.T) {
-
-	event := ntmevents.NewReservationConflictEvent(
-		"myproject", "internal/auth/handler.go", "BlueLake", "cc_1",
-		[]string{"GreenCastle", "RedMountain"},
-	)
-
-	att, ok := NewBusAttentionEvent(event)
+// File conflicts reach the feed as work-coordination problems from the
+// projection refresh; the guidance must point at the session diff and use no
+// stale --session/--file argument forms.
+func TestNormalizedCoordinationProblemEvent_FileConflict(t *testing.T) {
+	att, ok := normalizedCoordinationProblemEvent(time.Date(2026, 3, 22, 19, 45, 0, 0, time.UTC), "myproject", adapters.CoordinationProblem{
+		Kind:     "file_conflict",
+		Severity: "warning",
+		Summary:  "cmd/main.go edited by BlueLake and GreenCastle",
+		Agents:   []string{"GreenCastle", "BlueLake"},
+		Paths:    []string{"cmd/main.go"},
+	})
 	if !ok {
-		t.Fatal("expected ReservationConflictEvent to normalize")
+		t.Fatal("file_conflict problem should normalize")
 	}
-
-	if att.Category != EventCategoryFile {
-		t.Errorf("Category = %q, want %q", att.Category, EventCategoryFile)
-	}
-	if att.Type != EventTypeFileConflict {
-		t.Errorf("Type = %q, want %q", att.Type, EventTypeFileConflict)
-	}
-	if att.Actionability != ActionabilityActionRequired {
-		t.Errorf("Actionability = %q, want %q", att.Actionability, ActionabilityActionRequired)
-	}
-	if att.Severity != SeverityWarning {
-		t.Errorf("Severity = %q, want %q", att.Severity, SeverityWarning)
-	}
-	if !strings.Contains(att.Summary, "reservation conflict") {
-		t.Errorf("Summary should contain 'reservation conflict', got %q", att.Summary)
-	}
-	if !strings.Contains(att.Summary, "internal/auth/handler.go") {
-		t.Errorf("Summary should contain file path, got %q", att.Summary)
-	}
-	if att.Details == nil {
-		t.Fatal("Details must not be nil")
-	}
-	if att.Details["conflict_kind"] != "reservation" {
-		t.Errorf("conflict_kind = %v, want 'reservation'", att.Details["conflict_kind"])
-	}
-	if att.Details["path"] != "internal/auth/handler.go" {
-		t.Errorf("path = %v, want 'internal/auth/handler.go'", att.Details["path"])
-	}
-	if len(att.NextActions) == 0 {
-		t.Error("NextActions must suggest follow-up commands")
-	}
-	foundInspectCoordination := false
-	for _, action := range att.NextActions {
-		if strings.Contains(action.Args, "--session=") {
-			t.Errorf("NextAction args should not use stale --session form: %q", action.Args)
-		}
-		if strings.Contains(action.Args, "--file=") {
-			t.Errorf("NextAction args should not use unsupported --file form: %q", action.Args)
-		}
-		if action.Action == "robot-locks" {
-			t.Errorf("NextActions should not reference nonexistent robot-locks action: %+v", action)
-		}
-		if action.Action == "robot-inspect-coordination" {
-			foundInspectCoordination = true
-			if action.Args != "--robot-inspect-coordination=BlueLake" {
-				t.Errorf("inspect-coordination args = %q, want %q", action.Args, "--robot-inspect-coordination=BlueLake")
-			}
-		}
-	}
-	if !foundInspectCoordination {
-		t.Error("NextActions should include robot-inspect-coordination guidance")
-	}
-}
-
-func TestNewBusAttentionEvent_FileConflict(t *testing.T) {
-
-	event := ntmevents.NewFileConflictEvent(
-		"myproject", "cmd/main.go",
-		[]string{"BlueLake", "GreenCastle"},
-	)
-
-	att, ok := NewBusAttentionEvent(event)
-	if !ok {
-		t.Fatal("expected FileConflictEvent to normalize")
-	}
-
-	if att.Category != EventCategoryFile {
-		t.Errorf("Category = %q, want %q", att.Category, EventCategoryFile)
-	}
-	if att.Type != EventTypeFileConflict {
-		t.Errorf("Type = %q, want %q", att.Type, EventTypeFileConflict)
-	}
-	if att.Actionability != ActionabilityActionRequired {
-		t.Errorf("Actionability = %q, want %q", att.Actionability, ActionabilityActionRequired)
-	}
-	if !strings.Contains(att.Summary, "file conflict") {
-		t.Errorf("Summary should contain 'file conflict', got %q", att.Summary)
-	}
-	if !strings.Contains(att.Summary, "cmd/main.go") {
-		t.Errorf("Summary should contain file path, got %q", att.Summary)
-	}
-	if att.Details == nil {
-		t.Fatal("Details must not be nil")
-	}
-	if att.Details["conflict_kind"] != "file" {
-		t.Errorf("conflict_kind = %v, want 'file'", att.Details["conflict_kind"])
-	}
-	if len(att.NextActions) == 0 {
-		t.Error("NextActions must suggest follow-up commands")
-	}
-	foundDiff := false
-	for _, action := range att.NextActions {
-		if strings.Contains(action.Args, "--session=") {
-			t.Errorf("NextAction args should not use stale --session form: %q", action.Args)
-		}
-		if strings.Contains(action.Args, "--file=") {
-			t.Errorf("NextAction args should not use unsupported --file form: %q", action.Args)
-		}
-		if action.Action == "robot-diff" {
-			foundDiff = true
-			if action.Args != "--robot-diff=myproject" {
-				t.Errorf("robot-diff args = %q, want %q", action.Args, "--robot-diff=myproject")
-			}
-		}
-	}
-	if !foundDiff {
-		t.Error("NextActions should include robot-diff guidance")
-	}
-}
-
-func TestNewReservationConflictEvent_UsesCanonicalNextActions(t *testing.T) {
-
-	conflict := watcher.FileConflict{
-		Path:           "internal/auth/handler.go",
-		RequestorAgent: "BlueLake",
-		RequestorPane:  "cc_1",
-		SessionName:    "myproject",
-		Holders:        []string{"GreenCastle", "RedMountain"},
-		DetectedAt:     time.Date(2026, 3, 24, 5, 0, 0, 0, time.UTC),
-	}
-
-	att, ok := NewReservationConflictEvent(conflict)
-	if !ok {
-		t.Fatal("expected watcher reservation conflict to normalize")
-	}
-
-	foundInspectCoordination := false
-	for _, action := range att.NextActions {
-		if strings.Contains(action.Args, "--session=") {
-			t.Errorf("NextAction args should not use stale --session form: %q", action.Args)
-		}
-		if strings.Contains(action.Args, "--file=") {
-			t.Errorf("NextAction args should not use unsupported --file form: %q", action.Args)
-		}
-		if action.Action == "robot-locks" {
-			t.Errorf("NextActions should not reference nonexistent robot-locks action: %+v", action)
-		}
-		if action.Action == "robot-inspect-coordination" {
-			foundInspectCoordination = true
-			if action.Args != "--robot-inspect-coordination=BlueLake" {
-				t.Errorf("inspect-coordination args = %q, want %q", action.Args, "--robot-inspect-coordination=BlueLake")
-			}
-		}
-	}
-	if !foundInspectCoordination {
-		t.Error("NextActions should include robot-inspect-coordination guidance")
-	}
-}
-
-func TestConflictEvents_FeedToJournal(t *testing.T) {
-
-	feed := newTestAttentionFeed(t)
-
-	// Publish a reservation conflict
-	reservationEvt := ntmevents.NewReservationConflictEvent(
-		"proj", "src/auth.go", "Agent1", "cc_1", []string{"Agent2"},
-	)
-	published, ok := feed.PublishBusEvent(reservationEvt)
-	if !ok {
-		t.Fatal("reservation conflict should be publishable")
-	}
-	if published.Cursor == 0 {
-		t.Error("published event should have a cursor")
-	}
-
-	// Publish a file conflict
-	fileEvt := ntmevents.NewFileConflictEvent("proj", "src/main.go", []string{"A", "B"})
-	published2, ok := feed.PublishBusEvent(fileEvt)
-	if !ok {
-		t.Fatal("file conflict should be publishable")
-	}
-	if published2.Cursor <= published.Cursor {
-		t.Errorf("cursor should be monotonically increasing: %d <= %d", published2.Cursor, published.Cursor)
-	}
-
-	// Verify replay returns both
-	events, _, err := feed.Replay(0, 100)
-	if err != nil {
-		t.Fatalf("Replay error: %v", err)
-	}
-	if len(events) != 2 {
-		t.Errorf("expected 2 events in journal, got %d", len(events))
-	}
-}
-
-func TestNewBusAttentionEvent_RotationStarted(t *testing.T) {
-
-	att := mustBusAttentionEvent(t, ntmevents.NewRotationStartedEvent("proj", "cod-1", 91.0, "architect"))
-
-	if att.Type != EventTypeAgentCompacted {
-		t.Fatalf("Type = %q, want %q", att.Type, EventTypeAgentCompacted)
-	}
-	if att.Severity != SeverityInfo {
-		t.Fatalf("Severity = %q, want %q", att.Severity, SeverityInfo)
-	}
-	if !strings.Contains(att.Summary, "rotation started for cod-1") {
-		t.Fatalf("Summary = %q, want started agent id", att.Summary)
-	}
-}
-
-func TestNewBusAttentionEvent_RotationFailedFallsBackToNewAgent(t *testing.T) {
-
-	att := mustBusAttentionEvent(t, ntmevents.NewRotationCompletedEvent("proj", "", "cod-2", 0, false, "handoff timeout"))
-
-	if att.Type != EventTypeAgentError {
-		t.Fatalf("Type = %q, want %q", att.Type, EventTypeAgentError)
+	if att.Category != EventCategoryFile || att.Type != EventTypeFileConflict {
+		t.Fatalf("category/type = %q/%q, want %q/%q", att.Category, att.Type, EventCategoryFile, EventTypeFileConflict)
 	}
 	if att.Actionability != ActionabilityActionRequired {
 		t.Fatalf("Actionability = %q, want %q", att.Actionability, ActionabilityActionRequired)
 	}
-	if att.Severity != SeverityError {
-		t.Fatalf("Severity = %q, want %q", att.Severity, SeverityError)
+	if att.Details["signal"] != attentionSignalFileConflict {
+		t.Fatalf("signal = %v, want %q", att.Details["signal"], attentionSignalFileConflict)
 	}
-	if !strings.Contains(att.Summary, "rotation failed for cod-2") {
-		t.Fatalf("Summary = %q, want fallback agent id", att.Summary)
+	if len(att.NextActions) != 1 || att.NextActions[0].Action != "robot-diff" || att.NextActions[0].Args != "--robot-diff=myproject" {
+		t.Fatalf("NextActions = %+v, want a single --robot-diff=myproject action", att.NextActions)
 	}
-}
-
-func TestConflictEvents_PartialObservability(t *testing.T) {
-
-	// Reservation conflict with empty holders — should still work
-	event := ntmevents.NewReservationConflictEvent(
-		"proj", "file.go", "Agent1", "cc_1", nil,
-	)
-	att, ok := NewBusAttentionEvent(event)
-	if !ok {
-		t.Fatal("reservation conflict with nil holders should normalize")
-	}
-	if att.Actionability != ActionabilityActionRequired {
-		t.Errorf("even with no holders, actionability should be action_required")
-	}
-
-	// File conflict with single agent (edge case)
-	event2 := ntmevents.NewFileConflictEvent("proj", "f.go", []string{"OnlyAgent"})
-	att2, ok := NewBusAttentionEvent(event2)
-	if !ok {
-		t.Fatal("file conflict with one agent should normalize")
-	}
-	if att2.Details["conflict_kind"] != "file" {
-		t.Errorf("conflict_kind should be 'file'")
+	if strings.Contains(att.NextActions[0].Args, "--session=") || strings.Contains(att.NextActions[0].Args, "--file=") {
+		t.Fatalf("NextAction args use a stale form: %q", att.NextActions[0].Args)
 	}
 }
 

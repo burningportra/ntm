@@ -166,8 +166,9 @@ func (m *UnifiedMessenger) Inbox(ctx context.Context) ([]UnifiedMessage, error) 
 	return unified, nil
 }
 
-// Send sends a message via the preferred channel (defaulting to Agent Mail if available, else BD)
-// For now, it tries Agent Mail first.
+// Send sends a message via the preferred channel: Agent Mail when available,
+// otherwise BD. When Agent Mail is configured but the send fails, the error is
+// returned rather than silently falling back to BD.
 func (m *UnifiedMessenger) Send(ctx context.Context, to, subject, body string) error {
 	if err := requireUnifiedContext(ctx, "send unified message"); err != nil {
 		return err
@@ -192,10 +193,10 @@ func (m *UnifiedMessenger) Send(ctx context.Context, to, subject, body string) e
 		if err == nil {
 			return nil
 		}
-		// If failed, try BD? Or maybe user specifies channel preference?
-		// Fallthrough only on error might be confusing.
-		// For now, just return error if AM configured but failed.
-		// If AM not configured/available, try BD.
+		// Deliberate policy: when Agent Mail is configured but the send
+		// fails, surface the error instead of falling back to BD — a silent
+		// fallback would mask Agent Mail outages and split conversations
+		// across channels. BD is used only when AM is unavailable.
 	}
 
 	if m.bdClient != nil {

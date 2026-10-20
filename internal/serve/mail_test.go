@@ -1,17 +1,25 @@
 package serve
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
 // isolateSessionRegistries points the ntm session registries at an empty
@@ -81,10 +89,35 @@ var agentScopedRoutes = []agentScopedRoute{
 	{"POST", "/api/v1/mail/contacts/request", `{"from_agent":"GreenCastle","to_agent":"BlueLake"}`, "request_contact", "registration_token", map[string]interface{}{"from": "GreenCastle", "to": "BlueLake", "status": "pending"}},
 	{"POST", "/api/v1/mail/contacts/respond", `{"to_agent":"GreenCastle","from_agent":"BlueLake","accept":true}`, "respond_contact", "registration_token", map[string]interface{}{"from": "BlueLake", "to": "GreenCastle", "approved": true}},
 	{"PUT", "/api/v1/mail/contacts/policy", `{"agent_name":"GreenCastle","policy":"open"}`, "set_contact_policy", "registration_token", map[string]interface{}{"agent": "GreenCastle", "policy": "open"}},
-	{"POST", "/api/v1/reservations", `{"agent_name":"GreenCastle","paths":["a.go"]}`, "file_reservation_paths", "registration_token", map[string]interface{}{"granted": []map[string]interface{}{{"id": 5, "path_pattern": "a.go"}}, "conflicts": []interface{}{}}},
+	{"POST", "/api/v1/reservations", `{"agent_name":"GreenCastle","paths":["a.go"]}`, "file_reservation_paths", "registration_token", map[string]interface{}{"granted": []map[string]interface{}{{"id": 5, "path_pattern": "a.go", "expires_ts": agentScopedLeaseExpiry}}, "conflicts": []interface{}{}}},
 	{"DELETE", "/api/v1/reservations", `{"agent_name":"GreenCastle","ids":[5]}`, "release_file_reservations", "registration_token", map[string]interface{}{"released": 1}},
 	{"POST", "/api/v1/reservations/5/renew", `{"agent_name":"GreenCastle"}`, "renew_file_reservations", "registration_token", map[string]interface{}{"renewed": 1}},
 	{"POST", "/api/v1/reservations/5/force-release", `{"agent_name":"GreenCastle"}`, "force_release_file_reservation", "registration_token", map[string]interface{}{"released": 1}},
+}
+
+// agentScopedLeaseExpiry keeps the granted lease live through the readback.
+var agentScopedLeaseExpiry = time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+
+// agentScopedHandlers answers the route's Agent Mail call through recorder.
+// A grant is verified against the project resource and the active listing
+// (GH#328), so the reservation route also answers those reads.
+func agentScopedHandlers(srv *Server, route agentScopedRoute, recorder *tokenRecorder) map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+	handlers := map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
+		route.tool: recorder.handler(route.tool, route.tokenArg, route.result),
+	}
+	if route.tool != "file_reservation_paths" {
+		return handlers
+	}
+	project := srv.projectDirSnapshot()
+	resource := func(text string) func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+		return func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+			return map[string]interface{}{"contents": []map[string]string{{"text": text}}}, nil
+		}
+	}
+	handlers["resource:resource://project/"+url.PathEscape(project)] = resource(fmt.Sprintf(`{"id":4,"slug":"p","human_key":%q}`, project))
+	handlers["resource:resource://file_reservations/"+url.PathEscape(project)] = resource(fmt.Sprintf(
+		`[{"id":5,"project_id":4,"agent":"GreenCastle","path_pattern":"a.go","exclusive":false,"reason":"","expires_ts":%q}]`, agentScopedLeaseExpiry))
+	return handlers
 }
 
 func serveAgentScopedRoute(t *testing.T, srv *Server, route agentScopedRoute, token string) {
@@ -110,6 +143,9 @@ func serveAgentScopedRoute(t *testing.T, srv *Server, route agentScopedRoute, to
 // every one of these calls was refused.
 func TestAgentScopedMailRoutesSendTheCallersToken(t *testing.T) {
 	isolateSessionRegistries(t)
+	// Force-release reaches Agent Mail directly only under the "auto" policy;
+	// the default approval workflow is covered by the HTTP fixture tests.
+	setForceReleasePolicy(t, "auto")
 	routes := append([]agentScopedRoute{
 		// Release by id needs its own call, since it shares the tool with
 		// DELETE /reservations.
@@ -120,9 +156,7 @@ func TestAgentScopedMailRoutesSendTheCallersToken(t *testing.T) {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
 			srv, _ := setupTestServer(t)
 			recorder := &tokenRecorder{}
-			srv.mailClient = newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
-				route.tool: recorder.handler(route.tool, route.tokenArg, route.result),
-			})
+			srv.mailClient = newMockAgentMailMCPClient(t, agentScopedHandlers(srv, route, recorder))
 
 			serveAgentScopedRoute(t, srv, route, "TOK-CALLER")
 			serveAgentScopedRoute(t, srv, route, "")
@@ -142,14 +176,13 @@ func TestAgentScopedMailRoutesSendTheCallersToken(t *testing.T) {
 // spawned after serve built its mail client. A caller's token still wins.
 func TestAgentScopedMailRoutesFallBackToSavedTokens(t *testing.T) {
 	isolateSessionRegistries(t)
+	setForceReleasePolicy(t, "auto")
 
 	for _, route := range agentScopedRoutes {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
 			srv, _ := setupTestServer(t)
 			recorder := &tokenRecorder{}
-			srv.mailClient = newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
-				route.tool: recorder.handler(route.tool, route.tokenArg, route.result),
-			})
+			srv.mailClient = newMockAgentMailMCPClient(t, agentScopedHandlers(srv, route, recorder))
 			serveAgentScopedRoute(t, srv, route, "")
 
 			registry := agentmail.NewSessionAgentRegistry("bd6m68a", srv.projectDirSnapshot())
@@ -311,6 +344,9 @@ func TestCORSAllowsTheAgentMailTokenHeader(t *testing.T) {
 // router, and checks the status and error code serve answers with. Before
 // bd-m0gm2 every one of them answered 500 INTERNAL_ERROR.
 func TestAgentMailRefusalsMapToHTTPStatus(t *testing.T) {
+	// The force-release refusals come from Agent Mail itself, which the
+	// handler reaches without an approval only under the "auto" policy.
+	setForceReleasePolicy(t, "auto")
 	toolError := func(text string) func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
 		return func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
 			envelope, err := json.Marshal(map[string]interface{}{
@@ -519,4 +555,229 @@ func TestMailReadPathsRedactUniformly(t *testing.T) {
 			t.Errorf("reply body leaked the secret: %q", *safe.BodyMD)
 		}
 	})
+}
+
+type forceReleaseHTTPFixture struct {
+	server      *Server
+	store       *state.Store
+	router      http.Handler
+	calls       atomic.Int32
+	inspections atomic.Int32
+	malformed   atomic.Bool
+}
+
+func newForceReleaseHTTPFixture(t *testing.T) *forceReleaseHTTPFixture {
+	t.Helper()
+	setForceReleasePolicy(t, "approval")
+	server, store := setupTestServer(t)
+	fixture := &forceReleaseHTTPFixture{server: server, store: store}
+	server.mailClient = newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
+		"list_file_reservations": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+			fixture.inspections.Add(1)
+			return []agentmail.FileReservation{{
+				ID: 17, ProjectID: 4, AgentName: "BlueLake", PathPattern: "internal/serve/*",
+				CreatedTS: agentmail.FlexTime{Time: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+				ExpiresTS: agentmail.FlexTime{Time: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
+				Exclusive: true,
+			}}, nil
+		},
+		"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+			fixture.calls.Add(1)
+			if args["project_key"] != agentmail.CanonicalProjectKey(server.projectDirSnapshot()) ||
+				args["agent_name"] != "RedStone" || args["file_reservation_id"] != float64(17) {
+				t.Errorf("release changed approved project/actor/reservation: %+v", args)
+			}
+			if fixture.malformed.Load() {
+				// The server may have acted, but its receipt cannot be
+				// decoded. A retry must not repeat this mutation.
+				return map[string]interface{}{"success": "receipt lost"}, nil
+			}
+			return agentmail.ForceReleaseResult{
+				Success: true, PreviousHolder: "BlueLake", PathPattern: "internal/serve/*",
+			}, nil
+		},
+	})
+	router := chi.NewRouter()
+	router.Use(server.idempotencyMiddleware)
+	router.With(server.RequirePermission(PermForceRelease)).Post("/api/v1/reservations/{id}/force-release", server.handleForceReleaseReservation)
+	router.With(server.RequirePermission(PermApproveRequests)).Post("/api/v1/approvals/{id}/approve", server.handleApprovalApproveV1)
+	router.With(server.RequirePermission(PermApproveRequests)).Post("/api/v1/approvals/{id}/deny", server.handleApprovalDenyV1)
+	fixture.router = router
+	return fixture
+}
+
+func (fixture *forceReleaseHTTPFixture) post(t *testing.T, actor, path, key string, body interface{}) (*httptest.ResponseRecorder, map[string]interface{}) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, reader)
+	// Authentication's validated RBAC context is the only identity input.
+	req = req.WithContext(withRoleContext(req.Context(), &RoleContext{Role: RoleAdmin, UserID: actor}))
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	rec := httptest.NewRecorder()
+	fixture.router.ServeHTTP(rec, req)
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode HTTP response: %v: %s", err, rec.Body.String())
+	}
+	return rec, decoded
+}
+
+func forceReleaseResponseApprovalID(t *testing.T, body map[string]interface{}) string {
+	t.Helper()
+	id, _ := body["approval_id"].(string)
+	if id == "" {
+		if details, ok := body["details"].(map[string]interface{}); ok {
+			id, _ = details["approval_id"].(string)
+		}
+	}
+	if id == "" {
+		t.Fatalf("approval ID missing: %+v", body)
+	}
+	return id
+}
+
+func (fixture *forceReleaseHTTPFixture) approve(t *testing.T, id string) {
+	t.Helper()
+	rec, _ := fixture.post(t, "bob", "/api/v1/approvals/"+id+"/approve", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second-operator approval: %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestForceReleaseHTTPApprovalLifecycleAndIdempotentReplay(t *testing.T) {
+	fixture := newForceReleaseHTTPFixture(t)
+	const path = "/api/v1/reservations/17/force-release"
+	body := ForceReleaseRequest{AgentName: "RedStone", Note: "holder crashed", NotifyPrevious: true}
+	rec, decoded := fixture.post(t, "alice", path, "release-one", body)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("initial request: %d: %s", rec.Code, rec.Body.String())
+	}
+	id := forceReleaseResponseApprovalID(t, decoded)
+	record, err := fixture.store.GetApproval(id)
+	if err != nil || record == nil || record.RequestedBy != "alice" || !record.RequiresSLB ||
+		!strings.Contains(record.Resource, "BlueLake") || !strings.Contains(record.Resource, "internal/serve/*") {
+		t.Fatalf("approval omitted principal or lease review evidence: %+v, %v", record, err)
+	}
+	rec, decoded = fixture.post(t, "alice", path, "release-one", body)
+	if rec.Code != http.StatusForbidden || forceReleaseResponseApprovalID(t, decoded) != id {
+		t.Fatalf("pending replay changed approval: %d: %s", rec.Code, rec.Body.String())
+	}
+	if fixture.calls.Load() != 0 {
+		t.Fatal("pending request reached external release")
+	}
+	rec, _ = fixture.post(t, "alice", "/api/v1/approvals/"+id+"/approve", "", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("self-approval: %d: %s", rec.Code, rec.Body.String())
+	}
+	fixture.approve(t, id)
+	rec, decoded = fixture.post(t, "alice", path, "release-one", body)
+	if rec.Code != http.StatusOK || decoded["force_released"] != true || decoded["approval_status"] != "consumed" {
+		t.Fatalf("approved release: %d: %s", rec.Code, rec.Body.String())
+	}
+	rec, _ = fixture.post(t, "alice", path, "release-one", body)
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Idempotent-Replay") != "true" || fixture.calls.Load() != 1 {
+		t.Fatalf("successful retry repeated mutation: %d, calls=%d: %s", rec.Code, fixture.calls.Load(), rec.Body.String())
+	}
+	inspections := fixture.inspections.Load()
+	rec, decoded = fixture.post(t, "alice", path, "a-new-http-request", body)
+	if rec.Code != http.StatusConflict || forceReleaseResponseApprovalID(t, decoded) != id ||
+		fixture.calls.Load() != 1 || fixture.inspections.Load() != inspections {
+		t.Fatalf("spent replay must refuse before another lease read/release: %d: %s", rec.Code, rec.Body.String())
+	}
+	history, err := fixture.server.approvalEngine().History(t.Context())
+	if err != nil || len(history) != 1 {
+		t.Fatalf("replay minted a new approval: %+v, %v", history, err)
+	}
+}
+
+func TestForceReleaseHTTPUnconfirmedReceiptRequiresExplicitReauthorization(t *testing.T) {
+	fixture := newForceReleaseHTTPFixture(t)
+	fixture.malformed.Store(true)
+	const path = "/api/v1/reservations/17/force-release"
+	body := ForceReleaseRequest{AgentName: "RedStone", Note: "holder crashed"}
+	_, decoded := fixture.post(t, "alice", path, "uncertain-release", body)
+	id := forceReleaseResponseApprovalID(t, decoded)
+	fixture.approve(t, id)
+	rec, decoded := fixture.post(t, "alice", path, "uncertain-release", body)
+	details, _ := decoded["details"].(map[string]interface{})
+	if rec.Code < 400 || details["approval_status"] != "consumed" ||
+		details["execution_status"] != "unconfirmed" || fixture.calls.Load() != 1 {
+		t.Fatalf("malformed receipt lost spent/uncertain evidence: %d: %s", rec.Code, rec.Body.String())
+	}
+	rec, _ = fixture.post(t, "alice", path, "uncertain-release", body)
+	if rec.Code != http.StatusConflict || fixture.calls.Load() != 1 {
+		t.Fatalf("uncertain retry repeated release: %d, calls=%d", rec.Code, fixture.calls.Load())
+	}
+
+	body.NewApproval = id
+	rec, decoded = fixture.post(t, "alice", path, "deliberate-new-attempt", body)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("explicit new attempt: %d: %s", rec.Code, rec.Body.String())
+	}
+	nextID := forceReleaseResponseApprovalID(t, decoded)
+	if nextID == id {
+		t.Fatal("explicit new attempt reused consumed grant")
+	}
+	rec, decoded = fixture.post(t, "alice", path, "deliberate-new-attempt", body)
+	if rec.Code != http.StatusForbidden || forceReleaseResponseApprovalID(t, decoded) != nextID {
+		t.Fatalf("renewal replay did not reuse successor: %d: %s", rec.Code, rec.Body.String())
+	}
+	fixture.approve(t, nextID)
+	fixture.malformed.Store(false)
+	rec, _ = fixture.post(t, "alice", path, "deliberate-new-attempt", body)
+	if rec.Code != http.StatusOK || fixture.calls.Load() != 2 {
+		t.Fatalf("approved new attempt: %d: %s", rec.Code, rec.Body.String())
+	}
+	rec, _ = fixture.post(t, "alice", path, "renewal-with-another-http-key", body)
+	if rec.Code != http.StatusConflict || fixture.calls.Load() != 2 {
+		t.Fatalf("renewal replay minted another execution: %d: %s", rec.Code, rec.Body.String())
+	}
+	history, err := fixture.server.approvalEngine().History(t.Context())
+	if err != nil || len(history) != 2 {
+		t.Fatalf("renewal replays minted extra approvals: %+v, %v", history, err)
+	}
+}
+
+func TestForceReleaseHTTPApprovalCannotChangeRequesterOrMailActor(t *testing.T) {
+	fixture := newForceReleaseHTTPFixture(t)
+	const path = "/api/v1/reservations/17/force-release"
+	body := ForceReleaseRequest{AgentName: "RedStone"}
+	_, decoded := fixture.post(t, "alice", path, "", body)
+	id := forceReleaseResponseApprovalID(t, decoded)
+	fixture.approve(t, id)
+
+	spoofed := map[string]interface{}{"agent_name": "RedStone", "requested_by": "alice", "requestor": "alice"}
+	rec, decoded := fixture.post(t, "mallory", path, "", spoofed)
+	if rec.Code != http.StatusForbidden || fixture.calls.Load() != 0 {
+		t.Fatalf("body identity spoof dispatched release: %d: %s", rec.Code, rec.Body.String())
+	}
+	otherID := forceReleaseResponseApprovalID(t, decoded)
+	record, err := fixture.store.GetApproval(otherID)
+	if err != nil || record == nil || record.RequestedBy != "mallory" || otherID == id {
+		t.Fatalf("body controlled trusted requester: %+v, %v", record, err)
+	}
+	body.NewApproval = id
+	rec, _ = fixture.post(t, "mallory", path, "", body)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("foreign predecessor accepted: %d: %s", rec.Code, rec.Body.String())
+	}
+	body.AgentName = "GreenCastle"
+	rec, _ = fixture.post(t, "alice", path, "", body)
+	if rec.Code != http.StatusForbidden || fixture.calls.Load() != 0 {
+		t.Fatalf("changed mail actor reused approval: %d: %s", rec.Code, rec.Body.String())
+	}
+	record, _ = fixture.store.GetApproval(id)
+	if record == nil || record.Status != state.ApprovalApproved {
+		t.Fatalf("foreign attempts spent original approval: %+v", record)
+	}
 }

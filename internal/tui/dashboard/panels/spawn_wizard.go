@@ -86,6 +86,11 @@ func (sw *SpawnWizard) SetSize(width, height int) {
 	sw.height = height
 }
 
+// Size returns the wizard's current width and height.
+func (sw *SpawnWizard) Size() (width, height int) {
+	return sw.width, sw.height
+}
+
 // Init implements tea.Model.
 func (sw *SpawnWizard) Init() tea.Cmd {
 	return sw.methodForm.Init()
@@ -343,7 +348,7 @@ func (sw *SpawnWizard) initCountsForm() {
 				Validate(validateAgentCount),
 			huh.NewInput().
 				Title("Antigravity agents (agy)").
-				Description("Number of Google Antigravity agents (model pinned to Gemini 3.1 Pro (High))").
+				Description("Number of Google Antigravity agents (model pinned to Gemini 4 Argon (High))").
 				Placeholder("0").
 				Value(&sw.agyStr).
 				Validate(validateAgentCount),

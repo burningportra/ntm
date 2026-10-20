@@ -5,6 +5,7 @@ import (
 	"context"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -75,19 +76,20 @@ type Progress struct {
 
 // AgentHealth contains health information for a single agent
 type AgentHealth struct {
-	Pane                  int                         `json:"pane"`           // Pane index
-	PaneID                string                      `json:"pane_id"`        // Full pane ID
-	AgentType             string                      `json:"agent_type"`     // claude, codex, gemini, user, unknown
-	Status                Status                      `json:"status"`         // Overall health status
-	ProcessStatus         ProcessStatus               `json:"process_status"` // Process running state
-	Activity              ActivityLevel               `json:"activity"`       // Activity level
-	LastActivity          *time.Time                  `json:"last_activity"`  // Last activity timestamp
-	IdleSeconds           int                         `json:"idle_seconds"`   // Seconds since last activity
-	Issues                []Issue                     `json:"issues"`         // Detected issues
-	RateLimited           bool                        `json:"rate_limited"`   // True if agent hit rate limit
-	WaitSeconds           int                         `json:"wait_seconds"`   // Suggested wait time (if rate limited)
-	Progress              *Progress                   `json:"progress"`       // Detected work progress
-	ShellPID              int                         `json:"shell_pid"`      // Shell PID from tmux pane
+	Pane                  int                         `json:"pane"`                     // Pane index
+	PaneID                string                      `json:"pane_id"`                  // Full pane ID
+	AgentType             string                      `json:"agent_type"`               // claude, codex, gemini, user, unknown
+	Status                Status                      `json:"status"`                   // Overall health status
+	ProcessStatus         ProcessStatus               `json:"process_status"`           // Process running state
+	Activity              ActivityLevel               `json:"activity"`                 // Activity level
+	LastActivity          *time.Time                  `json:"last_activity"`            // Last activity timestamp
+	IdleSeconds           int                         `json:"idle_seconds"`             // Seconds since last activity
+	Issues                []Issue                     `json:"issues"`                   // Detected issues
+	RateLimited           bool                        `json:"rate_limited"`             // True if agent hit rate limit
+	WaitSeconds           int                         `json:"wait_seconds"`             // Suggested wait time (if rate limited)
+	Progress              *Progress                   `json:"progress"`                 // Detected work progress
+	ShellPID              int                         `json:"shell_pid"`                // Shell PID from tmux pane
+	UptimeSeconds         int                         `json:"uptime_seconds,omitempty"` // Age of the pane's shell incarnation (set by ntm health; absent when unreadable)
 	ObservedState         status.AgentState           `json:"observed_state"`
 	LastKnownState        status.AgentState           `json:"last_known_state,omitempty"`
 	ObservationFreshness  status.ObservationFreshness `json:"observation_freshness"`
@@ -226,21 +228,6 @@ func isSessionMissing(err error) bool {
 		strings.Contains(msg, "no sessions")
 }
 
-// checkAgent performs health checks on a single agent pane
-func checkAgent(ctx context.Context, pa tmux.PaneActivity) AgentHealth {
-	agent := newAgentHealth(pa)
-
-	// Capture pane output for analysis
-	output, err := tmux.CapturePaneOutputContext(ctx, pa.Pane.ID, 50)
-	if err != nil {
-		agent.ProcessStatus = ProcessUnknown
-		agent.Status = StatusUnknown
-		return agent
-	}
-
-	return analyzeAgentHealth(agent, pa, output)
-}
-
 func checkAgentObservation(observation status.PaneObservation) AgentHealth {
 	pa := tmux.PaneActivity{
 		Pane:         observation.Metadata,
@@ -303,6 +290,17 @@ func analyzeAgentHealth(agent AgentHealth, pa tmux.PaneActivity, output string) 
 	// work — the worst failure mode for an unattended swarm (GH#230).
 	if issue, ok := detectBlockingPrompt(output, string(pa.Pane.Type)); ok {
 		agent.Issues = append(agent.Issues, issue)
+	}
+
+	// Generic interactive-gate screens (bd-jf22c): trust dialogs, auth/login
+	// gates, and first-run onboarding choices that are not covered by the
+	// exact agent-type-gated signatures above. Skip when the specific
+	// signature already flagged the same dialog so the pane is not reported
+	// twice for one screen.
+	if !hasIssueType(agent.Issues, "trust_prompt") {
+		if issue, ok := detectInteractiveGateIssue(output, string(pa.Pane.Type), pa.Pane.Width); ok {
+			agent.Issues = append(agent.Issues, issue)
+		}
 	}
 
 	// Determine activity level
@@ -438,6 +436,31 @@ func detectBlockingPrompt(output, agentType string) (Issue, bool) {
 	return Issue{}, false
 }
 
+// detectInteractiveGateIssue is the generic sibling of detectBlockingPrompt
+// (bd-jf22c): it recognizes the family of modal gate screens — trust dialogs,
+// auth/login gates, onboarding choices — via the shared
+// agent.DetectInteractiveGate detector. Only real agent panes are
+// checked: a user shell that greps this repo (or an agent transcript pasted
+// into a plain pane) legitimately prints these phrases. The detector itself
+// scans only the live tail and vetoes matches while working chrome is
+// visible; the residual risk (an idle agent quoting a gate phrase in its
+// final lines) is documented on DetectInteractiveGate.
+func detectInteractiveGateIssue(output, agentType string, paneWidth int) (Issue, bool) {
+	trimmed := strings.TrimSpace(agentType)
+	canonical := agent.AgentType(trimmed).Canonical()
+	if trimmed == "" || canonical == agent.AgentTypeUser || canonical == agent.AgentTypeUnknown {
+		return Issue{}, false
+	}
+	gate, ok := agent.DetectInteractiveGate(output, paneWidth)
+	if !ok {
+		return Issue{}, false
+	}
+	return Issue{
+		Type:    "interactive_gate",
+		Message: "Blocked on interactive gate screen (" + strconv.Quote(gate) + "); needs a keystroke before the pane can accept work",
+	}, true
+}
+
 // promptScanLineBudget caps how many tail lines outputAfterMostRecentPrompt
 // will scan when looking for a recovery prompt. A typical tmux capture is a
 // few hundred lines; 1024 covers realistic scrollback without making
@@ -523,12 +546,6 @@ func hasRateLimitChatter(output string) bool {
 		}
 	}
 	return false
-}
-
-// parseWaitTime extracts the suggested wait time in seconds from rate limit messages
-// Returns 0 if no wait time is found
-func parseWaitTime(output string) int {
-	return ratelimit.ParseWaitSeconds(output)
 }
 
 // hasRateLimitIssue checks if any issue indicates a rate limit
@@ -640,7 +657,7 @@ func detectProgress(output string, activity ActivityLevel, issues []Issue) *Prog
 // hasErrorIssue checks if any issue indicates an error (crash, auth, network)
 func hasErrorIssue(issues []Issue) bool {
 	for _, issue := range issues {
-		if issue.Type == "crash" || issue.Type == "auth_error" || issue.Type == "network_error" {
+		if issue.Type == "crash" || issue.Type == "auth_error" || issue.Type == "network_error" || issue.Type == "interactive_gate" {
 			return true
 		}
 	}
@@ -711,19 +728,6 @@ func detectActivity(output string, lastActivity time.Time, agentType string) Act
 	return ActivityStale
 }
 
-// detectProcessStatus determines if the agent process is running.
-//
-// When shellPID > 0 it uses PID-based liveness as the primary signal:
-// the shell's child process (the agent) is checked via /proc. This avoids
-// false positives from AI agents that routinely print strings like
-// "exit status" or "connection closed" in their normal output.
-//
-// Text-pattern matching is only used as a fallback when no PID is available
-// (e.g. in tests or when tmux doesn't report a PID).
-func detectProcessStatus(output string, command string, shellPID int) ProcessStatus {
-	return detectProcessStatusForAgent(output, command, shellPID, "")
-}
-
 // paneRunsAgent reports whether a pane is expected to have an agent process
 // running under its shell. A user or unrecognized pane is not, so its shell
 // having no children is normal rather than evidence of a crash. An empty
@@ -785,11 +789,11 @@ func detectProcessStatusForAgent(output string, command string, shellPID int, ag
 
 // calculateStatus determines overall status from all factors
 func calculateStatus(agent AgentHealth) Status {
-	// Error status if any critical issues. trust_prompt is critical: the pane
-	// is parked on a modal dialog and will never do work until a human (or an
-	// explicit policy) answers it (GH#230).
+	// Error status if any critical issues. trust_prompt / interactive_gate are
+	// critical: the pane is parked on a modal dialog and will never do work
+	// until a human (or an explicit policy) answers it (GH#230, bd-jf22c).
 	for _, issue := range agent.Issues {
-		if issue.Type == "crash" || issue.Type == "auth_error" || issue.Type == "trust_prompt" {
+		if issue.Type == "crash" || issue.Type == "auth_error" || issue.Type == "trust_prompt" || issue.Type == "interactive_gate" {
 			return StatusError
 		}
 	}

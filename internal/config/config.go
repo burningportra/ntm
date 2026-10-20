@@ -24,12 +24,13 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/util"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 const (
 	// DefaultCodexModel is the model NTM uses when the operator requests a
 	// Codex pane without specifying a model.
-	DefaultCodexModel = "gpt-5.6-sol"
+	DefaultCodexModel = "gpt-6-astra"
 	// DefaultCodexReasoningEffort is the Codex reasoning budget used when no
 	// persona or agent spec provides one.
 	DefaultCodexReasoningEffort = "xhigh"
@@ -37,6 +38,11 @@ const (
 	// persona or agent spec provides one. Kept alongside the Codex default so
 	// both agent types share one obvious place to change the house default.
 	DefaultClaudeReasoningEffort = "xhigh"
+	// ClaudeEstimationModel is the model family NTM assumes for context-window
+	// and cost ESTIMATES on a Claude pane whose launch model was left to Claude
+	// Code (models.default_claude = "", the built-in default; ntm#334). It is
+	// never passed to Claude Code as --model.
+	ClaudeEstimationModel = "claude-opus"
 )
 
 // validSynthesisStrategies defines the canonical synthesis strategy names.
@@ -77,49 +83,49 @@ func validateSynthesisStrategy(name string) error {
 
 // Config represents the main configuration
 type Config struct {
-	ProjectsBase       string                `toml:"projects_base"`
-	Theme              string                `toml:"theme"`               // UI Theme (mocha, macchiato, nord, latte, auto)
-	HelpVerbosity      string                `toml:"help_verbosity"`      // Help verbosity: minimal or full (default: full)
-	PaletteFile        string                `toml:"palette_file"`        // Path to command_palette.md (optional)
-	SuggestionsEnabled bool                  `toml:"suggestions_enabled"` // Show contextual CLI suggestions
-	Agents             AgentConfig           `toml:"agents"`
-	Palette            []PaletteCmd          `toml:"palette"`
-	PaletteState       PaletteState          `toml:"palette_state"`
-	Tmux               TmuxConfig            `toml:"tmux"`
-	Robot              RobotConfig           `toml:"robot"`
-	CommandHooks       []CommandHookConfig   `toml:"command_hooks"`
-	AgentMail          AgentMailConfig       `toml:"agent_mail"`
-	Integrations       IntegrationsConfig    `toml:"integrations"` // External tool integrations (dcg, caam, etc.)
-	Models             ModelsConfig          `toml:"models"`
-	Alerts             AlertsConfig          `toml:"alerts"`
-	Checkpoints        CheckpointsConfig     `toml:"checkpoints"`
-	Notifications      notify.Config         `toml:"notifications"`
-	Resilience         ResilienceConfig      `toml:"resilience"`
-	Scanner            ScannerConfig         `toml:"scanner"`          // UBS scanner configuration
-	CASS               CASSConfig            `toml:"cass"`             // CASS integration configuration
-	Accounts           AccountsConfig        `toml:"accounts"`         // Multi-account management
-	Rotation           RotationConfig        `toml:"rotation"`         // Account rotation configuration
-	GeminiSetup        GeminiSetupConfig     `toml:"gemini_setup"`     // Gemini post-spawn setup
-	Context            ContextConfig         `toml:"context"`          // Context pack options
-	ContextRotation    ContextRotationConfig `toml:"context_rotation"` // Context window rotation
-	SessionRecovery    SessionRecoveryConfig `toml:"recovery"`         // Smart session recovery
-	Cleanup            CleanupConfig         `toml:"cleanup"`          // Temp file cleanup configuration
-	FileReservation    FileReservationConfig `toml:"file_reservation"` // Auto file reservation via Agent Mail
-	Memory             MemoryConfig          `toml:"memory"`           // CASS Memory (cm) integration
-	Assign             AssignConfig          `toml:"assign"`           // Assignment strategy configuration
-	Ensemble           EnsembleConfig        `toml:"ensemble"`         // Reasoning ensemble defaults
-	Swarm              SwarmConfig           `toml:"swarm"`            // Weighted multi-project agent swarm
-	SpawnPacing        SpawnPacingConfig     `toml:"spawn_pacing"`     // Spawn scheduler pacing configuration
-	Safety             SafetyConfig          `toml:"safety"`           // Safety profile selection + defaults
-	Preflight          PreflightConfig       `toml:"preflight"`        // Prompt preflight/lint configuration
-	Redaction          RedactionConfig       `toml:"redaction"`        // Secrets/PII redaction configuration
-	Privacy            PrivacyConfig         `toml:"privacy"`          // Privacy mode configuration
-	Encryption         EncryptionConfig      `toml:"encryption"`       // Encryption at rest for artifacts
-	Send               SendConfig            `toml:"send"`             // Send command defaults
-	Prompts            PromptsConfig         `toml:"prompts"`          // Per-agent-type default prompts
-	Retry              RetryConfig           `toml:"retry"`            // Unified retry policy configuration
-	Routing            RoutingConfig         `toml:"routing"`          // Agent routing/scoring weights
-	Coordinator        CoordinatorConfig     `toml:"coordinator"`      // Session coordinator (digests, auto-assign, conflict handling)
+	ProjectsBase    string                `toml:"projects_base"`
+	Theme           string                `toml:"theme"`          // UI Theme (mocha, macchiato, nord, latte, auto)
+	HelpVerbosity   string                `toml:"help_verbosity"` // Help verbosity: minimal or full (default: full)
+	PaletteFile     string                `toml:"palette_file"`   // Path to command_palette.md (optional)
+	Agents          AgentConfig           `toml:"agents"`
+	Palette         []PaletteCmd          `toml:"palette"`
+	PaletteState    PaletteState          `toml:"palette_state"`
+	Tmux            TmuxConfig            `toml:"tmux"`
+	Robot           RobotConfig           `toml:"robot"`
+	CommandHooks    []CommandHookConfig   `toml:"command_hooks"`
+	AgentMail       AgentMailConfig       `toml:"agent_mail"`
+	Integrations    IntegrationsConfig    `toml:"integrations"` // External tool integrations (dcg, caam, etc.)
+	Models          ModelsConfig          `toml:"models"`
+	Alerts          AlertsConfig          `toml:"alerts"`
+	Checkpoints     CheckpointsConfig     `toml:"checkpoints"`
+	Notifications   notify.Config         `toml:"notifications"`
+	Resilience      ResilienceConfig      `toml:"resilience"`
+	Scanner         ScannerConfig         `toml:"scanner"`          // UBS scanner configuration
+	Bugs            BugsConfig            `toml:"bugs"`             // UBS bug push routing (ntm bugs watch)
+	CASS            CASSConfig            `toml:"cass"`             // CASS integration configuration
+	Rotation        RotationConfig        `toml:"rotation"`         // Account rotation configuration
+	GeminiSetup     GeminiSetupConfig     `toml:"gemini_setup"`     // Gemini post-spawn setup
+	Context         ContextConfig         `toml:"context"`          // Context pack options
+	ContextRotation ContextRotationConfig `toml:"context_rotation"` // Context window rotation
+	SessionRecovery SessionRecoveryConfig `toml:"recovery"`         // Smart session recovery
+	Cleanup         CleanupConfig         `toml:"cleanup"`          // Temp file cleanup configuration
+	FileReservation FileReservationConfig `toml:"file_reservation"` // Auto file reservation via Agent Mail
+	Memory          MemoryConfig          `toml:"memory"`           // CASS Memory (cm) integration
+	Assign          AssignConfig          `toml:"assign"`           // Assignment strategy configuration
+	Ensemble        EnsembleConfig        `toml:"ensemble"`         // Reasoning ensemble defaults
+	Swarm           SwarmConfig           `toml:"swarm"`            // Weighted multi-project agent swarm
+	SpawnPacing     SpawnPacingConfig     `toml:"spawn_pacing"`     // Spawn scheduler pacing configuration
+	Spawn           SpawnConfig           `toml:"spawn"`            // Spawn defaults (prompt stagger) for ntm spawn and --robot-spawn
+	Safety          SafetyConfig          `toml:"safety"`           // Safety profile selection + defaults
+	Preflight       PreflightConfig       `toml:"preflight"`        // Prompt preflight/lint configuration
+	Redaction       RedactionConfig       `toml:"redaction"`        // Secrets/PII redaction configuration
+	Privacy         PrivacyConfig         `toml:"privacy"`          // Privacy mode configuration
+	Encryption      EncryptionConfig      `toml:"encryption"`       // Encryption at rest for artifacts
+	Send            SendConfig            `toml:"send"`             // Send command defaults
+	Prompts         PromptsConfig         `toml:"prompts"`          // Per-agent-type default prompts
+	Retry           RetryConfig           `toml:"retry"`            // Unified retry policy configuration
+	Routing         RoutingConfig         `toml:"routing"`          // Agent routing/scoring weights
+	Coordinator     CoordinatorConfig     `toml:"coordinator"`      // Session coordinator (digests, auto-assign, conflict handling)
 
 	// Runtime-only fields (populated by project config merging)
 	ProjectDefaults map[string]int `toml:"-"`
@@ -147,6 +153,13 @@ type CoordinatorConfig struct {
 	SendDigests bool   `toml:"send_digests"` // Send periodic digests to human
 	HumanAgent  string `toml:"human_agent"`  // Agent name to send digests to (default: "Human")
 	MailNudge   bool   `toml:"mail_nudge"`   // Prompt idle panes that have unread Agent Mail
+
+	// Mail nudge tunables (GH#231). NudgeCooldownSeconds is the per-pane
+	// minimum spacing between nudges (default 60; non-positive values fall
+	// back to 60). NudgeMessage optionally overrides the built-in nudge
+	// prompt verbatim.
+	NudgeCooldownSeconds int    `toml:"nudge_cooldown_seconds"`
+	NudgeMessage         string `toml:"nudge_message"`
 }
 
 // DefaultCoordinatorConfig mirrors coordinator.DefaultCoordinatorConfig and
@@ -154,16 +167,18 @@ type CoordinatorConfig struct {
 // disagree with the runtime defaults exposed by `ntm coordinator status`.
 func DefaultCoordinatorConfig() CoordinatorConfig {
 	return CoordinatorConfig{
-		PollInterval:      5 * time.Second,
-		DigestInterval:    5 * time.Minute,
-		AutoAssign:        false,
-		IdleThreshold:     30.0,
-		AssignOnlyIdle:    true,
-		ConflictNotify:    true,
-		ConflictNegotiate: false,
-		SendDigests:       false,
-		HumanAgent:        "Human",
-		MailNudge:         false,
+		PollInterval:         5 * time.Second,
+		DigestInterval:       5 * time.Minute,
+		AutoAssign:           false,
+		IdleThreshold:        30.0,
+		AssignOnlyIdle:       true,
+		ConflictNotify:       false,
+		ConflictNegotiate:    false,
+		SendDigests:          false,
+		HumanAgent:           "Human",
+		MailNudge:            false,
+		NudgeCooldownSeconds: 60,
+		NudgeMessage:         "",
 	}
 }
 
@@ -174,15 +189,18 @@ type RetryConfig struct {
 	InitialDelayMs int     `toml:"initial_delay_ms"` // Initial delay between retries in ms (default: 1000)
 	MaxDelayMs     int     `toml:"max_delay_ms"`     // Maximum delay cap in ms (default: 30000)
 	BackoffFactor  float64 `toml:"backoff_factor"`   // Exponential backoff multiplier (default: 2.0)
-	Jitter         bool    `toml:"jitter"`           // Add random jitter to delays (default: true)
+	Jitter         bool    `toml:"jitter"`           // Add random jitter to delays (default: false; opt-in)
 
-	// Subsystem-specific overrides (inherit global values if zero/empty)
-	Webhook    RetryOverride `toml:"webhook"`
-	Alerts     RetryOverride `toml:"alerts"`
-	Scheduler  RetryOverride `toml:"scheduler"`
-	Completion RetryOverride `toml:"completion"`
-	DB         RetryOverride `toml:"db"`
-	Assign     RetryOverride `toml:"assign"`
+	// Subsystem-specific overrides (inherit global values if zero/empty).
+	// Only the subsystems with a live retry loop exist; the former
+	// scheduler/completion/db/assign overrides were removed in v1.26.0
+	// (bd-ws6-config-truth-ienmd.2) because no such retry loops ship.
+	Webhook RetryOverride `toml:"webhook"`
+	Alerts  RetryOverride `toml:"alerts"`
+	// AgentMail governs the Agent Mail MCP busy-retry loop
+	// (internal/agentmail callToolWithBusyRetry). Defaults preserve the
+	// historical hardcoded behavior: 3 retries with a 500ms initial backoff.
+	AgentMail RetryOverride `toml:"agent_mail"`
 }
 
 // RetryOverride allows per-subsystem overrides of the global retry policy.
@@ -250,7 +268,6 @@ type CommandHookConfig struct {
 	Timeout         CommandHookDuration `toml:"timeout"`
 	Enabled         *bool               `toml:"enabled"`
 	WorkDir         string              `toml:"workdir"`
-	Description     string              `toml:"description"`
 	Name            string              `toml:"name"`
 	ContinueOnError bool                `toml:"continue_on_error"`
 	Env             map[string]string   `toml:"env"`
@@ -297,10 +314,13 @@ func DefaultRetryConfig() RetryConfig {
 		InitialDelayMs: 1000,
 		MaxDelayMs:     30000,
 		BackoffFactor:  2.0,
-		Jitter:         true,
-		Webhook:        RetryOverride{MaxAttempts: 5},
-		Scheduler:      RetryOverride{MaxAttempts: 5},
-		DB:             RetryOverride{MaxAttempts: 6},
+		// Jitter defaults to false: no shipped retry loop ever jittered while
+		// this section was reader-less, so wiring the knob (WS6-wire,
+		// bd-ws6-config-truth-ienmd.1) keeps default behavior identical and
+		// makes jitter strictly opt-in.
+		Jitter:    false,
+		Webhook:   RetryOverride{MaxAttempts: 5},
+		AgentMail: RetryOverride{MaxAttempts: 3, InitialDelayMs: 500},
 	}
 }
 
@@ -322,14 +342,8 @@ func (c *RetryConfig) RetryPolicyFor(subsystem string) (maxAttempts int, initial
 		override = c.Webhook
 	case "alerts":
 		override = c.Alerts
-	case "scheduler":
-		override = c.Scheduler
-	case "completion":
-		override = c.Completion
-	case "db":
-		override = c.DB
-	case "assign":
-		override = c.Assign
+	case "agent_mail":
+		override = c.AgentMail
 	}
 
 	if override.MaxAttempts > 0 {
@@ -409,20 +423,16 @@ func DefaultSemanticConfig() SemanticConfig {
 }
 
 // RobotOutputConfig holds configuration for robot mode output format.
+// The pretty/timestamps/compress keys were deprecated in v1.28.0
+// (bd-6otuk): only robot.output.format has a runtime reader.
 type RobotOutputConfig struct {
-	Format     string `toml:"format"`     // Output format: "json" or "toon"
-	Pretty     bool   `toml:"pretty"`     // Pretty print output (adds whitespace for readability)
-	Timestamps bool   `toml:"timestamps"` // Include timestamps in output
-	Compress   bool   `toml:"compress"`   // Compression for large outputs
+	Format string `toml:"format"` // Output format: "json" or "toon"
 }
 
 // DefaultRobotOutputConfig returns sensible robot output defaults.
 func DefaultRobotOutputConfig() RobotOutputConfig {
 	return RobotOutputConfig{
-		Format:     "json", // JSON for backwards compatibility
-		Pretty:     false,  // Compact by default
-		Timestamps: true,   // Include timestamps
-		Compress:   false,  // No compression by default
+		Format: "json", // JSON for backwards compatibility
 	}
 }
 
@@ -450,31 +460,23 @@ func DefaultRobotConfig() RobotConfig {
 
 // CheckpointsConfig holds configuration for automatic checkpoints
 type CheckpointsConfig struct {
-	Enabled               bool `toml:"enabled"`                  // Top-level toggle for auto-checkpoints
-	BeforeBroadcast       bool `toml:"before_broadcast"`         // Auto-checkpoint before sending to all agents
-	BeforeAddAgents       int  `toml:"before_add_agents"`        // Auto-checkpoint when adding >= N agents (0 = disabled)
-	MaxAutoCheckpoints    int  `toml:"max_auto_checkpoints"`     // Max auto-checkpoints per session (rotation)
-	ScrollbackLines       int  `toml:"scrollback_lines"`         // Lines of scrollback to capture
-	IncludeGit            bool `toml:"include_git"`              // Capture git state in auto-checkpoints
-	AutoCheckpointOnSpawn bool `toml:"auto_checkpoint_on_spawn"` // Auto-checkpoint when spawning session
-	IntervalMinutes       int  `toml:"interval_minutes"`         // Periodic checkpoint interval (0 = disabled)
-	OnRotation            bool `toml:"on_rotation"`              // Checkpoint before context rotation
-	OnError               bool `toml:"on_error"`                 // Checkpoint when agent error detected
+	Enabled            bool `toml:"enabled"`              // Top-level toggle for auto-checkpoints
+	BeforeBroadcast    bool `toml:"before_broadcast"`     // Auto-checkpoint before sending to all agents
+	BeforeAddAgents    int  `toml:"before_add_agents"`    // Auto-checkpoint when adding >= N agents (0 = disabled)
+	MaxAutoCheckpoints int  `toml:"max_auto_checkpoints"` // Max auto-checkpoints per session (rotation)
+	ScrollbackLines    int  `toml:"scrollback_lines"`     // Lines of scrollback to capture
+	IncludeGit         bool `toml:"include_git"`          // Capture git state in auto-checkpoints
 }
 
 // DefaultCheckpointsConfig returns sensible checkpoint defaults
 func DefaultCheckpointsConfig() CheckpointsConfig {
 	return CheckpointsConfig{
-		Enabled:               true,
-		BeforeBroadcast:       true,
-		BeforeAddAgents:       3,  // Auto-checkpoint when adding 3+ agents
-		MaxAutoCheckpoints:    10, // Keep last 10 auto-checkpoints per session
-		ScrollbackLines:       500,
-		IncludeGit:            true,
-		AutoCheckpointOnSpawn: false, // Don't checkpoint empty sessions by default
-		IntervalMinutes:       0,     // Disabled by default (no periodic checkpoints)
-		OnRotation:            true,  // Checkpoint before rotation by default
-		OnError:               true,  // Checkpoint on error by default
+		Enabled:            true,
+		BeforeBroadcast:    true,
+		BeforeAddAgents:    3,  // Auto-checkpoint when adding 3+ agents
+		MaxAutoCheckpoints: 10, // Keep last 10 auto-checkpoints per session
+		ScrollbackLines:    500,
+		IncludeGit:         true,
 	}
 }
 
@@ -483,6 +485,7 @@ type AlertsConfig struct {
 	Enabled                 bool    `toml:"enabled"`                   // Top-level toggle for alerts
 	AgentStuckMinutes       int     `toml:"agent_stuck_minutes"`       // Minutes without output before alerting
 	DiskLowThresholdGB      float64 `toml:"disk_low_threshold_gb"`     // Minimum free disk space (GB)
+	DiskFullHorizonHours    float64 `toml:"disk_full_horizon_hours"`   // Alert when disk is projected full within this many hours (0 = disabled)
 	MailBacklogThreshold    int     `toml:"mail_backlog_threshold"`    // Unread messages before alerting
 	BeadStaleHours          int     `toml:"bead_stale_hours"`          // Hours before in-progress bead is stale
 	ContextWarningThreshold float64 `toml:"context_warning_threshold"` // Context usage percentage that triggers a warning
@@ -495,6 +498,7 @@ func DefaultAlertsConfig() AlertsConfig {
 		Enabled:                 true,
 		AgentStuckMinutes:       5,
 		DiskLowThresholdGB:      5.0,
+		DiskFullHorizonHours:    0,
 		MailBacklogThreshold:    10,
 		BeadStaleHours:          24,
 		ContextWarningThreshold: 75.0,
@@ -516,9 +520,8 @@ type ResilienceConfig struct {
 
 // RateLimitConfig holds configuration for rate limit detection
 type RateLimitConfig struct {
-	Detect   bool     `toml:"detect"`   // Enable rate limit detection
-	Notify   bool     `toml:"notify"`   // Send notification on rate limit
-	Patterns []string `toml:"patterns"` // Custom patterns to detect (in addition to defaults)
+	Detect bool `toml:"detect"` // Enable rate limit detection
+	Notify bool `toml:"notify"` // Send notification on rate limit
 	// AutoRotate is a co-located convenience for callers who think of the
 	// "switch accounts when a rate limit hits" behaviour as a property of
 	// rate-limit handling rather than rotation. When true, it is folded into
@@ -542,57 +545,24 @@ func DefaultResilienceConfig() ResilienceConfig {
 		NotifyOnCrash:       true,  // Notify on crash by default
 		NotifyOnMaxRestarts: true,  // Notify when max restarts exceeded
 		RateLimit: RateLimitConfig{
-			Detect:   true, // Detect rate limits by default
-			Notify:   true, // Notify on rate limit by default
-			Patterns: nil,  // Use default patterns (rate limit, 429, too many requests, quota exceeded)
+			Detect: true, // Detect rate limits by default
+			Notify: true, // Notify on rate limit by default
 		},
 	}
 }
 
-// AccountEntry represents a single account for a provider
-type AccountEntry struct {
-	Email    string `toml:"email"`
-	Alias    string `toml:"alias"`
-	Priority int    `toml:"priority"`
-}
+// The [accounts] section (AccountsConfig/AccountEntry) was deprecated in
+// v1.28.0 (bd-6otuk): the whole section was parsed, validated, and printed
+// but consumed by nothing at runtime. See deprecatedKnobPrefixes in
+// removed_knobs.go.
 
-// AccountsConfig holds multi-account management configuration
-type AccountsConfig struct {
-	StateFile          string         `toml:"state_file"`            // Path to account state JSON
-	AutoRotate         bool           `toml:"auto_rotate"`           // Auto-rotate on limit detection
-	ResetBufferMinutes int            `toml:"reset_buffer_minutes"`  // Minutes before reset to consider available
-	Claude             []AccountEntry `toml:"claude"`                // Claude accounts
-	Codex              []AccountEntry `toml:"codex"`                 // Codex accounts
-	Gemini             []AccountEntry `toml:"gemini"`                // Gemini accounts
-	Antigravity        []AccountEntry `toml:"antigravity,omitempty"` // Antigravity (agy) accounts
-	Cursor             []AccountEntry `toml:"cursor,omitempty"`      // Cursor accounts
-	Windsurf           []AccountEntry `toml:"windsurf,omitempty"`    // Windsurf accounts
-	Aider              []AccountEntry `toml:"aider,omitempty"`       // Aider accounts
-	Ollama             []AccountEntry `toml:"ollama,omitempty"`      // Ollama accounts
-}
-
-// DefaultAccountsConfig returns the default accounts configuration
-func DefaultAccountsConfig() AccountsConfig {
-	return AccountsConfig{
-		StateFile:          "~/.config/ntm/account_state.json",
-		AutoRotate:         true,
-		ResetBufferMinutes: 15,
-		Claude:             nil,
-		Codex:              nil,
-		Gemini:             nil,
-		Cursor:             nil,
-		Windsurf:           nil,
-		Aider:              nil,
-		Ollama:             nil,
-	}
-}
-
-// RotationAccount represents a configured account for rotation
+// RotationAccount represents a configured account for rotation.
+// The priority key was deprecated in v1.28.0 (bd-6otuk): it was validated
+// but never used for ordering — accounts are used in the order written.
 type RotationAccount struct {
 	Provider string `toml:"provider"` // claude, codex, gemini
 	Email    string `toml:"email"`    // Account email
 	Alias    string `toml:"alias"`    // Short name for display (optional)
-	Priority int    `toml:"priority"` // Lower = higher priority (optional, default by order)
 }
 
 // RotationThresholds defines when to trigger account rotation
@@ -603,24 +573,29 @@ type RotationThresholds struct {
 	RestartIfSessionHours int     `toml:"restart_if_session_hours"` // Restart after N hours
 }
 
-// RotationDashboard defines dashboard display settings for rotation
-type RotationDashboard struct {
-	ShowQuotaBars     bool `toml:"show_quota_bars"`     // Show quota bars in dashboard
-	ShowAccountStatus bool `toml:"show_account_status"` // Show account status
-	ShowResetTimers   bool `toml:"show_reset_timers"`   // Show reset countdown
-}
-
 // RotationConfig holds account rotation configuration
 type RotationConfig struct {
 	Enabled            bool               `toml:"enabled"`             // Top-level toggle
-	PreferRestart      bool               `toml:"prefer_restart"`      // Prefer restart over switch
 	AutoOpenBrowser    bool               `toml:"auto_open_browser"`   // Auto-open browser for auth
 	AutoTrigger        bool               `toml:"auto_trigger"`        // Show notification when rate limit detected
 	AutoInitiate       bool               `toml:"auto_initiate"`       // Automatically start rotation (aggressive)
 	ContinuationPrompt string             `toml:"continuation_prompt"` // Prompt template on rotation
 	Accounts           []RotationAccount  `toml:"accounts"`            // Configured accounts per provider
 	Thresholds         RotationThresholds `toml:"thresholds"`
-	Dashboard          RotationDashboard  `toml:"dashboard"`
+
+	// UsagePercentThreshold enables the coordinator's context-rotation trigger
+	// (bd-rpmg8). When > 0, the session coordinator tick compares each agent
+	// pane's TRANSCRIPT-SOURCED context usage percentage (ground truth from the
+	// agent CLI's own session transcript — never scrollback estimates; that
+	// minimum-confidence gate is fixed, not configurable) against this value
+	// and enqueues a pending context rotation through the existing
+	// pending/confirm machinery when exceeded. 0 (the default) disables the
+	// trigger entirely: no transcript probing, no behavior change.
+	UsagePercentThreshold float64 `toml:"usage_percent_threshold"`
+	// AutoConfirm executes a context rotation enqueued by the usage trigger
+	// immediately via the existing confirm path instead of leaving it pending
+	// for a manual `ntm rotate context confirm`.
+	AutoConfirm bool `toml:"auto_confirm"`
 }
 
 // GetAccountsForProvider returns all accounts for a given provider in priority order
@@ -648,7 +623,6 @@ func (c *RotationConfig) SuggestNextAccount(provider, currentEmail string) *Rota
 func DefaultRotationConfig() RotationConfig {
 	return RotationConfig{
 		Enabled:            false, // Opt-in by default
-		PreferRestart:      true,  // Restart is cleaner than switch
 		AutoOpenBrowser:    false, // Don't auto-open browser
 		ContinuationPrompt: "Continue where you left off. Previous context: {{.Context}}",
 		Thresholds: RotationThresholds{
@@ -657,61 +631,16 @@ func DefaultRotationConfig() RotationConfig {
 			RestartIfTokensAbove:  100000,
 			RestartIfSessionHours: 8,
 		},
-		Dashboard: RotationDashboard{
-			ShowQuotaBars:     true,
-			ShowAccountStatus: true,
-			ShowResetTimers:   true,
-		},
+		UsagePercentThreshold: 0,     // Context-rotation trigger OFF by default (bd-rpmg8)
+		AutoConfirm:           false, // Enqueued rotations wait for manual confirm by default
 	}
-}
-
-// ValidateAccountsConfig validates account management configuration.
-func ValidateAccountsConfig(cfg *AccountsConfig) error {
-	if cfg.ResetBufferMinutes < 0 {
-		return fmt.Errorf("reset_buffer_minutes: must be non-negative, got %d", cfg.ResetBufferMinutes)
-	}
-
-	validateEntries := func(provider string, entries []AccountEntry) error {
-		for i, entry := range entries {
-			if strings.TrimSpace(entry.Email) == "" {
-				return fmt.Errorf("%s[%d].email: must not be empty", provider, i)
-			}
-			if entry.Priority < 0 {
-				return fmt.Errorf("%s[%d].priority: must be non-negative, got %d", provider, i, entry.Priority)
-			}
-		}
-		return nil
-	}
-
-	if err := validateEntries("claude", cfg.Claude); err != nil {
-		return err
-	}
-	if err := validateEntries("codex", cfg.Codex); err != nil {
-		return err
-	}
-	if err := validateEntries("gemini", cfg.Gemini); err != nil {
-		return err
-	}
-	if err := validateEntries("antigravity", cfg.Antigravity); err != nil {
-		return err
-	}
-	if err := validateEntries("cursor", cfg.Cursor); err != nil {
-		return err
-	}
-	if err := validateEntries("windsurf", cfg.Windsurf); err != nil {
-		return err
-	}
-	if err := validateEntries("aider", cfg.Aider); err != nil {
-		return err
-	}
-	if err := validateEntries("ollama", cfg.Ollama); err != nil {
-		return err
-	}
-	return nil
 }
 
 // ValidateRotationConfig validates account rotation configuration.
 func ValidateRotationConfig(cfg *RotationConfig) error {
+	if cfg.UsagePercentThreshold < 0 || cfg.UsagePercentThreshold > 100 {
+		return fmt.Errorf("usage_percent_threshold: must be between 0 and 100, got %g", cfg.UsagePercentThreshold)
+	}
 	if cfg.Thresholds.WarningPercent < 0 || cfg.Thresholds.WarningPercent > 100 {
 		return fmt.Errorf("thresholds.warning_percent: must be between 0 and 100, got %d", cfg.Thresholds.WarningPercent)
 	}
@@ -736,24 +665,20 @@ func ValidateRotationConfig(cfg *RotationConfig) error {
 		if strings.TrimSpace(account.Email) == "" {
 			return fmt.Errorf("accounts[%d].email: must not be empty", i)
 		}
-		if account.Priority < 0 {
-			return fmt.Errorf("accounts[%d].priority: must be non-negative, got %d", i, account.Priority)
-		}
 	}
 	return nil
 }
 
 // CASSConfig holds configuration for CASS (Coding Agent Session Search) integration
+// The cass.show_install_hints key and the [cass.duplicates]/[cass.search]/
+// [cass.tui] tables were deprecated in v1.28.0 (bd-6otuk): parsed and echoed
+// but consumed by nothing at runtime (duplicate checking reads CLI flags).
 type CASSConfig struct {
-	Enabled          bool   `toml:"enabled"`            // Top-level switch - disable all CASS features
-	ShowInstallHints bool   `toml:"show_install_hints"` // Show installation hints when CASS not found
-	BinaryPath       string `toml:"binary_path"`        // Path to cass binary (auto-detect from PATH if empty)
-	Timeout          int    `toml:"timeout"`            // Timeout for CASS operations (seconds)
+	Enabled    bool   `toml:"enabled"`     // Top-level switch - disable all CASS features
+	BinaryPath string `toml:"binary_path"` // Path to cass binary (auto-detect from PATH if empty)
+	Timeout    int    `toml:"timeout"`     // Timeout for CASS operations (seconds)
 
-	Context    CASSContextConfig   `toml:"context"`    // Context injection settings
-	Duplicates CASSDuplicateConfig `toml:"duplicates"` // Duplicate detection settings
-	Search     CASSSearchConfig    `toml:"search"`     // Search defaults
-	TUI        CASSTUIConfig       `toml:"tui"`        // TUI settings
+	Context CASSContextConfig `toml:"context"` // Context injection settings
 }
 
 // CASSContextConfig holds settings for automatic context injection
@@ -767,34 +692,12 @@ type CASSContextConfig struct {
 	PreferSameProject  bool    `toml:"prefer_same_project"`   // Prefer results from same project
 }
 
-// CASSDuplicateConfig holds settings for duplicate detection
-type CASSDuplicateConfig struct {
-	Enabled             bool    `toml:"enabled"`              // Check for duplicates before sending
-	SimilarityThreshold float64 `toml:"similarity_threshold"` // 0-1, higher = stricter matching
-	LookbackDays        int     `toml:"lookback_days"`        // How far back to check
-	PromptOnMatch       bool    `toml:"prompt_on_match"`      // Ask user before proceeding
-}
-
-// CASSSearchConfig holds default search settings
-type CASSSearchConfig struct {
-	DefaultLimit  int    `toml:"default_limit"`  // Default number of search results
-	DefaultFields string `toml:"default_fields"` // Default field selection
-	IncludeMeta   bool   `toml:"include_meta"`   // Include metadata in results
-}
-
-// CASSTUIConfig holds TUI-related CASS settings
-type CASSTUIConfig struct {
-	ShowActivitySparkline bool `toml:"show_activity_sparkline"` // Show activity sparkline in status bar
-	ShowStatusIndicator   bool `toml:"show_status_indicator"`   // Show CASS health indicator
-}
-
 // DefaultCASSConfig returns the default CASS configuration
 func DefaultCASSConfig() CASSConfig {
 	return CASSConfig{
-		Enabled:          true,
-		ShowInstallHints: true,
-		BinaryPath:       "", // Auto-detect from PATH
-		Timeout:          30,
+		Enabled:    true,
+		BinaryPath: "", // Auto-detect from PATH
+		Timeout:    30,
 
 		Context: CASSContextConfig{
 			Enabled:            true,
@@ -804,21 +707,6 @@ func DefaultCASSConfig() CASSConfig {
 			MinRelevance:       0.5, // Only include results with >= 50% relevance
 			SkipIfContextAbove: 80,  // Skip injection if context usage > 80%
 			PreferSameProject:  true,
-		},
-		Duplicates: CASSDuplicateConfig{
-			Enabled:             true,
-			SimilarityThreshold: 0.7,
-			LookbackDays:        7,
-			PromptOnMatch:       true,
-		},
-		Search: CASSSearchConfig{
-			DefaultLimit:  10,
-			DefaultFields: "summary",
-			IncludeMeta:   true,
-		},
-		TUI: CASSTUIConfig{
-			ShowActivitySparkline: true,
-			ShowStatusIndicator:   true,
 		},
 	}
 }
@@ -836,21 +724,20 @@ func ValidateGeminiSetupConfig(cfg *GeminiSetupConfig) error {
 
 // AgentConfig defines the commands for each agent type
 type AgentConfig struct {
-	Claude       string            `toml:"claude"`
-	Codex        string            `toml:"codex"`
-	Gemini       string            `toml:"gemini"`
-	Pi           string            `toml:"pi"`
-	Kimi         string            `toml:"kimi"`
-	Muse         string            `toml:"muse"`        // Muse Code (Meta) launch command
-	Antigravity  string            `toml:"antigravity"` // Antigravity (agy) launch command — successor to the Gemini CLI
-	Grok         string            `toml:"grok"`        // Official xAI Grok Build launch command
-	Ollama       string            `toml:"ollama"`
-	Cursor       string            `toml:"cursor"`
-	Windsurf     string            `toml:"windsurf"`
-	Aider        string            `toml:"aider"`
-	Opencode     string            `toml:"oc"`      // Opencode (https://opencode.ai) launch command — see ntm#116
-	Plugins      map[string]string `toml:"plugins"` // Custom agent commands keyed by type
-	DefaultCount int               `toml:"default_count"`
+	Claude      string `toml:"claude"`
+	Codex       string `toml:"codex"`
+	Gemini      string `toml:"gemini"`
+	Pi          string `toml:"pi"`
+	Kimi        string `toml:"kimi"`
+	Muse        string `toml:"muse"`        // Muse Code (Meta) launch command
+	Antigravity string `toml:"antigravity"` // Antigravity (agy) launch command — successor to the Gemini CLI
+	Grok        string `toml:"grok"`        // Official xAI Grok Build launch command
+	Ollama      string `toml:"ollama"`
+	Cursor      string `toml:"cursor"`
+	Windsurf    string `toml:"windsurf"`
+	Aider       string `toml:"aider"`
+	Opencode    string `toml:"oc"`  // Opencode (https://opencode.ai) launch command — see ntm#116
+	Omp         string `toml:"omp"` // Oh My Pi (omp) launch command; empty uses DefaultOmpCommand
 
 	// ClaudeIsolateCredentials opts Claude panes into per-pane
 	// CLAUDE_CONFIG_DIR isolation at spawn (GH#237). Claude Code rewrites the
@@ -882,16 +769,14 @@ func DefaultContextConfig() ContextConfig {
 
 // ContextRotationConfig holds configuration for automatic context window rotation
 type ContextRotationConfig struct {
-	Enabled              bool                     `toml:"enabled"`                // Top-level toggle for context rotation
-	WarningThreshold     float64                  `toml:"warning_threshold"`      // 0.0-1.0, warn when context usage exceeds this
-	RotateThreshold      float64                  `toml:"rotate_threshold"`       // 0.0-1.0, rotate agent when usage exceeds this
-	SummaryMaxTokens     int                      `toml:"summary_max_tokens"`     // Max tokens for handoff summary
-	MinSessionAgeSec     int                      `toml:"min_session_age_sec"`    // Don't rotate agents younger than this
-	TryCompactFirst      bool                     `toml:"try_compact_first"`      // Try to compact before rotating
-	RequireConfirm       bool                     `toml:"require_confirm"`        // Require user confirmation before rotating
-	ConfirmTimeoutSec    int                      `toml:"confirm_timeout_sec"`    // Seconds to wait for confirmation (0 = no auto-rotate)
-	DefaultConfirmAction string                   `toml:"default_confirm_action"` // Action if timeout expires: "rotate", "ignore", "compact"
-	Recovery             CompactionRecoveryConfig `toml:"recovery"`               // Compaction-recovery prompt behaviour (issue #113)
+	RotateThreshold  float64 `toml:"rotate_threshold"`   // 0.0-1.0, rotate agent when usage exceeds this
+	SummaryMaxTokens int     `toml:"summary_max_tokens"` // Max tokens for handoff summary
+	TryCompactFirst  bool    `toml:"try_compact_first"`  // Try to compact before rotating
+	// ConfirmTimeoutSec is how long a pending rotation request stays open for
+	// confirmation (0 = the default). Nothing runs when it lapses; the
+	// coordinator re-requests while the agent stays over its threshold.
+	ConfirmTimeoutSec int                      `toml:"confirm_timeout_sec"`
+	Recovery          CompactionRecoveryConfig `toml:"recovery"` // Compaction-recovery prompt behaviour (issue #113)
 }
 
 // CompactionRecoveryConfig holds configuration for the compaction recovery
@@ -932,43 +817,26 @@ func DefaultCompactionRecoveryConfig() CompactionRecoveryConfig {
 // DefaultContextRotationConfig returns sensible defaults for context rotation
 func DefaultContextRotationConfig() ContextRotationConfig {
 	return ContextRotationConfig{
-		Enabled:              true,
-		WarningThreshold:     0.80,     // Warn at 80%
-		RotateThreshold:      0.95,     // Rotate at 95%
-		SummaryMaxTokens:     2000,     // 2000 tokens for handoff summary
-		MinSessionAgeSec:     300,      // 5 minutes minimum session age
-		TryCompactFirst:      true,     // Try compaction before rotation
-		RequireConfirm:       false,    // Don't require confirmation by default
-		ConfirmTimeoutSec:    60,       // 60 seconds timeout for confirmation
-		DefaultConfirmAction: "rotate", // Auto-rotate on timeout
-		Recovery:             DefaultCompactionRecoveryConfig(),
+		RotateThreshold:  0.95, // Rotate at 95%
+		SummaryMaxTokens: 2000, // 2000 tokens for handoff summary
+		TryCompactFirst:  true, // Try compaction before rotation
+		// Ten minutes to answer a pending rotation. At 60s an unattended
+		// request lapsed and was re-requested (and re-announced) every minute.
+		ConfirmTimeoutSec: 600,
+		Recovery:          DefaultCompactionRecoveryConfig(),
 	}
 }
 
 // ValidateContextRotationConfig validates the context rotation configuration
 func ValidateContextRotationConfig(cfg *ContextRotationConfig) error {
-	if cfg.WarningThreshold < 0.0 || cfg.WarningThreshold > 1.0 {
-		return fmt.Errorf("warning_threshold must be between 0.0 and 1.0, got %f", cfg.WarningThreshold)
-	}
 	if cfg.RotateThreshold < 0.0 || cfg.RotateThreshold > 1.0 {
 		return fmt.Errorf("rotate_threshold must be between 0.0 and 1.0, got %f", cfg.RotateThreshold)
-	}
-	if cfg.WarningThreshold >= cfg.RotateThreshold {
-		return fmt.Errorf("warning_threshold (%f) must be less than rotate_threshold (%f)",
-			cfg.WarningThreshold, cfg.RotateThreshold)
 	}
 	if cfg.SummaryMaxTokens < 500 || cfg.SummaryMaxTokens > 10000 {
 		return fmt.Errorf("summary_max_tokens must be between 500 and 10000, got %d", cfg.SummaryMaxTokens)
 	}
-	if cfg.MinSessionAgeSec < 0 {
-		return fmt.Errorf("min_session_age_sec must be non-negative, got %d", cfg.MinSessionAgeSec)
-	}
 	if cfg.ConfirmTimeoutSec < 0 {
 		return fmt.Errorf("confirm_timeout_sec must be non-negative, got %d", cfg.ConfirmTimeoutSec)
-	}
-	validActions := map[string]bool{"rotate": true, "ignore": true, "compact": true, "": true}
-	if !validActions[cfg.DefaultConfirmAction] {
-		return fmt.Errorf("default_confirm_action must be 'rotate', 'ignore', or 'compact', got %q", cfg.DefaultConfirmAction)
 	}
 	return nil
 }
@@ -1075,7 +943,6 @@ type SessionRecoveryConfig struct {
 	IncludeBeadsContext bool `toml:"include_beads_context"` // Include BV task status
 	MaxRecoveryTokens   int  `toml:"max_recovery_tokens"`   // Cap recovery context size
 	AutoInjectOnSpawn   bool `toml:"auto_inject_on_spawn"`  // Send automatically on spawn
-	StaleThresholdHours int  `toml:"stale_threshold_hours"` // Ignore context older than this
 	MaxCMRules          int  `toml:"max_cm_rules"`          // Max CM rules to include (default: 10)
 	MaxCMSnippets       int  `toml:"max_cm_snippets"`       // Max CM history snippets (default: 3)
 	TimeoutSeconds      int  `toml:"timeout_seconds"`       // Window for gathering recovery sources before degrading to partial recovery
@@ -1103,7 +970,6 @@ func DefaultSessionRecoveryConfig() SessionRecoveryConfig {
 		IncludeBeadsContext: true, // Include bead/task context
 		MaxRecoveryTokens:   2000, // Token budget for recovery context
 		AutoInjectOnSpawn:   true, // Inject on spawn by default
-		StaleThresholdHours: 24,   // Consider context up to 24 hours old
 		MaxCMRules:          10,   // Max CM rules to include
 		MaxCMSnippets:       3,    // Max CM history snippets
 		TimeoutSeconds:      15,   // Gather recovery sources for at most 15s, then degrade
@@ -1178,34 +1044,49 @@ func ValidateFileReservationConfig(cfg *FileReservationConfig) error {
 // MemoryConfig holds configuration for CASS Memory (cm) integration.
 // When enabled, NTM can query the memory system for relevant context
 // before starting tasks and include learned rules in session recovery.
+//
+// Session-recovery tuning lives in [recovery], not here: include_cm_memories,
+// max_cm_rules and timeout_seconds are the single knobs for it. [memory]
+// keeps only what it actually owns — whether the integration is on at all,
+// how long a cm query may take, and the send-time injection budget. The
+// overlapping memory.include_in_recovery / memory.max_rules aliases were
+// removed (ntm#323); `ntm config migrate` strips them from existing files.
 type MemoryConfig struct {
-	Enabled             bool `toml:"enabled"`               // Top-level toggle for memory integration
-	IncludeInRecovery   bool `toml:"include_in_recovery"`   // Include memory context in session recovery
-	MaxRules            int  `toml:"max_rules"`             // Maximum number of rules to inject
-	IncludeAntiPatterns bool `toml:"include_anti_patterns"` // Include anti-patterns in context
-	IncludeHistory      bool `toml:"include_history"`       // Include historical snippets
-	QueryTimeoutSeconds int  `toml:"query_timeout_seconds"` // Timeout for cm command
+	Enabled bool `toml:"enabled"` // Top-level toggle for memory integration
+	// QueryTimeoutSeconds bounds a cm query issued for send-time injection.
+	// Session recovery has its own budget in recovery.timeout_seconds.
+	QueryTimeoutSeconds int `toml:"query_timeout_seconds"`
+
+	// Per-task rule injection at send time (--with-memory, bd-3j6hm).
+	// send_injection makes robot sends inject rules by default (the
+	// --with-memory flag enables it per call regardless); send_max_rules and
+	// send_budget_tokens bound the injected block.
+	SendInjection    bool `toml:"send_injection"`     // Inject rules on robot sends by default
+	SendMaxRules     int  `toml:"send_max_rules"`     // Max rules injected per send
+	SendBudgetTokens int  `toml:"send_budget_tokens"` // Token budget for the injected block
 }
 
 // DefaultMemoryConfig returns sensible defaults for memory integration.
 func DefaultMemoryConfig() MemoryConfig {
 	return MemoryConfig{
-		Enabled:             true, // Enabled by default (when cm is available)
-		IncludeInRecovery:   true, // Include in session recovery context
-		MaxRules:            10,   // Cap number of rules to inject
-		IncludeAntiPatterns: true, // Include anti-patterns by default
-		IncludeHistory:      true, // Include historical snippets
-		QueryTimeoutSeconds: 5,    // 5 second timeout for cm queries
+		Enabled:             true,  // Enabled by default (when cm is available)
+		QueryTimeoutSeconds: 5,     // 5 second timeout for cm queries
+		SendInjection:       false, // Opt-in: --with-memory drives per-call injection
+		SendMaxRules:        5,     // Top-N rules injected per send
+		SendBudgetTokens:    1500,  // Token budget for the injected rules block
 	}
 }
 
 // ValidateMemoryConfig validates the memory configuration.
 func ValidateMemoryConfig(cfg *MemoryConfig) error {
-	if cfg.MaxRules < 0 {
-		return fmt.Errorf("max_rules must be non-negative, got %d", cfg.MaxRules)
-	}
 	if cfg.QueryTimeoutSeconds < 1 {
 		return fmt.Errorf("query_timeout_seconds must be at least 1, got %d", cfg.QueryTimeoutSeconds)
+	}
+	if cfg.SendMaxRules < 0 {
+		return fmt.Errorf("send_max_rules must be non-negative, got %d", cfg.SendMaxRules)
+	}
+	if cfg.SendBudgetTokens < 0 {
+		return fmt.Errorf("send_budget_tokens must be non-negative, got %d", cfg.SendBudgetTokens)
 	}
 	return nil
 }
@@ -1271,39 +1152,9 @@ type PaletteState struct {
 
 // TmuxConfig holds tmux-specific settings
 type TmuxConfig struct {
-	DefaultPanes    int    `toml:"default_panes"`
-	PaletteKey      string `toml:"palette_key"`
-	PaneInitDelayMs int    `toml:"pane_init_delay_ms"` // Delay before sending keys to new panes
-	HistoryLimit    int    `toml:"history_limit"`      // Scrollback buffer lines per pane (default 50000)
-	// ActivityIndicators control pane border activity coloring.
-	ActivityIndicators ActivityIndicatorConfig `toml:"activity_indicators"`
-}
-
-// ActivityIndicatorConfig controls tmux pane border color thresholds.
-type ActivityIndicatorConfig struct {
-	Enabled        bool `toml:"enabled"`         // Top-level toggle for activity indicators
-	ActiveSeconds  int  `toml:"active_seconds"`  // Seconds since activity to be considered active
-	StalledSeconds int  `toml:"stalled_seconds"` // Seconds since activity to be considered stalled
-}
-
-// DefaultActivityIndicatorConfig returns sensible defaults for pane activity indicators.
-func DefaultActivityIndicatorConfig() ActivityIndicatorConfig {
-	return ActivityIndicatorConfig{
-		Enabled:        true,
-		ActiveSeconds:  30,
-		StalledSeconds: 120,
-	}
-}
-
-// ValidateActivityIndicatorConfig validates activity indicator thresholds.
-func ValidateActivityIndicatorConfig(cfg *ActivityIndicatorConfig) error {
-	if cfg.ActiveSeconds < 1 {
-		return fmt.Errorf("active_seconds must be at least 1, got %d", cfg.ActiveSeconds)
-	}
-	if cfg.StalledSeconds <= cfg.ActiveSeconds {
-		return fmt.Errorf("stalled_seconds (%d) must be greater than active_seconds (%d)", cfg.StalledSeconds, cfg.ActiveSeconds)
-	}
-	return nil
+	DefaultPanes    int `toml:"default_panes"`
+	PaneInitDelayMs int `toml:"pane_init_delay_ms"` // Delay before sending keys to new panes
+	HistoryLimit    int `toml:"history_limit"`      // Scrollback buffer lines per pane (default 50000)
 }
 
 // AgentMailConfig holds Agent Mail server settings
@@ -1312,7 +1163,6 @@ type AgentMailConfig struct {
 	URL          string `toml:"url"`           // Server endpoint
 	Token        string `toml:"token"`         // Bearer token
 	AutoRegister bool   `toml:"auto_register"` // Auto-register sessions as agents
-	ProgramName  string `toml:"program_name"`  // Program identifier for registration
 	// SupervisorEnabled controls whether ntm spawns and manages the
 	// `am serve-http` daemon under its supervisor. Default false keeps
 	// Agent Mail ownership external: ntm may use the configured MCP URL,
@@ -1320,6 +1170,21 @@ type AgentMailConfig struct {
 	// `am` process on port 8765. Set to true only when you explicitly want
 	// ntm to own the Agent Mail daemon lifecycle for a session.
 	SupervisorEnabled *bool `toml:"supervisor_enabled,omitempty"`
+	// PaneBadges shows each managed pane's assigned Agent Mail name in its
+	// tmux pane border next to the pane title, with a compact drift marker
+	// (`[BlueLake!]`) when the canonical identity file disagrees with the
+	// name NTM assigned (ntm#312). Badge state is cached in per-pane tmux user
+	// options written at identity assignment (before the agent launches) and
+	// reconciled on spawn/add/adopt/restart and `ntm mapping`; the border
+	// renders only the cached value. Default false (opt-in) so enabling NTM
+	// never changes an existing tmux layout unasked. Requires Enabled.
+	PaneBadges *bool `toml:"pane_badges,omitempty"`
+	// PaneBadgeFormat is the badge label template. Tokens: {name} (assigned
+	// name, "?" when unresolved), {drift} ("!" on any discrepancy) and
+	// {lifecycle} (" (starting)", " (exited)", " (unknown)", empty while
+	// running). Default "[{name}{drift}]{lifecycle}". tmux format syntax is
+	// not allowed; the rendered label is sanitised before it reaches tmux.
+	PaneBadgeFormat string `toml:"pane_badge_format,omitempty"`
 }
 
 // SupervisorEnabledOrDefault returns the effective value of
@@ -1333,17 +1198,12 @@ func (a AgentMailConfig) SupervisorEnabledOrDefault() bool {
 
 // NewClient builds the Agent Mail client for projectKey from these settings.
 // Every surface builds its client here so the server is resolved one way:
-// AGENT_MAIL_URL and AGENT_MAIL_TOKEN override url and token, which override
-// the client defaults. When Enabled is false the client answers every call
-// with agentmail.ErrDisabled instead of contacting the server.
+// AGENT_MAIL_URL and AGENT_MAIL_TOKEN override url and token (see
+// agentmail.ConfigOptions), which override the client defaults. When Enabled
+// is false the client answers every call with agentmail.ErrDisabled instead of
+// contacting the server.
 func (a AgentMailConfig) NewClient(projectKey string) *agentmail.Client {
-	opts := []agentmail.Option{agentmail.WithProjectKey(projectKey)}
-	if a.URL != "" && os.Getenv("AGENT_MAIL_URL") == "" {
-		opts = append(opts, agentmail.WithBaseURL(a.URL))
-	}
-	if a.Token != "" && os.Getenv("AGENT_MAIL_TOKEN") == "" {
-		opts = append(opts, agentmail.WithToken(a.Token))
-	}
+	opts := append([]agentmail.Option{agentmail.WithProjectKey(projectKey)}, agentmail.ConfigOptions(a.URL, a.Token)...)
 	if !a.Enabled {
 		opts = append(opts, agentmail.WithDisabled())
 	}
@@ -1362,16 +1222,76 @@ func AgentMailForProject(projectDir string) AgentMailConfig {
 	return cfg.AgentMail
 }
 
+// PaneBadgesOrDefault returns the effective value of PaneBadges with the
+// documented default-false semantics applied. Badges also require Enabled:
+// with Agent Mail off there are no assigned identities to display.
+func (a AgentMailConfig) PaneBadgesOrDefault() bool {
+	if !a.Enabled || a.PaneBadges == nil {
+		return false
+	}
+	return *a.PaneBadges
+}
+
+// PaneBadgeFormatOrDefault returns the badge label template, falling back to
+// agentmail.DefaultBadgeTemplate when unset.
+func (a AgentMailConfig) PaneBadgeFormatOrDefault() string {
+	if strings.TrimSpace(a.PaneBadgeFormat) == "" {
+		return agentmail.DefaultBadgeTemplate
+	}
+	return a.PaneBadgeFormat
+}
+
+// ValidateAgentMailConfig validates Agent Mail settings.
+func ValidateAgentMailConfig(cfg *AgentMailConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if err := agentmail.ValidateBadgeTemplate(cfg.PaneBadgeFormat); err != nil {
+		return fmt.Errorf("pane_badge_format: %w", err)
+	}
+	return nil
+}
+
 // IntegrationsConfig holds external tool integration settings.
 type IntegrationsConfig struct {
 	DCG           DCGConfig           `toml:"dcg"`
 	CAAM          CAAMConfig          `toml:"caam"`           // CAAM (Coding Agent Account Manager) integration
 	RCH           RCHConfig           `toml:"rch"`            // RCH (Remote Compilation Helper) integration
-	Caut          CautConfig          `toml:"caut"`           // caut (Cloud API Usage Tracker) integration
 	ProcessTriage ProcessTriageConfig `toml:"process_triage"` // pt (process_triage) Bayesian health classification
 	Rano          RanoConfig          `toml:"rano"`           // rano network observer for per-agent API tracking
-	Proxy         ProxyConfig         `toml:"proxy"`          // rust_proxy (local HTTP proxy) integration
 	XF            XFConfig            `toml:"xf"`             // xf (X/Twitter archive search) integration
+	BV            BVConfig            `toml:"bv"`             // bv (beads_viewer) graph analysis integration
+}
+
+// BVConfig holds configuration for the bv (beads_viewer) integration.
+// bv resolves from PATH; there is no enable switch because every bv surface
+// already degrades gracefully when the binary is missing.
+type BVConfig struct {
+	// TimeoutSeconds bounds each bv subprocess ntm launches (--robot-insights,
+	// --robot-triage, --robot-plan, --check-drift, ...). On medium repos the
+	// cached robot-insights path can exceed the historical hard-coded 30s and
+	// silently degrade the dependency-cycle check (GH#253). The NTM_BV_TIMEOUT
+	// environment variable (whole seconds) overrides this value.
+	TimeoutSeconds int `toml:"timeout_seconds"`
+}
+
+// DefaultBVConfig returns defaults for the bv integration. 30 seconds
+// preserves the historical hard-coded timeout.
+func DefaultBVConfig() BVConfig {
+	return BVConfig{
+		TimeoutSeconds: 30,
+	}
+}
+
+// ValidateBVConfig validates bv integration configuration.
+func ValidateBVConfig(cfg *BVConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.TimeoutSeconds <= 0 {
+		return fmt.Errorf("timeout_seconds must be positive, got %d", cfg.TimeoutSeconds)
+	}
+	return nil
 }
 
 // DCGConfig holds configuration for the DCG (destructive_commit_guard) integration.
@@ -1415,6 +1335,41 @@ type AssignConfig struct {
 	// too-small value falsely fails in-progress work and then injects the
 	// NEXT bead's prompt into the still-working agent mid-task.
 	IdleThreshold string `toml:"idle_threshold"`
+	// WorkSource is the opt-in policy every automated dispatch path and work
+	// snapshot applies to the project's canonical Beads JSONL (GH #283).
+	WorkSource WorkSourceConfig `toml:"work_source"`
+}
+
+// WorkSourceConfig is [assign.work_source]. The zero value permits ordinary
+// local development: dirty, unpushed, any program.
+type WorkSourceConfig struct {
+	// RequiredRef is a full local ref name (e.g. "refs/remotes/origin/main")
+	// that HEAD must equal before work is dispatched or advertised. ntm never
+	// fetches or checks it out; refresh it yourself.
+	RequiredRef string `toml:"required_ref"`
+	// RequireClean refuses work from a checkout with uncommitted changes.
+	RequireClean bool `toml:"require_clean"`
+	// ProgramLabels limits work to beads carrying one of these labels (e.g.
+	// "program:lms"); other beads are excluded as program_scope.
+	ProgramLabels []string `toml:"program_labels"`
+}
+
+// Policy converts the configuration to the work-source policy it enables.
+func (c WorkSourceConfig) Policy() worksource.ProjectPolicy {
+	return worksource.ProjectPolicy{
+		RequiredRef:   strings.TrimSpace(c.RequiredRef),
+		RequireClean:  c.RequireClean,
+		ProgramLabels: append([]string(nil), c.ProgramLabels...),
+	}
+}
+
+// ValidateWorkSourceConfig rejects a required ref that could never match, so
+// a typo fails at configuration time instead of refusing every dispatch.
+func ValidateWorkSourceConfig(cfg *WorkSourceConfig) error {
+	if cfg == nil || strings.TrimSpace(cfg.RequiredRef) == "" {
+		return nil
+	}
+	return worksource.ValidateRequiredRef(cfg.RequiredRef)
 }
 
 // DefaultAssignIdleThreshold is the default watch-loop inactivity window
@@ -1574,118 +1529,140 @@ func DefaultIntegrationsConfig() IntegrationsConfig {
 		},
 		CAAM:          DefaultCAAMConfig(),
 		RCH:           DefaultRCHConfig(),
-		Caut:          DefaultCautConfig(),
 		ProcessTriage: DefaultProcessTriageConfig(),
 		Rano:          DefaultRanoConfig(),
-		Proxy:         DefaultProxyConfig(),
 		XF:            DefaultXFConfig(),
+		BV:            DefaultBVConfig(),
 	}
 }
 
 // CAAMConfig holds configuration for CAAM (Coding Agent Account Manager) integration.
 // CAAM provides automatic account rotation when rate limits are hit.
+// The enabled/auto_rotate/providers keys were deprecated in v1.28.0
+// (bd-6otuk): caam availability is probed at call time and rotation is
+// governed by [rotation] and the --auto-rotate-accounts flag.
 type CAAMConfig struct {
-	Enabled           bool     `toml:"enabled"`             // Enable CAAM account management
-	BinaryPath        string   `toml:"binary_path"`         // Path to caam binary (optional, defaults to PATH lookup)
-	AutoRotate        bool     `toml:"auto_rotate"`         // Enable automatic account rotation on rate limit
-	Providers         []string `toml:"providers"`           // Providers to manage (empty = all available)
-	RateLimitPatterns []string `toml:"rate_limit_patterns"` // Custom rate limit detection patterns
-	AccountCooldown   int      `toml:"account_cooldown"`    // Cooldown before retrying same account (seconds)
-	AlertThreshold    int      `toml:"alert_threshold"`     // Alert threshold (percentage of limit)
+	BinaryPath string `toml:"binary_path"` // Path to caam binary (optional, defaults to PATH lookup)
+
+	// AutoFailover enables the coordinator's automatic account failover
+	// (bd-um3uy): when a coordinator tick observes a banner-verified rate
+	// limit on an agent pane whose reset lies beyond reset_horizon_minutes,
+	// and a verified alternate caam account with headroom exists, the
+	// coordinator switches accounts through the same machinery
+	// --robot-switch-account uses. Default false: no caam probing, no new
+	// subprocess calls, no behavior change.
+	AutoFailover bool `toml:"auto_failover"`
+
+	// ResetHorizonMinutes is the minimum detected-reset distance that
+	// justifies an automatic failover: limits that reset sooner than this
+	// are waited out instead of burning an account switch. A reset hint that
+	// cannot be parsed into a time is treated as BEYOND the horizon (a
+	// long-lived limit is the common case for unparseable phrasing, and the
+	// remaining gates — verified alternate, per-pane hourly cooldown — bound
+	// the blast radius). 0 fails over on any detected limit. Must be >= 0.
+	ResetHorizonMinutes int `toml:"reset_horizon_minutes"`
+
+	// FailoverProviders is the per-provider allow-list for auto-failover
+	// (canonical names: "claude", "openai", "gemini"). Empty means NO
+	// providers — the feature is doubly opt-in (auto_failover AND an
+	// explicit allow-list). Deliberately separate from Providers above,
+	// whose empty value means "all available".
+	FailoverProviders []string `toml:"failover_providers"`
+
+	// SeatSelection enables policy-driven seat selection at pane launch
+	// (ntm#319): a `spawn`/`add` pane that carries no persona pin asks caam
+	// which account to launch on, ranked by EARLIEST RESET WITH HEADROOM, so
+	// included quota that is about to refresh is spent first and a
+	// later-resetting reserve seat is preserved.
+	//
+	// The key is named for the POLICY, not for caam, precisely so it is not
+	// read as a sibling of AutoFailover above. The two are unrelated and do
+	// not interact: AutoFailover swaps the HOST credential mid-session for a
+	// running pane; seat selection only chooses which persona a NEW pane
+	// launches under, and never touches a pane that is already running.
+	//
+	// Default false. Off, nothing calls caam and launch behavior is
+	// byte-identical to a host without caam installed. On, an unpinned pane
+	// whose seat cannot be determined is SKIPPED with the reason reported —
+	// printed for an interactive run, carried in `seat_skips` under --json,
+	// and surfaced through AddOptions.Outcome for composed callers like
+	// `ntm scale` that see neither. It never falls through to whatever the
+	// agent command template pins statically, because that fallthrough is the
+	// bug this exists to fix.
+	// A pinned pane (an explicit --persona / --profile-set) always keeps its
+	// pin and is never re-ranked.
+	SeatSelection bool `toml:"seat_selection"`
 }
 
 // DefaultCAAMConfig returns sensible defaults for CAAM integration.
 func DefaultCAAMConfig() CAAMConfig {
 	return CAAMConfig{
-		Enabled:           true,                                   // Enabled by default (when caam is available)
-		BinaryPath:        "",                                     // Default to PATH lookup
-		AutoRotate:        true,                                   // Auto-rotate on rate limit by default
-		Providers:         []string{"claude", "openai", "gemini"}, // Manage all major providers
-		RateLimitPatterns: nil,                                    // Use built-in patterns
-		AccountCooldown:   300,                                    // 5 minute cooldown
-		AlertThreshold:    80,                                     // Alert at 80% of limit
+		BinaryPath: "", // Default to PATH lookup
+
+		AutoFailover:        false, // Coordinator auto-failover OFF by default (bd-um3uy)
+		ResetHorizonMinutes: 30,    // Only fail over when the reset is > 30 minutes away
+		FailoverProviders:   nil,   // Empty allow-list = no providers (doubly opt-in)
+		SeatSelection:       false, // Spawn/add seat selection OFF by default (ntm#319)
 	}
+}
+
+// ValidateCAAMConfig validates CAAM integration configuration.
+func ValidateCAAMConfig(cfg *CAAMConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.ResetHorizonMinutes < 0 {
+		return fmt.Errorf("reset_horizon_minutes must be >= 0, got %d", cfg.ResetHorizonMinutes)
+	}
+	return nil
 }
 
 // RCHConfig holds configuration for RCH (Remote Compilation Helper) integration.
 // RCH provides build offloading to remote workers for faster compilation.
+// The min_build_time/fallback_local/show_location/preferred_worker/
+// dcg_whitelist keys were deprecated in v1.28.0 (bd-6otuk): parsed and
+// echoed but consumed by nothing (dcg_whitelist was a documented legacy
+// no-op).
 type RCHConfig struct {
 	Enabled           bool     `toml:"enabled"`            // Enable RCH build offloading
 	BinaryPath        string   `toml:"binary_path"`        // Path to rch binary (optional, defaults to PATH lookup)
-	MinBuildTime      int      `toml:"min_build_time"`     // Minimum build time (seconds) to consider remote; builds faster than this run locally
 	InterceptPatterns []string `toml:"intercept_patterns"` // Commands to intercept (regex patterns)
-	FallbackLocal     bool     `toml:"fallback_local"`     // Fallback to local build on RCH failure
-	ShowLocation      bool     `toml:"show_location"`      // Show build location in output
-	PreferredWorker   string   `toml:"preferred_worker"`   // Worker preference (by name or "auto")
-	DCGWhitelist      bool     `toml:"dcg_whitelist"`      // Legacy no-op: modern DCG handles RCH hook commands directly
 }
 
 // DefaultRCHConfig returns sensible defaults for RCH integration.
 func DefaultRCHConfig() RCHConfig {
 	return RCHConfig{
-		Enabled:      true, // Enabled by default (when rch is available)
-		BinaryPath:   "",   // Default to PATH lookup
-		MinBuildTime: 10,   // Only offload builds expected to take 10+ seconds
+		Enabled:    true, // Enabled by default (when rch is available)
+		BinaryPath: "",   // Default to PATH lookup
 		InterceptPatterns: []string{
 			"^cargo (build|test|check|rustc)",
 			"^go (build|test)",
 			"^npm run build",
 			"^make",
 		},
-		FallbackLocal:   true,   // Fallback to local if remote fails
-		ShowLocation:    true,   // Show where build ran
-		PreferredWorker: "auto", // Auto-select best worker
-		DCGWhitelist:    true,   // Legacy no-op retained in config files
-	}
-}
-
-// CautConfig holds configuration for caut (Cloud API Usage Tracker) integration.
-// caut tracks API usage, quotas, and spending across cloud providers.
-type CautConfig struct {
-	Enabled          bool     `toml:"enabled"`            // Enable caut usage tracking integration
-	BinaryPath       string   `toml:"binary_path"`        // Path to caut binary (optional, defaults to PATH lookup)
-	PollInterval     int      `toml:"poll_interval"`      // Polling interval in seconds
-	AlertThreshold   int      `toml:"alert_threshold"`    // Alert threshold (percentage of quota)
-	Providers        []string `toml:"providers"`          // Providers to track (empty = all available)
-	PerAgentTracking bool     `toml:"per_agent_tracking"` // Enable per-agent usage attribution
-	Currency         string   `toml:"currency"`           // Cost display currency
-}
-
-// DefaultCautConfig returns sensible defaults for caut integration.
-func DefaultCautConfig() CautConfig {
-	return CautConfig{
-		Enabled:          true,  // Enabled by default (when caut is available)
-		BinaryPath:       "",    // Default to PATH lookup
-		PollInterval:     60,    // Poll every 60 seconds
-		AlertThreshold:   80,    // Alert at 80% quota usage
-		Providers:        nil,   // Track all available providers
-		PerAgentTracking: true,  // Enable per-agent tracking if supported
-		Currency:         "USD", // Default to USD
 	}
 }
 
 // ProcessTriageConfig holds configuration for process_triage (pt) integration.
 // pt uses Bayesian classification to identify useful, abandoned, and zombie processes.
+// The binary_path key was deprecated in v1.28.0 (bd-6otuk): the pt adapter
+// resolves the binary from PATH.
 type ProcessTriageConfig struct {
-	Enabled        bool   `toml:"enabled"`         // Enable process triage integration
-	BinaryPath     string `toml:"binary_path"`     // Path to pt binary (optional, defaults to PATH lookup)
-	CheckInterval  int    `toml:"check_interval"`  // How often to check processes (seconds)
-	IdleThreshold  int    `toml:"idle_threshold"`  // Seconds of idle before considering abandoned
-	StuckThreshold int    `toml:"stuck_threshold"` // Seconds stuck before considering zombie
-	OnStuck        string `toml:"on_stuck"`        // Action when stuck: "alert", "kill", "ignore"
-	UseRanoData    bool   `toml:"use_rano_data"`   // Use rano network data to improve classification
+	Enabled        bool `toml:"enabled"`         // Enable process triage integration
+	CheckInterval  int  `toml:"check_interval"`  // How often to check processes (seconds)
+	IdleThreshold  int  `toml:"idle_threshold"`  // Seconds of idle before considering abandoned
+	StuckThreshold int  `toml:"stuck_threshold"` // Seconds stuck before considering zombie
+	UseRanoData    bool `toml:"use_rano_data"`   // Use rano network data to improve classification
 }
 
 // DefaultProcessTriageConfig returns sensible defaults for process_triage integration.
 func DefaultProcessTriageConfig() ProcessTriageConfig {
 	return ProcessTriageConfig{
-		Enabled:        true,    // Enabled by default (when pt is available)
-		BinaryPath:     "",      // Default to PATH lookup
-		CheckInterval:  30,      // Check every 30 seconds
-		IdleThreshold:  300,     // 5 minutes idle = abandoned candidate
-		StuckThreshold: 600,     // 10 minutes stuck = zombie candidate
-		OnStuck:        "alert", // Alert by default, don't auto-kill
-		UseRanoData:    true,    // Use rano data when available
+		Enabled:        true, // Enabled by default (when pt is available)
+		CheckInterval:  30,   // Check every 30 seconds
+		IdleThreshold:  300,  // 5 minutes idle = abandoned candidate
+		StuckThreshold: 600,  // 10 minutes stuck = zombie candidate
+		UseRanoData:    true, // Use rano data when available
 	}
 }
 
@@ -1696,19 +1673,8 @@ func ValidateProcessTriageConfig(cfg *ProcessTriageConfig) error {
 	}
 
 	// Skip validation for unconfigured/zero-valued configs (use defaults)
-	if !cfg.Enabled && cfg.CheckInterval == 0 && cfg.IdleThreshold == 0 && cfg.StuckThreshold == 0 && cfg.OnStuck == "" {
+	if !cfg.Enabled && cfg.CheckInterval == 0 && cfg.IdleThreshold == 0 && cfg.StuckThreshold == 0 {
 		return nil
-	}
-
-	if cfg.BinaryPath != "" {
-		path := ExpandHome(cfg.BinaryPath)
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("binary_path: %w", err)
-		}
-		if info.IsDir() {
-			return fmt.Errorf("binary_path: %q is a directory", path)
-		}
 	}
 
 	if cfg.CheckInterval < 5 {
@@ -1723,34 +1689,28 @@ func ValidateProcessTriageConfig(cfg *ProcessTriageConfig) error {
 		return fmt.Errorf("stuck_threshold (%d) must be >= idle_threshold (%d)", cfg.StuckThreshold, cfg.IdleThreshold)
 	}
 
-	validActions := map[string]bool{"alert": true, "kill": true, "ignore": true}
-	if !validActions[cfg.OnStuck] {
-		return fmt.Errorf("on_stuck must be 'alert', 'kill', or 'ignore', got %q", cfg.OnStuck)
-	}
-
 	return nil
 }
 
 // RanoConfig holds configuration for the rano network observer integration.
-// rano monitors network activity per process, enabling per-agent API tracking.
+// rano's monitor records per-process connection events into an SQLite
+// database; ntm reads that history with `rano export` for per-agent
+// connection counts. ntm does not start the monitor.
+// The binary_path/providers keys were deprecated in v1.28.0 (bd-6otuk):
+// the rano adapter resolves the binary from PATH and tracks all known
+// providers.
 type RanoConfig struct {
-	Enabled        bool     `toml:"enabled"`          // Enable rano network monitoring integration
-	BinaryPath     string   `toml:"binary_path"`      // Path to rano binary (optional, defaults to PATH lookup)
-	PollIntervalMs int      `toml:"poll_interval_ms"` // Polling interval in milliseconds
-	Providers      []string `toml:"providers"`        // Track these providers (empty = all known: anthropic, openai, google)
-	PersistHistory bool     `toml:"persist_history"`  // Persist historical network data
-	HistoryDays    int      `toml:"history_days"`     // Days to retain historical data
+	Enabled        bool   `toml:"enabled"`          // Enable rano network monitoring integration
+	PollIntervalMs int    `toml:"poll_interval_ms"` // Polling interval in milliseconds
+	SQLitePath     string `toml:"sqlite_path"`      // rano observer database ntm reads (rano's --sqlite / sqlite=); relative paths resolve against the working directory
 }
 
 // DefaultRanoConfig returns sensible defaults for rano integration.
 func DefaultRanoConfig() RanoConfig {
 	return RanoConfig{
-		Enabled:        true,                                      // Enabled by default (when rano is available)
-		BinaryPath:     "",                                        // Default to PATH lookup
-		PollIntervalMs: 1000,                                      // Poll every second
-		Providers:      []string{"anthropic", "openai", "google"}, // Track major AI providers
-		PersistHistory: true,                                      // Keep historical data
-		HistoryDays:    7,                                         // Retain for a week
+		Enabled:        true,              // Enabled by default (when rano is available)
+		PollIntervalMs: 1000,              // Poll every second
+		SQLitePath:     "observer.sqlite", // rano's own default database name
 	}
 }
 
@@ -1761,157 +1721,61 @@ func ValidateRanoConfig(cfg *RanoConfig) error {
 	}
 
 	// Skip validation for unconfigured/zero-valued configs (use defaults)
-	if !cfg.Enabled && cfg.PollIntervalMs == 0 && len(cfg.Providers) == 0 {
+	if !cfg.Enabled && cfg.PollIntervalMs == 0 {
 		return nil
-	}
-
-	if cfg.BinaryPath != "" {
-		path := ExpandHome(cfg.BinaryPath)
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("binary_path: %w", err)
-		}
-		if info.IsDir() {
-			return fmt.Errorf("binary_path: %q is a directory", path)
-		}
 	}
 
 	if cfg.PollIntervalMs < 100 {
 		return fmt.Errorf("poll_interval_ms must be at least 100ms, got %d", cfg.PollIntervalMs)
 	}
 
-	if cfg.HistoryDays < 0 {
-		return fmt.Errorf("history_days must be non-negative, got %d", cfg.HistoryDays)
-	}
-
-	return nil
-}
-
-// ProxyConfig holds configuration for rust_proxy integration.
-// rust_proxy provides a lightweight local HTTP proxy used by some workflows.
-type ProxyConfig struct {
-	Enabled       bool   `toml:"enabled"`        // Enable rust_proxy integration
-	BinPath       string `toml:"bin_path"`       // Path to rust_proxy binary (or command name in PATH)
-	CheckInterval string `toml:"check_interval"` // How often to poll health/status (duration string, e.g. "30s")
-}
-
-// DefaultProxyConfig returns sensible defaults for rust_proxy integration.
-func DefaultProxyConfig() ProxyConfig {
-	return ProxyConfig{
-		Enabled:       true,
-		BinPath:       "rust_proxy",
-		CheckInterval: "30s",
-	}
-}
-
-// ValidateProxyConfig validates the rust_proxy configuration.
-func ValidateProxyConfig(cfg *ProxyConfig) error {
-	if cfg == nil {
-		return nil
-	}
-
-	// Skip validation for unconfigured/zero-valued configs (use defaults).
-	if !cfg.Enabled && cfg.BinPath == "" && cfg.CheckInterval == "" {
-		return nil
-	}
-	if !cfg.Enabled {
-		return nil
-	}
-
-	if strings.TrimSpace(cfg.BinPath) == "" {
-		return fmt.Errorf("bin_path: must be non-empty when enabled")
-	}
-	if strings.TrimSpace(cfg.CheckInterval) == "" {
-		return fmt.Errorf("check_interval: must be non-empty when enabled")
-	}
-	d, err := time.ParseDuration(strings.TrimSpace(cfg.CheckInterval))
-	if err != nil {
-		return fmt.Errorf("check_interval: %w", err)
-	}
-	if d <= 0 {
-		return fmt.Errorf("check_interval: must be > 0, got %q", cfg.CheckInterval)
-	}
 	return nil
 }
 
 // XFConfig holds configuration for xf (X/Twitter archive search) integration.
 // xf enables querying local X/Twitter archives from NTM via robot/tool bridges.
+// Only the enabled toggle remains: it gates the built-in xf-search palette
+// entry (internal/robot GetPalette). The former bin_path/archive_path/
+// default_mode knobs were removed in v1.26.0 (bd-ws6-config-truth-ienmd.2) —
+// the shipped xf surfaces resolve the binary from PATH.
 type XFConfig struct {
-	Enabled     bool   `toml:"enabled"`      // Enable xf integration
-	BinPath     string `toml:"bin_path"`     // Path to xf binary (or command name in PATH)
-	ArchivePath string `toml:"archive_path"` // Path to xf archive directory (supports ~ expansion)
-	DefaultMode string `toml:"default_mode"` // keyword|semantic|hybrid
+	Enabled bool `toml:"enabled"` // Enable xf integration (gates the xf-search palette entry)
 }
 
 // DefaultXFConfig returns sensible defaults for xf integration.
 func DefaultXFConfig() XFConfig {
 	return XFConfig{
-		Enabled:     true,
-		BinPath:     "xf",
-		ArchivePath: "~/.xf/archive",
-		DefaultMode: "hybrid",
+		Enabled: true,
 	}
-}
-
-// ValidateXFConfig validates the xf configuration.
-func ValidateXFConfig(cfg *XFConfig) error {
-	if cfg == nil {
-		return nil
-	}
-
-	// Skip validation for unconfigured/zero-valued configs (use defaults).
-	if !cfg.Enabled && cfg.BinPath == "" && cfg.ArchivePath == "" && cfg.DefaultMode == "" {
-		return nil
-	}
-	if !cfg.Enabled {
-		return nil
-	}
-
-	if strings.TrimSpace(cfg.BinPath) == "" {
-		return fmt.Errorf("bin_path: must be non-empty when enabled")
-	}
-	if strings.TrimSpace(cfg.ArchivePath) == "" {
-		return fmt.Errorf("archive_path: must be non-empty when enabled")
-	}
-
-	if cfg.DefaultMode != "" {
-		mode := strings.ToLower(strings.TrimSpace(cfg.DefaultMode))
-		switch mode {
-		case "keyword", "semantic", "hybrid":
-			// ok
-		default:
-			return fmt.Errorf("default_mode: must be keyword, semantic, or hybrid, got %q", cfg.DefaultMode)
-		}
-	}
-
-	// Ensure ~ is expandable (and avoid storing unexpanded "~" surprises downstream).
-	_ = ExpandHome(cfg.ArchivePath)
-	return nil
 }
 
 // ModelsConfig holds model alias configuration for each agent type
 type ModelsConfig struct {
-	DefaultClaude   string            `toml:"default_claude"`   // Default model for Claude
-	DefaultCodex    string            `toml:"default_codex"`    // Default model for Codex
-	DefaultGemini   string            `toml:"default_gemini"`   // Default model for Gemini
-	DefaultPi       string            `toml:"default_pi"`       // Default model for Pi
-	DefaultKimi     string            `toml:"default_kimi"`     // Default model for Kimi
-	DefaultMuse     string            `toml:"default_muse"`     // Default model for Muse Code
-	DefaultGrok     string            `toml:"default_grok"`     // Optional Grok Build default; empty delegates to the CLI
-	DefaultOpencode string            `toml:"default_opencode"` // Default model for Opencode (oc); empty delegates to the OpenCode CLI
-	DefaultOllama   string            `toml:"default_ollama"`   // Default model for Ollama
-	Claude          map[string]string `toml:"claude"`           // Claude model aliases
-	Codex           map[string]string `toml:"codex"`            // Codex model aliases
-	Gemini          map[string]string `toml:"gemini"`           // Gemini model aliases
-	Pi              map[string]string `toml:"pi"`               // Pi model aliases
-	Kimi            map[string]string `toml:"kimi"`             // Kimi model aliases
-	Muse            map[string]string `toml:"muse"`             // Muse Code model aliases
-	Grok            map[string]string `toml:"grok"`             // Grok Build model aliases
-	Ollama          map[string]string `toml:"ollama"`           // Ollama model aliases
-	Cursor          map[string]string `toml:"cursor"`           // Cursor model aliases
-	Windsurf        map[string]string `toml:"windsurf"`         // Windsurf model aliases
-	Aider           map[string]string `toml:"aider"`            // Aider model aliases
-	Opencode        map[string]string `toml:"opencode"`         // Opencode (oc) model aliases — see ntm#116
+	DefaultClaude string `toml:"default_claude"` // Default model for Claude
+	DefaultCodex  string `toml:"default_codex"`  // Default model for Codex
+	DefaultGemini string `toml:"default_gemini"` // Default model for Gemini
+	DefaultPi     string `toml:"default_pi"`     // Default model for Pi
+	DefaultKimi   string `toml:"default_kimi"`   // Default model for Kimi
+	DefaultMuse   string `toml:"default_muse"`   // Default model for Muse Code
+	DefaultGrok   string `toml:"default_grok"`   // Optional Grok Build default; empty delegates to the CLI
+	DefaultOllama string `toml:"default_ollama"` // Default model for Ollama
+	// DefaultOpencode is the optional OpenCode default; empty delegates model
+	// selection to OpenCode's own config (ntm#261).
+	DefaultOpencode string            `toml:"default_opencode"`
+	DefaultOmp      string            `toml:"default_omp"`
+	Claude          map[string]string `toml:"claude"`   // Claude model aliases
+	Codex           map[string]string `toml:"codex"`    // Codex model aliases
+	Gemini          map[string]string `toml:"gemini"`   // Gemini model aliases
+	Pi              map[string]string `toml:"pi"`       // Pi model aliases
+	Kimi            map[string]string `toml:"kimi"`     // Kimi model aliases
+	Muse            map[string]string `toml:"muse"`     // Muse Code model aliases
+	Grok            map[string]string `toml:"grok"`     // Grok Build model aliases
+	Ollama          map[string]string `toml:"ollama"`   // Ollama model aliases
+	Cursor          map[string]string `toml:"cursor"`   // Cursor model aliases
+	Windsurf        map[string]string `toml:"windsurf"` // Windsurf model aliases
+	Aider           map[string]string `toml:"aider"`    // Aider model aliases
+	Opencode        map[string]string `toml:"opencode"` // Opencode (oc) model aliases — see ntm#116
+	Omp             map[string]string `toml:"omp"`      // Oh My Pi (omp) model aliases; omp fuzzy-matches whatever is passed
 	// ContextLimits allows overriding built-in context window sizes for models.
 	// Keys are model names (e.g., "claude-opus-4-6"), values are token counts.
 	// These override the built-in defaults in internal/models/registry.go.
@@ -1922,21 +1786,30 @@ type ModelsConfig struct {
 // Model IDs should match those in internal/agents/profiles.go (no date suffixes).
 func DefaultModels() ModelsConfig {
 	return ModelsConfig{
-		DefaultClaude:   "claude-opus-4-8",
-		DefaultCodex:    DefaultCodexModel,
-		DefaultGemini:   "gemini-3-pro-preview",
-		DefaultPi:       "",
-		DefaultKimi:     "kimi-k2",
-		DefaultMuse:     "muse-wonder-1.0",
-		DefaultGrok:     "",
-		DefaultOpencode: "vercel/deepseek/deepseek-v4-flash",
-		DefaultOllama:   "llama3",
+		// Empty: no --model is injected, so Claude Code launches with its own
+		// default / saved model and context setting. A hard-coded model ID went
+		// stale with every model release (ntm#15, #71, #78, #196, #334).
+		DefaultClaude: "",
+		DefaultCodex:  DefaultCodexModel,
+		DefaultGemini: "gemini-3-pro-preview",
+		DefaultPi:     "",
+		DefaultKimi:   "kimi-k2",
+		DefaultMuse:   "muse-wonder-1.0",
+		DefaultGrok:   "",
+		DefaultOllama: "llama3",
+		// Empty: OpenCode's own config chooses the model (ntm#261).
+		DefaultOpencode: "",
+		// Empty: omp's own config (modelRoles.default) chooses the model and
+		// no --model is injected.
+		DefaultOmp: "",
+		// Claude Code resolves its own family aliases to the newest model in
+		// that family, so mapping to them (not to dated IDs) never goes stale.
 		Claude: map[string]string{
-			"opus":      "claude-opus-4-8",
-			"sonnet":    "claude-sonnet-4-6",
-			"haiku":     "claude-haiku-4-5",
-			"architect": "claude-opus-4-8",
-			"fast":      "claude-sonnet-4-6",
+			"opus":      "opus",
+			"sonnet":    "sonnet",
+			"haiku":     "haiku",
+			"architect": "opus",
+			"fast":      "sonnet",
 		},
 		Codex: map[string]string{
 			"gpt4":  "gpt-4",
@@ -1978,6 +1851,9 @@ func DefaultModels() ModelsConfig {
 			"deepseek-v4-flash": "vercel/deepseek/deepseek-v4-flash",
 			"flash":             "vercel/deepseek/deepseek-v4-flash",
 		},
+		// omp resolves models itself (fuzzy --model matching over every
+		// provider it is logged into), so the alias table starts empty.
+		Omp: map[string]string{},
 	}
 }
 func canonicalModelLookupAgentType(agentType string) string {
@@ -2008,15 +1884,17 @@ func canonicalModelLookupAgentType(agentType string) string {
 		return "aider"
 	case agent.AgentTypeOpencode:
 		return "opencode"
+	case agent.AgentTypeOmp:
+		return "omp"
 	default:
 		return strings.ToLower(strings.TrimSpace(agentType))
 	}
 }
 
 // AntigravityRequiredModel is the ONLY model agy (Antigravity CLI) may run on.
-// agy is hard-pinned to it everywhere (never a Flash/Anthropic/other tier) per
+// agy is hard-pinned to it everywhere (never an Anthropic/other tier) per
 // the model guard (bd-47kjh.1.7); it is intentionally NOT user-configurable.
-const AntigravityRequiredModel = "Gemini 3.1 Pro (High)"
+const AntigravityRequiredModel = "Gemini 4 Argon (High)"
 
 // GetModelName resolves a model alias to its full model name.
 // Returns the alias itself if no mapping is found.
@@ -2054,6 +1932,8 @@ func (m *ModelsConfig) AliasesFor(agentType string) map[string]string {
 		return m.Aider
 	case "opencode":
 		return m.Opencode
+	case "omp":
+		return m.Omp
 	}
 	return nil
 }
@@ -2084,10 +1964,12 @@ func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 			return m.DefaultMuse
 		case "grok":
 			return m.DefaultGrok
-		case "opencode":
-			return m.DefaultOpencode
 		case "ollama":
 			return m.DefaultOllama
+		case "opencode":
+			return m.DefaultOpencode
+		case "omp":
+			return m.DefaultOmp
 		}
 		return ""
 	}
@@ -2112,6 +1994,14 @@ func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 var cliModelAliases = map[string][]string{
 	"claude": {"best", "default", "fable", "haiku", "opus", "opusplan", "sonnet"},
 	"gemini": {"auto", "flash", "flash-lite", "pro"},
+}
+
+// modelFamilySeeds names model families a type always has even when no
+// configured id carries them. Claude's default is empty and its alias targets
+// are the bare family words (ntm#334), so no known id starts with "claude"
+// and full ids such as claude-fable-5-1 would otherwise be refused.
+var modelFamilySeeds = map[string][]string{
+	"claude": {"claude"},
 }
 
 // ValidateModel reports whether an explicit model names something the agent's
@@ -2169,6 +2059,9 @@ func (m *ModelsConfig) ValidateModel(agentType, model string) error {
 		}
 	} else {
 		requested := modelNameTokens(lower)
+		if slices.ContainsFunc(modelFamilySeeds[kind], func(family string) bool { return slices.Contains(requested, family) }) {
+			return nil
+		}
 		for _, id := range ids {
 			if tokens := modelNameTokens(id); len(tokens) > 0 && strings.HasPrefix(id, tokens[0]) && slices.Contains(requested, tokens[0]) {
 				return nil
@@ -2354,10 +2247,6 @@ func findPaletteMarkdownForPath(configPath string) string {
 	return findPaletteMarkdownForPathAndCWD(configPath, "")
 }
 
-func findPaletteMarkdown() string {
-	return findPaletteMarkdownForPath(DefaultPath())
-}
-
 // DetectPalettePathForConfigPathAndCWD returns the palette markdown path to use
 // for a selected config path and working directory, if any. Precedence:
 // explicit cfg.PaletteFile, then auto-discovered markdown adjacent to that
@@ -2370,19 +2259,6 @@ func DetectPalettePathForConfigPathAndCWD(cfg *Config, configPath, cwd string) s
 		return cfg.PaletteFile
 	}
 	return findPaletteMarkdownForPathAndCWD(configPath, cwd)
-}
-
-// DetectPalettePathForConfigPath returns the palette markdown path to use for
-// a selected config path, if any. Precedence: explicit cfg.PaletteFile, then
-// auto-discovered markdown adjacent to that config path or in the current cwd.
-func DetectPalettePathForConfigPath(cfg *Config, configPath string) string {
-	return DetectPalettePathForConfigPathAndCWD(cfg, configPath, "")
-}
-
-// DetectPalettePath returns the palette markdown path to use, if any.
-// Precedence: explicit cfg.PaletteFile, then auto-discovered markdown.
-func DetectPalettePath(cfg *Config) string {
-	return DetectPalettePathForConfigPath(cfg, DefaultPath())
 }
 
 // LoadPaletteFromMarkdown parses a command palette from markdown format.
@@ -2492,11 +2368,17 @@ type SafetyConfig struct {
 	// - safe: preflight on, redaction=redact, stricter destructive command gating
 	// - paranoid: preflight on, redaction=block, privacy=on by default
 	Profile string `toml:"profile"`
+
+	// ClaudePolicyHook gives every Claude agent ntm launches a PreToolUse
+	// hook (passed with --settings) that checks each Bash command against the
+	// ntm safety policy and refuses blocked ones. PreToolUse hooks apply even
+	// under --dangerously-skip-permissions. Default true.
+	ClaudePolicyHook bool `toml:"claude_policy_hook"`
 }
 
 // DefaultSafetyConfig returns sensible safety defaults.
 func DefaultSafetyConfig() SafetyConfig {
-	return SafetyConfig{Profile: SafetyProfileStandard}
+	return SafetyConfig{Profile: SafetyProfileStandard, ClaudePolicyHook: true}
 }
 
 // ValidateSafetyConfig validates the safety configuration.
@@ -2515,9 +2397,9 @@ func ValidateSafetyConfig(cfg *SafetyConfig) error {
 }
 
 // PreflightConfig controls prompt preflight (lint/validation) defaults.
+// The preflight.enabled key was deprecated in v1.28.0 (bd-6otuk): no send
+// path ever consulted it (it was surfaced in doctor output only).
 type PreflightConfig struct {
-	// Enabled controls whether prompt preflight is used by commands that send content.
-	Enabled bool `toml:"enabled"`
 	// Strict controls whether warnings are treated as errors by default.
 	Strict bool `toml:"strict"`
 }
@@ -2525,8 +2407,7 @@ type PreflightConfig struct {
 // DefaultPreflightConfig returns sensible preflight defaults.
 func DefaultPreflightConfig() PreflightConfig {
 	return PreflightConfig{
-		Enabled: true,
-		Strict:  false,
+		Strict: false,
 	}
 }
 
@@ -2537,7 +2418,6 @@ func ValidatePreflightConfig(cfg *PreflightConfig) error {
 }
 
 type safetyProfileDefaults struct {
-	preflightEnabled bool
 	preflightStrict  bool
 	redactionMode    string
 	privacyEnabled   bool
@@ -2546,21 +2426,18 @@ type safetyProfileDefaults struct {
 
 var safetyProfileMap = map[string]safetyProfileDefaults{
 	SafetyProfileStandard: {
-		preflightEnabled: true,
 		preflightStrict:  false,
 		redactionMode:    "warn",
 		privacyEnabled:   false,
 		dcgAllowOverride: true,
 	},
 	SafetyProfileSafe: {
-		preflightEnabled: true,
 		preflightStrict:  false,
 		redactionMode:    "redact",
 		privacyEnabled:   false,
 		dcgAllowOverride: false,
 	},
 	SafetyProfileParanoid: {
-		preflightEnabled: true,
 		preflightStrict:  true,
 		redactionMode:    "block",
 		privacyEnabled:   true,
@@ -2587,7 +2464,6 @@ func applySafetyProfileDefaults(cfg *Config) {
 	cfg.Safety.Profile = normalizeSafetyProfile(cfg.Safety.Profile)
 	def := safetyProfileMap[cfg.Safety.Profile]
 
-	cfg.Preflight.Enabled = def.preflightEnabled
 	cfg.Preflight.Strict = def.preflightStrict
 	cfg.Redaction.Mode = def.redactionMode
 	cfg.Privacy.Enabled = def.privacyEnabled
@@ -2759,9 +2635,11 @@ type PromptsConfig struct {
 	GmiDefaultFile string `toml:"gmi_default_file"` // File path for Gemini default prompt
 	AgyDefault     string `toml:"agy_default"`      // Default prompt for Antigravity (agy) agents
 	AgyDefaultFile string `toml:"agy_default_file"` // File path for Antigravity default prompt
+	OmpDefault     string `toml:"omp_default"`      // Default prompt for Oh My Pi (omp) agents
+	OmpDefaultFile string `toml:"omp_default_file"` // File path for Oh My Pi default prompt
 }
 
-// ResolveForType returns the default prompt for a given agent type string (cc, cod, gmi).
+// ResolveForType returns the default prompt for a given agent type string (cc, cod, gmi, agy, omp).
 // It reads from the inline string first, falling back to the file if configured.
 func (p PromptsConfig) ResolveForType(agentType string) (string, error) {
 	var val, filePath string
@@ -2774,6 +2652,8 @@ func (p PromptsConfig) ResolveForType(agentType string) (string, error) {
 		val, filePath = p.GmiDefault, p.GmiDefaultFile
 	case "agy":
 		val, filePath = p.AgyDefault, p.AgyDefaultFile
+	case "omp":
+		val, filePath = p.OmpDefault, p.OmpDefaultFile
 	default:
 		return "", nil
 	}
@@ -2838,15 +2718,12 @@ func Default() *Config {
 	}
 
 	cfg := &Config{
-		ProjectsBase:       projectsBase,
-		SuggestionsEnabled: true,
-		Agents:             DefaultAgentTemplates(),
+		ProjectsBase: projectsBase,
+		Agents:       DefaultAgentTemplates(),
 		Tmux: TmuxConfig{
-			DefaultPanes:       10,
-			PaletteKey:         "F6",
-			PaneInitDelayMs:    1000,
-			HistoryLimit:       50000,
-			ActivityIndicators: DefaultActivityIndicatorConfig(),
+			DefaultPanes:    10,
+			PaneInitDelayMs: 1000,
+			HistoryLimit:    50000,
 		},
 		Robot: DefaultRobotConfig(),
 		AgentMail: AgentMailConfig{
@@ -2854,7 +2731,6 @@ func Default() *Config {
 			URL:          DefaultAgentMailURL,
 			Token:        "",
 			AutoRegister: true,
-			ProgramName:  "ntm",
 		},
 		Integrations:    DefaultIntegrationsConfig(),
 		Models:          DefaultModels(),
@@ -2863,8 +2739,8 @@ func Default() *Config {
 		Notifications:   notify.DefaultConfig(),
 		Resilience:      DefaultResilienceConfig(),
 		Scanner:         DefaultScannerConfig(),
+		Bugs:            DefaultBugsConfig(),
 		CASS:            DefaultCASSConfig(),
-		Accounts:        DefaultAccountsConfig(),
 		Rotation:        DefaultRotationConfig(),
 		GeminiSetup:     DefaultGeminiSetupConfig(),
 		Context:         DefaultContextConfig(),
@@ -2882,6 +2758,7 @@ func Default() *Config {
 		Privacy:         DefaultPrivacyConfig(),
 		Encryption:      DefaultEncryptionConfig(),
 		SpawnPacing:     DefaultSpawnPacingConfig(),
+		Spawn:           DefaultSpawnConfig(),
 		Retry:           DefaultRetryConfig(),
 		Routing:         DefaultRoutingConfig(),
 		Coordinator:     DefaultCoordinatorConfig(),
@@ -3070,7 +2947,25 @@ func loadWithCWD(path, cwd string) (*Config, error) {
 			return nil, fmt.Errorf("parsing config: %w", err)
 		}
 		if fields := undecodedConfigFields(md); len(fields) > 0 {
-			return nil, fmt.Errorf("parsing config: unknown field(s): %s", strings.Join(fields, ", "))
+			// WS6-remove-finalize (bd-ws6-config-truth-ienmd.3): keys removed
+			// in v1.26.0 warned for one release; since v1.27.0 each is a hard
+			// strict-loader error with the same key + disposition text.
+			// Genuinely unknown fields remain a hard error as before.
+			//
+			// Dead-knob batch two (bd-6otuk): the v1.28.0 deprecated keys
+			// completed the same runway — they warned for one release and are
+			// hard strict-loader errors since v1.29.0, with their own
+			// release-pair error text.
+			//
+			// All three kinds are reported together in ONE error so a single
+			// failed load lists everything the user must fix.
+			byTier, unknown := classifyUndecodedKeys(fields)
+			if len(byTier) > 0 || len(unknown) > 0 {
+				// Typed error (message text unchanged) so the human CLI
+				// fallback can collapse dead-key failures into one line
+				// pointing at `ntm config migrate`.
+				return nil, &DeadKeyLoadError{ByTier: byTier, Unknown: unknown}
+			}
 		}
 
 		// Canonicalize the profile string for stable downstream outputs (config show, robot status).
@@ -3090,6 +2985,12 @@ func loadWithCWD(path, cwd string) (*Config, error) {
 			cfg.Rotation.Enabled = true
 			cfg.Rotation.AutoTrigger = true
 		}
+
+		// [recovery] is the single section for session-recovery tuning. All
+		// that survives of the old memory.* overlap is one live rule:
+		// disabling the memory integration also disables the CM slice of
+		// recovery context, unless [recovery] says otherwise.
+		applyMemoryRecoveryLink(cfg, &md)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -3127,6 +3028,15 @@ func loadWithCWD(path, cwd string) (*Config, error) {
 	if binary := os.Getenv("NTM_CASS_BINARY"); binary != "" {
 		cfg.CASS.BinaryPath = binary
 	}
+
+	// BV Env Overrides (GH#253). NTM_BV_TIMEOUT (whole seconds) wins over
+	// [integrations.bv] timeout_seconds; internal/bv also consults the same
+	// variable at call time for paths that never load config.
+	if timeout := os.Getenv("NTM_BV_TIMEOUT"); timeout != "" {
+		if t, err := strconv.Atoi(strings.TrimSpace(timeout)); err == nil && t > 0 {
+			cfg.Integrations.BV.TimeoutSeconds = t
+		}
+	}
 	// CASS Context Env Overrides
 	if contextEnabled := os.Getenv("NTM_CASS_CONTEXT_ENABLED"); contextEnabled != "" {
 		cfg.CASS.Context.Enabled = contextEnabled == "1" || contextEnabled == "true"
@@ -3145,10 +3055,7 @@ func loadWithCWD(path, cwd string) (*Config, error) {
 		cfg.CASS.Context.PreferSameProject = preferSame == "1" || preferSame == "true"
 	}
 
-	// Accounts/Rotation Env Overrides
-	if autoRotate := os.Getenv("NTM_ACCOUNTS_AUTO_ROTATE"); autoRotate != "" {
-		cfg.Accounts.AutoRotate = autoRotate == "1" || autoRotate == "true"
-	}
+	// Rotation Env Overrides
 	if rotationEnabled := os.Getenv("NTM_ROTATION_ENABLED"); rotationEnabled != "" {
 		cfg.Rotation.Enabled = rotationEnabled == "1" || rotationEnabled == "true"
 	}
@@ -3178,11 +3085,6 @@ func loadWithCWD(path, cwd string) (*Config, error) {
 	}
 	if autoInject := os.Getenv("NTM_RECOVERY_AUTO_INJECT"); autoInject != "" {
 		cfg.SessionRecovery.AutoInjectOnSpawn = autoInject == "1" || autoInject == "true"
-	}
-	if staleHours := os.Getenv("NTM_RECOVERY_STALE_HOURS"); staleHours != "" {
-		if n, err := strconv.Atoi(staleHours); err == nil && n > 0 {
-			cfg.SessionRecovery.StaleThresholdHours = n
-		}
 	}
 
 	// 4. Palette Precedence: Markdown > TOML > Default
@@ -3701,7 +3603,20 @@ func validateNTMConfigTOML(contents string) error {
 		return fmt.Errorf("parsing TOML: %w", err)
 	}
 	if fields := undecodedConfigFields(md); len(fields) > 0 {
-		return fmt.Errorf("unknown field(s): %s", strings.Join(fields, ", "))
+		// Same partition as the strict loader (WS6-remove-finalize): removed
+		// knobs get their disposition text (what to delete and why); the
+		// v1.28.0 deprecated batch (bd-6otuk) is rejected the same way since
+		// its v1.29.0 warn→error flip, so `ntm config set` cannot persist a
+		// config the strict loader would refuse; genuinely unknown fields
+		// keep the unknown-field error.
+		byTier, unknown := classifyUndecodedKeys(fields)
+		if len(byTier) > 0 || len(unknown) > 0 {
+			// Same rendering as the strict loader, so `config set` cannot
+			// persist a file the loader would refuse and the two surfaces
+			// cannot disagree about what is dead.
+			err := &DeadKeyLoadError{ByTier: byTier, Unknown: unknown}
+			return fmt.Errorf("%s", strings.TrimPrefix(err.Error(), "parsing config: "))
+		}
 	}
 	return nil
 }
@@ -4026,7 +3941,6 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "# Show contextual CLI suggestions")
-	fmt.Fprintf(w, "suggestions_enabled = %t\n", cfg.SuggestionsEnabled)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "# Path to command palette markdown file (optional)")
@@ -4084,21 +3998,14 @@ func Print(cfg *Config, w io.Writer) error {
 	if cfg.Agents.Opencode != "" {
 		fmt.Fprintf(w, "oc = %q\n", cfg.Agents.Opencode)
 	}
+	fmt.Fprintf(w, "omp = %q\n", OmpCommandOrDefault(cfg.Agents.Omp))
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[tmux]")
 	fmt.Fprintln(w, "# Tmux-specific settings")
 	fmt.Fprintf(w, "default_panes = %d\n", cfg.Tmux.DefaultPanes)
-	fmt.Fprintf(w, "palette_key = %q\n", cfg.Tmux.PaletteKey)
 	fmt.Fprintf(w, "pane_init_delay_ms = %d  # Delay before send-keys to new panes\n", cfg.Tmux.PaneInitDelayMs)
 	fmt.Fprintf(w, "history_limit = %d       # Scrollback buffer lines per pane\n", cfg.Tmux.HistoryLimit)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[tmux.activity_indicators]")
-	fmt.Fprintln(w, "# Pane border activity coloring thresholds")
-	fmt.Fprintf(w, "enabled = %t\n", cfg.Tmux.ActivityIndicators.Enabled)
-	fmt.Fprintf(w, "active_seconds = %d   # Mark pane active within this many seconds\n", cfg.Tmux.ActivityIndicators.ActiveSeconds)
-	fmt.Fprintf(w, "stalled_seconds = %d  # Mark pane stalled after this many seconds\n", cfg.Tmux.ActivityIndicators.StalledSeconds)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[robot]")
@@ -4117,9 +4024,6 @@ func Print(cfg *Config, w io.Writer) error {
 	} else {
 		fmt.Fprintln(w, "# format = \"json\"")
 	}
-	fmt.Fprintf(w, "pretty = %t\n", cfg.Robot.Output.Pretty)
-	fmt.Fprintf(w, "timestamps = %t\n", cfg.Robot.Output.Timestamps)
-	fmt.Fprintf(w, "compress = %t\n", cfg.Robot.Output.Compress)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[agent_mail]")
@@ -4134,7 +4038,6 @@ func Print(cfg *Config, w io.Writer) error {
 		fmt.Fprintln(w, "# token = \"\"  # Or set AGENT_MAIL_TOKEN env var")
 	}
 	fmt.Fprintf(w, "auto_register = %t\n", cfg.AgentMail.AutoRegister)
-	fmt.Fprintf(w, "program_name = %q\n", cfg.AgentMail.ProgramName)
 	fmt.Fprintln(w, "# If true, ntm starts/stops `am serve-http` for session monitors.")
 	fmt.Fprintln(w, "# Default false prevents ntm from hijacking a user-owned Agent Mail server.")
 	fmt.Fprintf(w, "supervisor_enabled = %t\n", cfg.AgentMail.SupervisorEnabledOrDefault())
@@ -4173,17 +4076,22 @@ func Print(cfg *Config, w io.Writer) error {
 
 	fmt.Fprintln(w, "[integrations.caam]")
 	fmt.Fprintln(w, "# Coding Agent Account Manager (caam) settings")
-	fmt.Fprintf(w, "enabled = %t\n", cfg.Integrations.CAAM.Enabled)
 	if cfg.Integrations.CAAM.BinaryPath != "" {
 		fmt.Fprintf(w, "binary_path = %q\n", cfg.Integrations.CAAM.BinaryPath)
 	} else {
 		fmt.Fprintln(w, "# binary_path = \"\"  # Auto-detect from PATH")
 	}
-	fmt.Fprintf(w, "auto_rotate = %t\n", cfg.Integrations.CAAM.AutoRotate)
-	fmt.Fprintf(w, "providers = %s\n", renderTOMLStringArray(cfg.Integrations.CAAM.Providers))
-	fmt.Fprintf(w, "rate_limit_patterns = %s\n", renderTOMLStringArray(cfg.Integrations.CAAM.RateLimitPatterns))
-	fmt.Fprintf(w, "account_cooldown = %d\n", cfg.Integrations.CAAM.AccountCooldown)
-	fmt.Fprintf(w, "alert_threshold = %d\n", cfg.Integrations.CAAM.AlertThreshold)
+	fmt.Fprintln(w, "# Coordinator auto-failover on detected rate limits (bd-um3uy).")
+	fmt.Fprintln(w, "# Doubly opt-in: auto_failover must be true AND failover_providers non-empty.")
+	fmt.Fprintf(w, "auto_failover = %t\n", cfg.Integrations.CAAM.AutoFailover)
+	fmt.Fprintf(w, "reset_horizon_minutes = %d  # Only fail over when the reset is further away than this\n", cfg.Integrations.CAAM.ResetHorizonMinutes)
+	fmt.Fprintf(w, "failover_providers = %s  # Allow-list (\"claude\", \"openai\", \"gemini\"); empty = none\n", renderTOMLStringArray(cfg.Integrations.CAAM.FailoverProviders))
+	fmt.Fprintln(w, "# Seat selection for UNPINNED spawn/add panes (ntm#319). Unrelated to")
+	fmt.Fprintln(w, "# auto_failover above: this only picks which account a NEW pane launches on,")
+	fmt.Fprintln(w, "# ranked by earliest reset with headroom. An explicit --persona always wins;")
+	fmt.Fprintln(w, "# a pane whose seat cannot be read is skipped with a reason, never pinned")
+	fmt.Fprintln(w, "# statically. Off by default.")
+	fmt.Fprintf(w, "seat_selection = %t\n", cfg.Integrations.CAAM.SeatSelection)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations.rch]")
@@ -4194,102 +4102,50 @@ func Print(cfg *Config, w io.Writer) error {
 	} else {
 		fmt.Fprintln(w, "# binary_path = \"\"  # Auto-detect from PATH")
 	}
-	fmt.Fprintf(w, "min_build_time = %d\n", cfg.Integrations.RCH.MinBuildTime)
 	fmt.Fprintf(w, "intercept_patterns = %s\n", renderTOMLStringArray(cfg.Integrations.RCH.InterceptPatterns))
-	fmt.Fprintf(w, "fallback_local = %t\n", cfg.Integrations.RCH.FallbackLocal)
-	fmt.Fprintf(w, "show_location = %t\n", cfg.Integrations.RCH.ShowLocation)
-	fmt.Fprintf(w, "preferred_worker = %q\n", cfg.Integrations.RCH.PreferredWorker)
-	fmt.Fprintf(w, "dcg_whitelist = %t\n", cfg.Integrations.RCH.DCGWhitelist)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[integrations.caut]")
-	fmt.Fprintln(w, "# Cloud API usage tracker (caut) settings")
-	fmt.Fprintf(w, "enabled = %t\n", cfg.Integrations.Caut.Enabled)
-	if cfg.Integrations.Caut.BinaryPath != "" {
-		fmt.Fprintf(w, "binary_path = %q\n", cfg.Integrations.Caut.BinaryPath)
-	} else {
-		fmt.Fprintln(w, "# binary_path = \"\"  # Auto-detect from PATH")
-	}
-	fmt.Fprintf(w, "poll_interval = %d\n", cfg.Integrations.Caut.PollInterval)
-	fmt.Fprintf(w, "alert_threshold = %d\n", cfg.Integrations.Caut.AlertThreshold)
-	fmt.Fprintf(w, "providers = %s\n", renderTOMLStringArray(cfg.Integrations.Caut.Providers))
-	fmt.Fprintf(w, "per_agent_tracking = %t\n", cfg.Integrations.Caut.PerAgentTracking)
-	fmt.Fprintf(w, "currency = %q\n", cfg.Integrations.Caut.Currency)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations.process_triage]")
 	fmt.Fprintln(w, "# Process triage (pt) Bayesian process classification settings")
 	fmt.Fprintf(w, "enabled = %t\n", cfg.Integrations.ProcessTriage.Enabled)
-	if cfg.Integrations.ProcessTriage.BinaryPath != "" {
-		fmt.Fprintf(w, "binary_path = %q\n", cfg.Integrations.ProcessTriage.BinaryPath)
-	} else {
-		fmt.Fprintln(w, "# binary_path = \"\"  # Auto-detect from PATH")
-	}
 	fmt.Fprintf(w, "check_interval = %d\n", cfg.Integrations.ProcessTriage.CheckInterval)
 	fmt.Fprintf(w, "idle_threshold = %d\n", cfg.Integrations.ProcessTriage.IdleThreshold)
 	fmt.Fprintf(w, "stuck_threshold = %d\n", cfg.Integrations.ProcessTriage.StuckThreshold)
-	fmt.Fprintf(w, "on_stuck = %q\n", cfg.Integrations.ProcessTriage.OnStuck)
 	fmt.Fprintf(w, "use_rano_data = %t\n", cfg.Integrations.ProcessTriage.UseRanoData)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations.rano]")
-	fmt.Fprintln(w, "# rano network observer settings for per-agent API tracking")
+	fmt.Fprintln(w, "# rano network observer: per-agent connection counts read from rano's database")
 	fmt.Fprintf(w, "enabled = %t\n", cfg.Integrations.Rano.Enabled)
-	if cfg.Integrations.Rano.BinaryPath != "" {
-		fmt.Fprintf(w, "binary_path = %q\n", cfg.Integrations.Rano.BinaryPath)
-	} else {
-		fmt.Fprintln(w, "# binary_path = \"rano\"  # Auto-detect from PATH")
-	}
 	fmt.Fprintf(w, "poll_interval_ms = %d\n", cfg.Integrations.Rano.PollIntervalMs)
-	fmt.Fprintf(w, "providers = %s\n", renderTOMLStringArray(cfg.Integrations.Rano.Providers))
-	fmt.Fprintf(w, "persist_history = %t\n", cfg.Integrations.Rano.PersistHistory)
-	fmt.Fprintf(w, "history_days = %d\n", cfg.Integrations.Rano.HistoryDays)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[integrations.proxy]")
-	fmt.Fprintln(w, "# rust_proxy (local HTTP proxy) settings")
-	fmt.Fprintf(w, "enabled = %t\n", cfg.Integrations.Proxy.Enabled)
-	if cfg.Integrations.Proxy.BinPath != "" {
-		fmt.Fprintf(w, "bin_path = %q\n", cfg.Integrations.Proxy.BinPath)
-	} else {
-		fmt.Fprintln(w, "# bin_path = \"rust_proxy\"  # Auto-detect from PATH")
-	}
-	if cfg.Integrations.Proxy.CheckInterval != "" {
-		fmt.Fprintf(w, "check_interval = %q\n", cfg.Integrations.Proxy.CheckInterval)
-	} else {
-		fmt.Fprintln(w, "# check_interval = \"30s\"")
-	}
+	fmt.Fprintln(w, "# Database rano's monitor writes (rano --sqlite PATH, or sqlite= in ~/.config/rano/config.conf)")
+	fmt.Fprintf(w, "sqlite_path = %q\n", cfg.Integrations.Rano.SQLitePath)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[integrations.xf]")
 	fmt.Fprintln(w, "# X/Twitter archive search (xf) settings")
+	fmt.Fprintln(w, "# enabled gates the built-in xf-search palette entry; xf resolves from PATH")
 	fmt.Fprintf(w, "enabled = %t\n", cfg.Integrations.XF.Enabled)
-	if cfg.Integrations.XF.BinPath != "" {
-		fmt.Fprintf(w, "bin_path = %q\n", cfg.Integrations.XF.BinPath)
-	} else {
-		fmt.Fprintln(w, "# bin_path = \"xf\"  # Auto-detect from PATH")
-	}
-	if cfg.Integrations.XF.ArchivePath != "" {
-		fmt.Fprintf(w, "archive_path = %q\n", cfg.Integrations.XF.ArchivePath)
-	} else {
-		fmt.Fprintln(w, "# archive_path = \"~/.xf/archive\"")
-	}
-	if cfg.Integrations.XF.DefaultMode != "" {
-		fmt.Fprintf(w, "default_mode = %q\n", cfg.Integrations.XF.DefaultMode)
-	} else {
-		fmt.Fprintln(w, "# default_mode = \"hybrid\"  # keyword|semantic|hybrid")
-	}
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "[integrations.bv]")
+	fmt.Fprintln(w, "# bv (beads_viewer) graph analysis settings; bv resolves from PATH")
+	fmt.Fprintln(w, "# Timeout for each bv subprocess (robot-insights cycle check, triage, plan, drift).")
+	fmt.Fprintln(w, "# Override per-invocation with NTM_BV_TIMEOUT=<seconds> (env wins).")
+	fmt.Fprintf(w, "timeout_seconds = %d\n", cfg.Integrations.BV.TimeoutSeconds)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[safety]")
 	fmt.Fprintln(w, "# Safety profile presets that set defaults for multiple knobs")
 	fmt.Fprintln(w, "# profile = \"standard\"  # standard|safe|paranoid")
 	fmt.Fprintf(w, "profile = %q\n", cfg.Safety.Profile)
+	fmt.Fprintln(w, "# Check every Bash command of ntm-launched Claude agents against the safety")
+	fmt.Fprintln(w, "# policy with a Claude Code PreToolUse hook (passed via --settings)")
+	fmt.Fprintf(w, "claude_policy_hook = %t\n", cfg.Safety.ClaudePolicyHook)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[preflight]")
 	fmt.Fprintln(w, "# Prompt preflight (lint/validation) defaults")
-	fmt.Fprintf(w, "enabled = %t\n", cfg.Preflight.Enabled)
 	fmt.Fprintf(w, "strict = %t\n", cfg.Preflight.Strict)
 	fmt.Fprintln(w)
 
@@ -4408,12 +4264,22 @@ func Print(cfg *Config, w io.Writer) error {
 	} else {
 		fmt.Fprintln(w, "# agy_default_file = \"\"")
 	}
+	if cfg.Prompts.OmpDefault != "" {
+		fmt.Fprintf(w, "omp_default = %q\n", cfg.Prompts.OmpDefault)
+	} else {
+		fmt.Fprintln(w, "# omp_default = \"\"")
+	}
+	if cfg.Prompts.OmpDefaultFile != "" {
+		fmt.Fprintf(w, "omp_default_file = %q\n", cfg.Prompts.OmpDefaultFile)
+	} else {
+		fmt.Fprintln(w, "# omp_default_file = \"\"")
+	}
 	fmt.Fprintln(w)
 
 	// Write models configuration
 	fmt.Fprintln(w, "[models]")
 	fmt.Fprintln(w, "# Default models when no specifier given")
-	fmt.Fprintf(w, "default_claude = %q\n", cfg.Models.DefaultClaude)
+	fmt.Fprintf(w, "default_claude = %q  # Empty passes no --model: Claude Code uses its own default/saved model\n", cfg.Models.DefaultClaude)
 	fmt.Fprintf(w, "default_codex = %q\n", cfg.Models.DefaultCodex)
 	fmt.Fprintf(w, "default_gemini = %q\n", cfg.Models.DefaultGemini)
 	if cfg.Models.DefaultPi != "" {
@@ -4426,9 +4292,8 @@ func Print(cfg *Config, w io.Writer) error {
 		fmt.Fprintf(w, "default_muse = %q\n", cfg.Models.DefaultMuse)
 	}
 	fmt.Fprintf(w, "default_grok = %q  # Empty delegates model selection to Grok Build\n", cfg.Models.DefaultGrok)
-	if cfg.Models.DefaultOpencode != "" {
-		fmt.Fprintf(w, "default_opencode = %q\n", cfg.Models.DefaultOpencode)
-	}
+	fmt.Fprintf(w, "default_opencode = %q  # Empty delegates model selection to OpenCode's own config\n", cfg.Models.DefaultOpencode)
+	fmt.Fprintf(w, "default_omp = %q  # Empty delegates model selection to omp's own config (modelRoles.default)\n", cfg.Models.DefaultOmp)
 	fmt.Fprintln(w)
 
 	// Write Claude model aliases. Alias keys are quoted in every [models.*]
@@ -4497,12 +4362,23 @@ func Print(cfg *Config, w io.Writer) error {
 	}
 	fmt.Fprintln(w)
 
+	// omp fuzzy-matches --model across every provider it is logged into, so
+	// the alias table is intentionally empty unless the operator configures it.
+	fmt.Fprintln(w, "[models.omp]")
+	fmt.Fprintln(w, "# Oh My Pi model aliases (e.g., --omp=2:opus or --omp=2:MODEL:high)")
+	for _, alias := range sortedStringMapKeys(cfg.Models.Omp) {
+		fullName := cfg.Models.Omp[alias]
+		fmt.Fprintf(w, "%s = %q\n", alias, fullName)
+	}
+	fmt.Fprintln(w)
+
 	// Write alerts configuration
 	fmt.Fprintln(w, "[alerts]")
 	fmt.Fprintln(w, "# Alert system configuration for proactive problem detection")
 	fmt.Fprintf(w, "enabled = %t\n", cfg.Alerts.Enabled)
 	fmt.Fprintf(w, "agent_stuck_minutes = %d    # Minutes without output before alerting\n", cfg.Alerts.AgentStuckMinutes)
 	fmt.Fprintf(w, "disk_low_threshold_gb = %.1f  # Minimum free disk space (GB)\n", cfg.Alerts.DiskLowThresholdGB)
+	fmt.Fprintf(w, "disk_full_horizon_hours = %.1f # Alert when disk is projected full within this many hours (0 = disabled)\n", cfg.Alerts.DiskFullHorizonHours)
 	fmt.Fprintf(w, "mail_backlog_threshold = %d  # Unread messages before alerting\n", cfg.Alerts.MailBacklogThreshold)
 	fmt.Fprintf(w, "bead_stale_hours = %d       # Hours before in-progress bead is stale\n", cfg.Alerts.BeadStaleHours)
 	fmt.Fprintf(w, "context_warning_threshold = %.1f # Context usage percentage that triggers a warning\n", cfg.Alerts.ContextWarningThreshold)
@@ -4518,10 +4394,6 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "max_auto_checkpoints = %d        # Max auto-checkpoints per session (rotation)\n", cfg.Checkpoints.MaxAutoCheckpoints)
 	fmt.Fprintf(w, "scrollback_lines = %d           # Lines of scrollback to capture\n", cfg.Checkpoints.ScrollbackLines)
 	fmt.Fprintf(w, "include_git = %t               # Capture git state in auto-checkpoints\n", cfg.Checkpoints.IncludeGit)
-	fmt.Fprintf(w, "auto_checkpoint_on_spawn = %t   # Auto-checkpoint when spawning session\n", cfg.Checkpoints.AutoCheckpointOnSpawn)
-	fmt.Fprintf(w, "interval_minutes = %d           # Periodic checkpoint interval (0 = disabled)\n", cfg.Checkpoints.IntervalMinutes)
-	fmt.Fprintf(w, "on_rotation = %t               # Checkpoint before context rotation\n", cfg.Checkpoints.OnRotation)
-	fmt.Fprintf(w, "on_error = %t                  # Checkpoint when agent error detected\n", cfg.Checkpoints.OnError)
 	fmt.Fprintln(w)
 
 	// Write notifications configuration
@@ -4616,56 +4488,17 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "# Rate limit detection configuration")
 	fmt.Fprintf(w, "detect = %t   # Enable rate limit detection\n", cfg.Resilience.RateLimit.Detect)
 	fmt.Fprintf(w, "notify = %t   # Send notification on rate limit\n", cfg.Resilience.RateLimit.Notify)
-	if len(cfg.Resilience.RateLimit.Patterns) > 0 {
-		patternItems := make([]string, 0, len(cfg.Resilience.RateLimit.Patterns))
-		for _, p := range cfg.Resilience.RateLimit.Patterns {
-			patternItems = append(patternItems, fmt.Sprintf("%q", p))
-		}
-		fmt.Fprintf(w, "patterns = [%s]  # Custom patterns (in addition to defaults)\n", strings.Join(patternItems, ", "))
-	} else {
-		fmt.Fprintln(w, "# patterns = [\"custom pattern\"]  # Custom patterns (in addition to defaults)")
-	}
 	fmt.Fprintln(w)
-
-	// Write accounts configuration
-	fmt.Fprintln(w, "[accounts]")
-	fmt.Fprintln(w, "# Multi-account management for quota rotation")
-	fmt.Fprintf(w, "state_file = %q            # Path to account state JSON\n", cfg.Accounts.StateFile)
-	fmt.Fprintf(w, "auto_rotate = %t            # Auto-rotate when limit detected\n", cfg.Accounts.AutoRotate)
-	fmt.Fprintf(w, "reset_buffer_minutes = %d   # Minutes before reset to consider available\n", cfg.Accounts.ResetBufferMinutes)
-	fmt.Fprintln(w)
-
-	writeAccountEntries := func(section string, accounts []AccountEntry) {
-		if len(accounts) > 0 {
-			for _, acct := range accounts {
-				fmt.Fprintf(w, "[[accounts.%s]]\n", section)
-				fmt.Fprintf(w, "email = %q\n", acct.Email)
-				fmt.Fprintf(w, "alias = %q\n", acct.Alias)
-				fmt.Fprintf(w, "priority = %d\n", acct.Priority)
-				fmt.Fprintln(w)
-			}
-			return
-		}
-		fmt.Fprintf(w, "# [[accounts.%s]]\n", section)
-		fmt.Fprintln(w, "# email = \"primary@example.com\"")
-		fmt.Fprintln(w, "# alias = \"main\"")
-		fmt.Fprintln(w, "# priority = 1")
-		fmt.Fprintln(w)
-	}
-
-	writeAccountEntries("claude", cfg.Accounts.Claude)
-	writeAccountEntries("codex", cfg.Accounts.Codex)
-	writeAccountEntries("gemini", cfg.Accounts.Gemini)
-	writeAccountEntries("antigravity", cfg.Accounts.Antigravity)
 
 	// Write rotation configuration
 	fmt.Fprintln(w, "[rotation]")
 	fmt.Fprintln(w, "# Account rotation and restart configuration")
 	fmt.Fprintf(w, "enabled = %t               # Top-level toggle\n", cfg.Rotation.Enabled)
-	fmt.Fprintf(w, "prefer_restart = %t        # Prefer restart over account switch\n", cfg.Rotation.PreferRestart)
 	fmt.Fprintf(w, "auto_open_browser = %t     # Auto-open browser for auth\n", cfg.Rotation.AutoOpenBrowser)
 	fmt.Fprintf(w, "auto_trigger = %t          # Show notification when rate limit detected\n", cfg.Rotation.AutoTrigger)
 	fmt.Fprintf(w, "auto_initiate = %t         # Automatically start rotation when possible\n", cfg.Rotation.AutoInitiate)
+	fmt.Fprintf(w, "usage_percent_threshold = %.1f  # >0 enables coordinator context-rotation trigger on transcript-sourced usage %% (0 = off)\n", cfg.Rotation.UsagePercentThreshold)
+	fmt.Fprintf(w, "auto_confirm = %t          # Auto-execute context rotations enqueued by the usage trigger\n", cfg.Rotation.AutoConfirm)
 	fmt.Fprintf(w, "continuation_prompt = %q\n", cfg.Rotation.ContinuationPrompt)
 	fmt.Fprintln(w)
 
@@ -4675,7 +4508,6 @@ func Print(cfg *Config, w io.Writer) error {
 			fmt.Fprintf(w, "provider = %q\n", acct.Provider)
 			fmt.Fprintf(w, "email = %q\n", acct.Email)
 			fmt.Fprintf(w, "alias = %q\n", acct.Alias)
-			fmt.Fprintf(w, "priority = %d\n", acct.Priority)
 			fmt.Fprintln(w)
 		}
 	} else {
@@ -4683,7 +4515,6 @@ func Print(cfg *Config, w io.Writer) error {
 		fmt.Fprintln(w, "# provider = \"claude\"")
 		fmt.Fprintln(w, "# email = \"primary@example.com\"")
 		fmt.Fprintln(w, "# alias = \"main\"")
-		fmt.Fprintln(w, "# priority = 1")
 		fmt.Fprintln(w)
 	}
 
@@ -4692,12 +4523,6 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "critical_percent = %d       # Consider limited at this %%\n", cfg.Rotation.Thresholds.CriticalPercent)
 	fmt.Fprintf(w, "restart_if_tokens_above = %.0f  # Restart if tokens exceed this\n", cfg.Rotation.Thresholds.RestartIfTokensAbove)
 	fmt.Fprintf(w, "restart_if_session_hours = %d   # Restart after N hours\n", cfg.Rotation.Thresholds.RestartIfSessionHours)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[rotation.dashboard]")
-	fmt.Fprintf(w, "show_quota_bars = %t       # Show quota bars in dashboard\n", cfg.Rotation.Dashboard.ShowQuotaBars)
-	fmt.Fprintf(w, "show_account_status = %t   # Show account status\n", cfg.Rotation.Dashboard.ShowAccountStatus)
-	fmt.Fprintf(w, "show_reset_timers = %t     # Show reset countdown\n", cfg.Rotation.Dashboard.ShowResetTimers)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[scanner]")
@@ -4709,51 +4534,22 @@ func Print(cfg *Config, w io.Writer) error {
 	}
 	fmt.Fprintln(w)
 
-	fmt.Fprintln(w, "[scanner.defaults]")
-	fmt.Fprintf(w, "timeout = %q\n", cfg.Scanner.Defaults.Timeout)
-	fmt.Fprintf(w, "parallel = %t\n", cfg.Scanner.Defaults.Parallel)
-	fmt.Fprintf(w, "exclude = %s\n", renderTOMLStringArray(cfg.Scanner.Defaults.Exclude))
-	fmt.Fprintf(w, "languages = %s\n", renderTOMLStringArray(cfg.Scanner.Defaults.Languages))
-	fmt.Fprintln(w)
+	// The [scanner.defaults]/[scanner.thresholds.*]/[scanner.tools]/
+	// [scanner.beads]/[scanner.notifications] TOML tables were deprecated in
+	// v1.28.0 (bd-6otuk): only scanner.ubs_path has a runtime reader. They are
+	// intentionally not printed so effective/default output cannot reintroduce
+	// deprecated keys.
 
-	writeThresholdConfig := func(name string, threshold ThresholdConfig) {
-		fmt.Fprintf(w, "[scanner.thresholds.%s]\n", name)
-		fmt.Fprintf(w, "block_critical = %t\n", threshold.BlockCritical)
-		fmt.Fprintf(w, "fail_critical = %t\n", threshold.FailCritical)
-		fmt.Fprintf(w, "block_errors = %d\n", threshold.BlockErrors)
-		fmt.Fprintf(w, "fail_errors = %d\n", threshold.FailErrors)
-		fmt.Fprintf(w, "show_warnings = %t\n", threshold.ShowWarnings)
-		fmt.Fprintf(w, "show_info = %t\n", threshold.ShowInfo)
-		fmt.Fprintln(w)
-	}
-
-	writeThresholdConfig("pre_commit", cfg.Scanner.Thresholds.PreCommit)
-	writeThresholdConfig("ci", cfg.Scanner.Thresholds.CI)
-	writeThresholdConfig("dashboard", cfg.Scanner.Thresholds.Dashboard)
-	writeThresholdConfig("interactive", cfg.Scanner.Thresholds.Interactive)
-
-	fmt.Fprintln(w, "[scanner.tools]")
-	fmt.Fprintf(w, "enabled = %s\n", renderTOMLStringArray(cfg.Scanner.Tools.Enabled))
-	fmt.Fprintf(w, "disabled = %s\n", renderTOMLStringArray(cfg.Scanner.Tools.Disabled))
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[scanner.beads]")
-	fmt.Fprintf(w, "auto_create = %t\n", cfg.Scanner.Beads.AutoCreate)
-	fmt.Fprintf(w, "min_severity = %q\n", cfg.Scanner.Beads.MinSeverity)
-	fmt.Fprintf(w, "auto_close = %t\n", cfg.Scanner.Beads.AutoClose)
-	fmt.Fprintf(w, "labels = %s\n", renderTOMLStringArray(cfg.Scanner.Beads.Labels))
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[scanner.notifications]")
-	fmt.Fprintf(w, "enabled = %t\n", cfg.Scanner.Notifications.Enabled)
-	fmt.Fprintf(w, "on_new_critical = %t\n", cfg.Scanner.Notifications.OnNewCritical)
-	fmt.Fprintf(w, "summary_after_scan = %t\n", cfg.Scanner.Notifications.SummaryAfterScan)
+	fmt.Fprintln(w, "[bugs]")
+	fmt.Fprintln(w, "# UBS bug push routing (ntm bugs watch)")
+	fmt.Fprintf(w, "push_routing = %t  # Route NEW findings to reservation holders (opt-in)\n", cfg.Bugs.PushRouting)
+	fmt.Fprintf(w, "interval = %q  # Scan interval for 'ntm bugs watch'\n", cfg.Bugs.EffectiveInterval().String())
+	fmt.Fprintf(w, "cooldown_minutes = %d  # Minimum minutes between bug nudges to the same pane\n", cfg.Bugs.CooldownMinutes)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[cass]")
 	fmt.Fprintln(w, "# CASS (Coding Agent Session Search) configuration")
 	fmt.Fprintf(w, "enabled = %t\n", cfg.CASS.Enabled)
-	fmt.Fprintf(w, "show_install_hints = %t\n", cfg.CASS.ShowInstallHints)
 	fmt.Fprintf(w, "timeout = %d\n", cfg.CASS.Timeout)
 	if cfg.CASS.BinaryPath != "" {
 		fmt.Fprintf(w, "binary_path = %q\n", cfg.CASS.BinaryPath)
@@ -4773,27 +4569,6 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "min_relevance = %.2f        # Minimum relevance score (0.0-1.0)\n", cfg.CASS.Context.MinRelevance)
 	fmt.Fprintf(w, "skip_if_context_above = %.0f  # Skip if context usage > this %% (0-100)\n", cfg.CASS.Context.SkipIfContextAbove)
 	fmt.Fprintf(w, "prefer_same_project = %t   # Prefer results from same project\n", cfg.CASS.Context.PreferSameProject)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[cass.duplicates]")
-	fmt.Fprintln(w, "# Duplicate detection settings")
-	fmt.Fprintf(w, "enabled = %t                # Check for duplicates before sending\n", cfg.CASS.Duplicates.Enabled)
-	fmt.Fprintf(w, "similarity_threshold = %.2f # 0-1, higher = stricter matching\n", cfg.CASS.Duplicates.SimilarityThreshold)
-	fmt.Fprintf(w, "lookback_days = %d          # How far back to check\n", cfg.CASS.Duplicates.LookbackDays)
-	fmt.Fprintf(w, "prompt_on_match = %t        # Ask user before proceeding\n", cfg.CASS.Duplicates.PromptOnMatch)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[cass.search]")
-	fmt.Fprintln(w, "# Search defaults")
-	fmt.Fprintf(w, "default_limit = %d\n", cfg.CASS.Search.DefaultLimit)
-	fmt.Fprintf(w, "default_fields = %q\n", cfg.CASS.Search.DefaultFields)
-	fmt.Fprintf(w, "include_meta = %t\n", cfg.CASS.Search.IncludeMeta)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[cass.tui]")
-	fmt.Fprintln(w, "# TUI settings")
-	fmt.Fprintf(w, "show_activity_sparkline = %t\n", cfg.CASS.TUI.ShowActivitySparkline)
-	fmt.Fprintf(w, "show_status_indicator = %t\n", cfg.CASS.TUI.ShowStatusIndicator)
 	fmt.Fprintln(w)
 
 	// Write Gemini setup configuration
@@ -4816,13 +4591,9 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintln(w, "[context_rotation]")
 	fmt.Fprintln(w, "# Context window rotation configuration")
 	fmt.Fprintln(w, "# Monitors agent context usage and rotates before exhaustion")
-	fmt.Fprintf(w, "enabled = %t                    # Top-level toggle for context rotation\n", cfg.ContextRotation.Enabled)
-	fmt.Fprintf(w, "warning_threshold = %.2f        # Warn when context usage exceeds this (0.0-1.0)\n", cfg.ContextRotation.WarningThreshold)
 	fmt.Fprintf(w, "rotate_threshold = %.2f         # Rotate agent when usage exceeds this (0.0-1.0)\n", cfg.ContextRotation.RotateThreshold)
 	fmt.Fprintf(w, "summary_max_tokens = %d        # Max tokens for handoff summary\n", cfg.ContextRotation.SummaryMaxTokens)
-	fmt.Fprintf(w, "min_session_age_sec = %d        # Don't rotate agents younger than this\n", cfg.ContextRotation.MinSessionAgeSec)
 	fmt.Fprintf(w, "try_compact_first = %t         # Try to compact before rotating\n", cfg.ContextRotation.TryCompactFirst)
-	fmt.Fprintf(w, "require_confirm = %t           # Require user confirmation before rotating\n", cfg.ContextRotation.RequireConfirm)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[recovery]")
@@ -4833,7 +4604,6 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "include_beads_context = %t\n", cfg.SessionRecovery.IncludeBeadsContext)
 	fmt.Fprintf(w, "max_recovery_tokens = %d\n", cfg.SessionRecovery.MaxRecoveryTokens)
 	fmt.Fprintf(w, "auto_inject_on_spawn = %t\n", cfg.SessionRecovery.AutoInjectOnSpawn)
-	fmt.Fprintf(w, "stale_threshold_hours = %d\n", cfg.SessionRecovery.StaleThresholdHours)
 	fmt.Fprintf(w, "max_cm_rules = %d\n", cfg.SessionRecovery.MaxCMRules)
 	fmt.Fprintf(w, "max_cm_snippets = %d\n", cfg.SessionRecovery.MaxCMSnippets)
 	fmt.Fprintf(w, "timeout_seconds = %d        # Seconds to gather recovery sources before degrading to partial recovery\n", cfg.SessionRecovery.TimeoutSeconds)
@@ -4858,46 +4628,33 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "operator_gated_labels = %s\n", renderTOMLStringArray(cfg.Assign.OperatorGatedLabels))
 	fmt.Fprintln(w)
 
+	fmt.Fprintln(w, "[assign.work_source]")
+	fmt.Fprintln(w, "# Opt-in policy for dispatching and advertising Beads work. Empty = any local checkout.")
+	fmt.Fprintln(w, "# Full local ref HEAD must equal (e.g. \"refs/remotes/origin/main\"); never fetched.")
+	fmt.Fprintf(w, "required_ref = %q\n", cfg.Assign.WorkSource.RequiredRef)
+	fmt.Fprintln(w, "# Refuse work from a checkout with uncommitted changes.")
+	fmt.Fprintf(w, "require_clean = %t\n", cfg.Assign.WorkSource.RequireClean)
+	fmt.Fprintln(w, "# Only beads carrying one of these labels (e.g. \"program:lms\"). Empty = all.")
+	fmt.Fprintf(w, "program_labels = %s\n", renderTOMLStringArray(cfg.Assign.WorkSource.ProgramLabels))
+	fmt.Fprintln(w)
+
 	fmt.Fprintln(w, "[spawn_pacing]")
-	fmt.Fprintln(w, "# Global spawn scheduler pacing defaults")
+	fmt.Fprintln(w, "# Spawn admission control (concurrency caps)")
 	fmt.Fprintf(w, "enabled = %t\n", cfg.SpawnPacing.Enabled)
 	fmt.Fprintf(w, "max_concurrent_spawns = %d\n", cfg.SpawnPacing.MaxConcurrentSpawns)
-	fmt.Fprintf(w, "max_spawns_per_sec = %.2f\n", cfg.SpawnPacing.MaxSpawnsPerSecond)
-	fmt.Fprintf(w, "burst_size = %d\n", cfg.SpawnPacing.BurstSize)
-	fmt.Fprintf(w, "default_retries = %d\n", cfg.SpawnPacing.DefaultRetries)
-	fmt.Fprintf(w, "retry_delay_ms = %d\n", cfg.SpawnPacing.RetryDelayMs)
-	fmt.Fprintf(w, "backpressure_threshold = %d\n", cfg.SpawnPacing.BackpressureThreshold)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[spawn_pacing.agent_caps]")
 	fmt.Fprintf(w, "claude_max_concurrent = %d\n", cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent)
-	fmt.Fprintf(w, "claude_rate_per_sec = %.2f\n", cfg.SpawnPacing.AgentCaps.ClaudeRatePerSec)
-	fmt.Fprintf(w, "claude_ramp_up_delay_ms = %d\n", cfg.SpawnPacing.AgentCaps.ClaudeRampUpDelayMs)
 	fmt.Fprintf(w, "codex_max_concurrent = %d\n", cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent)
-	fmt.Fprintf(w, "codex_rate_per_sec = %.2f\n", cfg.SpawnPacing.AgentCaps.CodexRatePerSec)
-	fmt.Fprintf(w, "codex_ramp_up_delay_ms = %d\n", cfg.SpawnPacing.AgentCaps.CodexRampUpDelayMs)
 	fmt.Fprintf(w, "gemini_max_concurrent = %d\n", cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent)
-	fmt.Fprintf(w, "gemini_rate_per_sec = %.2f\n", cfg.SpawnPacing.AgentCaps.GeminiRatePerSec)
-	fmt.Fprintf(w, "gemini_ramp_up_delay_ms = %d\n", cfg.SpawnPacing.AgentCaps.GeminiRampUpDelayMs)
-	fmt.Fprintf(w, "cooldown_on_failure_ms = %d\n", cfg.SpawnPacing.AgentCaps.CooldownOnFailureMs)
-	fmt.Fprintf(w, "recovery_successes = %d\n", cfg.SpawnPacing.AgentCaps.RecoverySuccesses)
+	fmt.Fprintf(w, "omp_max_concurrent = %d\n", cfg.SpawnPacing.AgentCaps.OmpMaxConcurrent)
 	fmt.Fprintln(w)
 
-	fmt.Fprintln(w, "[spawn_pacing.headroom]")
-	fmt.Fprintf(w, "enabled = %t\n", cfg.SpawnPacing.Headroom.Enabled)
-	fmt.Fprintf(w, "min_free_mb = %d\n", cfg.SpawnPacing.Headroom.MinFreeMB)
-	fmt.Fprintf(w, "min_free_disk_mb = %d\n", cfg.SpawnPacing.Headroom.MinFreeDiskMB)
-	fmt.Fprintf(w, "max_load_average = %.2f\n", cfg.SpawnPacing.Headroom.MaxLoadAverage)
-	fmt.Fprintf(w, "max_open_files = %d\n", cfg.SpawnPacing.Headroom.MaxOpenFiles)
-	fmt.Fprintf(w, "check_interval_ms = %d\n", cfg.SpawnPacing.Headroom.CheckIntervalMs)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[spawn_pacing.backoff]")
-	fmt.Fprintf(w, "initial_delay_ms = %d\n", cfg.SpawnPacing.Backoff.InitialDelayMs)
-	fmt.Fprintf(w, "max_delay_ms = %d\n", cfg.SpawnPacing.Backoff.MaxDelayMs)
-	fmt.Fprintf(w, "multiplier = %.2f\n", cfg.SpawnPacing.Backoff.Multiplier)
-	fmt.Fprintf(w, "max_consecutive_failures = %d\n", cfg.SpawnPacing.Backoff.MaxConsecutiveFailures)
-	fmt.Fprintf(w, "global_pause_duration_ms = %d\n", cfg.SpawnPacing.Backoff.GlobalPauseDurationMs)
+	fmt.Fprintln(w, "[spawn]")
+	fmt.Fprintln(w, "# Defaults for `ntm spawn` and `--robot-spawn` when the flag is not given (flags win)")
+	fmt.Fprintf(w, "stagger_mode = %q  # Prompt pacing between agents: none, fixed, or smart\n", cfg.Spawn.StaggerMode)
+	fmt.Fprintf(w, "stagger_delay = %q  # Fixed-mode interval between consecutive agents (0-5m)\n", cfg.Spawn.StaggerDelay.String())
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[file_reservation]")
@@ -4915,12 +4672,13 @@ func Print(cfg *Config, w io.Writer) error {
 
 	fmt.Fprintln(w, "[memory]")
 	fmt.Fprintln(w, "# cass-memory integration defaults")
+	fmt.Fprintln(w, "# Session-recovery tuning lives in [recovery] (include_cm_memories,")
+	fmt.Fprintln(w, "# max_cm_rules, timeout_seconds), not here.")
 	fmt.Fprintf(w, "enabled = %t\n", cfg.Memory.Enabled)
-	fmt.Fprintf(w, "include_in_recovery = %t\n", cfg.Memory.IncludeInRecovery)
-	fmt.Fprintf(w, "max_rules = %d\n", cfg.Memory.MaxRules)
-	fmt.Fprintf(w, "include_anti_patterns = %t\n", cfg.Memory.IncludeAntiPatterns)
-	fmt.Fprintf(w, "include_history = %t\n", cfg.Memory.IncludeHistory)
-	fmt.Fprintf(w, "query_timeout_seconds = %d\n", cfg.Memory.QueryTimeoutSeconds)
+	fmt.Fprintf(w, "query_timeout_seconds = %d          # Budget for a cm query behind send-time injection\n", cfg.Memory.QueryTimeoutSeconds)
+	fmt.Fprintf(w, "send_injection = %t             # Inject rules on robot sends by default (--with-memory)\n", cfg.Memory.SendInjection)
+	fmt.Fprintf(w, "send_max_rules = %d\n", cfg.Memory.SendMaxRules)
+	fmt.Fprintf(w, "send_budget_tokens = %d\n", cfg.Memory.SendBudgetTokens)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[swarm]")
@@ -4951,11 +4709,6 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "cc = %d\n", cfg.Swarm.Tier3Allocation.CC)
 	fmt.Fprintf(w, "cod = %d\n", cfg.Swarm.Tier3Allocation.Cod)
 	fmt.Fprintf(w, "gmi = %d\n", cfg.Swarm.Tier3Allocation.Gmi)
-	fmt.Fprintln(w)
-
-	fmt.Fprintln(w, "[swarm.marching_orders]")
-	fmt.Fprintf(w, "default = %q\n", cfg.Swarm.MarchingOrders.Default)
-	fmt.Fprintf(w, "review = %q\n", cfg.Swarm.MarchingOrders.Review)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "[ensemble]")
@@ -5024,6 +4777,23 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "findings_threshold = %.2f\n", cfg.Ensemble.EarlyStop.FindingsThreshold)
 	fmt.Fprintf(w, "similarity_threshold = %.2f\n", cfg.Ensemble.EarlyStop.SimilarityThreshold)
 	fmt.Fprintf(w, "window_size = %d\n", cfg.Ensemble.EarlyStop.WindowSize)
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "[coordinator]")
+	fmt.Fprintln(w, "# Session coordinator (ntm coordinator run): monitoring, digests, auto-assign,")
+	fmt.Fprintln(w, "# conflict handling, and the Agent Mail idle-pane nudge (GH#231)")
+	fmt.Fprintf(w, "poll_interval = %q  # How often to poll agent status\n", cfg.Coordinator.PollInterval.String())
+	fmt.Fprintf(w, "digest_interval = %q  # How often to send digests\n", cfg.Coordinator.DigestInterval.String())
+	fmt.Fprintf(w, "auto_assign = %t  # Automatically assign work to idle agents\n", cfg.Coordinator.AutoAssign)
+	fmt.Fprintf(w, "idle_threshold = %.1f  # Seconds of inactivity before considering idle\n", cfg.Coordinator.IdleThreshold)
+	fmt.Fprintf(w, "assign_only_idle = %t  # Only assign to truly idle agents\n", cfg.Coordinator.AssignOnlyIdle)
+	fmt.Fprintf(w, "conflict_notify = %t  # Notify when conflicts detected\n", cfg.Coordinator.ConflictNotify)
+	fmt.Fprintf(w, "conflict_negotiate = %t  # Attempt automatic conflict resolution\n", cfg.Coordinator.ConflictNegotiate)
+	fmt.Fprintf(w, "send_digests = %t  # Send periodic digests to the human agent\n", cfg.Coordinator.SendDigests)
+	fmt.Fprintf(w, "human_agent = %q  # Agent name digests are sent to\n", cfg.Coordinator.HumanAgent)
+	fmt.Fprintf(w, "mail_nudge = %t  # Nudge idle panes that have unread Agent Mail\n", cfg.Coordinator.MailNudge)
+	fmt.Fprintf(w, "nudge_cooldown_seconds = %d  # Minimum seconds between nudges to the same pane\n", cfg.Coordinator.NudgeCooldownSeconds)
+	fmt.Fprintf(w, "nudge_message = %q  # Optional override for the nudge prompt (empty = built-in)\n", cfg.Coordinator.NudgeMessage)
 	fmt.Fprintln(w)
 
 	fmt.Fprintln(w, "# Command Palette entries")
@@ -5195,6 +4965,47 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty path")
 	}
+
+	// Paths whose value is not the raw struct field resolve here, ahead of
+	// everything else, so the exception is stated exactly once.
+	if override, ok := configValueOverrides[path]; ok {
+		return override(cfg), nil
+	}
+
+	// A dead key is not merely unknown: the loader, `config migrate` and
+	// `ntm doctor` all recognize it and name its replacement, so this surface
+	// says the same thing rather than sending the user off to look for a
+	// typo (ntm#323). Checked before resolution because a removed knob may
+	// still carry a struct field during its deprecation window.
+	if disposition, _, dead := classifyDeadKey(path); dead {
+		return nil, fmt.Errorf("config key %s was %s — it is no longer read; run 'ntm config migrate' to clean it up", path, disposition)
+	}
+
+	// Structural resolution over `toml` tags is the authority.
+	//
+	// The switch below is a hand-maintained index that had silently drifted
+	// from the struct: `agents.claude_isolate_credentials` and
+	// `agents.claude_token_file` are live keys read at spawn time
+	// (internal/swarm/claude_config_home.go) yet answered "unknown config
+	// path", as did `agent_mail.pane_badges` and every key under
+	// [command_hooks], [retry] and [routing]. An operator verifying a
+	// documented key with `ntm config get` was told it did not exist.
+	//
+	// It also *shadowed* deeper paths: a map entry such as `models.claude.<alias>`
+	// returned the whole map because the case matched on `parts[1]` and ignored
+	// the rest.
+	// Resolving structurally first fixes that and makes reachability a
+	// property of the struct instead of of anyone remembering to add a case.
+	// TestGetValueReachesEveryTOMLLeaf enforces it.
+	switch value, outcome := configValueByTOMLPath(reflect.ValueOf(cfg).Elem(), strings.Split(path, ".")); outcome {
+	case configLookupFound:
+		return value, nil
+	case configLookupAbsentKey:
+		// The container exists and simply has no such entry. Definitive — do
+		// not let the switch below answer with the whole container instead.
+		return nil, fmt.Errorf("unknown config path: %s", path)
+	}
+
 	parts := strings.Split(path, ".")
 
 	switch parts[0] {
@@ -5206,8 +5017,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 		return cfg.HelpVerbosity, nil
 	case "palette_file":
 		return cfg.PaletteFile, nil
-	case "suggestions_enabled":
-		return cfg.SuggestionsEnabled, nil
 	case "palette":
 		return cfg.Palette, nil
 	case "palette_state":
@@ -5249,10 +5058,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Agents.Aider, nil
 		case "oc":
 			return cfg.Agents.Opencode, nil
-		case "plugins":
-			return cfg.Agents.Plugins, nil
-		case "default_count":
-			return cfg.Agents.DefaultCount, nil
+		case "omp":
+			return cfg.Agents.Omp, nil
 		}
 	case "tmux":
 		if len(parts) < 2 {
@@ -5261,24 +5068,10 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 		switch parts[1] {
 		case "default_panes":
 			return cfg.Tmux.DefaultPanes, nil
-		case "palette_key":
-			return cfg.Tmux.PaletteKey, nil
 		case "pane_init_delay_ms":
 			return cfg.Tmux.PaneInitDelayMs, nil
 		case "history_limit":
 			return cfg.Tmux.HistoryLimit, nil
-		case "activity_indicators":
-			if len(parts) < 3 {
-				return cfg.Tmux.ActivityIndicators, nil
-			}
-			switch parts[2] {
-			case "enabled":
-				return cfg.Tmux.ActivityIndicators.Enabled, nil
-			case "active_seconds":
-				return cfg.Tmux.ActivityIndicators.ActiveSeconds, nil
-			case "stalled_seconds":
-				return cfg.Tmux.ActivityIndicators.StalledSeconds, nil
-			}
 		}
 	case "robot":
 		if len(parts) < 2 {
@@ -5294,12 +5087,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			switch parts[2] {
 			case "format":
 				return cfg.Robot.Output.Format, nil
-			case "pretty":
-				return cfg.Robot.Output.Pretty, nil
-			case "timestamps":
-				return cfg.Robot.Output.Timestamps, nil
-			case "compress":
-				return cfg.Robot.Output.Compress, nil
 			}
 		}
 	case "agent_mail":
@@ -5315,8 +5102,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return "[redacted]", nil
 		case "auto_register":
 			return cfg.AgentMail.AutoRegister, nil
-		case "program_name":
-			return cfg.AgentMail.ProgramName, nil
 		case "supervisor_enabled":
 			return cfg.AgentMail.SupervisorEnabledOrDefault(), nil
 		}
@@ -5350,36 +5135,26 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			switch parts[2] {
 			case "enabled":
 				return cfg.Integrations.Rano.Enabled, nil
-			case "binary_path":
-				return cfg.Integrations.Rano.BinaryPath, nil
 			case "poll_interval_ms":
 				return cfg.Integrations.Rano.PollIntervalMs, nil
-			case "providers":
-				return cfg.Integrations.Rano.Providers, nil
-			case "persist_history":
-				return cfg.Integrations.Rano.PersistHistory, nil
-			case "history_days":
-				return cfg.Integrations.Rano.HistoryDays, nil
+			case "sqlite_path":
+				return cfg.Integrations.Rano.SQLitePath, nil
 			}
 		case "caam":
 			if len(parts) < 3 {
 				return cfg.Integrations.CAAM, nil
 			}
 			switch parts[2] {
-			case "enabled":
-				return cfg.Integrations.CAAM.Enabled, nil
 			case "binary_path":
 				return cfg.Integrations.CAAM.BinaryPath, nil
-			case "auto_rotate":
-				return cfg.Integrations.CAAM.AutoRotate, nil
-			case "providers":
-				return cfg.Integrations.CAAM.Providers, nil
-			case "rate_limit_patterns":
-				return cfg.Integrations.CAAM.RateLimitPatterns, nil
-			case "account_cooldown":
-				return cfg.Integrations.CAAM.AccountCooldown, nil
-			case "alert_threshold":
-				return cfg.Integrations.CAAM.AlertThreshold, nil
+			case "auto_failover":
+				return cfg.Integrations.CAAM.AutoFailover, nil
+			case "reset_horizon_minutes":
+				return cfg.Integrations.CAAM.ResetHorizonMinutes, nil
+			case "failover_providers":
+				return cfg.Integrations.CAAM.FailoverProviders, nil
+			case "seat_selection":
+				return cfg.Integrations.CAAM.SeatSelection, nil
 			}
 		case "rch":
 			if len(parts) < 3 {
@@ -5390,38 +5165,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 				return cfg.Integrations.RCH.Enabled, nil
 			case "binary_path":
 				return cfg.Integrations.RCH.BinaryPath, nil
-			case "min_build_time":
-				return cfg.Integrations.RCH.MinBuildTime, nil
 			case "intercept_patterns":
 				return cfg.Integrations.RCH.InterceptPatterns, nil
-			case "fallback_local":
-				return cfg.Integrations.RCH.FallbackLocal, nil
-			case "show_location":
-				return cfg.Integrations.RCH.ShowLocation, nil
-			case "preferred_worker":
-				return cfg.Integrations.RCH.PreferredWorker, nil
-			case "dcg_whitelist":
-				return cfg.Integrations.RCH.DCGWhitelist, nil
-			}
-		case "caut":
-			if len(parts) < 3 {
-				return cfg.Integrations.Caut, nil
-			}
-			switch parts[2] {
-			case "enabled":
-				return cfg.Integrations.Caut.Enabled, nil
-			case "binary_path":
-				return cfg.Integrations.Caut.BinaryPath, nil
-			case "poll_interval":
-				return cfg.Integrations.Caut.PollInterval, nil
-			case "alert_threshold":
-				return cfg.Integrations.Caut.AlertThreshold, nil
-			case "providers":
-				return cfg.Integrations.Caut.Providers, nil
-			case "per_agent_tracking":
-				return cfg.Integrations.Caut.PerAgentTracking, nil
-			case "currency":
-				return cfg.Integrations.Caut.Currency, nil
 			}
 		case "process_triage":
 			if len(parts) < 3 {
@@ -5430,30 +5175,14 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			switch parts[2] {
 			case "enabled":
 				return cfg.Integrations.ProcessTriage.Enabled, nil
-			case "binary_path":
-				return cfg.Integrations.ProcessTriage.BinaryPath, nil
 			case "check_interval":
 				return cfg.Integrations.ProcessTriage.CheckInterval, nil
 			case "idle_threshold":
 				return cfg.Integrations.ProcessTriage.IdleThreshold, nil
 			case "stuck_threshold":
 				return cfg.Integrations.ProcessTriage.StuckThreshold, nil
-			case "on_stuck":
-				return cfg.Integrations.ProcessTriage.OnStuck, nil
 			case "use_rano_data":
 				return cfg.Integrations.ProcessTriage.UseRanoData, nil
-			}
-		case "proxy":
-			if len(parts) < 3 {
-				return cfg.Integrations.Proxy, nil
-			}
-			switch parts[2] {
-			case "enabled":
-				return cfg.Integrations.Proxy.Enabled, nil
-			case "bin_path":
-				return cfg.Integrations.Proxy.BinPath, nil
-			case "check_interval":
-				return cfg.Integrations.Proxy.CheckInterval, nil
 			}
 		case "xf":
 			if len(parts) < 3 {
@@ -5462,12 +5191,14 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			switch parts[2] {
 			case "enabled":
 				return cfg.Integrations.XF.Enabled, nil
-			case "bin_path":
-				return cfg.Integrations.XF.BinPath, nil
-			case "archive_path":
-				return cfg.Integrations.XF.ArchivePath, nil
-			case "default_mode":
-				return cfg.Integrations.XF.DefaultMode, nil
+			}
+		case "bv":
+			if len(parts) < 3 {
+				return cfg.Integrations.BV, nil
+			}
+			switch parts[2] {
+			case "timeout_seconds":
+				return cfg.Integrations.BV.TimeoutSeconds, nil
 			}
 		}
 	case "models":
@@ -5491,6 +5222,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Models.DefaultMuse, nil
 		case "default_opencode":
 			return cfg.Models.DefaultOpencode, nil
+		case "default_omp":
+			return cfg.Models.DefaultOmp, nil
 		case "claude":
 			return cfg.Models.Claude, nil
 		case "codex":
@@ -5505,6 +5238,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Models.Kimi, nil
 		case "muse":
 			return cfg.Models.Muse, nil
+		case "omp":
+			return cfg.Models.Omp, nil
 		}
 	case "alerts":
 		if len(parts) < 2 {
@@ -5517,6 +5252,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Alerts.AgentStuckMinutes, nil
 		case "disk_low_threshold_gb":
 			return cfg.Alerts.DiskLowThresholdGB, nil
+		case "disk_full_horizon_hours":
+			return cfg.Alerts.DiskFullHorizonHours, nil
 		case "mail_backlog_threshold":
 			return cfg.Alerts.MailBacklogThreshold, nil
 		case "bead_stale_hours":
@@ -5543,14 +5280,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Checkpoints.ScrollbackLines, nil
 		case "include_git":
 			return cfg.Checkpoints.IncludeGit, nil
-		case "auto_checkpoint_on_spawn":
-			return cfg.Checkpoints.AutoCheckpointOnSpawn, nil
-		case "interval_minutes":
-			return cfg.Checkpoints.IntervalMinutes, nil
-		case "on_rotation":
-			return cfg.Checkpoints.OnRotation, nil
-		case "on_error":
-			return cfg.Checkpoints.OnError, nil
 		}
 	case "notifications":
 		if len(parts) < 2 {
@@ -5654,8 +5383,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 				return cfg.Resilience.RateLimit.Detect, nil
 			case "notify":
 				return cfg.Resilience.RateLimit.Notify, nil
-			case "patterns":
-				return cfg.Resilience.RateLimit.Patterns, nil
 			}
 		}
 	case "context_rotation":
@@ -5663,24 +5390,14 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.ContextRotation, nil
 		}
 		switch parts[1] {
-		case "enabled":
-			return cfg.ContextRotation.Enabled, nil
-		case "warning_threshold":
-			return cfg.ContextRotation.WarningThreshold, nil
 		case "rotate_threshold":
 			return cfg.ContextRotation.RotateThreshold, nil
 		case "summary_max_tokens":
 			return cfg.ContextRotation.SummaryMaxTokens, nil
-		case "min_session_age_sec":
-			return cfg.ContextRotation.MinSessionAgeSec, nil
 		case "try_compact_first":
 			return cfg.ContextRotation.TryCompactFirst, nil
-		case "require_confirm":
-			return cfg.ContextRotation.RequireConfirm, nil
 		case "confirm_timeout_sec":
 			return cfg.ContextRotation.ConfirmTimeoutSec, nil
-		case "default_confirm_action":
-			return cfg.ContextRotation.DefaultConfirmAction, nil
 		}
 	case "context":
 		if len(parts) < 2 {
@@ -5707,8 +5424,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.SessionRecovery.MaxRecoveryTokens, nil
 		case "auto_inject_on_spawn":
 			return cfg.SessionRecovery.AutoInjectOnSpawn, nil
-		case "stale_threshold_hours":
-			return cfg.SessionRecovery.StaleThresholdHours, nil
 		case "max_cm_rules":
 			return cfg.SessionRecovery.MaxCMRules, nil
 		case "max_cm_snippets":
@@ -5741,6 +5456,18 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Assign.PromptTemplateFile, nil
 		case "operator_gated_labels":
 			return append([]string(nil), cfg.Assign.OperatorGatedLabels...), nil
+		case "work_source":
+			if len(parts) < 3 {
+				return cfg.Assign.WorkSource, nil
+			}
+			switch parts[2] {
+			case "required_ref":
+				return cfg.Assign.WorkSource.RequiredRef, nil
+			case "require_clean":
+				return cfg.Assign.WorkSource.RequireClean, nil
+			case "program_labels":
+				return append([]string(nil), cfg.Assign.WorkSource.ProgramLabels...), nil
+			}
 		}
 	case "file_reservation":
 		if len(parts) < 2 {
@@ -5773,16 +5500,14 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 		switch parts[1] {
 		case "enabled":
 			return cfg.Memory.Enabled, nil
-		case "include_in_recovery":
-			return cfg.Memory.IncludeInRecovery, nil
-		case "max_rules":
-			return cfg.Memory.MaxRules, nil
-		case "include_anti_patterns":
-			return cfg.Memory.IncludeAntiPatterns, nil
-		case "include_history":
-			return cfg.Memory.IncludeHistory, nil
 		case "query_timeout_seconds":
 			return cfg.Memory.QueryTimeoutSeconds, nil
+		case "send_injection":
+			return cfg.Memory.SendInjection, nil
+		case "send_max_rules":
+			return cfg.Memory.SendMaxRules, nil
+		case "send_budget_tokens":
+			return cfg.Memory.SendBudgetTokens, nil
 		}
 	case "privacy":
 		if len(parts) < 2 {
@@ -5815,8 +5540,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Preflight, nil
 		}
 		switch parts[1] {
-		case "enabled":
-			return cfg.Preflight.Enabled, nil
 		case "strict":
 			return cfg.Preflight.Strict, nil
 		}
@@ -5887,6 +5610,10 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Prompts.AgyDefault, nil
 		case "agy_default_file":
 			return cfg.Prompts.AgyDefaultFile, nil
+		case "omp_default":
+			return cfg.Prompts.OmpDefault, nil
+		case "omp_default_file":
+			return cfg.Prompts.OmpDefaultFile, nil
 		}
 	case "spawn_pacing":
 		if len(parts) < 2 {
@@ -5897,16 +5624,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.SpawnPacing.Enabled, nil
 		case "max_concurrent_spawns":
 			return cfg.SpawnPacing.MaxConcurrentSpawns, nil
-		case "max_spawns_per_sec":
-			return cfg.SpawnPacing.MaxSpawnsPerSecond, nil
-		case "burst_size":
-			return cfg.SpawnPacing.BurstSize, nil
-		case "default_retries":
-			return cfg.SpawnPacing.DefaultRetries, nil
-		case "retry_delay_ms":
-			return cfg.SpawnPacing.RetryDelayMs, nil
-		case "backpressure_threshold":
-			return cfg.SpawnPacing.BackpressureThreshold, nil
 		case "agent_caps":
 			if len(parts) < 3 {
 				return cfg.SpawnPacing.AgentCaps, nil
@@ -5914,61 +5631,23 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			switch parts[2] {
 			case "claude_max_concurrent":
 				return cfg.SpawnPacing.AgentCaps.ClaudeMaxConcurrent, nil
-			case "claude_rate_per_sec":
-				return cfg.SpawnPacing.AgentCaps.ClaudeRatePerSec, nil
-			case "claude_ramp_up_delay_ms":
-				return cfg.SpawnPacing.AgentCaps.ClaudeRampUpDelayMs, nil
 			case "codex_max_concurrent":
 				return cfg.SpawnPacing.AgentCaps.CodexMaxConcurrent, nil
-			case "codex_rate_per_sec":
-				return cfg.SpawnPacing.AgentCaps.CodexRatePerSec, nil
-			case "codex_ramp_up_delay_ms":
-				return cfg.SpawnPacing.AgentCaps.CodexRampUpDelayMs, nil
 			case "gemini_max_concurrent":
 				return cfg.SpawnPacing.AgentCaps.GeminiMaxConcurrent, nil
-			case "gemini_rate_per_sec":
-				return cfg.SpawnPacing.AgentCaps.GeminiRatePerSec, nil
-			case "gemini_ramp_up_delay_ms":
-				return cfg.SpawnPacing.AgentCaps.GeminiRampUpDelayMs, nil
-			case "cooldown_on_failure_ms":
-				return cfg.SpawnPacing.AgentCaps.CooldownOnFailureMs, nil
-			case "recovery_successes":
-				return cfg.SpawnPacing.AgentCaps.RecoverySuccesses, nil
+			case "omp_max_concurrent":
+				return cfg.SpawnPacing.AgentCaps.OmpMaxConcurrent, nil
 			}
-		case "headroom":
-			if len(parts) < 3 {
-				return cfg.SpawnPacing.Headroom, nil
-			}
-			switch parts[2] {
-			case "enabled":
-				return cfg.SpawnPacing.Headroom.Enabled, nil
-			case "min_free_mb":
-				return cfg.SpawnPacing.Headroom.MinFreeMB, nil
-			case "min_free_disk_mb":
-				return cfg.SpawnPacing.Headroom.MinFreeDiskMB, nil
-			case "max_load_average":
-				return cfg.SpawnPacing.Headroom.MaxLoadAverage, nil
-			case "max_open_files":
-				return cfg.SpawnPacing.Headroom.MaxOpenFiles, nil
-			case "check_interval_ms":
-				return cfg.SpawnPacing.Headroom.CheckIntervalMs, nil
-			}
-		case "backoff":
-			if len(parts) < 3 {
-				return cfg.SpawnPacing.Backoff, nil
-			}
-			switch parts[2] {
-			case "initial_delay_ms":
-				return cfg.SpawnPacing.Backoff.InitialDelayMs, nil
-			case "max_delay_ms":
-				return cfg.SpawnPacing.Backoff.MaxDelayMs, nil
-			case "multiplier":
-				return cfg.SpawnPacing.Backoff.Multiplier, nil
-			case "max_consecutive_failures":
-				return cfg.SpawnPacing.Backoff.MaxConsecutiveFailures, nil
-			case "global_pause_duration_ms":
-				return cfg.SpawnPacing.Backoff.GlobalPauseDurationMs, nil
-			}
+		}
+	case "spawn":
+		if len(parts) < 2 {
+			return cfg.Spawn, nil
+		}
+		switch parts[1] {
+		case "stagger_mode":
+			return cfg.Spawn.StaggerMode, nil
+		case "stagger_delay":
+			return cfg.Spawn.StaggerDelay, nil
 		}
 	case "swarm":
 		if len(parts) < 2 {
@@ -5997,10 +5676,36 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Swarm.StaggerDelayMs, nil
 		case "auto_rotate_accounts":
 			return cfg.Swarm.AutoRotateAccounts, nil
-		case "limit_patterns":
-			return cfg.Swarm.LimitPatterns, nil
-		case "marching_orders":
-			return cfg.Swarm.MarchingOrders, nil
+		}
+	case "coordinator":
+		if len(parts) < 2 {
+			return cfg.Coordinator, nil
+		}
+		switch parts[1] {
+		case "poll_interval":
+			return cfg.Coordinator.PollInterval, nil
+		case "digest_interval":
+			return cfg.Coordinator.DigestInterval, nil
+		case "auto_assign":
+			return cfg.Coordinator.AutoAssign, nil
+		case "idle_threshold":
+			return cfg.Coordinator.IdleThreshold, nil
+		case "assign_only_idle":
+			return cfg.Coordinator.AssignOnlyIdle, nil
+		case "conflict_notify":
+			return cfg.Coordinator.ConflictNotify, nil
+		case "conflict_negotiate":
+			return cfg.Coordinator.ConflictNegotiate, nil
+		case "send_digests":
+			return cfg.Coordinator.SendDigests, nil
+		case "human_agent":
+			return cfg.Coordinator.HumanAgent, nil
+		case "mail_nudge":
+			return cfg.Coordinator.MailNudge, nil
+		case "nudge_cooldown_seconds":
+			return cfg.Coordinator.NudgeCooldownSeconds, nil
+		case "nudge_message":
+			return cfg.Coordinator.NudgeMessage, nil
 		}
 	case "ensemble":
 		if len(parts) < 2 {
@@ -6080,6 +5785,18 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 				return cfg.Ensemble.EarlyStop.WindowSize, nil
 			}
 		}
+	case "bugs":
+		if len(parts) < 2 {
+			return cfg.Bugs, nil
+		}
+		switch parts[1] {
+		case "push_routing":
+			return cfg.Bugs.PushRouting, nil
+		case "interval":
+			return cfg.Bugs.Interval, nil
+		case "cooldown_minutes":
+			return cfg.Bugs.CooldownMinutes, nil
+		}
 	case "cass":
 		if len(parts) < 2 {
 			return cfg.CASS, nil
@@ -6087,8 +5804,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 		switch parts[1] {
 		case "enabled":
 			return cfg.CASS.Enabled, nil
-		case "show_install_hints":
-			return cfg.CASS.ShowInstallHints, nil
 		case "binary_path":
 			return cfg.CASS.BinaryPath, nil
 		case "timeout":
@@ -6113,42 +5828,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			case "prefer_same_project":
 				return cfg.CASS.Context.PreferSameProject, nil
 			}
-		case "duplicates":
-			if len(parts) < 3 {
-				return cfg.CASS.Duplicates, nil
-			}
-			switch parts[2] {
-			case "enabled":
-				return cfg.CASS.Duplicates.Enabled, nil
-			case "similarity_threshold":
-				return cfg.CASS.Duplicates.SimilarityThreshold, nil
-			case "lookback_days":
-				return cfg.CASS.Duplicates.LookbackDays, nil
-			case "prompt_on_match":
-				return cfg.CASS.Duplicates.PromptOnMatch, nil
-			}
-		case "search":
-			if len(parts) < 3 {
-				return cfg.CASS.Search, nil
-			}
-			switch parts[2] {
-			case "default_limit":
-				return cfg.CASS.Search.DefaultLimit, nil
-			case "default_fields":
-				return cfg.CASS.Search.DefaultFields, nil
-			case "include_meta":
-				return cfg.CASS.Search.IncludeMeta, nil
-			}
-		case "tui":
-			if len(parts) < 3 {
-				return cfg.CASS.TUI, nil
-			}
-			switch parts[2] {
-			case "show_activity_sparkline":
-				return cfg.CASS.TUI.ShowActivitySparkline, nil
-			case "show_status_indicator":
-				return cfg.CASS.TUI.ShowStatusIndicator, nil
-			}
 		}
 	case "scanner":
 		if len(parts) < 2 {
@@ -6157,110 +5836,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 		switch parts[1] {
 		case "ubs_path":
 			return cfg.Scanner.UBSPath, nil
-		case "defaults":
-			if len(parts) < 3 {
-				return cfg.Scanner.Defaults, nil
-			}
-			switch parts[2] {
-			case "timeout":
-				return cfg.Scanner.Defaults.Timeout, nil
-			case "parallel":
-				return cfg.Scanner.Defaults.Parallel, nil
-			case "exclude":
-				return cfg.Scanner.Defaults.Exclude, nil
-			case "languages":
-				return cfg.Scanner.Defaults.Languages, nil
-			}
-		case "thresholds":
-			if len(parts) < 3 {
-				return cfg.Scanner.Thresholds, nil
-			}
-			var threshold *ThresholdConfig
-			switch parts[2] {
-			case "pre_commit":
-				threshold = &cfg.Scanner.Thresholds.PreCommit
-			case "ci":
-				threshold = &cfg.Scanner.Thresholds.CI
-			case "dashboard":
-				threshold = &cfg.Scanner.Thresholds.Dashboard
-			case "interactive":
-				threshold = &cfg.Scanner.Thresholds.Interactive
-			}
-			if threshold != nil {
-				if len(parts) < 4 {
-					return *threshold, nil
-				}
-				switch parts[3] {
-				case "block_critical":
-					return threshold.BlockCritical, nil
-				case "fail_critical":
-					return threshold.FailCritical, nil
-				case "block_errors":
-					return threshold.BlockErrors, nil
-				case "fail_errors":
-					return threshold.FailErrors, nil
-				case "show_warnings":
-					return threshold.ShowWarnings, nil
-				case "show_info":
-					return threshold.ShowInfo, nil
-				}
-			}
-		case "tools":
-			if len(parts) < 3 {
-				return cfg.Scanner.Tools, nil
-			}
-			switch parts[2] {
-			case "enabled":
-				return cfg.Scanner.Tools.Enabled, nil
-			case "disabled":
-				return cfg.Scanner.Tools.Disabled, nil
-			}
-		case "beads":
-			if len(parts) < 3 {
-				return cfg.Scanner.Beads, nil
-			}
-			switch parts[2] {
-			case "auto_create":
-				return cfg.Scanner.Beads.AutoCreate, nil
-			case "min_severity":
-				return cfg.Scanner.Beads.MinSeverity, nil
-			case "auto_close":
-				return cfg.Scanner.Beads.AutoClose, nil
-			case "labels":
-				return cfg.Scanner.Beads.Labels, nil
-			}
-		case "notifications":
-			if len(parts) < 3 {
-				return cfg.Scanner.Notifications, nil
-			}
-			switch parts[2] {
-			case "enabled":
-				return cfg.Scanner.Notifications.Enabled, nil
-			case "on_new_critical":
-				return cfg.Scanner.Notifications.OnNewCritical, nil
-			case "summary_after_scan":
-				return cfg.Scanner.Notifications.SummaryAfterScan, nil
-			}
-		}
-	case "accounts":
-		if len(parts) < 2 {
-			return cfg.Accounts, nil
-		}
-		switch parts[1] {
-		case "state_file":
-			return cfg.Accounts.StateFile, nil
-		case "auto_rotate":
-			return cfg.Accounts.AutoRotate, nil
-		case "reset_buffer_minutes":
-			return cfg.Accounts.ResetBufferMinutes, nil
-		case "claude":
-			return cfg.Accounts.Claude, nil
-		case "codex":
-			return cfg.Accounts.Codex, nil
-		case "gemini":
-			return cfg.Accounts.Gemini, nil
-		case "antigravity":
-			return cfg.Accounts.Antigravity, nil
 		}
 	case "rotation":
 		if len(parts) < 2 {
@@ -6269,14 +5844,16 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 		switch parts[1] {
 		case "enabled":
 			return cfg.Rotation.Enabled, nil
-		case "prefer_restart":
-			return cfg.Rotation.PreferRestart, nil
 		case "auto_open_browser":
 			return cfg.Rotation.AutoOpenBrowser, nil
 		case "auto_trigger":
 			return cfg.Rotation.AutoTrigger, nil
 		case "auto_initiate":
 			return cfg.Rotation.AutoInitiate, nil
+		case "usage_percent_threshold":
+			return cfg.Rotation.UsagePercentThreshold, nil
+		case "auto_confirm":
+			return cfg.Rotation.AutoConfirm, nil
 		case "continuation_prompt":
 			return cfg.Rotation.ContinuationPrompt, nil
 		case "accounts":
@@ -6294,18 +5871,6 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 				return cfg.Rotation.Thresholds.RestartIfTokensAbove, nil
 			case "restart_if_session_hours":
 				return cfg.Rotation.Thresholds.RestartIfSessionHours, nil
-			}
-		case "dashboard":
-			if len(parts) < 3 {
-				return cfg.Rotation.Dashboard, nil
-			}
-			switch parts[2] {
-			case "show_quota_bars":
-				return cfg.Rotation.Dashboard.ShowQuotaBars, nil
-			case "show_account_status":
-				return cfg.Rotation.Dashboard.ShowAccountStatus, nil
-			case "show_reset_timers":
-				return cfg.Rotation.Dashboard.ShowResetTimers, nil
 			}
 		}
 	case "gemini_setup":
@@ -6325,6 +5890,112 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 	}
 
 	return nil, fmt.Errorf("unknown config path: %s", path)
+}
+
+// configValueOverrides holds the dotted paths whose read value is deliberately
+// not the struct field behind them. Everything else resolves structurally, so
+// this is the complete exception list.
+var configValueOverrides = map[string]func(cfg *Config) interface{}{
+	// The Agent Mail token is a secret; reading config must never print it.
+	"agent_mail.token": func(*Config) interface{} { return "[redacted]" },
+	// Report the effective value — what the supervisor actually does, and what
+	// `config show` and `config diff` print — not the raw zero value.
+	"agent_mail.supervisor_enabled": func(cfg *Config) interface{} {
+		return cfg.AgentMail.SupervisorEnabledOrDefault()
+	},
+}
+
+// configLookup distinguishes "this path is not structurally addressable" from
+// "the container resolved but holds no such key". The difference matters
+// because only the former may fall through to the legacy switch; letting a
+// map miss fall through made `<map>.<absent>` return the whole map.
+type configLookup int
+
+const (
+	configLookupUnaddressable configLookup = iota // caller may try the legacy switch
+	configLookupFound
+	configLookupAbsentKey // definitive: container resolved, key is not in it
+)
+
+// configValueByTOMLPath walks v by `toml` tag names, one path segment at a
+// time, and returns the addressed value.
+//
+// Maps with string keys are traversable too, so a custom entry such as
+// `models.claude.<alias>` resolves instead of returning its whole container.
+func configValueByTOMLPath(v reflect.Value, parts []string) (interface{}, configLookup) {
+	for _, part := range parts {
+		for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+			if v.IsNil() {
+				return nil, configLookupUnaddressable
+			}
+			v = v.Elem()
+		}
+		switch v.Kind() {
+		case reflect.Struct:
+			field, ok := configStructFieldByTOMLName(v, part)
+			if !ok {
+				return nil, configLookupUnaddressable
+			}
+			v = field
+		case reflect.Map:
+			if v.Type().Key().Kind() != reflect.String {
+				return nil, configLookupUnaddressable
+			}
+			if v.IsNil() {
+				return nil, configLookupAbsentKey
+			}
+			entry := v.MapIndex(reflect.ValueOf(part).Convert(v.Type().Key()))
+			if !entry.IsValid() {
+				return nil, configLookupAbsentKey
+			}
+			v = entry
+		default:
+			// Path continues past a scalar: not addressable.
+			return nil, configLookupUnaddressable
+		}
+	}
+	// At the leaf, a nil pointer is an answer, not a miss: optional tri-state
+	// knobs such as `agent_mail.pane_badges` (*bool) are legitimately unset,
+	// and reporting "unknown config path" for them would repeat the very bug
+	// this resolver exists to fix.
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return nil, configLookupFound
+		}
+		v = v.Elem()
+	}
+	if !v.CanInterface() {
+		return nil, configLookupUnaddressable
+	}
+	return v.Interface(), configLookupFound
+}
+
+// configStructFieldByTOMLName finds the exported field of v whose `toml` tag
+// names it. Fields tagged `-` are intentionally not addressable; untagged
+// exported fields fall back to their lowercased Go name, matching how the TOML
+// decoder resolves them.
+func configStructFieldByTOMLName(v reflect.Value, name string) (reflect.Value, bool) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.PkgPath != "" {
+			continue // unexported
+		}
+		tag := field.Tag.Get("toml")
+		if tag == "-" {
+			continue
+		}
+		if comma := strings.IndexByte(tag, ','); comma >= 0 {
+			tag = tag[:comma]
+		}
+		if tag == "" {
+			tag = strings.ToLower(field.Name)
+		}
+		if tag == name {
+			return v.Field(i), true
+		}
+	}
+	return reflect.Value{}, false
 }
 
 // Reset removes the config file at path and creates a new one with defaults.
@@ -6382,7 +6053,6 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("theme", defaults.Theme, cfg.Theme)
 	addDiff("help_verbosity", defaults.HelpVerbosity, cfg.HelpVerbosity)
 	addDiff("palette_file", defaults.PaletteFile, cfg.PaletteFile)
-	addDiff("suggestions_enabled", defaults.SuggestionsEnabled, cfg.SuggestionsEnabled)
 	addDiff("palette", defaults.Palette, cfg.Palette)
 	addDiff("palette_state.pinned", defaults.PaletteState.Pinned, cfg.PaletteState.Pinned)
 	addDiff("palette_state.favorites", defaults.PaletteState.Favorites, cfg.PaletteState.Favorites)
@@ -6398,30 +6068,21 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("agents.cursor", defaults.Agents.Cursor, cfg.Agents.Cursor)
 	addDiff("agents.windsurf", defaults.Agents.Windsurf, cfg.Agents.Windsurf)
 	addDiff("agents.aider", defaults.Agents.Aider, cfg.Agents.Aider)
-	addDiff("agents.plugins", defaults.Agents.Plugins, cfg.Agents.Plugins)
-	addDiff("agents.default_count", defaults.Agents.DefaultCount, cfg.Agents.DefaultCount)
+	addDiff("agents.omp", defaults.Agents.Omp, cfg.Agents.Omp)
 
 	// Tmux
 	addDiff("tmux.default_panes", defaults.Tmux.DefaultPanes, cfg.Tmux.DefaultPanes)
-	addDiff("tmux.palette_key", defaults.Tmux.PaletteKey, cfg.Tmux.PaletteKey)
 	addDiff("tmux.pane_init_delay_ms", defaults.Tmux.PaneInitDelayMs, cfg.Tmux.PaneInitDelayMs)
 	addDiff("tmux.history_limit", defaults.Tmux.HistoryLimit, cfg.Tmux.HistoryLimit)
-	addDiff("tmux.activity_indicators.enabled", defaults.Tmux.ActivityIndicators.Enabled, cfg.Tmux.ActivityIndicators.Enabled)
-	addDiff("tmux.activity_indicators.active_seconds", defaults.Tmux.ActivityIndicators.ActiveSeconds, cfg.Tmux.ActivityIndicators.ActiveSeconds)
-	addDiff("tmux.activity_indicators.stalled_seconds", defaults.Tmux.ActivityIndicators.StalledSeconds, cfg.Tmux.ActivityIndicators.StalledSeconds)
 
 	// Robot
 	addDiff("robot.verbosity", defaults.Robot.Verbosity, cfg.Robot.Verbosity)
 	addDiff("robot.output.format", defaults.Robot.Output.Format, cfg.Robot.Output.Format)
-	addDiff("robot.output.pretty", defaults.Robot.Output.Pretty, cfg.Robot.Output.Pretty)
-	addDiff("robot.output.timestamps", defaults.Robot.Output.Timestamps, cfg.Robot.Output.Timestamps)
-	addDiff("robot.output.compress", defaults.Robot.Output.Compress, cfg.Robot.Output.Compress)
 
 	// Agent Mail
 	addDiff("agent_mail.enabled", defaults.AgentMail.Enabled, cfg.AgentMail.Enabled)
 	addDiff("agent_mail.url", defaults.AgentMail.URL, cfg.AgentMail.URL)
 	addDiff("agent_mail.auto_register", defaults.AgentMail.AutoRegister, cfg.AgentMail.AutoRegister)
-	addDiff("agent_mail.program_name", defaults.AgentMail.ProgramName, cfg.AgentMail.ProgramName)
 	addDiff("agent_mail.supervisor_enabled", defaults.AgentMail.SupervisorEnabledOrDefault(), cfg.AgentMail.SupervisorEnabledOrDefault())
 
 	// Integrations (DCG)
@@ -6432,40 +6093,22 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("integrations.dcg.audit_log", defaults.Integrations.DCG.AuditLog, cfg.Integrations.DCG.AuditLog)
 	addDiff("integrations.dcg.allow_override", defaults.Integrations.DCG.AllowOverride, cfg.Integrations.DCG.AllowOverride)
 	addDiff("integrations.rano.enabled", defaults.Integrations.Rano.Enabled, cfg.Integrations.Rano.Enabled)
-	addDiff("integrations.rano.binary_path", defaults.Integrations.Rano.BinaryPath, cfg.Integrations.Rano.BinaryPath)
 	addDiff("integrations.rano.poll_interval_ms", defaults.Integrations.Rano.PollIntervalMs, cfg.Integrations.Rano.PollIntervalMs)
-	addDiff("integrations.rano.providers", defaults.Integrations.Rano.Providers, cfg.Integrations.Rano.Providers)
-	addDiff("integrations.rano.persist_history", defaults.Integrations.Rano.PersistHistory, cfg.Integrations.Rano.PersistHistory)
-	addDiff("integrations.rano.history_days", defaults.Integrations.Rano.HistoryDays, cfg.Integrations.Rano.HistoryDays)
-	addDiff("integrations.caam.enabled", defaults.Integrations.CAAM.Enabled, cfg.Integrations.CAAM.Enabled)
+	addDiff("integrations.rano.sqlite_path", defaults.Integrations.Rano.SQLitePath, cfg.Integrations.Rano.SQLitePath)
 	addDiff("integrations.caam.binary_path", defaults.Integrations.CAAM.BinaryPath, cfg.Integrations.CAAM.BinaryPath)
-	addDiff("integrations.caam.auto_rotate", defaults.Integrations.CAAM.AutoRotate, cfg.Integrations.CAAM.AutoRotate)
-	addDiff("integrations.caam.providers", defaults.Integrations.CAAM.Providers, cfg.Integrations.CAAM.Providers)
-	addDiff("integrations.caam.rate_limit_patterns", defaults.Integrations.CAAM.RateLimitPatterns, cfg.Integrations.CAAM.RateLimitPatterns)
-	addDiff("integrations.caam.account_cooldown", defaults.Integrations.CAAM.AccountCooldown, cfg.Integrations.CAAM.AccountCooldown)
-	addDiff("integrations.caam.alert_threshold", defaults.Integrations.CAAM.AlertThreshold, cfg.Integrations.CAAM.AlertThreshold)
+	addDiff("integrations.caam.auto_failover", defaults.Integrations.CAAM.AutoFailover, cfg.Integrations.CAAM.AutoFailover)
+	addDiff("integrations.caam.reset_horizon_minutes", defaults.Integrations.CAAM.ResetHorizonMinutes, cfg.Integrations.CAAM.ResetHorizonMinutes)
+	addDiff("integrations.caam.failover_providers", defaults.Integrations.CAAM.FailoverProviders, cfg.Integrations.CAAM.FailoverProviders)
+	addDiff("integrations.caam.seat_selection", defaults.Integrations.CAAM.SeatSelection, cfg.Integrations.CAAM.SeatSelection)
 	addDiff("integrations.rch.enabled", defaults.Integrations.RCH.Enabled, cfg.Integrations.RCH.Enabled)
 	addDiff("integrations.rch.binary_path", defaults.Integrations.RCH.BinaryPath, cfg.Integrations.RCH.BinaryPath)
-	addDiff("integrations.rch.min_build_time", defaults.Integrations.RCH.MinBuildTime, cfg.Integrations.RCH.MinBuildTime)
 	addDiff("integrations.rch.intercept_patterns", defaults.Integrations.RCH.InterceptPatterns, cfg.Integrations.RCH.InterceptPatterns)
-	addDiff("integrations.rch.fallback_local", defaults.Integrations.RCH.FallbackLocal, cfg.Integrations.RCH.FallbackLocal)
-	addDiff("integrations.rch.show_location", defaults.Integrations.RCH.ShowLocation, cfg.Integrations.RCH.ShowLocation)
-	addDiff("integrations.rch.preferred_worker", defaults.Integrations.RCH.PreferredWorker, cfg.Integrations.RCH.PreferredWorker)
-	addDiff("integrations.rch.dcg_whitelist", defaults.Integrations.RCH.DCGWhitelist, cfg.Integrations.RCH.DCGWhitelist)
-	addDiff("integrations.caut.enabled", defaults.Integrations.Caut.Enabled, cfg.Integrations.Caut.Enabled)
-	addDiff("integrations.caut.binary_path", defaults.Integrations.Caut.BinaryPath, cfg.Integrations.Caut.BinaryPath)
-	addDiff("integrations.caut.poll_interval", defaults.Integrations.Caut.PollInterval, cfg.Integrations.Caut.PollInterval)
-	addDiff("integrations.caut.alert_threshold", defaults.Integrations.Caut.AlertThreshold, cfg.Integrations.Caut.AlertThreshold)
-	addDiff("integrations.caut.providers", defaults.Integrations.Caut.Providers, cfg.Integrations.Caut.Providers)
-	addDiff("integrations.caut.per_agent_tracking", defaults.Integrations.Caut.PerAgentTracking, cfg.Integrations.Caut.PerAgentTracking)
-	addDiff("integrations.caut.currency", defaults.Integrations.Caut.Currency, cfg.Integrations.Caut.Currency)
 	addDiff("integrations.process_triage.enabled", defaults.Integrations.ProcessTriage.Enabled, cfg.Integrations.ProcessTriage.Enabled)
-	addDiff("integrations.process_triage.binary_path", defaults.Integrations.ProcessTriage.BinaryPath, cfg.Integrations.ProcessTriage.BinaryPath)
 	addDiff("integrations.process_triage.check_interval", defaults.Integrations.ProcessTriage.CheckInterval, cfg.Integrations.ProcessTriage.CheckInterval)
 	addDiff("integrations.process_triage.idle_threshold", defaults.Integrations.ProcessTriage.IdleThreshold, cfg.Integrations.ProcessTriage.IdleThreshold)
 	addDiff("integrations.process_triage.stuck_threshold", defaults.Integrations.ProcessTriage.StuckThreshold, cfg.Integrations.ProcessTriage.StuckThreshold)
-	addDiff("integrations.process_triage.on_stuck", defaults.Integrations.ProcessTriage.OnStuck, cfg.Integrations.ProcessTriage.OnStuck)
 	addDiff("integrations.process_triage.use_rano_data", defaults.Integrations.ProcessTriage.UseRanoData, cfg.Integrations.ProcessTriage.UseRanoData)
+	addDiff("integrations.bv.timeout_seconds", defaults.Integrations.BV.TimeoutSeconds, cfg.Integrations.BV.TimeoutSeconds)
 
 	// Models
 	addDiff("models.default_claude", defaults.Models.DefaultClaude, cfg.Models.DefaultClaude)
@@ -6476,6 +6119,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("models.default_muse", defaults.Models.DefaultMuse, cfg.Models.DefaultMuse)
 	addDiff("models.default_grok", defaults.Models.DefaultGrok, cfg.Models.DefaultGrok)
 	addDiff("models.default_opencode", defaults.Models.DefaultOpencode, cfg.Models.DefaultOpencode)
+	addDiff("models.default_omp", defaults.Models.DefaultOmp, cfg.Models.DefaultOmp)
 	addDiff("models.claude", defaults.Models.Claude, cfg.Models.Claude)
 	addDiff("models.codex", defaults.Models.Codex, cfg.Models.Codex)
 	addDiff("models.gemini", defaults.Models.Gemini, cfg.Models.Gemini)
@@ -6483,11 +6127,13 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("models.kimi", defaults.Models.Kimi, cfg.Models.Kimi)
 	addDiff("models.muse", defaults.Models.Muse, cfg.Models.Muse)
 	addDiff("models.grok", defaults.Models.Grok, cfg.Models.Grok)
+	addDiff("models.omp", defaults.Models.Omp, cfg.Models.Omp)
 
 	// Alerts
 	addDiff("alerts.enabled", defaults.Alerts.Enabled, cfg.Alerts.Enabled)
 	addDiff("alerts.agent_stuck_minutes", defaults.Alerts.AgentStuckMinutes, cfg.Alerts.AgentStuckMinutes)
 	addDiff("alerts.disk_low_threshold_gb", defaults.Alerts.DiskLowThresholdGB, cfg.Alerts.DiskLowThresholdGB)
+	addDiff("alerts.disk_full_horizon_hours", defaults.Alerts.DiskFullHorizonHours, cfg.Alerts.DiskFullHorizonHours)
 	addDiff("alerts.mail_backlog_threshold", defaults.Alerts.MailBacklogThreshold, cfg.Alerts.MailBacklogThreshold)
 	addDiff("alerts.bead_stale_hours", defaults.Alerts.BeadStaleHours, cfg.Alerts.BeadStaleHours)
 	addDiff("alerts.context_warning_threshold", defaults.Alerts.ContextWarningThreshold, cfg.Alerts.ContextWarningThreshold)
@@ -6500,10 +6146,6 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("checkpoints.max_auto_checkpoints", defaults.Checkpoints.MaxAutoCheckpoints, cfg.Checkpoints.MaxAutoCheckpoints)
 	addDiff("checkpoints.scrollback_lines", defaults.Checkpoints.ScrollbackLines, cfg.Checkpoints.ScrollbackLines)
 	addDiff("checkpoints.include_git", defaults.Checkpoints.IncludeGit, cfg.Checkpoints.IncludeGit)
-	addDiff("checkpoints.auto_checkpoint_on_spawn", defaults.Checkpoints.AutoCheckpointOnSpawn, cfg.Checkpoints.AutoCheckpointOnSpawn)
-	addDiff("checkpoints.interval_minutes", defaults.Checkpoints.IntervalMinutes, cfg.Checkpoints.IntervalMinutes)
-	addDiff("checkpoints.on_rotation", defaults.Checkpoints.OnRotation, cfg.Checkpoints.OnRotation)
-	addDiff("checkpoints.on_error", defaults.Checkpoints.OnError, cfg.Checkpoints.OnError)
 
 	// Notifications
 	addDiff("notifications.enabled", defaults.Notifications.Enabled, cfg.Notifications.Enabled)
@@ -6536,7 +6178,6 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("resilience.notify_on_max_restarts", defaults.Resilience.NotifyOnMaxRestarts, cfg.Resilience.NotifyOnMaxRestarts)
 	addDiff("resilience.rate_limit.detect", defaults.Resilience.RateLimit.Detect, cfg.Resilience.RateLimit.Detect)
 	addDiff("resilience.rate_limit.notify", defaults.Resilience.RateLimit.Notify, cfg.Resilience.RateLimit.Notify)
-	addDiff("resilience.rate_limit.patterns", defaults.Resilience.RateLimit.Patterns, cfg.Resilience.RateLimit.Patterns)
 
 	// Context pack options
 	addDiff("context.ms_skills", defaults.Context.MSSkills, cfg.Context.MSSkills)
@@ -6548,7 +6189,6 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("recovery.include_beads_context", defaults.SessionRecovery.IncludeBeadsContext, cfg.SessionRecovery.IncludeBeadsContext)
 	addDiff("recovery.max_recovery_tokens", defaults.SessionRecovery.MaxRecoveryTokens, cfg.SessionRecovery.MaxRecoveryTokens)
 	addDiff("recovery.auto_inject_on_spawn", defaults.SessionRecovery.AutoInjectOnSpawn, cfg.SessionRecovery.AutoInjectOnSpawn)
-	addDiff("recovery.stale_threshold_hours", defaults.SessionRecovery.StaleThresholdHours, cfg.SessionRecovery.StaleThresholdHours)
 	addDiff("recovery.max_cm_rules", defaults.SessionRecovery.MaxCMRules, cfg.SessionRecovery.MaxCMRules)
 	addDiff("recovery.max_cm_snippets", defaults.SessionRecovery.MaxCMSnippets, cfg.SessionRecovery.MaxCMSnippets)
 	addDiff("recovery.timeout_seconds", defaults.SessionRecovery.TimeoutSeconds, cfg.SessionRecovery.TimeoutSeconds)
@@ -6563,6 +6203,9 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("assign.prompt_template", defaults.Assign.PromptTemplate, cfg.Assign.PromptTemplate)
 	addDiff("assign.prompt_template_file", defaults.Assign.PromptTemplateFile, cfg.Assign.PromptTemplateFile)
 	addDiff("assign.operator_gated_labels", defaults.Assign.OperatorGatedLabels, cfg.Assign.OperatorGatedLabels)
+	addDiff("assign.work_source.required_ref", defaults.Assign.WorkSource.RequiredRef, cfg.Assign.WorkSource.RequiredRef)
+	addDiff("assign.work_source.require_clean", defaults.Assign.WorkSource.RequireClean, cfg.Assign.WorkSource.RequireClean)
+	addDiff("assign.work_source.program_labels", defaults.Assign.WorkSource.ProgramLabels, cfg.Assign.WorkSource.ProgramLabels)
 
 	// File reservation
 	addDiff("file_reservation.enabled", defaults.FileReservation.Enabled, cfg.FileReservation.Enabled)
@@ -6577,11 +6220,10 @@ func Diff(cfg *Config) []ConfigDiff {
 
 	// Memory
 	addDiff("memory.enabled", defaults.Memory.Enabled, cfg.Memory.Enabled)
-	addDiff("memory.include_in_recovery", defaults.Memory.IncludeInRecovery, cfg.Memory.IncludeInRecovery)
-	addDiff("memory.max_rules", defaults.Memory.MaxRules, cfg.Memory.MaxRules)
-	addDiff("memory.include_anti_patterns", defaults.Memory.IncludeAntiPatterns, cfg.Memory.IncludeAntiPatterns)
-	addDiff("memory.include_history", defaults.Memory.IncludeHistory, cfg.Memory.IncludeHistory)
 	addDiff("memory.query_timeout_seconds", defaults.Memory.QueryTimeoutSeconds, cfg.Memory.QueryTimeoutSeconds)
+	addDiff("memory.send_injection", defaults.Memory.SendInjection, cfg.Memory.SendInjection)
+	addDiff("memory.send_max_rules", defaults.Memory.SendMaxRules, cfg.Memory.SendMaxRules)
+	addDiff("memory.send_budget_tokens", defaults.Memory.SendBudgetTokens, cfg.Memory.SendBudgetTokens)
 
 	// Privacy
 	addDiff("privacy.enabled", defaults.Privacy.Enabled, cfg.Privacy.Enabled)
@@ -6593,7 +6235,6 @@ func Diff(cfg *Config) []ConfigDiff {
 
 	// Safety, preflight, redaction, encryption
 	addDiff("safety.profile", defaults.Safety.Profile, cfg.Safety.Profile)
-	addDiff("preflight.enabled", defaults.Preflight.Enabled, cfg.Preflight.Enabled)
 	addDiff("preflight.strict", defaults.Preflight.Strict, cfg.Preflight.Strict)
 	addDiff("redaction.mode", defaults.Redaction.Mode, cfg.Redaction.Mode)
 	addDiff("redaction.allowlist", defaults.Redaction.Allowlist, cfg.Redaction.Allowlist)
@@ -6617,17 +6258,14 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("prompts.gmi_default_file", defaults.Prompts.GmiDefaultFile, cfg.Prompts.GmiDefaultFile)
 	addDiff("prompts.agy_default", defaults.Prompts.AgyDefault, cfg.Prompts.AgyDefault)
 	addDiff("prompts.agy_default_file", defaults.Prompts.AgyDefaultFile, cfg.Prompts.AgyDefaultFile)
+	addDiff("prompts.omp_default", defaults.Prompts.OmpDefault, cfg.Prompts.OmpDefault)
+	addDiff("prompts.omp_default_file", defaults.Prompts.OmpDefaultFile, cfg.Prompts.OmpDefaultFile)
 
 	// Context Rotation
-	addDiff("context_rotation.enabled", defaults.ContextRotation.Enabled, cfg.ContextRotation.Enabled)
-	addDiff("context_rotation.warning_threshold", defaults.ContextRotation.WarningThreshold, cfg.ContextRotation.WarningThreshold)
 	addDiff("context_rotation.rotate_threshold", defaults.ContextRotation.RotateThreshold, cfg.ContextRotation.RotateThreshold)
 	addDiff("context_rotation.summary_max_tokens", defaults.ContextRotation.SummaryMaxTokens, cfg.ContextRotation.SummaryMaxTokens)
-	addDiff("context_rotation.min_session_age_sec", defaults.ContextRotation.MinSessionAgeSec, cfg.ContextRotation.MinSessionAgeSec)
 	addDiff("context_rotation.try_compact_first", defaults.ContextRotation.TryCompactFirst, cfg.ContextRotation.TryCompactFirst)
-	addDiff("context_rotation.require_confirm", defaults.ContextRotation.RequireConfirm, cfg.ContextRotation.RequireConfirm)
 	addDiff("context_rotation.confirm_timeout_sec", defaults.ContextRotation.ConfirmTimeoutSec, cfg.ContextRotation.ConfirmTimeoutSec)
-	addDiff("context_rotation.default_confirm_action", defaults.ContextRotation.DefaultConfirmAction, cfg.ContextRotation.DefaultConfirmAction)
 
 	// Ensemble defaults
 	addDiff("ensemble.default_ensemble", defaults.Ensemble.DefaultEnsemble, cfg.Ensemble.DefaultEnsemble)
@@ -6657,7 +6295,6 @@ func Diff(cfg *Config) []ConfigDiff {
 
 	// CASS
 	addDiff("cass.enabled", defaults.CASS.Enabled, cfg.CASS.Enabled)
-	addDiff("cass.show_install_hints", defaults.CASS.ShowInstallHints, cfg.CASS.ShowInstallHints)
 	addDiff("cass.binary_path", defaults.CASS.BinaryPath, cfg.CASS.BinaryPath)
 	addDiff("cass.timeout", defaults.CASS.Timeout, cfg.CASS.Timeout)
 
@@ -6669,58 +6306,28 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("cass.context.min_relevance", defaults.CASS.Context.MinRelevance, cfg.CASS.Context.MinRelevance)
 	addDiff("cass.context.skip_if_context_above", defaults.CASS.Context.SkipIfContextAbove, cfg.CASS.Context.SkipIfContextAbove)
 	addDiff("cass.context.prefer_same_project", defaults.CASS.Context.PreferSameProject, cfg.CASS.Context.PreferSameProject)
-	addDiff("cass.duplicates.enabled", defaults.CASS.Duplicates.Enabled, cfg.CASS.Duplicates.Enabled)
-	addDiff("cass.duplicates.similarity_threshold", defaults.CASS.Duplicates.SimilarityThreshold, cfg.CASS.Duplicates.SimilarityThreshold)
-	addDiff("cass.duplicates.lookback_days", defaults.CASS.Duplicates.LookbackDays, cfg.CASS.Duplicates.LookbackDays)
-	addDiff("cass.duplicates.prompt_on_match", defaults.CASS.Duplicates.PromptOnMatch, cfg.CASS.Duplicates.PromptOnMatch)
-	addDiff("cass.search.default_limit", defaults.CASS.Search.DefaultLimit, cfg.CASS.Search.DefaultLimit)
-	addDiff("cass.search.default_fields", defaults.CASS.Search.DefaultFields, cfg.CASS.Search.DefaultFields)
-	addDiff("cass.search.include_meta", defaults.CASS.Search.IncludeMeta, cfg.CASS.Search.IncludeMeta)
-	addDiff("cass.tui.show_activity_sparkline", defaults.CASS.TUI.ShowActivitySparkline, cfg.CASS.TUI.ShowActivitySparkline)
-	addDiff("cass.tui.show_status_indicator", defaults.CASS.TUI.ShowStatusIndicator, cfg.CASS.TUI.ShowStatusIndicator)
 
 	// Scanner
 	addDiff("scanner.ubs_path", defaults.Scanner.UBSPath, cfg.Scanner.UBSPath)
-	addDiff("scanner.defaults.timeout", defaults.Scanner.Defaults.Timeout, cfg.Scanner.Defaults.Timeout)
-	addDiff("scanner.defaults.parallel", defaults.Scanner.Defaults.Parallel, cfg.Scanner.Defaults.Parallel)
-	addDiff("scanner.defaults.exclude", defaults.Scanner.Defaults.Exclude, cfg.Scanner.Defaults.Exclude)
-	addDiff("scanner.defaults.languages", defaults.Scanner.Defaults.Languages, cfg.Scanner.Defaults.Languages)
-	addDiff("scanner.thresholds.pre_commit", defaults.Scanner.Thresholds.PreCommit, cfg.Scanner.Thresholds.PreCommit)
-	addDiff("scanner.thresholds.ci", defaults.Scanner.Thresholds.CI, cfg.Scanner.Thresholds.CI)
-	addDiff("scanner.thresholds.dashboard", defaults.Scanner.Thresholds.Dashboard, cfg.Scanner.Thresholds.Dashboard)
-	addDiff("scanner.thresholds.interactive", defaults.Scanner.Thresholds.Interactive, cfg.Scanner.Thresholds.Interactive)
-	addDiff("scanner.tools.enabled", defaults.Scanner.Tools.Enabled, cfg.Scanner.Tools.Enabled)
-	addDiff("scanner.tools.disabled", defaults.Scanner.Tools.Disabled, cfg.Scanner.Tools.Disabled)
-	addDiff("scanner.beads.auto_create", defaults.Scanner.Beads.AutoCreate, cfg.Scanner.Beads.AutoCreate)
-	addDiff("scanner.beads.min_severity", defaults.Scanner.Beads.MinSeverity, cfg.Scanner.Beads.MinSeverity)
-	addDiff("scanner.beads.auto_close", defaults.Scanner.Beads.AutoClose, cfg.Scanner.Beads.AutoClose)
-	addDiff("scanner.beads.labels", defaults.Scanner.Beads.Labels, cfg.Scanner.Beads.Labels)
-	addDiff("scanner.notifications.enabled", defaults.Scanner.Notifications.Enabled, cfg.Scanner.Notifications.Enabled)
-	addDiff("scanner.notifications.on_new_critical", defaults.Scanner.Notifications.OnNewCritical, cfg.Scanner.Notifications.OnNewCritical)
-	addDiff("scanner.notifications.summary_after_scan", defaults.Scanner.Notifications.SummaryAfterScan, cfg.Scanner.Notifications.SummaryAfterScan)
 
-	// Accounts and rotation
-	addDiff("accounts.state_file", defaults.Accounts.StateFile, cfg.Accounts.StateFile)
-	addDiff("accounts.auto_rotate", defaults.Accounts.AutoRotate, cfg.Accounts.AutoRotate)
-	addDiff("accounts.reset_buffer_minutes", defaults.Accounts.ResetBufferMinutes, cfg.Accounts.ResetBufferMinutes)
-	addDiff("accounts.claude", defaults.Accounts.Claude, cfg.Accounts.Claude)
-	addDiff("accounts.codex", defaults.Accounts.Codex, cfg.Accounts.Codex)
-	addDiff("accounts.gemini", defaults.Accounts.Gemini, cfg.Accounts.Gemini)
-	addDiff("accounts.antigravity", defaults.Accounts.Antigravity, cfg.Accounts.Antigravity)
+	// Bugs (UBS push routing)
+	addDiff("bugs.push_routing", defaults.Bugs.PushRouting, cfg.Bugs.PushRouting)
+	addDiff("bugs.interval", defaults.Bugs.Interval, cfg.Bugs.Interval)
+	addDiff("bugs.cooldown_minutes", defaults.Bugs.CooldownMinutes, cfg.Bugs.CooldownMinutes)
+
+	// Rotation
 	addDiff("rotation.enabled", defaults.Rotation.Enabled, cfg.Rotation.Enabled)
-	addDiff("rotation.prefer_restart", defaults.Rotation.PreferRestart, cfg.Rotation.PreferRestart)
 	addDiff("rotation.auto_open_browser", defaults.Rotation.AutoOpenBrowser, cfg.Rotation.AutoOpenBrowser)
 	addDiff("rotation.auto_trigger", defaults.Rotation.AutoTrigger, cfg.Rotation.AutoTrigger)
 	addDiff("rotation.auto_initiate", defaults.Rotation.AutoInitiate, cfg.Rotation.AutoInitiate)
 	addDiff("rotation.continuation_prompt", defaults.Rotation.ContinuationPrompt, cfg.Rotation.ContinuationPrompt)
 	addDiff("rotation.accounts", defaults.Rotation.Accounts, cfg.Rotation.Accounts)
+	addDiff("rotation.usage_percent_threshold", defaults.Rotation.UsagePercentThreshold, cfg.Rotation.UsagePercentThreshold)
+	addDiff("rotation.auto_confirm", defaults.Rotation.AutoConfirm, cfg.Rotation.AutoConfirm)
 	addDiff("rotation.thresholds.warning_percent", defaults.Rotation.Thresholds.WarningPercent, cfg.Rotation.Thresholds.WarningPercent)
 	addDiff("rotation.thresholds.critical_percent", defaults.Rotation.Thresholds.CriticalPercent, cfg.Rotation.Thresholds.CriticalPercent)
 	addDiff("rotation.thresholds.restart_if_tokens_above", defaults.Rotation.Thresholds.RestartIfTokensAbove, cfg.Rotation.Thresholds.RestartIfTokensAbove)
 	addDiff("rotation.thresholds.restart_if_session_hours", defaults.Rotation.Thresholds.RestartIfSessionHours, cfg.Rotation.Thresholds.RestartIfSessionHours)
-	addDiff("rotation.dashboard.show_quota_bars", defaults.Rotation.Dashboard.ShowQuotaBars, cfg.Rotation.Dashboard.ShowQuotaBars)
-	addDiff("rotation.dashboard.show_account_status", defaults.Rotation.Dashboard.ShowAccountStatus, cfg.Rotation.Dashboard.ShowAccountStatus)
-	addDiff("rotation.dashboard.show_reset_timers", defaults.Rotation.Dashboard.ShowResetTimers, cfg.Rotation.Dashboard.ShowResetTimers)
 
 	// Gemini setup
 	addDiff("gemini_setup.auto_select_pro_model", defaults.GeminiSetup.AutoSelectProModel, cfg.GeminiSetup.AutoSelectProModel)
@@ -6740,20 +6347,29 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("swarm.panes_per_session", defaults.Swarm.PanesPerSession, cfg.Swarm.PanesPerSession)
 	addDiff("swarm.stagger_delay_ms", defaults.Swarm.StaggerDelayMs, cfg.Swarm.StaggerDelayMs)
 	addDiff("swarm.auto_rotate_accounts", defaults.Swarm.AutoRotateAccounts, cfg.Swarm.AutoRotateAccounts)
-	addDiff("swarm.limit_patterns", defaults.Swarm.LimitPatterns, cfg.Swarm.LimitPatterns)
-	addDiff("swarm.marching_orders", defaults.Swarm.MarchingOrders, cfg.Swarm.MarchingOrders)
 
 	// Spawn pacing
 	addDiff("spawn_pacing.enabled", defaults.SpawnPacing.Enabled, cfg.SpawnPacing.Enabled)
 	addDiff("spawn_pacing.max_concurrent_spawns", defaults.SpawnPacing.MaxConcurrentSpawns, cfg.SpawnPacing.MaxConcurrentSpawns)
-	addDiff("spawn_pacing.max_spawns_per_sec", defaults.SpawnPacing.MaxSpawnsPerSecond, cfg.SpawnPacing.MaxSpawnsPerSecond)
-	addDiff("spawn_pacing.burst_size", defaults.SpawnPacing.BurstSize, cfg.SpawnPacing.BurstSize)
-	addDiff("spawn_pacing.default_retries", defaults.SpawnPacing.DefaultRetries, cfg.SpawnPacing.DefaultRetries)
-	addDiff("spawn_pacing.retry_delay_ms", defaults.SpawnPacing.RetryDelayMs, cfg.SpawnPacing.RetryDelayMs)
-	addDiff("spawn_pacing.backpressure_threshold", defaults.SpawnPacing.BackpressureThreshold, cfg.SpawnPacing.BackpressureThreshold)
 	addDiff("spawn_pacing.agent_caps", defaults.SpawnPacing.AgentCaps, cfg.SpawnPacing.AgentCaps)
-	addDiff("spawn_pacing.headroom", defaults.SpawnPacing.Headroom, cfg.SpawnPacing.Headroom)
-	addDiff("spawn_pacing.backoff", defaults.SpawnPacing.Backoff, cfg.SpawnPacing.Backoff)
+
+	// Spawn defaults
+	addDiff("spawn.stagger_mode", defaults.Spawn.StaggerMode, cfg.Spawn.StaggerMode)
+	addDiff("spawn.stagger_delay", defaults.Spawn.StaggerDelay, cfg.Spawn.StaggerDelay)
+
+	// Coordinator
+	addDiff("coordinator.poll_interval", defaults.Coordinator.PollInterval, cfg.Coordinator.PollInterval)
+	addDiff("coordinator.digest_interval", defaults.Coordinator.DigestInterval, cfg.Coordinator.DigestInterval)
+	addDiff("coordinator.auto_assign", defaults.Coordinator.AutoAssign, cfg.Coordinator.AutoAssign)
+	addDiff("coordinator.idle_threshold", defaults.Coordinator.IdleThreshold, cfg.Coordinator.IdleThreshold)
+	addDiff("coordinator.assign_only_idle", defaults.Coordinator.AssignOnlyIdle, cfg.Coordinator.AssignOnlyIdle)
+	addDiff("coordinator.conflict_notify", defaults.Coordinator.ConflictNotify, cfg.Coordinator.ConflictNotify)
+	addDiff("coordinator.conflict_negotiate", defaults.Coordinator.ConflictNegotiate, cfg.Coordinator.ConflictNegotiate)
+	addDiff("coordinator.send_digests", defaults.Coordinator.SendDigests, cfg.Coordinator.SendDigests)
+	addDiff("coordinator.human_agent", defaults.Coordinator.HumanAgent, cfg.Coordinator.HumanAgent)
+	addDiff("coordinator.mail_nudge", defaults.Coordinator.MailNudge, cfg.Coordinator.MailNudge)
+	addDiff("coordinator.nudge_cooldown_seconds", defaults.Coordinator.NudgeCooldownSeconds, cfg.Coordinator.NudgeCooldownSeconds)
+	addDiff("coordinator.nudge_message", defaults.Coordinator.NudgeMessage, cfg.Coordinator.NudgeMessage)
 
 	return diffs
 }
@@ -6781,11 +6397,12 @@ func Validate(cfg *Config) []error {
 		errs = append(errs, fmt.Errorf("ensemble: %w", err))
 	}
 
-	// Validate tmux activity indicators
-	if err := ValidateActivityIndicatorConfig(&cfg.Tmux.ActivityIndicators); err != nil {
-		errs = append(errs, fmt.Errorf("tmux.activity_indicators: %w", err))
+	// Validate Agent Mail config (pane badge template)
+	if err := ValidateAgentMailConfig(&cfg.AgentMail); err != nil {
+		errs = append(errs, fmt.Errorf("agent_mail: %w", err))
 	}
 
+	// Validate tmux activity indicators
 	// Validate robot output config
 	if err := ValidateRobotOutputConfig(&cfg.Robot.Output); err != nil {
 		errs = append(errs, fmt.Errorf("robot.output: %w", err))
@@ -6796,24 +6413,28 @@ func Validate(cfg *Config) []error {
 		errs = append(errs, fmt.Errorf("integrations.dcg: %w", err))
 	}
 
+	// Validate CAAM integration config
+	if err := ValidateCAAMConfig(&cfg.Integrations.CAAM); err != nil {
+		errs = append(errs, fmt.Errorf("integrations.caam: %w", err))
+	}
+
 	// Validate ProcessTriage integration config
 	if err := ValidateProcessTriageConfig(&cfg.Integrations.ProcessTriage); err != nil {
 		errs = append(errs, fmt.Errorf("integrations.process_triage: %w", err))
 	}
 
+	// Validate BV integration config
+	if err := ValidateBVConfig(&cfg.Integrations.BV); err != nil {
+		errs = append(errs, fmt.Errorf("integrations.bv: %w", err))
+	}
+
+	if err := ValidateWorkSourceConfig(&cfg.Assign.WorkSource); err != nil {
+		errs = append(errs, fmt.Errorf("assign.work_source: %w", err))
+	}
+
 	// Validate rano integration config
 	if err := ValidateRanoConfig(&cfg.Integrations.Rano); err != nil {
 		errs = append(errs, fmt.Errorf("integrations.rano: %w", err))
-	}
-
-	// Validate rust_proxy integration config
-	if err := ValidateProxyConfig(&cfg.Integrations.Proxy); err != nil {
-		errs = append(errs, fmt.Errorf("integrations.proxy: %w", err))
-	}
-
-	// Validate xf integration config
-	if err := ValidateXFConfig(&cfg.Integrations.XF); err != nil {
-		errs = append(errs, fmt.Errorf("integrations.xf: %w", err))
 	}
 
 	if err := ValidateCommandHooks(cfg.CommandHooks); err != nil {
@@ -6848,6 +6469,11 @@ func Validate(cfg *Config) []error {
 		errs = append(errs, fmt.Errorf("spawn_pacing: %w", err))
 	}
 
+	// Validate spawn defaults
+	if err := ValidateSpawnConfig(&cfg.Spawn); err != nil {
+		errs = append(errs, fmt.Errorf("spawn: %w", err))
+	}
+
 	// Validate file reservation config
 	if err := ValidateFileReservationConfig(&cfg.FileReservation); err != nil {
 		errs = append(errs, fmt.Errorf("file_reservation: %w", err))
@@ -6856,11 +6482,6 @@ func Validate(cfg *Config) []error {
 	// Validate scanner config
 	if err := ValidateScannerConfig(&cfg.Scanner); err != nil {
 		errs = append(errs, fmt.Errorf("scanner: %w", err))
-	}
-
-	// Validate account management config
-	if err := ValidateAccountsConfig(&cfg.Accounts); err != nil {
-		errs = append(errs, fmt.Errorf("accounts: %w", err))
 	}
 
 	// Validate account rotation config
@@ -6880,9 +6501,6 @@ func Validate(cfg *Config) []error {
 
 	if cfg.SessionRecovery.MaxRecoveryTokens < 0 {
 		errs = append(errs, fmt.Errorf("recovery.max_recovery_tokens: must be non-negative, got %d", cfg.SessionRecovery.MaxRecoveryTokens))
-	}
-	if cfg.SessionRecovery.StaleThresholdHours < 0 {
-		errs = append(errs, fmt.Errorf("recovery.stale_threshold_hours: must be non-negative, got %d", cfg.SessionRecovery.StaleThresholdHours))
 	}
 	if cfg.SessionRecovery.MaxCMRules < 0 {
 		errs = append(errs, fmt.Errorf("recovery.max_cm_rules: must be non-negative, got %d", cfg.SessionRecovery.MaxCMRules))
@@ -6929,6 +6547,9 @@ func Validate(cfg *Config) []error {
 	if cfg.Alerts.DiskLowThresholdGB < 0 {
 		errs = append(errs, fmt.Errorf("alerts.disk_low_threshold_gb: must be non-negative, got %.1f", cfg.Alerts.DiskLowThresholdGB))
 	}
+	if cfg.Alerts.DiskFullHorizonHours < 0 {
+		errs = append(errs, fmt.Errorf("alerts.disk_full_horizon_hours: must be non-negative, got %.1f", cfg.Alerts.DiskFullHorizonHours))
+	}
 	if cfg.Alerts.MailBacklogThreshold < 0 {
 		errs = append(errs, fmt.Errorf("alerts.mail_backlog_threshold: must be non-negative, got %d", cfg.Alerts.MailBacklogThreshold))
 	}
@@ -6951,9 +6572,6 @@ func Validate(cfg *Config) []error {
 	}
 	if cfg.Checkpoints.ScrollbackLines < 0 {
 		errs = append(errs, fmt.Errorf("checkpoints.scrollback_lines: must be non-negative, got %d", cfg.Checkpoints.ScrollbackLines))
-	}
-	if cfg.Checkpoints.IntervalMinutes < 0 {
-		errs = append(errs, fmt.Errorf("checkpoints.interval_minutes: must be non-negative, got %d", cfg.Checkpoints.IntervalMinutes))
 	}
 
 	// Validate resilience
@@ -6991,16 +6609,6 @@ func Validate(cfg *Config) []error {
 	if cfg.CASS.Context.LookbackDays < 0 {
 		errs = append(errs, fmt.Errorf("cass.context.lookback_days: must be non-negative, got %d", cfg.CASS.Context.LookbackDays))
 	}
-	if cfg.CASS.Duplicates.SimilarityThreshold < 0 || cfg.CASS.Duplicates.SimilarityThreshold > 1 {
-		errs = append(errs, fmt.Errorf("cass.duplicates.similarity_threshold: must be between 0.0 and 1.0, got %.2f", cfg.CASS.Duplicates.SimilarityThreshold))
-	}
-	if cfg.CASS.Duplicates.LookbackDays < 0 {
-		errs = append(errs, fmt.Errorf("cass.duplicates.lookback_days: must be non-negative, got %d", cfg.CASS.Duplicates.LookbackDays))
-	}
-	if cfg.CASS.Search.DefaultLimit < 0 {
-		errs = append(errs, fmt.Errorf("cass.search.default_limit: must be non-negative, got %d", cfg.CASS.Search.DefaultLimit))
-	}
-
 	// Validate tmux settings
 	if cfg.Tmux.DefaultPanes < 1 {
 		errs = append(errs, fmt.Errorf("tmux.default_panes: must be at least 1, got %d", cfg.Tmux.DefaultPanes))

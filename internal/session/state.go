@@ -7,6 +7,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentsession"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // StateVersion is the schema version for migrations
@@ -63,13 +64,14 @@ type AgentConfig struct {
 	Windsurf    int `json:"windsurf"`
 	Aider       int `json:"aider"`
 	Opencode    int `json:"oc"`
+	Omp         int `json:"omp,omitempty"`
 	Ollama      int `json:"ollama"`
 	User        int `json:"user"`
 }
 
 // Total returns the total number of agents.
 func (a AgentConfig) Total() int {
-	return a.Claude + a.Codex + a.Gemini + a.Pi + a.Kimi + a.Muse + a.Antigravity + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Ollama + a.User
+	return a.Claude + a.Codex + a.Gemini + a.Pi + a.Kimi + a.Muse + a.Antigravity + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Omp + a.Ollama + a.User
 }
 
 // ErrAutomatedRelaunchNotImplemented is the sentinel returned when a saved
@@ -92,16 +94,18 @@ func ValidateAutomatedRelaunch(state *SessionState) error {
 
 // PaneState represents the state of a single pane.
 type PaneState struct {
-	Title       string `json:"title"`             // e.g., "myproject__cc_1"
-	Index       int    `json:"index"`             // Pane index
-	WindowIndex int    `json:"window_index"`      // Window index
-	AgentType   string `json:"agent_type"`        // "cc", "cod", "gmi", "grok", "user"
-	Model       string `json:"model,omitempty"`   // Model variant if any
-	Command     string `json:"command,omitempty"` // The agent launch command
-	Active      bool   `json:"active"`            // Was this the active pane?
-	Width       int    `json:"width,omitempty"`   // Pane width
-	Height      int    `json:"height,omitempty"`  // Pane height
-	PaneID      string `json:"pane_id,omitempty"` // Original pane ID
+	Title       string                `json:"title"`                 // e.g., "myproject__cc_1"
+	Index       int                   `json:"index"`                 // Pane index
+	WindowIndex int                   `json:"window_index"`          // Window index
+	AgentType   string                `json:"agent_type"`            // "cc", "cod", "gmi", "grok", "omp", "user"
+	Model       string                `json:"model,omitempty"`       // Model variant if any
+	Command     string                `json:"command,omitempty"`     // The agent launch command
+	Active      bool                  `json:"active"`                // Was this the active pane?
+	Width       int                   `json:"width,omitempty"`       // Pane width
+	Height      int                   `json:"height,omitempty"`      // Pane height
+	PaneID      string                `json:"pane_id,omitempty"`     // Original pane ID
+	WorkDir     string                `json:"cwd,omitempty"`         // Pane-specific project/worktree directory
+	LaunchSpec  *tmux.AgentLaunchSpec `json:"launch_spec,omitempty"` // Exact rendered launch and recovery settings
 
 	// Agent CLI session linkage (for resume). Captured best-effort by
 	// discovering the most-recent provider session for the pane's cwd+agent.
@@ -156,6 +160,7 @@ type ConfigSnapshot struct {
 	WindsurfCmd    string `json:"windsurf_cmd,omitempty"`
 	AiderCmd       string `json:"aider_cmd,omitempty"`
 	OpencodeCmd    string `json:"opencode_cmd,omitempty"`
+	OmpCmd         string `json:"omp_cmd,omitempty"`
 	OllamaCmd      string `json:"ollama_cmd,omitempty"`
 }
 
@@ -172,6 +177,7 @@ type AgentCommands struct {
 	Windsurf    string
 	Aider       string
 	Opencode    string
+	Omp         string
 	Ollama      string
 }
 

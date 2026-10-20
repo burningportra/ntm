@@ -7,48 +7,10 @@ import (
 	"testing"
 	"time"
 
-	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
-
-// TestSelectInterruptTargetsWindowAware documents the targeting fix at the heart
-// of #172: on a multi-window / window-per-agent layout a bare --panes index
-// selects the matching WINDOW rather than the window-local pane index. Every
-// pane shares window-local index 0 here, so the pre-fix behavior either matched
-// nothing (--panes=2) or broadcast to every window (--panes=0). The fix makes
-// --panes=2 hit exactly the agent in window 2, and a genuinely-absent window
-// (--panes=9) still resolves to an empty set so the fail-loud path triggers.
-func TestSelectInterruptTargetsWindowAware(t *testing.T) {
-	// Window-per-agent layout: three windows, each a single pane at index 0.
-	panes := []tmux.Pane{
-		{ID: "%1", Index: 0, WindowIndex: 0, Type: tmux.AgentType("claude"), Title: "s__cc_1"},
-		{ID: "%2", Index: 0, WindowIndex: 1, Type: tmux.AgentType("codex"), Title: "s__cod_1"},
-		{ID: "%3", Index: 0, WindowIndex: 2, Type: tmux.AgentType("gemini"), Title: "s__gmi_1"},
-	}
-
-	// --panes=2 now selects the single pane in window 2 (was: matched nothing).
-	got := selectInterruptTargets(panes, map[string]bool{"2": true}, false)
-	if len(got) != 1 || got[0].ID != "%3" {
-		t.Fatalf("expected --panes=2 to resolve to the window-2 pane %%3, got %v", got)
-	}
-
-	// A window that does not exist still resolves to an empty set (fail-loud).
-	if got := selectInterruptTargets(panes, map[string]bool{"9": true}, false); len(got) != 0 {
-		t.Fatalf("expected empty target set for absent window --panes=9, got %d", len(got))
-	}
-
-	// An explicit window.pane address resolves to exactly that pane.
-	if got := selectInterruptTargets(panes, map[string]bool{"1.0": true}, false); len(got) != 1 || got[0].ID != "%2" {
-		t.Fatalf("expected --panes=1.0 to resolve to %%2, got %v", got)
-	}
-
-	// A %N pane id resolves regardless of topology.
-	if got := selectInterruptTargets(panes, map[string]bool{"%1": true}, false); len(got) != 1 || got[0].ID != "%1" {
-		t.Fatalf("expected --panes=%%1 to resolve to %%1, got %v", got)
-	}
-}
 
 func TestResolveInterruptTargetsSelectorsDeduplicateAndFailTyped(t *testing.T) {
 	panes := []tmux.Pane{
@@ -56,18 +18,55 @@ func TestResolveInterruptTargetsSelectorsDeduplicateAndFailTyped(t *testing.T) {
 		{ID: "%2", Index: 0, WindowIndex: 1, Type: tmux.AgentType("codex")},
 		{ID: "%3", Index: 0, WindowIndex: 2, Type: tmux.AgentType("gemini")},
 	}
-	selected, err := resolveInterruptTargets(panes, []string{"2", "2.0", "%3"}, false)
+	selected, err := resolveInterruptTargets(panes, []string{"2", "2.0", "%3"}, false, nil)
 	if err != nil {
 		t.Fatalf("resolveInterruptTargets() error = %v", err)
 	}
 	if len(selected) != 1 || selected[0].ID != "%3" {
 		t.Fatalf("selected = %v, want one physical pane %%3", selected)
 	}
-	if _, err := resolveInterruptTargets(panes, []string{"9.0"}, false); err == nil || paneSelectorRobotErrorCode(err) != ErrCodePaneNotFound {
+	if _, err := resolveInterruptTargets(panes, []string{"9.0"}, false, nil); err == nil || paneSelectorRobotErrorCode(err) != ErrCodePaneNotFound {
 		t.Fatalf("missing selector error = %v", err)
 	}
-	if _, err := resolveInterruptTargets(panes, []string{"1.x"}, false); err == nil || paneSelectorRobotErrorCode(err) != ErrCodeInvalidFlag {
+	if _, err := resolveInterruptTargets(panes, []string{"1.x"}, false, nil); err == nil || paneSelectorRobotErrorCode(err) != ErrCodeInvalidFlag {
 		t.Fatalf("invalid selector error = %v", err)
+	}
+}
+
+func TestResolveInterruptTargetsTypeFilterNarrowsDefaultAndSelectedSets(t *testing.T) {
+	panes := []tmux.Pane{
+		{ID: "%0", Index: 0, Type: tmux.AgentType("user")},
+		{ID: "%1", Index: 1, Type: tmux.AgentType("claude")},
+		{ID: "%2", Index: 2, Type: tmux.AgentType("codex")},
+		{ID: "%3", Index: 3, Type: tmux.AgentType("codex")},
+	}
+	ids := func(selected []tmux.Pane) string {
+		out := make([]string, 0, len(selected))
+		for _, p := range selected {
+			out = append(out, p.ID)
+		}
+		return strings.Join(out, ",")
+	}
+
+	selected, err := resolveInterruptTargets(panes, nil, false, []string{"cod"})
+	if err != nil || ids(selected) != "%2,%3" {
+		t.Fatalf("--type=cod over the default set = %q (err %v), want %%2,%%3", ids(selected), err)
+	}
+	selected, err = resolveInterruptTargets(panes, nil, false, []string{" claude ", "cc"})
+	if err != nil || ids(selected) != "%1" {
+		t.Fatalf("--type=claude,cc = %q (err %v), want %%1", ids(selected), err)
+	}
+	selected, err = resolveInterruptTargets(panes, []string{"%1", "%2"}, false, []string{"codex"})
+	if err != nil || ids(selected) != "%2" {
+		t.Fatalf("--panes=%%1,%%2 --type=codex = %q (err %v), want %%2", ids(selected), err)
+	}
+	selected, err = resolveInterruptTargets(panes, nil, false, []string{"aider"})
+	if err != nil || len(selected) != 0 {
+		t.Fatalf("--type=aider = %q (err %v), want no targets", ids(selected), err)
+	}
+	selected, err = resolveInterruptTargets(panes, nil, false, nil)
+	if err != nil || ids(selected) != "%1,%2,%3" {
+		t.Fatalf("no --type = %q (err %v), want every agent pane", ids(selected), err)
 	}
 }
 
@@ -214,20 +213,16 @@ func TestInterruptFollowUpAppliesRedactionBeforeSideEffects(t *testing.T) {
 	})
 }
 
-func TestInterruptFollowUpRejectsMixedGrokTargetsBeforeActuation(t *testing.T) {
+// GH#251 phase 2: grok panes accept automated prompt delivery, so a follow-up
+// message targeting a mixed claude+grok batch passes the preflight.
+func TestInterruptFollowUpAcceptsMixedGrokTargets(t *testing.T) {
 	t.Parallel()
 	panes := []tmux.Pane{
 		{ID: "%1", Index: 0, Type: tmux.AgentClaude, Title: "proj__cc_1"},
 		{ID: "%2", Index: 1, Type: tmux.AgentUnknown, Title: "proj__grok_1"},
 	}
-	err := validateInterruptFollowUpTargets(panes, panes, InterruptOptions{Session: "proj", Message: "continue"})
-	var dispatchErr *dispatchsvc.Error
-	if !errors.As(err, &dispatchErr) || dispatchErr.Code != dispatchsvc.ErrPromptDeliveryUnsupported {
-		t.Fatalf("follow-up preflight error = %T %v, want %q", err, err, dispatchsvc.ErrPromptDeliveryUnsupported)
-	}
-	response := robotDispatchPrepareErrorResponse(err)
-	if response.Success || response.ErrorCode != ErrCodeNotImplemented || ExitCodeForResponse(response) != 2 {
-		t.Fatalf("interrupt response = %+v, want NOT_IMPLEMENTED / exit 2", response)
+	if err := validateInterruptFollowUpTargets(panes, panes, InterruptOptions{Session: "proj", Message: "continue"}); err != nil {
+		t.Fatalf("follow-up preflight error = %v, want nil (grok delivery is supported)", err)
 	}
 	if err := validateInterruptFollowUpTargets(panes, panes, InterruptOptions{Session: "proj"}); err != nil {
 		t.Fatalf("message-less interrupt preflight = %v, want allowed", err)
@@ -335,18 +330,22 @@ func TestClearRestoredMuseDrafts(t *testing.T) {
 func TestInterruptKeyForAgentStopsMuseWithEscape(t *testing.T) {
 	tests := []struct {
 		agentType tmux.AgentType
-		want      interruptKey
+		key       string
+		label     string
 	}{
-		{tmux.AgentMuse, interruptKey{tmuxKey: "Escape", label: "Escape"}},
-		{tmux.AgentType("muse-code"), interruptKey{tmuxKey: "Escape", label: "Escape"}},
-		{tmux.AgentClaude, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
-		{tmux.AgentCodex, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
-		{tmux.AgentUser, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
-		{tmux.AgentUnknown, interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}},
+		{tmux.AgentMuse, "Escape", "Escape"},
+		{tmux.AgentType("muse-code"), "Escape", "Escape"},
+		{tmux.AgentClaude, "C-c", "Ctrl+C"},
+		{tmux.AgentCodex, "C-c", "Ctrl+C"},
+		{tmux.AgentUser, "C-c", "Ctrl+C"},
+		{tmux.AgentUnknown, "C-c", "Ctrl+C"},
 	}
 	for _, tt := range tests {
-		if got := interruptKeyForAgent(tt.agentType); got != tt.want {
-			t.Errorf("interruptKeyForAgent(%q) = %+v, want %+v", tt.agentType, got, tt.want)
+		if got := tmux.InterruptKeyForAgent(tt.agentType); got != tt.key {
+			t.Errorf("InterruptKeyForAgent(%q) = %q, want %q", tt.agentType, got, tt.key)
+		}
+		if got := tmux.InterruptKeyLabel(tt.agentType); got != tt.label {
+			t.Errorf("InterruptKeyLabel(%q) = %q, want %q", tt.agentType, got, tt.label)
 		}
 	}
 }

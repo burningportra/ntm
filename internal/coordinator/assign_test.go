@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -17,9 +19,11 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	assignmentstore "github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/status"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 type fakeCoordinatorReservationClient struct {
@@ -29,6 +33,7 @@ type fakeCoordinatorReservationClient struct {
 	reserveErr     error
 	reservations   []agentmail.FileReservation
 	listErr        error
+	beforeList     func()
 	releaseResult  *agentmail.ReleaseReservationsResult
 	releaseErr     error
 	releaseIDs     [][]int
@@ -37,6 +42,8 @@ type fakeCoordinatorReservationClient struct {
 	releaseStarted chan struct{}
 	allowRelease   chan struct{}
 	releaseOnce    sync.Once
+	renewRequests  []agentmail.RenewReservationsOptions
+	renewFn        func(context.Context, agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error)
 }
 
 func (f *fakeCoordinatorReservationClient) EnsureProject(_ context.Context, projectKey string) (*agentmail.Project, error) {
@@ -55,6 +62,9 @@ func (f *fakeCoordinatorReservationClient) ReservePaths(context.Context, agentma
 }
 
 func (f *fakeCoordinatorReservationClient) ListReservations(context.Context, string, string, bool) ([]agentmail.FileReservation, error) {
+	if f.beforeList != nil {
+		f.beforeList()
+	}
 	return append([]agentmail.FileReservation(nil), f.reservations...), f.listErr
 }
 
@@ -93,8 +103,830 @@ func (f *fakeCoordinatorReservationClient) ReleaseReservations(_ context.Context
 	return &agentmail.ReleaseReservationsResult{Released: len(ids) + len(paths)}, nil
 }
 
-func (f *fakeCoordinatorReservationClient) RenewReservations(context.Context, agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+func (f *fakeCoordinatorReservationClient) RenewReservations(ctx context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+	f.renewRequests = append(f.renewRequests, opts)
+	if f.renewFn != nil {
+		return f.renewFn(ctx, opts)
+	}
 	return &agentmail.RenewReservationsResult{}, nil
+}
+
+func newAssignmentHeartbeatTestCoordinator(t *testing.T) (*SessionCoordinator, *assignmentstore.AssignmentStore, *fakeCoordinatorReservationClient) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	const session, beadID, owner, paneID = "lease-heartbeat", "ntm-heartbeat", "BlueLake", "%94"
+	projectDir := t.TempDir()
+	expiresAt := time.Now().UTC().Add(2 * time.Minute)
+	store := assignmentstore.NewStore(session)
+	store.Assignments[beadID] = &assignmentstore.Assignment{
+		BeadID: beadID, BeadTitle: "Long-running work", Pane: 1, AgentType: "cc", AgentName: owner,
+		Status: assignmentstore.StatusWorking, AssignedAt: time.Now().UTC().Add(-58 * time.Minute), IdempotencyKey: "heartbeat-generation",
+		ClaimActor: "BlueLake:heartbeat-generation", DispatchTarget: paneID, OccupancyKey: paneID, DispatchState: assignmentstore.DispatchSent,
+		ReservationRequired: true, ReservationState: assignmentstore.ReservationReserved, ReservationCompleted: true,
+		ReservationAgent: owner, ReservationTarget: paneID, ReservationRequested: []string{"internal/a.go", "internal/b.go"},
+		ReservedPaths: []string{"internal/a.go", "internal/b.go"}, ReservationIDs: []int{941, 942}, ReservationExpiresAt: &expiresAt,
+	}
+	if err := store.Save(); err != nil {
+		t.Fatalf("seed heartbeat assignment: %v", err)
+	}
+	registry := agentmail.NewSessionAgentRegistry(session, projectDir)
+	registry.AddAgent(session+"__cc_1", paneID, owner)
+	if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+		t.Fatalf("save heartbeat pane registry: %v", err)
+	}
+	client := &fakeCoordinatorReservationClient{reservations: []agentmail.FileReservation{
+		{ID: 941, ProjectID: 9, AgentName: owner, Reason: "bead assignment: " + beadID, PathPattern: "internal/a.go", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: expiresAt}},
+		{ID: 942, ProjectID: 9, AgentName: owner, Reason: "bead assignment: " + beadID, PathPattern: "internal/b.go", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: expiresAt.Add(time.Minute)}},
+		{ID: 999, ProjectID: 9, AgentName: owner, Reason: "another task", PathPattern: "other.go", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: expiresAt}},
+	}}
+	client.renewFn = func(_ context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		for i := range client.reservations {
+			for _, id := range opts.ReservationIDs {
+				if client.reservations[i].ID == id {
+					client.reservations[i].ExpiresTS.Time = client.reservations[i].ExpiresTS.Add(time.Duration(opts.ExtendSeconds) * time.Second)
+				}
+			}
+		}
+		return &agentmail.RenewReservationsResult{Renewed: len(opts.ReservationIDs)}, nil
+	}
+	c := New(session, projectDir, nil, "Coordinator")
+	c.config.AutoAssign, c.config.ConflictNotify = false, false
+	c.reservationClient = client
+	c.workItemDetailsFn = func(context.Context, string) (*bv.BeadAssignmentDetails, error) {
+		return &bv.BeadAssignmentDetails{ID: beadID, Status: "in_progress", Assignee: "BlueLake:heartbeat-generation"}, nil
+	}
+	c.workItemStatusFn = func(context.Context, string) (string, error) {
+		return "in_progress", nil
+	}
+	c.monitor = NewAgentMonitor(session, nil, projectDir)
+	c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+		ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+			return []tmux.PaneActivity{{Pane: tmux.Pane{ID: paneID, Index: 1, Title: session + "__cc_1", Type: tmux.AgentClaude}, LastActivity: time.Now().Add(-time.Minute)}}, nil
+		},
+		CapturePane: func(context.Context, string, int) (string, error) { return idleCapture, nil },
+	})
+	return c, store, client
+}
+
+func TestRunCycleRenewsAssignmentReservationsWithAutoAssignOff(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	before := store.Get("ntm-heartbeat")
+	unrelatedExpiry := client.reservations[2].ExpiresTS.Time
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if len(client.renewRequests) != 1 {
+		t.Fatalf("renew requests = %+v", client.renewRequests)
+	}
+	request := client.renewRequests[0]
+	if !reflect.DeepEqual(request.ReservationIDs, []int{941, 942}) || len(request.Paths) != 0 || request.AgentName != "BlueLake" || request.ExtendSeconds != 3600 || request.ProjectKey != c.projectKey {
+		t.Fatalf("renewal widened ownership: %+v", request)
+	}
+	if !client.reservations[2].ExpiresTS.Equal(unrelatedExpiry) {
+		t.Fatal("renewed an unrelated lease belonging to the same agent")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	after := store.Get(before.BeadID)
+	if after.ReservationExpiresAt == nil || !after.ReservationExpiresAt.Equal(before.ReservationExpiresAt.Add(time.Hour)) || after.ReservationRenewalError != "" || after.ReservationRenewalCheckedAt == nil || after.Status != assignmentstore.StatusWorking {
+		t.Fatalf("renewal was not durably recorded: %+v", after)
+	}
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.renewRequests) != 1 {
+		t.Fatal("renewed again while durable expiry was outside the lead window")
+	}
+}
+
+func TestRunCycleMaintainsProvenAssignmentsDespiteObservationFailures(t *testing.T) {
+	for _, failure := range []string{"sibling_capture", "whole_topology", "capture_and_cleanup"} {
+		t.Run(failure, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			const unknownBead, closedBead = "ntm-unobservable", "ntm-finished"
+			for _, sibling := range []struct {
+				bead, pane, owner string
+				id                int
+			}{
+				{unknownBead, "%95", "RedLake", 951},
+				{closedBead, "%96", "GreenLake", 961},
+			} {
+				row := store.Get("ntm-heartbeat")
+				row.BeadID, row.AgentName, row.ReservationAgent = sibling.bead, sibling.owner, sibling.owner
+				row.IdempotencyKey = sibling.bead + "-generation"
+				row.ClaimActor = sibling.owner + ":" + row.IdempotencyKey
+				row.DispatchTarget, row.OccupancyKey, row.ReservationTarget = sibling.pane, sibling.pane, sibling.pane
+				row.ReservationRequested, row.ReservedPaths = []string{sibling.bead + ".go"}, []string{sibling.bead + ".go"}
+				row.ReservationIDs = []int{sibling.id}
+				store.Assignments[sibling.bead] = row
+				client.reservations = append(client.reservations, agentmail.FileReservation{
+					ID: sibling.id, ProjectID: 9, AgentName: sibling.owner, PathPattern: row.ReservedPaths[0],
+					Reason: "bead assignment: " + sibling.bead, Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: *row.ReservationExpiresAt},
+				})
+			}
+			if err := store.Save(); err != nil {
+				t.Fatal(err)
+			}
+			beforeUnknown := store.Get(unknownBead)
+			beforeHealthy := store.Get("ntm-heartbeat")
+			registry := agentmail.NewSessionAgentRegistry(c.session, c.projectKey)
+			registry.AddAgent(c.session+"__cc_1", "%94", "BlueLake")
+			registry.AddAgent(c.session+"__cc_2", "%95", "RedLake")
+			if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+				t.Fatal(err)
+			}
+			c.workItemStatusFn = func(_ context.Context, beadID string) (string, error) {
+				if beadID == closedBead {
+					return "closed", nil
+				}
+				return "in_progress", nil
+			}
+			c.workItemDetailsFn = func(_ context.Context, beadID string) (*bv.BeadAssignmentDetails, error) {
+				return &bv.BeadAssignmentDetails{ID: beadID, Status: "in_progress", Assignee: store.Get(beadID).ClaimActor}, nil
+			}
+			claimReleases := 0
+			c.releaseWorkItemClaimFn = func(_ context.Context, project, beadID, actor string) (bool, error) {
+				if project != c.projectKey || beadID != closedBead || actor != store.Get(closedBead).ClaimActor {
+					t.Fatalf("cleanup changed claim identity: %q %q %q", project, beadID, actor)
+				}
+				claimReleases++
+				return true, nil
+			}
+			c.config.AutoAssign = true
+			c.config.ConflictNotify = true
+			c.config.ConflictNegotiate = true
+			c.config.MailNudge = true
+			c.config.RotationUsageThreshold = 1
+			c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+				t.Fatal("degraded observation admitted new work")
+				return nil, nil
+			}
+			c.detectConflictsFn = func(context.Context) ([]Conflict, error) {
+				t.Fatal("degraded observation started conflict actions")
+				return nil, nil
+			}
+			c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					if failure == "whole_topology" {
+						return nil, errors.New("topology unavailable")
+					}
+					return []tmux.PaneActivity{
+						{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}},
+						{Pane: tmux.Pane{ID: "%95", Index: 2, Title: c.session + "__cc_2", Type: tmux.AgentClaude}},
+					}, nil
+				},
+				CapturePane: func(_ context.Context, paneID string, _ int) (string, error) {
+					if paneID == "%95" {
+						return "", errors.New("sibling capture unavailable")
+					}
+					return idleCapture, nil
+				},
+			})
+			if failure == "capture_and_cleanup" {
+				client.releaseErr = errors.New("terminal release unavailable")
+			}
+
+			results, err := c.RunCycle(t.Context())
+			wantObservationError := "sibling capture unavailable"
+			if failure == "whole_topology" {
+				wantObservationError = "topology unavailable"
+			}
+			if err == nil || !strings.Contains(err.Error(), wantObservationError) || !strings.Contains(err.Error(), unknownBead) || len(results) != 0 {
+				t.Fatalf("missing observation and target-maintenance errors: results=%+v err=%v", results, err)
+			}
+			if c.rotation != nil || c.caamFailover != nil || c.mailNudge != nil || c.conflictDetector != nil {
+				t.Fatal("degraded observation started automatic agent actions")
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			healthy := store.Get("ntm-heartbeat")
+			if failure == "whole_topology" {
+				if len(client.renewRequests) != 0 || healthy.ReservationRenewalError == "" || !healthy.ReservationExpiresAt.Equal(*beforeHealthy.ReservationExpiresAt) {
+					t.Fatalf("unavailable topology renewed an unproven owner: %+v requests=%+v", healthy, client.renewRequests)
+				}
+			} else if len(client.renewRequests) != 1 || !reflect.DeepEqual(client.renewRequests[0].ReservationIDs, []int{941, 942}) || healthy.ReservationRenewalError != "" || healthy.ReservationExpiresAt.Before(time.Now().Add(time.Hour)) {
+				t.Fatalf("sibling failure prevented exact healthy renewal: %+v requests=%+v", healthy, client.renewRequests)
+			}
+			unknown := store.Get(unknownBead)
+			if unknown.Status != assignmentstore.StatusWorking || unknown.ReservationRenewalError == "" ||
+				!unknown.ReservationExpiresAt.Equal(*beforeUnknown.ReservationExpiresAt) ||
+				!reflect.DeepEqual(unknown.ReservationIDs, beforeUnknown.ReservationIDs) || unknown.IdempotencyKey != beforeUnknown.IdempotencyKey {
+				t.Fatalf("unobservable assignment lost its ownership barrier: %+v", unknown)
+			}
+			closed := store.Get(closedBead)
+			if failure == "capture_and_cleanup" {
+				if !strings.Contains(err.Error(), "exact reservations for bead "+closedBead+" remain active") ||
+					!strings.Contains(closed.ClearError, "remain active") || closed.ClearState != assignmentstore.ClearStateReservationReleasing ||
+					closed.PendingTerminalStatus != assignmentstore.StatusCompleted || len(closed.ReservationIDs) != 1 || claimReleases != 0 {
+					t.Fatalf("cleanup error or durable retry barrier lost: %+v err=%v", closed, err)
+				}
+			} else if closed.Status != assignmentstore.StatusCompleted || len(closed.ReservationIDs) != 0 || claimReleases != 1 {
+				t.Fatalf("observation failure prevented authoritative terminal cleanup: %+v claims=%d", closed, claimReleases)
+			}
+			if len(client.releaseIDs) == 0 || failure != "capture_and_cleanup" && len(client.releaseIDs) != 1 {
+				t.Fatalf("unexpected terminal release attempts: %+v", client.releaseIDs)
+			}
+			for _, ids := range client.releaseIDs {
+				if !reflect.DeepEqual(ids, []int{961}) {
+					t.Fatalf("terminal cleanup widened release scope: %+v", client.releaseIDs)
+				}
+			}
+		})
+	}
+}
+
+func TestMaintainAssignmentsDoesNotStartOtherConfiguredActions(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	c.mailClient = &agentmail.Client{}
+	c.config.AutoAssign, c.config.SendDigests, c.config.MailNudge = true, true, true
+	c.config.ConflictNotify, c.config.ConflictNegotiate = true, true
+	c.config.RotationUsageThreshold = 1
+	c.ntmConfig = config.Default()
+	c.ntmConfig.Integrations.CAAM.AutoFailover = true
+	c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+		t.Fatal("maintenance assigned new work")
+		return nil, nil
+	}
+	c.detectConflictsFn = func(context.Context) ([]Conflict, error) {
+		t.Fatal("maintenance ran conflict actions")
+		return nil, nil
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c.started || c.rotation != nil || c.caamFailover != nil || c.mailNudge != nil || c.conflictDetector != nil {
+		t.Fatal("maintenance started an unrelated subsystem")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.renewRequests) != 1 || store.Get("ntm-heartbeat").ReservationExpiresAt.Before(time.Now().Add(time.Hour)) {
+		t.Fatalf("maintenance did not protect existing work: %+v", store.Get("ntm-heartbeat"))
+	}
+}
+
+func TestMaintainAssignmentsCancellationDoesNotReleaseOrRenew(t *testing.T) {
+	for _, stage := range []string{"before_observation", "during_observation", "before_terminal_cleanup"} {
+		t.Run(stage, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			before := store.Get("ntm-heartbeat")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			observations, statusReads := 0, 0
+			c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					observations++
+					return []tmux.PaneActivity{{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}}}, nil
+				},
+				CapturePane: func(context.Context, string, int) (string, error) {
+					if stage == "during_observation" {
+						cancel()
+						return "", context.Canceled
+					}
+					return idleCapture, nil
+				},
+			})
+			c.workItemStatusFn = func(context.Context, string) (string, error) {
+				statusReads++
+				cancel()
+				return "closed", nil
+			}
+			if stage == "before_observation" {
+				cancel()
+			}
+			if err := c.MaintainAssignments(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation error=%v", err)
+			}
+			if stage == "before_observation" && observations != 0 || stage != "before_terminal_cleanup" && statusReads != 0 {
+				t.Fatalf("work continued after cancellation: observations=%d statusReads=%d", observations, statusReads)
+			}
+			if len(client.releaseIDs) != 0 || len(client.renewRequests) != 0 {
+				t.Fatalf("cancellation caused lease mutation: releases=%v renewals=%v", client.releaseIDs, client.renewRequests)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			if after := store.Get(before.BeadID); !reflect.DeepEqual(before, after) {
+				t.Fatalf("cancellation changed durable assignment: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestRunCycleRetiresTerminalAssignmentsWithAutoAssignOff(t *testing.T) {
+	for _, trackerStatus := range []string{"closed", "tombstone"} {
+		t.Run(trackerStatus, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			before := store.Get("ntm-heartbeat")
+			// A newly acquired lease still needs prompt release when its task
+			// ends; maintenance must not wait until the renewal lead window.
+			expiresAt := time.Now().UTC().Add(time.Hour)
+			store.Assignments[before.BeadID].ReservationExpiresAt = &expiresAt
+			if err := store.Save(); err != nil {
+				t.Fatal(err)
+			}
+			c.workItemStatusFn = func(context.Context, string) (string, error) {
+				return trackerStatus, nil
+			}
+			c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+				t.Fatal("disabled auto-assignment admitted new work")
+				return nil, nil
+			}
+			claimReleases := 0
+			c.releaseWorkItemClaimFn = func(_ context.Context, projectKey, beadID, actor string) (bool, error) {
+				claimReleases++
+				if projectKey != c.projectKey || beadID != before.BeadID || actor != before.ClaimActor {
+					t.Fatalf("claim cleanup changed ownership: project=%q bead=%q actor=%q", projectKey, beadID, actor)
+				}
+				return true, nil
+			}
+
+			if results, err := c.RunCycle(t.Context()); err != nil || len(results) != 0 {
+				t.Fatalf("paused admission maintenance results=%+v error=%v", results, err)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := assignmentstore.StatusCompleted
+			if trackerStatus == "tombstone" {
+				wantStatus = assignmentstore.StatusFailed
+			}
+			after := store.Get(before.BeadID)
+			if after.Status != wantStatus || after.ClearState != assignmentstore.ClearStateNone ||
+				after.ReservationState != assignmentstore.ReservationReleased || len(after.ReservationIDs) != 0 ||
+				after.IdempotencyKey != before.IdempotencyKey || after.DispatchTarget != before.DispatchTarget || len(store.ListActive()) != 0 ||
+				after.PendingCompletionEventID != "" {
+				t.Fatalf("terminal assignment retained occupancy or lost its receipt: %+v", after)
+			}
+			if len(client.releaseIDs) != 1 || !reflect.DeepEqual(client.releaseIDs[0], before.ReservationIDs) || claimReleases != 1 || len(client.renewRequests) != 0 {
+				t.Fatalf("terminal cleanup effects: releases=%v claims=%d renewals=%v", client.releaseIDs, claimReleases, client.renewRequests)
+			}
+			if len(client.reservations) != 1 || client.reservations[0].ID != 999 {
+				t.Fatalf("terminal cleanup released an unrelated task's lease: %+v", client.reservations)
+			}
+			if _, err := c.RunCycle(t.Context()); err != nil || len(client.releaseIDs) != 1 || claimReleases != 1 {
+				t.Fatalf("completed cleanup replayed external effects: releases=%v claims=%d error=%v", client.releaseIDs, claimReleases, err)
+			}
+		})
+	}
+}
+
+func TestMaintainAssignmentsPreservesCompletionOutboxThroughCleanupRetry(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	c.WithCompletionEvents()
+	c.workItemStatusFn = func(context.Context, string) (string, error) { return "closed", nil }
+	claimReleases := 0
+	c.releaseWorkItemClaimFn = func(context.Context, string, string, string) (bool, error) {
+		claimReleases++
+		return true, nil
+	}
+	client.releaseErr = errors.New("release response unavailable")
+	if err := c.MaintainAssignments(t.Context()); err == nil {
+		t.Fatal("failed external cleanup reported success")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	barrier := store.Get("ntm-heartbeat")
+	eventID := barrier.PendingCompletionEventID
+	if eventID == "" || barrier.CompletionDetectedAt == nil || barrier.ClearState != assignmentstore.ClearStateReservationReleasing || len(store.ListPendingCompletionEvents()) != 0 {
+		t.Fatalf("cleanup did not preserve an undeliverable pending event: %+v", barrier)
+	}
+	failedReleaseAttempts := len(client.releaseIDs)
+	if failedReleaseAttempts == 0 || !strings.Contains(barrier.ClearError, "remain active") {
+		t.Fatalf("failed cleanup did not record its unresolved leases: %+v releases=%v", barrier, client.releaseIDs)
+	}
+	for _, ids := range client.releaseIDs {
+		if !reflect.DeepEqual(ids, []int{941, 942}) {
+			t.Fatalf("cleanup retry widened release scope: %+v", client.releaseIDs)
+		}
+	}
+	client.releaseErr = nil
+	c.workItemStatusFn = func(context.Context, string) (string, error) {
+		t.Fatal("maintenance re-read a durably terminal outcome")
+		return "", nil
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatalf("resume terminal cleanup: %v", err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	terminal := store.Get("ntm-heartbeat")
+	if terminal.Status != assignmentstore.StatusCompleted || terminal.PendingCompletionEventID != eventID ||
+		terminal.ClearState != assignmentstore.ClearStateNone || len(store.ListPendingCompletionEvents()) != 1 || claimReleases != 1 || len(client.releaseIDs) != failedReleaseAttempts+1 {
+		t.Fatalf("cleanup lost or duplicated the completion event: %+v claims=%d releases=%v", terminal, claimReleases, client.releaseIDs)
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(terminal.BeadID); got.PendingCompletionEventID != eventID || len(client.releaseIDs) != failedReleaseAttempts+1 || claimReleases != 1 {
+		t.Fatalf("maintenance replay repeated completion cleanup: %+v", got)
+	}
+	const consumer = "watch-completion-consumer"
+	if _, claimed, err := store.ClaimPendingCompletionEvent(t.Context(), terminal.BeadID, eventID, consumer, time.Minute); err != nil || !claimed {
+		t.Fatalf("claim completion event: claimed=%t error=%v", claimed, err)
+	}
+	if acknowledged, err := store.AcknowledgeCompletionEvent(t.Context(), terminal.BeadID, eventID, consumer); err != nil || !acknowledged {
+		t.Fatalf("acknowledge completion event: acknowledged=%t error=%v", acknowledged, err)
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(terminal.BeadID); got.PendingCompletionEventID != "" || len(store.ListPendingCompletionEvents()) != 0 || len(client.releaseIDs) != failedReleaseAttempts+1 || claimReleases != 1 {
+		t.Fatalf("maintenance resurrected an acknowledged completion: %+v", got)
+	}
+}
+
+func TestMaintenanceDoesNotRecreateAcknowledgedCompletionFromStaleObservation(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	c.WithCompletionEvents()
+	observed := store.Get("ntm-heartbeat")
+	c.workItemStatusFn = func(context.Context, string) (string, error) { return "closed", nil }
+	claimReleases := 0
+	c.releaseWorkItemClaimFn = func(context.Context, string, string, string) (bool, error) {
+		claimReleases++
+		return true, nil
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	eventID := store.Get(observed.BeadID).PendingCompletionEventID
+	if eventID == "" {
+		t.Fatal("watch maintenance lost its completion event")
+	}
+	const consumer = "competing-watch-consumer"
+	if _, claimed, err := store.ClaimPendingCompletionEvent(t.Context(), observed.BeadID, eventID, consumer, time.Minute); err != nil || !claimed {
+		t.Fatalf("claim completion event: claimed=%t error=%v", claimed, err)
+	}
+	if acknowledged, err := store.AcknowledgeCompletionEvent(t.Context(), observed.BeadID, eventID, consumer); err != nil || !acknowledged {
+		t.Fatalf("acknowledge completion event: acknowledged=%t error=%v", acknowledged, err)
+	}
+	// This maintenance pass captured an active generation before a competing
+	// watcher completed cleanup and consumed its event under the same locks.
+	if completed, err := c.reconcileTerminalAssignment(t.Context(), store, observed, assignmentstore.StatusCompleted, ""); err != nil || completed {
+		t.Fatalf("stale maintenance revisited terminal generation: completed=%t err=%v", completed, err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(observed.BeadID); got.Status != assignmentstore.StatusCompleted || got.PendingCompletionEventID != "" || len(client.releaseIDs) != 1 || claimReleases != 1 {
+		t.Fatalf("stale maintenance resurrected completion or repeated cleanup: %+v claims=%d releases=%v", got, claimReleases, client.releaseIDs)
+	}
+}
+
+func TestObservePreservesAssignmentsWithAutomaticActionsEnabled(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	before := store.Get("ntm-heartbeat")
+	c.config.AutoAssign = true
+	c.config.ConflictNotify = true
+	c.config.ConflictNegotiate = true
+	c.config.MailNudge = true
+	c.config.SendDigests = true
+	c.config.RotationUsageThreshold = 1
+	c.config.PollInterval = MinPollInterval
+	c.workItemStatusFn = func(context.Context, string) (string, error) {
+		t.Fatal("observation inspected assignment lifecycle")
+		return "closed", nil
+	}
+	c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+		t.Fatal("observation admitted new work")
+		return nil, nil
+	}
+	c.detectConflictsFn = func(context.Context) ([]Conflict, error) {
+		t.Fatal("observation ran conflict negotiation")
+		return nil, nil
+	}
+	if err := c.Observe(t.Context()); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if got := c.GetAgents()["%94"]; got == nil || !got.Healthy || got.ObservationFreshness != status.FreshnessFresh || got.AgentMailName != "BlueLake" {
+		t.Fatalf("observation did not produce current agent state: %+v", got)
+	}
+	if c.started || c.rotation != nil || c.mailNudge != nil || c.conflictDetector != nil {
+		t.Fatal("observation started background coordination")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if after := store.Get(before.BeadID); !reflect.DeepEqual(before, after) || len(client.renewRequests) != 0 || len(client.releaseIDs) != 0 {
+		t.Fatalf("observation changed durable assignment state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestRunCycleMaintainsIndependentAssignmentsDespiteFailures(t *testing.T) {
+	for _, failure := range []string{"renewal", "terminal_cleanup", "both"} {
+		t.Run(failure, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			const closedBead = "ntm-terminal-maintenance"
+			terminal := store.Get("ntm-heartbeat")
+			terminal.BeadID = closedBead
+			terminal.Pane = 2
+			terminal.IdempotencyKey = "terminal-maintenance-generation"
+			terminal.ClaimActor = "BlueLake:terminal-maintenance-generation"
+			terminal.DispatchTarget, terminal.OccupancyKey, terminal.ReservationTarget = "%95", "%95", "%95"
+			terminal.ReservationRequested, terminal.ReservedPaths = []string{"finished.go"}, []string{"finished.go"}
+			terminal.ReservationIDs = []int{951}
+			store.Assignments[closedBead] = terminal
+			if err := store.Save(); err != nil {
+				t.Fatal(err)
+			}
+			client.reservations = append(client.reservations, agentmail.FileReservation{
+				ID: 951, ProjectID: 9, AgentName: "BlueLake", PathPattern: "finished.go", Exclusive: true,
+				Reason: "bead assignment: " + closedBead, ExpiresTS: agentmail.FlexTime{Time: time.Now().Add(time.Hour)},
+			})
+			c.config.AutoAssign = true
+			c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+				t.Fatal("maintenance failure admitted new work")
+				return nil, nil
+			}
+			c.workItemStatusFn = func(_ context.Context, beadID string) (string, error) {
+				if beadID == closedBead {
+					return "closed", nil
+				}
+				return "in_progress", nil
+			}
+			claimReleases := 0
+			c.releaseWorkItemClaimFn = func(_ context.Context, projectKey, beadID, actor string) (bool, error) {
+				claimReleases++
+				if projectKey != c.projectKey || beadID != closedBead || actor != terminal.ClaimActor {
+					t.Fatalf("claim cleanup changed ownership: project=%q bead=%q actor=%q", projectKey, beadID, actor)
+				}
+				return true, nil
+			}
+			failsRenewal := failure == "renewal" || failure == "both"
+			failsCleanup := failure == "terminal_cleanup" || failure == "both"
+			if failsRenewal {
+				client.reservations[0].AgentName = "DifferentOwner"
+			}
+			if failsCleanup {
+				client.releaseErr = errors.New("terminal release unavailable")
+			}
+
+			_, err := c.RunCycle(t.Context())
+			if err == nil || failsRenewal && !strings.Contains(err.Error(), "reservation protection for ntm-heartbeat") ||
+				failsCleanup && !strings.Contains(err.Error(), "release terminal assignment "+closedBead) {
+				t.Fatalf("cycle did not retain every maintenance failure: %v", err)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			active := store.Get("ntm-heartbeat")
+			if active.Status != assignmentstore.StatusWorking || !reflect.DeepEqual(active.ReservationIDs, []int{941, 942}) {
+				t.Fatalf("unrelated cleanup changed active ownership: %+v", active)
+			}
+			if failsRenewal {
+				if active.ReservationRenewalError == "" || len(client.renewRequests) != 0 {
+					t.Fatalf("uncertain reservation was renewed or lost its diagnostic: %+v", active)
+				}
+			} else if len(client.renewRequests) != 1 || active.ReservationExpiresAt.Before(time.Now().Add(50*time.Minute)) {
+				t.Fatalf("failed terminal cleanup prevented healthy lease renewal: %+v requests=%v", active, client.renewRequests)
+			}
+			closed := store.Get(closedBead)
+			if failsCleanup {
+				if closed.ClearState != assignmentstore.ClearStateReservationReleasing || closed.ClearError == "" ||
+					closed.PendingTerminalStatus != assignmentstore.StatusCompleted || !reflect.DeepEqual(closed.ReservationIDs, []int{951}) || claimReleases != 0 {
+					t.Fatalf("failed cleanup lost its durable retry barrier: %+v claims=%d", closed, claimReleases)
+				}
+			} else if closed.Status != assignmentstore.StatusCompleted || len(closed.ReservationIDs) != 0 || claimReleases != 1 {
+				t.Fatalf("failed renewal prevented terminal cleanup: %+v claims=%d", closed, claimReleases)
+			}
+
+			// Maintenance can finish after admission is disabled, resuming the
+			// durable cleanup barrier without asking the tracker to reopen it.
+			c.config.AutoAssign = false
+			client.releaseErr = nil
+			client.reservations[0].AgentName = "BlueLake"
+			c.workItemStatusFn = func(_ context.Context, beadID string) (string, error) {
+				if beadID == closedBead {
+					t.Fatal("durable terminal barrier re-read tracker status")
+				}
+				return "in_progress", nil
+			}
+			if _, err := c.RunCycle(t.Context()); err != nil {
+				t.Fatalf("maintenance recovery while admission paused: %v", err)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			if closed := store.Get(closedBead); closed.Status != assignmentstore.StatusCompleted || closed.ClearState != assignmentstore.ClearStateNone || len(closed.ReservationIDs) != 0 || claimReleases != 1 {
+				t.Fatalf("terminal maintenance recovery lost progress: %+v claims=%d", closed, claimReleases)
+			}
+			if active := store.Get("ntm-heartbeat"); active.Status != assignmentstore.StatusWorking || active.ReservationRenewalError != "" || active.ReservationExpiresAt.Before(time.Now().Add(50*time.Minute)) || len(store.ListActive()) != 1 {
+				t.Fatalf("active maintenance recovery failed: %+v", active)
+			}
+		})
+	}
+}
+
+func TestRunCycleReconcilesLostAssignmentRenewalResponse(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	renew := client.renewFn
+	client.renewFn = func(ctx context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		_, _ = renew(ctx, opts)
+		return nil, errors.New("response lost after server commit")
+	}
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("authoritative readback did not reconcile lost response: %v", err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get("ntm-heartbeat"); got.ReservationRenewalError != "" || got.ReservationExpiresAt.Before(time.Now().Add(time.Hour)) {
+		t.Fatalf("lost-response recovery = %+v", got)
+	}
+}
+
+func TestRunCycleRefreshesStalePaneObservationBeforeReservationRenewal(t *testing.T) {
+	for _, stage := range []string{"claim", "lease", "replacement", "unrelated_capture"} {
+		t.Run(stage, func(t *testing.T) {
+			c, _, client := newAssignmentHeartbeatTestCoordinator(t)
+			observations := 0
+			c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					observations++
+					if stage == "replacement" && observations > 1 {
+						return []tmux.PaneActivity{{Pane: tmux.Pane{ID: "%94", Index: 1, Title: "shell", Type: tmux.AgentUser}}}, nil
+					}
+					if stage == "unrelated_capture" && observations > 1 {
+						return []tmux.PaneActivity{
+							{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}},
+							{Pane: tmux.Pane{ID: "%95", Index: 2, Title: c.session + "__cc_2", Type: tmux.AgentClaude}},
+						}, nil
+					}
+					return []tmux.PaneActivity{{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}, LastActivity: time.Now().Add(-time.Minute)}}, nil
+				},
+				CapturePane: func(_ context.Context, paneID string, _ int) (string, error) {
+					if paneID == "%95" {
+						return "", errors.New("unrelated capture failed during refresh")
+					}
+					return idleCapture, nil
+				},
+			})
+			ageObservation := func() {
+				c.mu.Lock()
+				c.agents["%94"].ObservedAt = time.Now().Add(-time.Minute)
+				c.mu.Unlock()
+			}
+			if stage == "lease" {
+				client.beforeList = func() {
+					ageObservation()
+					client.beforeList = nil
+				}
+			} else {
+				lookup := c.workItemDetailsFn
+				c.workItemDetailsFn = func(ctx context.Context, beadID string) (*bv.BeadAssignmentDetails, error) {
+					ageObservation()
+					return lookup(ctx, beadID)
+				}
+			}
+			_, err := c.RunCycle(t.Context())
+			if observations != 2 {
+				t.Fatalf("pane observations = %d, want a fresh observation after the slow %s read", observations, stage)
+			}
+			if stage == "replacement" {
+				if err == nil || len(client.renewRequests) != 0 {
+					t.Fatalf("renewed a lease after the pane became a user shell: requests=%v err=%v", client.renewRequests, err)
+				}
+			} else if err != nil || len(client.renewRequests) != 1 {
+				t.Fatalf("stale batch observation prevented renewal: requests=%v err=%v", client.renewRequests, err)
+			}
+		})
+	}
+}
+
+func TestRunCycleRetriesOnlyUnrenewedAssignmentReservationIDs(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	renew := client.renewFn
+	client.renewFn = func(ctx context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		opts.ReservationIDs = []int{941}
+		return renew(ctx, opts)
+	}
+	if _, err := c.RunCycle(t.Context()); err == nil {
+		t.Fatal("partially renewed assignment was accepted")
+	}
+	protectedExpiry := client.reservations[0].ExpiresTS.Time
+	client.renewFn = renew
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("retry of unrenewed lease: %v", err)
+	}
+	if len(client.renewRequests) != 2 || !reflect.DeepEqual(client.renewRequests[1].ReservationIDs, []int{942}) || !client.reservations[0].ExpiresTS.Equal(protectedExpiry) {
+		t.Fatalf("retry extended an already healthy lease: %+v", client.renewRequests)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get("ntm-heartbeat"); got.ReservationRenewalError != "" || !got.ReservationExpiresAt.Equal(protectedExpiry) {
+		t.Fatalf("partial renewal recovery not persisted: %+v", got)
+	}
+}
+
+func TestRunCycleRetainsAssignmentAfterPartialRenewalAndRecoversByReadback(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	before := store.Get("ntm-heartbeat")
+	c.config.AutoAssign = true
+	assignCalls := 0
+	c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) { assignCalls++; return nil, nil }
+	client.renewFn = func(context.Context, agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		client.reservations[0].ExpiresTS.Time = time.Now().Add(time.Hour)
+		return &agentmail.RenewReservationsResult{Renewed: 2}, nil // Incorrect success count.
+	}
+	if _, err := c.RunCycle(t.Context()); err == nil || !strings.Contains(err.Error(), "every assignment lease") {
+		t.Fatalf("partial renewal error = %v", err)
+	}
+	if assignCalls != 0 {
+		t.Fatal("new work was assigned with uncertain reservation protection")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	failed := store.Get(before.BeadID)
+	if failed.Status != assignmentstore.StatusWorking || failed.ReservationRenewalError == "" || !failed.ReservationExpiresAt.Equal(*before.ReservationExpiresAt) || !reflect.DeepEqual(failed.ReservationIDs, before.ReservationIDs) {
+		t.Fatalf("failed renewal released or altered the active assignment: %+v", failed)
+	}
+	// The server completes the second renewal after our inconclusive response.
+	client.reservations[1].ExpiresTS.Time = time.Now().Add(time.Hour)
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("readback recovery: %v", err)
+	}
+	if len(client.renewRequests) != 1 || assignCalls != 1 {
+		t.Fatalf("recovery repeated renewal or did not resume coordination: renew=%d assign=%d", len(client.renewRequests), assignCalls)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(before.BeadID); got.ReservationRenewalError != "" || got.ReservationExpiresAt.Before(time.Now().Add(50*time.Minute)) {
+		t.Fatalf("recovery was not persisted: %+v", got)
+	}
+}
+
+func TestRunCycleRejectsChangedAssignmentReservationBindings(t *testing.T) {
+	for _, kind := range []string{"project", "owner", "reason", "path", "missing", "expired", "released", "shared", "claim", "pane", "closed"} {
+		t.Run(kind, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			switch kind {
+			case "project":
+				client.reservations[0].ProjectID++
+			case "owner":
+				client.reservations[0].AgentName = "OtherAgent"
+			case "reason":
+				client.reservations[0].Reason = "another bead"
+			case "path":
+				client.reservations[0].PathPattern = "unrelated.go"
+			case "missing":
+				client.reservations = client.reservations[1:]
+			case "expired":
+				client.reservations[0].ExpiresTS.Time = time.Now().Add(-time.Second)
+			case "released":
+				client.reservations[0].ReleasedTS = &agentmail.FlexTime{Time: time.Now()}
+			case "shared":
+				client.reservations[0].Exclusive = false
+			case "claim":
+				c.workItemDetailsFn = func(context.Context, string) (*bv.BeadAssignmentDetails, error) {
+					return &bv.BeadAssignmentDetails{ID: "ntm-heartbeat", Status: "in_progress", Assignee: "NewOwner"}, nil
+				}
+			case "pane":
+				registry := agentmail.NewSessionAgentRegistry(c.session, c.projectKey)
+				registry.AddAgent(c.session+"__cc_1", "%94", "ReplacementAgent")
+				if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+					t.Fatal(err)
+				}
+			case "closed":
+				c.workItemDetailsFn = func(context.Context, string) (*bv.BeadAssignmentDetails, error) {
+					return &bv.BeadAssignmentDetails{ID: "ntm-heartbeat", Status: "closed"}, nil
+				}
+			}
+			_, err := c.RunCycle(t.Context())
+			if kind == "closed" {
+				if err != nil {
+					t.Fatalf("closed work should skip renewal: %v", err)
+				}
+			} else if err == nil {
+				t.Fatal("unsafe renewal did not fail")
+			}
+			if len(client.renewRequests) != 0 {
+				t.Fatalf("renewed after %s changed: %+v", kind, client.renewRequests)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			got := store.Get("ntm-heartbeat")
+			if got.Status != assignmentstore.StatusWorking || len(got.ReservationIDs) != 2 || (kind != "closed" && got.ReservationRenewalError == "") {
+				t.Fatalf("unsafe renewal lost durable occupancy/evidence: %+v", got)
+			}
+		})
+	}
 }
 
 func TestWorkAssignmentStruct(t *testing.T) {
@@ -159,45 +991,7 @@ func TestCoordinatorWorkAssignedEventUsesOnlyDurableTitle(t *testing.T) {
 	}
 }
 
-func TestRemoveRecommendation(t *testing.T) {
-	recs := []bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "First"},
-		{ID: "ntm-002", Title: "Second"},
-		{ID: "ntm-003", Title: "Third"},
-	}
-
-	result := removeRecommendation(recs, "ntm-002")
-
-	if len(result) != 2 {
-		t.Errorf("expected 2 recommendations after removal, got %d", len(result))
-	}
-	for _, r := range result {
-		if r.ID == "ntm-002" {
-			t.Error("expected ntm-002 to be removed")
-		}
-	}
-
-	// Test removing non-existent ID
-	result2 := removeRecommendation(recs, "ntm-999")
-	if len(result2) != 3 {
-		t.Errorf("expected 3 recommendations when removing non-existent, got %d", len(result2))
-	}
-
-	// Test empty slice (should not panic)
-	result3 := removeRecommendation(nil, "ntm-001")
-	if result3 != nil {
-		t.Errorf("expected nil for empty input, got %v", result3)
-	}
-
-	result4 := removeRecommendation([]bv.TriageRecommendation{}, "ntm-001")
-	if result4 != nil {
-		t.Errorf("expected nil for empty slice, got %v", result4)
-	}
-}
-
-func TestFindBestMatch(t *testing.T) {
-	c := New("test-session", "/tmp/test", nil, "TestAgent")
-
+func TestScoreAndSelectAssignmentsSkipsGatedRecommendations(t *testing.T) {
 	agent := &AgentState{
 		PaneID:        "%0",
 		AgentType:     "cc",
@@ -214,64 +1008,35 @@ func TestFindBestMatch(t *testing.T) {
 		{ID: "ntm-003", Title: "Another Ready", Status: "open", Priority: 2, Score: 0.7},
 	}
 
-	assignment, rec := c.findBestMatch(agent, recs)
+	selected := ScoreAndSelectAssignments([]*AgentState{agent}, recs, DefaultScoreConfig(), nil)
 
-	if assignment == nil {
-		t.Fatal("expected assignment, got nil")
+	if len(selected) != 1 {
+		t.Fatalf("expected 1 assignment for 1 agent, got %d", len(selected))
 	}
-	if rec == nil {
-		t.Fatal("expected recommendation, got nil")
+	if selected[0].Assignment.BeadID != "ntm-002" {
+		t.Errorf("expected BeadID 'ntm-002' (highest-scoring ungated), got %q", selected[0].Assignment.BeadID)
 	}
-	if assignment.BeadID != "ntm-002" {
-		t.Errorf("expected BeadID 'ntm-002' (first non-blocked), got %q", assignment.BeadID)
-	}
-	if assignment.AgentMailName != "BlueFox" {
-		t.Errorf("expected AgentMailName 'BlueFox', got %q", assignment.AgentMailName)
+	if selected[0].Assignment.AgentMailName != "BlueFox" {
+		t.Errorf("expected AgentMailName 'BlueFox', got %q", selected[0].Assignment.AgentMailName)
 	}
 }
 
-func TestFindBestMatchAllBlocked(t *testing.T) {
-	c := New("test-session", "/tmp/test", nil, "TestAgent")
-
+func TestScoreAndSelectAssignmentsAllGated(t *testing.T) {
 	agent := &AgentState{
 		PaneID:    "%0",
 		AgentType: "cc",
 	}
 
 	recs := []bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Blocked 1", Status: "Blocked"},
-		{ID: "ntm-002", Title: "Dependency", Status: "open", BlockedBy: []string{"ntm-prerequisite"}},
-		{ID: "ntm-003", Title: "Operator", Status: "open", Labels: []string{"blocked-on-operator"}},
+		{ID: "ntm-001", Title: "Blocked 1", Status: "Blocked", Score: 0.9},
+		{ID: "ntm-002", Title: "Dependency", Status: "open", BlockedBy: []string{"ntm-prerequisite"}, Score: 0.9},
+		{ID: "ntm-003", Title: "Operator", Status: "open", Labels: []string{"blocked-on-operator"}, Score: 0.9},
 	}
 
-	assignment, rec := c.findBestMatch(agent, recs)
+	selected := ScoreAndSelectAssignments([]*AgentState{agent}, recs, DefaultScoreConfig(), nil)
 
-	if assignment != nil {
-		t.Error("expected nil assignment when all are blocked")
-	}
-	if rec != nil {
-		t.Error("expected nil recommendation when all are blocked")
-	}
-}
-
-func TestFindBestMatchEmpty(t *testing.T) {
-	c := New("test-session", "/tmp/test", nil, "TestAgent")
-
-	agent := &AgentState{
-		PaneID:    "%0",
-		AgentType: "cc",
-	}
-
-	assignment, rec := c.findBestMatch(agent, nil)
-
-	if assignment != nil || rec != nil {
-		t.Error("expected nil for empty recommendations")
-	}
-
-	assignment, rec = c.findBestMatch(agent, []bv.TriageRecommendation{})
-
-	if assignment != nil || rec != nil {
-		t.Error("expected nil for empty slice")
+	if len(selected) != 0 {
+		t.Errorf("expected no assignments when all recommendations are gated, got %d", len(selected))
 	}
 }
 
@@ -323,6 +1088,14 @@ func TestAttemptAssignmentRequiresAgentMailIdentity(t *testing.T) {
 func TestAttemptAssignmentAtomicSuccessPersistsReceipt(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	projectDir := t.TempDir()
+	// Reservation candidates must resolve inside the repository (ntm#302), so
+	// the path this assignment reserves has to actually exist.
+	if err := os.MkdirAll(filepath.Join(projectDir, "internal", "coordinator"), 0o755); err != nil {
+		t.Fatalf("create repository path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "internal", "coordinator", "assign.go"), []byte("package coordinator\n"), 0o600); err != nil {
+		t.Fatalf("write repository path: %v", err)
+	}
 	c := New("coordinator-atomic-success", projectDir, &agentmail.Client{}, "CoordinatorAgent")
 	var order []string
 	c.atomicCoordinatorFactory = func(store *assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
@@ -372,6 +1145,114 @@ func TestAttemptAssignmentAtomicSuccessPersistsReceipt(t *testing.T) {
 	if stored == nil || stored.DispatchState != assignmentstore.DispatchSent || stored.DispatchReceiptID != "mail-91" ||
 		stored.ClaimActor != result.ClaimActor || stored.IdempotencyKey != result.IdempotencyKey || stored.OccupancyKey != "%9" {
 		t.Fatalf("durable coordinator assignment = %+v", stored)
+	}
+}
+
+const coordinatorContextCASSMarker = "NTM_COORDINATOR_CASS_HISTORY"
+
+// writeCoordinatorStubCass writes a stub cass that logs each invocation and
+// prints one dateless, high-scoring hit.
+func writeCoordinatorStubCass(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "cass.log")
+	payload := `{"query":"rate limiting","total_matches":1,"hits":[{"source_path":"/home/user/.cass/sessions/gateway/session-a.jsonl",` +
+		`"line_number":7,"agent":"codex","content":"` + coordinatorContextCASSMarker + ` token bucket per API key","score":0.93}]}`
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + logPath + "'\ncat <<'NTM_FIXTURE_EOF'\n" + payload + "\nNTM_FIXTURE_EOF\n"
+	binPath := filepath.Join(dir, "cass")
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub cass: %v", err)
+	}
+	return binPath, logPath
+}
+
+func readCoordinatorStubLog(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read stub log: %v", err)
+	}
+	return string(data)
+}
+
+// TestAttemptAssignmentEnrichesPromptAndRecoveryReplaysRecordedPrompt proves
+// coordinator auto-assign enriches the work-assignment message with CASS
+// history before the durable intent is recorded, and that pending recovery
+// re-delivers the recorded enriched prompt without querying cass again.
+func TestAttemptAssignmentEnrichesPromptAndRecoveryReplaysRecordedPrompt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cassBin, cassLog := writeCoordinatorStubCass(t)
+	query := robot.DefaultCASSConfig()
+	query.BinaryPath = cassBin
+	query.Timeout = 10 * time.Second
+	filter := robot.DefaultFilterConfig()
+	filter.MinRelevance = 0
+	filter.MaxAgeDays = 0
+	c := New("coordinator-prompt-context", t.TempDir(), &agentmail.Client{}, "CoordinatorAgent").
+		WithPromptContext(robot.PromptContextOptions{WithCASS: true, CASSConfig: &query, FilterConfig: &filter})
+
+	refuseDispatch := true
+	var dispatched []string
+	c.atomicCoordinatorFactory = func(store *assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
+		claim := assignmentstore.ClaimFunc(func(_ context.Context, beadID, actor string) (assignmentstore.ClaimReceipt, error) {
+			return assignmentstore.ClaimReceipt{BeadID: beadID, Actor: actor, Status: "in_progress", ClaimedAt: time.Now().UTC()}, nil
+		})
+		dispatch := assignmentstore.DispatchFunc(func(_ context.Context, request assignmentstore.DispatchRequest) (assignmentstore.DispatchReceipt, error) {
+			if refuseDispatch {
+				return assignmentstore.DispatchReceipt{}, assignmentstore.GuaranteeNoActuation(errors.New("mailbox unavailable"))
+			}
+			dispatched = append(dispatched, request.Prompt)
+			return assignmentstore.DispatchReceipt{DeliveryID: "mail-context"}, nil
+		})
+		preflight := assignmentstore.PromptPreflightFunc(func(_ context.Context, request assignmentstore.DispatchRequest) (assignmentstore.PromptPreflightResult, error) {
+			return assignmentstore.PromptPreflightResult{DispatchPrompt: request.Prompt, DurablePrompt: request.Prompt}, nil
+		})
+		return assignmentstore.NewAtomicCoordinator(store, claim, nil, dispatch, preflight)
+	}
+
+	work := &WorkAssignment{
+		BeadID: "ntm-context", BeadTitle: "Add rate limiting middleware", AgentPaneID: "%9", AgentPaneIndex: 4,
+		AgentMailName: "BlueFox", AgentType: "cod", Priority: 1, Score: 0.9,
+	}
+	rec := &bv.TriageRecommendation{ID: work.BeadID, Title: work.BeadTitle, Labels: []string{"gateway"}}
+	first := c.attemptAssignment(t.Context(), work, rec)
+	if first.Success || first.MessageSent || first.CASSInjection == nil || first.CASSInjection.ItemsInjected == 0 {
+		t.Fatalf("first attempt = %+v (cass %+v), want an enriched intent refused before delivery", first, first.CASSInjection)
+	}
+	cassCalls := readCoordinatorStubLog(t, cassLog)
+	if strings.Count(cassCalls, "search") != 1 || !strings.Contains(cassCalls, "gateway") || strings.Contains(cassCalls, "acknowledge") {
+		t.Fatalf("cass calls = %q, want one search over the bead title and labels", cassCalls)
+	}
+
+	store, err := assignmentstore.LoadStoreStrict(c.session)
+	if err != nil {
+		t.Fatalf("LoadStoreStrict: %v", err)
+	}
+	pending := store.Get(work.BeadID)
+	if pending == nil || pending.Status != assignmentstore.StatusClaimed || pending.DispatchState != assignmentstore.DispatchPending {
+		t.Fatalf("pending intent = %+v, want a claimed, undelivered row", pending)
+	}
+	history, body := strings.Index(pending.PendingPrompt, coordinatorContextCASSMarker), strings.Index(pending.PendingPrompt, "# Work Assignment")
+	if history < 0 || body < 0 || history > body {
+		t.Fatalf("recorded prompt lacks history above the assignment message:\n%s", pending.PendingPrompt)
+	}
+	if want := assignmentstore.PromptSHA256(c.formatAssignmentMessage(work, rec, pending.ClaimActor)); pending.BaseIntentSHA256 != want {
+		t.Fatalf("base intent = %q, want the unenriched message checksum %q", pending.BaseIntentSHA256, want)
+	}
+
+	refuseDispatch = false
+	recovered := c.recoverPendingAssignment(t.Context(), store, pending, coordinatorWorkAssignmentFromRecord(pending))
+	if !recovered.Success || !recovered.MessageSent || recovered.IdempotencyKey != pending.IdempotencyKey {
+		t.Fatalf("recovery = %+v, want key %s delivered", recovered, pending.IdempotencyKey)
+	}
+	if recovered.CASSInjection != nil {
+		t.Fatalf("recovery re-ran enrichment: %+v", recovered.CASSInjection)
+	}
+	if len(dispatched) != 1 || dispatched[0] != pending.PendingPrompt {
+		t.Fatalf("recovery delivered %q, want the recorded prompt", dispatched)
+	}
+	if calls := readCoordinatorStubLog(t, cassLog); calls != cassCalls {
+		t.Fatalf("recovery queried cass again: %q", calls)
 	}
 }
 
@@ -602,6 +1483,8 @@ func TestCoordinatorReservationPortPreservesMalformedReceiptHandle(t *testing.T)
 		name   string
 		mutate func(*agentmail.FileReservation)
 	}{
+		{name: "missing project", mutate: func(row *agentmail.FileReservation) { row.ProjectID = 0 }},
+		{name: "wrong project", mutate: func(row *agentmail.FileReservation) { row.ProjectID = 10 }},
 		{name: "nonexclusive", mutate: func(row *agentmail.FileReservation) { row.Exclusive = false }},
 		{name: "wrong agent", mutate: func(row *agentmail.FileReservation) { row.AgentName = "OtherAgent" }},
 		{name: "wrong reason", mutate: func(row *agentmail.FileReservation) { row.Reason = "bead assignment: ntm-other" }},
@@ -618,7 +1501,7 @@ func TestCoordinatorReservationPortPreservesMalformedReceiptHandle(t *testing.T)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			row := agentmail.FileReservation{
-				ID: 79, AgentName: "BlueLake", PathPattern: "internal/coordinator/**", Exclusive: true,
+				ID: 79, ProjectID: 9, AgentName: "BlueLake", PathPattern: "internal/coordinator/**", Exclusive: true,
 				ExpiresTS: agentmail.FlexTime{Time: time.Now().UTC().Add(time.Hour)},
 				Reason:    "bead assignment: ntm-malformed",
 			}
@@ -677,6 +1560,8 @@ func TestCoordinatorReservationPortReconcileMalformedReceiptRetainsHandle(t *tes
 		name   string
 		mutate func(*agentmail.FileReservation)
 	}{
+		{name: "missing project", mutate: func(row *agentmail.FileReservation) { row.ProjectID = 0 }},
+		{name: "wrong project", mutate: func(row *agentmail.FileReservation) { row.ProjectID = 10 }},
 		{name: "nonexclusive", mutate: func(row *agentmail.FileReservation) { row.Exclusive = false }},
 		{name: "missing expiry", mutate: func(row *agentmail.FileReservation) { row.ExpiresTS = agentmail.FlexTime{} }},
 		{name: "expired", mutate: func(row *agentmail.FileReservation) {
@@ -685,7 +1570,7 @@ func TestCoordinatorReservationPortReconcileMalformedReceiptRetainsHandle(t *tes
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			row := agentmail.FileReservation{
-				ID: 84, PathPattern: "internal/coordinator/**", AgentName: "BlueLake", Exclusive: true,
+				ID: 84, PathPattern: "internal/coordinator/**", AgentName: "BlueLake", ProjectID: 9, Exclusive: true,
 				Reason: "bead assignment: ntm-malformed-reconcile", ExpiresTS: agentmail.FlexTime{Time: time.Now().UTC().Add(time.Hour)},
 			}
 			test.mutate(&row)
@@ -711,7 +1596,8 @@ func TestCoordinatorReservationPortReconcileMalformedReceiptRetainsHandle(t *tes
 // internal/agentmail/tools_httptest_test.go. The ensure_project reply and the
 // Rust listing were read from am 0.3.36; the Python listing row is the one
 // mcp_agent_mail 0.3.4's file_reservations_resource builds. No grant and no
-// listing row names a project.
+// listing row names a project, so the client reads the project resource to
+// place them (GH#328); the ensure_project reply stands in for it.
 const (
 	capturedRustEnsureProjectText      = `{"id":79,"created_at":"2026-10-20T12:15:35.816042Z","slug":"p","identity_mode_used":"dir","canonical_path":"/p","human_key":"/p","repo_root":null,"git_common_dir":null,"branch":null,"worktree_name":null,"core_ignorecase":null,"normalized_remote":null,"project_uid":"a39a2518130842bb247a","discovery":null}`
 	capturedRustReservationGrantText   = `{"granted":[{"id":14598,"path_pattern":"scratch-bd-m0gm2-probe/does-not-exist.txt","exclusive":true,"reason":"bd-m0gm2 live probe (nonexistent path)","expires_ts":"2026-10-20T04:48:02.649015Z"}],"conflicts":[]}`
@@ -752,7 +1638,8 @@ func agentMailResourceReply(text string) string {
 }
 
 // replayAgentMail returns a real client whose server answers each call with
-// the reply recorded for its tool name, or for "resources/read".
+// the reply recorded for its tool name, or for the resource it reads
+// ("resource://project" or "resource://file_reservations").
 func replayAgentMail(t *testing.T, replies map[string]string) *agentmail.Client {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -760,6 +1647,7 @@ func replayAgentMail(t *testing.T, replies map[string]string) *agentmail.Client 
 			Method string `json:"method"`
 			Params struct {
 				Name string `json:"name"`
+				URI  string `json:"uri"`
 			} `json:"params"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -767,8 +1655,12 @@ func replayAgentMail(t *testing.T, replies map[string]string) *agentmail.Client 
 			return
 		}
 		call := req.Method
-		if call == "tools/call" {
+		switch call {
+		case "tools/call":
 			call = req.Params.Name
+		case "resources/read":
+			kind, _, _ := strings.Cut(strings.TrimPrefix(req.Params.URI, "resource://"), "/")
+			call = "resource://" + kind
 		}
 		reply, ok := replies[call]
 		if !ok {
@@ -784,33 +1676,44 @@ func replayAgentMail(t *testing.T, replies map[string]string) *agentmail.Client 
 }
 
 // TestCoordinatorReservationPortChecksLiveGrants replays both servers' grants
-// through the real client. Neither names a project, and the call that got them
-// named the bound project, so they are valid receipts; a grant for another
-// holder or for a path nobody asked for still is not.
+// through the real client. Neither names a project or a holder, so the client
+// reads both back from the project's listing (GH#328), here the Rust listing
+// row rewritten to the Rust grant's lease and the Python row for the Python
+// grant; a grant for another holder or for a path nobody asked for is no
+// receipt.
 func TestCoordinatorReservationPortChecksLiveGrants(t *testing.T) {
 	rustGrant := agentMailToolReply(liveReply(capturedRustReservationGrantText, "bd-live"))
 	otherHolder := agentMailToolReply(liveReply(strings.Replace(capturedRustReservationGrantText,
 		`"id":14598,`, `"id":14598,"agent_name":"OtherAgent",`, 1), "bd-live"))
+	rustListing := agentMailResourceReply(liveReply(strings.NewReplacer(
+		`"id":14709,`, `"id":14598,`,
+		"scratch-bd-00tl4/does-not-exist.txt", "scratch-bd-m0gm2-probe/does-not-exist.txt",
+	).Replace(capturedRustReservationListingText), "bd-live"))
+	pythonListing := agentMailResourceReply(liveReply(pythonReservationListingText, "bd-live"))
 	for _, test := range []struct {
 		name    string
 		reply   string
+		listing string
+		agent   string
 		path    string
 		wantID  int
 		wantErr bool
 	}{
-		{name: "rust", reply: rustGrant, path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598},
-		{name: "python", reply: liveReply(capturedPythonReservationReply, "bd-live"), path: "probe/c.txt", wantID: 4},
-		{name: "path not requested", reply: rustGrant, path: "internal/other.go", wantID: 14598, wantErr: true},
-		{name: "another holder", reply: otherHolder, path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598, wantErr: true},
+		{name: "rust", reply: rustGrant, listing: rustListing, agent: "NobleStork", path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598},
+		{name: "python", reply: liveReply(capturedPythonReservationReply, "bd-live"), listing: pythonListing, agent: "RedStone", path: "probe/c.txt", wantID: 4},
+		{name: "path not requested", reply: rustGrant, listing: rustListing, agent: "NobleStork", path: "internal/other.go", wantID: 14598, wantErr: true},
+		{name: "another holder", reply: otherHolder, listing: rustListing, agent: "NobleStork", path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := replayAgentMail(t, map[string]string{
-				"ensure_project":         agentMailToolReply(capturedRustEnsureProjectText),
-				"file_reservation_paths": test.reply,
+				"ensure_project":               agentMailToolReply(capturedRustEnsureProjectText),
+				"file_reservation_paths":       test.reply,
+				"resource://project":           agentMailResourceReply(capturedRustEnsureProjectText),
+				"resource://file_reservations": test.listing,
 			})
 			port := &coordinatorAgentMailReservationPort{client: client, projectKey: "/p"}
 			lease, err := port.Reserve(t.Context(), assignmentstore.ReservationRequest{
-				BeadID: "bd-live", AgentName: "NobleStork", Target: "%1", RequestedPaths: []string{test.path},
+				BeadID: "bd-live", AgentName: test.agent, Target: "%1", RequestedPaths: []string{test.path},
 			})
 			if !reflect.DeepEqual(lease.ReservationIDs, []int{test.wantID}) {
 				t.Fatalf("lease = %+v, want reservation %d kept for release", lease, test.wantID)
@@ -848,8 +1751,9 @@ func TestCoordinatorReservationPortReconcilesLiveListing(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := replayAgentMail(t, map[string]string{
-				"ensure_project": agentMailToolReply(capturedRustEnsureProjectText),
-				"resources/read": agentMailResourceReply(liveReply(test.listing, "bd-live")),
+				"ensure_project":               agentMailToolReply(capturedRustEnsureProjectText),
+				"resource://project":           agentMailResourceReply(capturedRustEnsureProjectText),
+				"resource://file_reservations": agentMailResourceReply(liveReply(test.listing, "bd-live")),
 			})
 			port := &coordinatorAgentMailReservationPort{client: client, projectKey: "/p"}
 			got, err := port.ReconcileReservation(t.Context(), assignmentstore.ReservationRequest{
@@ -2090,6 +2994,51 @@ func TestAssignWorkConcurrentCyclesDoNotRaceOnSharedActionableRecommendations(t 
 	}
 }
 
+// TestAssignWorkSelectsByScoreNotFirstFit proves the bd-v394r wire: AssignWork
+// plans through ScoreAndSelectAssignments, so agent/task affinity decides the
+// pairing. The simple chore is listed FIRST — first-fit matching would hand it
+// to whichever agent iterated first — yet the Claude agent must end up on the
+// complex feature (+0.15 cc affinity) and the Codex agent on the chore (+0.15
+// cod affinity), regardless of map iteration order.
+func TestAssignWorkSelectsByScoreNotFirstFit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c := New("coordinator-score-based", t.TempDir(), &agentmail.Client{}, "CoordinatorAgent")
+	addEligibleCoordinatorAgent(c, "%1", "BlueLakeClaude")
+	c.agents["%1"].AgentType = "cc"
+	addEligibleCoordinatorAgent(c, "%2", "BlueLakeCodex")
+	c.agents["%2"].PaneIndex = 2
+
+	c.workItemStatusFn = func(context.Context, string) (string, error) { return "open", nil }
+	c.actionableRecommendationsFn = func(context.Context, string, int) ([]bv.TriageRecommendation, error) {
+		return []bv.TriageRecommendation{
+			{ID: "ntm-chore", Title: "Tidy workspace", Type: "chore", Status: "open", Priority: 2, Score: 0.5},
+			{ID: "ntm-feature", Title: "Ship new engine", Type: "feature", Status: "open", Priority: 2, Score: 0.5},
+		}, nil
+	}
+	c.atomicCoordinatorFactory = successfulCoordinatorAtomicFactory("mail-score-based")
+
+	results, err := c.AssignWork(t.Context())
+	if err != nil {
+		t.Fatalf("AssignWork error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 assignments, got %d: %+v", len(results), results)
+	}
+	beadByPane := make(map[string]string)
+	for _, result := range results {
+		if !result.Success || result.Assignment == nil {
+			t.Fatalf("expected successful assignment, got %+v", result)
+		}
+		beadByPane[result.Assignment.AgentPaneID] = result.Assignment.BeadID
+	}
+	if beadByPane["%1"] != "ntm-feature" {
+		t.Errorf("expected cc agent %%1 to receive ntm-feature (complex-task affinity), got %q", beadByPane["%1"])
+	}
+	if beadByPane["%2"] != "ntm-chore" {
+		t.Errorf("expected cod agent %%2 to receive ntm-chore (simple-task affinity), got %q", beadByPane["%2"])
+	}
+}
+
 func successfulCoordinatorAtomicFactory(deliveryID string) func(*assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
 	return func(store *assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
 		claim := assignmentstore.ClaimFunc(func(_ context.Context, beadID, actor string) (assignmentstore.ClaimReceipt, error) {
@@ -2181,14 +3130,17 @@ func validCoordinatorSendResult() *agentmail.SendResult {
 	}
 }
 
-func TestFindBestMatchPropagatesPaneAndReservationPaths(t *testing.T) {
-	c := New("test-session", "/tmp/test", nil, "TestAgent")
+func TestScoreAndSelectAssignmentsPropagatesPaneAndReservationPaths(t *testing.T) {
 	agent := &AgentState{PaneID: "%9", PaneIndex: 4, AgentType: "cod", AgentMailName: "BlueFox"}
 	recommendations := []bv.TriageRecommendation{{
-		ID: "ntm-files", Title: "Update internal/coordinator/assign.go", Status: "open",
+		ID: "ntm-files", Title: "Update internal/coordinator/assign.go", Status: "open", Score: 0.8,
 		Reasons: []string{"also cover internal/coordinator/assign_test.go"},
 	}}
-	assignment, _ := c.findBestMatch(agent, recommendations)
+	selected := ScoreAndSelectAssignments([]*AgentState{agent}, recommendations, DefaultScoreConfig(), nil)
+	if len(selected) != 1 {
+		t.Fatalf("expected 1 assignment, got %d", len(selected))
+	}
+	assignment := selected[0].Assignment
 	if assignment == nil || assignment.AgentPaneID != "%9" || assignment.AgentPaneIndex != 4 {
 		t.Fatalf("assignment pane identity = %+v", assignment)
 	}
@@ -2488,16 +3440,12 @@ func TestScoreAndSelectAssignmentsWithAgentReservations(t *testing.T) {
 		{PaneID: "%2", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting, Reservations: []string{"a.go", "b.go", "c.go"}},
 	}
 
-	triage := &bv.TriageResponse{
-		Triage: bv.TriageData{
-			Recommendations: []bv.TriageRecommendation{
-				{ID: "ntm-001", Title: "Task", Type: "task", Status: "open", Priority: 2, Score: 0.5},
-			},
-		},
+	recommendations := []bv.TriageRecommendation{
+		{ID: "ntm-001", Title: "Task", Type: "task", Status: "open", Priority: 2, Score: 0.5},
 	}
 
 	config := DefaultScoreConfig()
-	results := ScoreAndSelectAssignments(agents, triage, config, nil) // nil reservations map
+	results := ScoreAndSelectAssignments(agents, recommendations, config, nil) // nil reservations map
 
 	if len(results) != 1 {
 		t.Fatalf("expected 1 assignment, got %d", len(results))
@@ -2522,24 +3470,20 @@ func TestScoreAndSelectAssignments(t *testing.T) {
 		{PaneID: "%2", AgentType: "cod", ContextUsage: 50, Status: robot.StateWaiting},
 	}
 
-	triage := &bv.TriageResponse{
-		Triage: bv.TriageData{
-			Recommendations: []bv.TriageRecommendation{
-				{ID: "ntm-001", Title: "Feature work", Type: "feature", Status: "open", Priority: 2, Score: 0.8},
-				{ID: "ntm-002", Title: "Quick fix", Type: "chore", Status: "open", Priority: 2, Score: 0.6},
-				{ID: "ntm-003", Title: "Blocked", Type: "task", Status: "blocked", Priority: 2, Score: 0.9},
-				{ID: "ntm-004", Title: "Dependency gated", Type: "task", Status: "open", Priority: 1, Score: 1, BlockedBy: []string{"ntm-prerequisite"}},
-				{ID: "ntm-005", Title: "Operator gated", Type: "task", Status: "open", Priority: 1, Score: 1, Labels: []string{"operator-action"}},
-				// A container node ranked above everything else. Containers are
-				// grouping nodes, never implementation work, so this must not
-				// be dispatched no matter how highly triage scores it.
-				{ID: "ntm-006", Title: "Epic container", Type: "epic", Status: "open", Priority: 0, Score: 1},
-			},
-		},
+	recommendations := []bv.TriageRecommendation{
+		{ID: "ntm-001", Title: "Feature work", Type: "feature", Status: "open", Priority: 2, Score: 0.8},
+		{ID: "ntm-002", Title: "Quick fix", Type: "chore", Status: "open", Priority: 2, Score: 0.6},
+		{ID: "ntm-003", Title: "Blocked", Type: "task", Status: "blocked", Priority: 2, Score: 0.9},
+		{ID: "ntm-004", Title: "Dependency gated", Type: "task", Status: "open", Priority: 1, Score: 1, BlockedBy: []string{"ntm-prerequisite"}},
+		{ID: "ntm-005", Title: "Operator gated", Type: "task", Status: "open", Priority: 1, Score: 1, Labels: []string{"operator-action"}},
+		// A container node ranked above everything else. Containers are
+		// grouping nodes, never implementation work, so this must not
+		// be dispatched no matter how highly triage scores it.
+		{ID: "ntm-006", Title: "Epic container", Type: "epic", Status: "open", Priority: 0, Score: 1},
 	}
 
 	config := DefaultScoreConfig()
-	results := ScoreAndSelectAssignments(agents, triage, config, nil)
+	results := ScoreAndSelectAssignments(agents, recommendations, config, nil)
 
 	if len(results) != 2 {
 		t.Fatalf("expected 2 assignments, got %d", len(results))
@@ -2565,20 +3509,20 @@ func TestScoreAndSelectAssignments(t *testing.T) {
 
 func TestScoreAndSelectAssignmentsEmpty(t *testing.T) {
 	// Empty agents
-	result := ScoreAndSelectAssignments(nil, &bv.TriageResponse{}, DefaultScoreConfig(), nil)
+	result := ScoreAndSelectAssignments(nil, []bv.TriageRecommendation{{ID: "ntm-001"}}, DefaultScoreConfig(), nil)
 	if result != nil {
 		t.Error("expected nil for empty agents")
 	}
 
-	// Empty triage
+	// Nil recommendations
 	agents := []*AgentState{{PaneID: "%0", AgentType: "cc"}}
 	result = ScoreAndSelectAssignments(agents, nil, DefaultScoreConfig(), nil)
 	if result != nil {
-		t.Error("expected nil for nil triage")
+		t.Error("expected nil for nil recommendations")
 	}
 
 	// Empty recommendations
-	result = ScoreAndSelectAssignments(agents, &bv.TriageResponse{}, DefaultScoreConfig(), nil)
+	result = ScoreAndSelectAssignments(agents, []bv.TriageRecommendation{}, DefaultScoreConfig(), nil)
 	if result != nil {
 		t.Error("expected nil for empty recommendations")
 	}
@@ -3017,654 +3961,110 @@ func TestScoreAssignmentWithNilProfile(t *testing.T) {
 	}
 }
 
-// Tests for AssignTasks function with strategies
-
-func TestAssignTasksBasic(t *testing.T) {
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
-		{PaneID: "%2", AgentType: "cod", ContextUsage: 50, Status: robot.StateWaiting},
+func TestCoordinatorMailDispatchErrorTerminalizesOnlyToolRejection(t *testing.T) {
+	rejection := &agentmail.ToolRejectionError{Err: errors.New("sender is not registered")}
+	if got := coordinatorMailDispatchError(rejection); !assignmentstore.IsGuaranteedNoActuation(got) {
+		t.Fatalf("explicit server rejection stayed outcome-unknown: %v", got)
+	}
+	wrapped := fmt.Errorf("send work assignment: %w", rejection)
+	if got := coordinatorMailDispatchError(wrapped); !assignmentstore.IsGuaranteedNoActuation(got) {
+		t.Fatalf("wrapped server rejection stayed outcome-unknown: %v", got)
 	}
 
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Epic task", Type: "epic", Status: "open", Priority: 2, Score: 0.8},
-		{ID: "ntm-002", Title: "Quick fix", Type: "chore", Status: "open", Priority: 2, Score: 0.6},
+	timeout := agentmail.NewAPIError("send_message", 0, agentmail.ErrTimeout)
+	if got := coordinatorMailDispatchError(timeout); assignmentstore.IsGuaranteedNoActuation(got) || !errors.Is(got, agentmail.ErrTimeout) {
+		t.Fatalf("ambiguous timeout was terminalized: %v", got)
 	}
 
-	assignments := AssignTasks(beads, agents, StrategyBalanced, nil)
-
-	if len(assignments) != 2 {
-		t.Fatalf("expected 2 assignments, got %d", len(assignments))
+	transport := errors.New("connection reset by peer")
+	if got := coordinatorMailDispatchError(transport); assignmentstore.IsGuaranteedNoActuation(got) {
+		t.Fatalf("ambiguous transport failure was terminalized: %v", got)
 	}
 
-	// Verify each agent got exactly one task
-	agentTasks := make(map[string]string)
-	for _, a := range assignments {
-		if existing, ok := agentTasks[a.Agent.PaneID]; ok {
-			t.Errorf("agent %s assigned twice: %s and %s", a.Agent.PaneID, existing, a.Bead.ID)
-		}
-		agentTasks[a.Agent.PaneID] = a.Bead.ID
-	}
-
-	// Verify assignments have reasoning
-	for _, a := range assignments {
-		if a.Reason == "" {
-			t.Errorf("assignment for %s missing reason", a.Bead.ID)
-		}
-		if a.Confidence <= 0 || a.Confidence > 1 {
-			t.Errorf("assignment confidence %f out of range [0,1]", a.Confidence)
-		}
+	if got := coordinatorMailDispatchError(nil); got != nil {
+		t.Fatalf("nil error changed to %v", got)
 	}
 }
 
-func TestAssignTasksMoreBeadsThanAgents(t *testing.T) {
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
+// TestRepositoryReservationPathsRequireRealRepositoryTargets pins ntm#302:
+// reservation candidates come from free-text bead titles, so slash-bearing
+// prose ("13714/2m", a date) used to become Agent Mail leases on paths that do
+// not exist. Only candidates that resolve inside the repository survive.
+func TestRepositoryReservationPathsRequireRealRepositoryTargets(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "internal", "coordinator"), 0o755); err != nil {
+		t.Fatalf("create repo tree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "internal", "coordinator", "assign.go"), []byte("package coordinator\n"), 0o600); err != nil {
+		t.Fatalf("write repo file: %v", err)
 	}
 
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.8},
-		{ID: "ntm-002", Title: "Task 2", Type: "task", Status: "open", Score: 0.6},
-		{ID: "ntm-003", Title: "Task 3", Type: "task", Status: "open", Score: 0.4},
-	}
-
-	assignments := AssignTasks(beads, agents, StrategyBalanced, nil)
-
-	// Should only get 1 assignment (limited by agents)
-	if len(assignments) != 1 {
-		t.Fatalf("expected 1 assignment (limited by agents), got %d", len(assignments))
-	}
-}
-
-func TestAssignTasksMoreAgentsThanBeads(t *testing.T) {
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
-		{PaneID: "%2", AgentType: "cod", ContextUsage: 40, Status: robot.StateWaiting},
-		{PaneID: "%3", AgentType: "gmi", ContextUsage: 20, Status: robot.StateWaiting},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.8},
-	}
-
-	assignments := AssignTasks(beads, agents, StrategyBalanced, nil)
-
-	// Should only get 1 assignment (limited by beads)
-	if len(assignments) != 1 {
-		t.Fatalf("expected 1 assignment (limited by beads), got %d", len(assignments))
-	}
-}
-
-func TestAssignTasksFiltersUnavailableAgents(t *testing.T) {
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
-		{PaneID: "%2", AgentType: "cc", ContextUsage: 95, Status: robot.StateWaiting},    // High context
-		{PaneID: "%3", AgentType: "cc", ContextUsage: 30, Status: robot.StateGenerating}, // Not idle
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.8},
-		{ID: "ntm-002", Title: "Task 2", Type: "task", Status: "open", Score: 0.6},
-	}
-
-	assignments := AssignTasks(beads, agents, StrategySpeed, nil)
-
-	// Should only assign to agent %1 (others unavailable)
-	if len(assignments) != 1 {
-		t.Fatalf("expected 1 assignment (only 1 available agent), got %d", len(assignments))
-	}
-
-	if assignments[0].Agent.PaneID != "%1" {
-		t.Errorf("expected agent %%1, got %s", assignments[0].Agent.PaneID)
-	}
-}
-
-func TestAssignTasksSkipsBlockedBeads(t *testing.T) {
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
-		{PaneID: "%2", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Blocked", Type: "task", Status: "blocked", Score: 0.9},
-		{ID: "ntm-002", Title: "Open", Type: "task", Status: "open", Score: 0.8},
-	}
-
-	assignments := AssignTasks(beads, agents, StrategySpeed, nil)
-
-	// Should only assign the open bead
-	if len(assignments) != 1 {
-		t.Fatalf("expected 1 assignment (blocked bead skipped), got %d", len(assignments))
-	}
-
-	if assignments[0].Bead.ID != "ntm-002" {
-		t.Errorf("expected bead ntm-002, got %s", assignments[0].Bead.ID)
-	}
-}
-
-func TestAssignTasksEmpty(t *testing.T) {
-	// Empty agents
-	result := AssignTasks([]*bv.TriageRecommendation{{ID: "1"}}, nil, StrategyBalanced, nil)
-	if result != nil {
-		t.Error("expected nil for empty agents")
-	}
-
-	// Empty beads
-	result = AssignTasks(nil, []*AgentState{{PaneID: "%1", Status: robot.StateWaiting}}, StrategyBalanced, nil)
-	if result != nil {
-		t.Error("expected nil for empty beads")
-	}
-}
-
-func TestStrategySpeed(t *testing.T) {
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
-		{PaneID: "%2", AgentType: "cod", ContextUsage: 30, Status: robot.StateWaiting},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "epic", Status: "open", Score: 0.5},
-		{ID: "ntm-002", Title: "Task 2", Type: "chore", Status: "open", Score: 0.8},
-	}
-
-	assignments := AssignTasks(beads, agents, StrategySpeed, nil)
-
-	// Speed strategy should assign quickly, not necessarily optimally
-	if len(assignments) != 2 {
-		t.Fatalf("expected 2 assignments, got %d", len(assignments))
-	}
-
-	// Verify reasons mention speed
-	for _, a := range assignments {
-		if !strings.Contains(a.Reason, "fastest") {
-			t.Logf("Speed strategy reason: %s", a.Reason)
-		}
-	}
-}
-
-func TestStrategyQuality(t *testing.T) {
-	// Create agents with profiles
-	testerProfile := &persona.Persona{Tags: []string{"testing"}}
-
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting, Profile: testerProfile},
-		{PaneID: "%2", AgentType: "cod", ContextUsage: 30, Status: robot.StateWaiting},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Add unit tests", Type: "task", Status: "open", Score: 0.5},
-	}
-
-	assignments := AssignTasks(beads, agents, StrategyQuality, nil)
-
-	if len(assignments) != 1 {
-		t.Fatalf("expected 1 assignment, got %d", len(assignments))
-	}
-
-	// Quality strategy should pick the best-matching agent (agent 1 has testing profile)
-	if assignments[0].Agent.PaneID != "%1" {
-		t.Errorf("expected agent %%1 (with testing profile) for test task, got %s", assignments[0].Agent.PaneID)
-	}
-}
-
-func TestStrategyDependency(t *testing.T) {
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", ContextUsage: 30, Status: robot.StateWaiting},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Low impact", Type: "task", Status: "open", Score: 0.9, UnblocksIDs: nil},
-		{ID: "ntm-002", Title: "High impact", Type: "task", Status: "open", Score: 0.5, UnblocksIDs: []string{"a", "b", "c"}},
-	}
-
-	assignments := AssignTasks(beads, agents, StrategyDependency, nil)
-
-	if len(assignments) != 1 {
-		t.Fatalf("expected 1 assignment, got %d", len(assignments))
-	}
-
-	// Dependency strategy should prioritize the blocker even though it has lower base score
-	if assignments[0].Bead.ID != "ntm-002" {
-		t.Errorf("expected bead ntm-002 (blocker), got %s", assignments[0].Bead.ID)
-	}
-
-	// Reason should mention unblocking
-	if !strings.Contains(assignments[0].Reason, "unblocks") {
-		t.Errorf("expected reason to mention unblocking, got: %s", assignments[0].Reason)
-	}
-}
-
-func TestParseStrategy(t *testing.T) {
-	tests := []struct {
-		input string
-		want  AssignmentStrategy
-	}{
-		{"balanced", StrategyBalanced},
-		{"BALANCED", StrategyBalanced},
-		{"speed", StrategySpeed},
-		{"fast", StrategySpeed},
-		{"quality", StrategyQuality},
-		{"best", StrategyQuality},
-		{"dependency", StrategyDependency},
-		{"deps", StrategyDependency},
-		{"blockers", StrategyDependency},
-		{"round-robin", StrategyRoundRobin},
-		{"roundrobin", StrategyRoundRobin},
-		{"rr", StrategyRoundRobin},
-		{"ROUND-ROBIN", StrategyRoundRobin},
-		{"unknown", StrategyBalanced}, // Default
-		{"", StrategyBalanced},        // Default
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := ParseStrategy(tt.input)
-			if got != tt.want {
-				t.Errorf("ParseStrategy(%q) = %v, want %v", tt.input, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestBuildStrategyConfig(t *testing.T) {
-	t.Run("speed disables expensive features", func(t *testing.T) {
-		config := buildStrategyConfig(StrategySpeed)
-		if config.UseAgentProfiles {
-			t.Error("speed strategy should disable UseAgentProfiles")
-		}
-		if config.PenalizeFileOverlap {
-			t.Error("speed strategy should disable PenalizeFileOverlap")
-		}
-		if config.PreferCriticalPath {
-			t.Error("speed strategy should disable PreferCriticalPath")
-		}
+	got := repositoryReservationPaths(root, []string{
+		"internal/coordinator/assign.go", // real file
+		"internal/coordinator/*.go",      // glob with a real literal prefix
+		"internal/coordinator/assign.go", // duplicate
+		"13714/2m",                       // rate expression
+		"2026/09/03",                     // date
+		"internal/coordinator/new.go",    // to-be-created file: parent exists
+		"docs/does-not-exist.md",         // plausible but absent
+		"/etc/passwd",                    // absolute
+		"../outside/file.go",             // escapes the repo
+		"   ",                            // blank
 	})
+	want := []string{"internal/coordinator/assign.go", "internal/coordinator/*.go", "internal/coordinator/new.go"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("repositoryReservationPaths() = %v, want %v", got, want)
+	}
 
-	t.Run("quality maximizes matching", func(t *testing.T) {
-		config := buildStrategyConfig(StrategyQuality)
-		if !config.UseAgentProfiles {
-			t.Error("quality strategy should enable UseAgentProfiles")
+	if got := repositoryReservationPaths("", []string{"internal/coordinator/assign.go"}); len(got) != 0 {
+		t.Fatalf("no project key must yield no reservations, got %v", got)
+	}
+}
+
+// TestIsFilePathRejectsLeadingDigitProse is the extraction-side half of the
+// same guard: "13714/2m" is a quantity, not a path.
+func TestIsFilePathRejectsLeadingDigitProse(t *testing.T) {
+	for _, s := range []string{"13714/2m", "2026/09/03", "3/4"} {
+		if isFilePath(s) {
+			t.Errorf("isFilePath(%q) = true, want false", s)
 		}
-		if config.ProfileTagBoostWeight < 0.2 {
-			t.Errorf("quality strategy should boost ProfileTagBoostWeight, got %f", config.ProfileTagBoostWeight)
-		}
-	})
-
-	t.Run("dependency weights critical path", func(t *testing.T) {
-		config := buildStrategyConfig(StrategyDependency)
-		if !config.PreferCriticalPath {
-			t.Error("dependency strategy should enable PreferCriticalPath")
-		}
-	})
-}
-
-func TestIsAgentAvailable(t *testing.T) {
-	tests := []struct {
-		name  string
-		agent *AgentState
-		want  bool
-	}{
-		{
-			name:  "idle with low context",
-			agent: &AgentState{Status: robot.StateWaiting, ContextUsage: 50},
-			want:  true,
-		},
-		{
-			name:  "idle at context threshold",
-			agent: &AgentState{Status: robot.StateWaiting, ContextUsage: 90},
-			want:  true,
-		},
-		{
-			name:  "idle over context threshold",
-			agent: &AgentState{Status: robot.StateWaiting, ContextUsage: 95},
-			want:  false,
-		},
-		{
-			name:  "generating",
-			agent: &AgentState{Status: robot.StateGenerating, ContextUsage: 30},
-			want:  false,
-		},
-		{
-			name:  "error state",
-			agent: &AgentState{Status: robot.StateError, ContextUsage: 30},
-			want:  false,
-		},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isAgentAvailable(tt.agent)
-			if got != tt.want {
-				t.Errorf("isAgentAvailable() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestComputeConfidence(t *testing.T) {
-	tests := []struct {
-		name    string
-		pair    scoredPair
-		wantMin float64
-		wantMax float64
-	}{
-		{
-			name: "high score high confidence",
-			pair: scoredPair{
-				score:     1.5,
-				breakdown: AssignmentScoreBreakdown{AgentTypeBonus: 0.1, ProfileTagBonus: 0.1},
-			},
-			wantMin: 0.8,
-			wantMax: 0.95,
-		},
-		{
-			name: "low score low confidence",
-			pair: scoredPair{
-				score:     0.2,
-				breakdown: AssignmentScoreBreakdown{},
-			},
-			wantMin: 0.1,
-			wantMax: 0.3,
-		},
-		{
-			name: "penalties reduce confidence",
-			pair: scoredPair{
-				score:     1.0,
-				breakdown: AssignmentScoreBreakdown{ContextPenalty: 0.1, FileOverlapPenalty: 0.1},
-			},
-			wantMin: 0.3,
-			wantMax: 0.6,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			confidence := computeConfidence(tt.pair)
-			if confidence < tt.wantMin || confidence > tt.wantMax {
-				t.Errorf("computeConfidence() = %f, want in [%f, %f]", confidence, tt.wantMin, tt.wantMax)
-			}
-		})
-	}
-}
-
-func TestBuildAssignmentReason(t *testing.T) {
-	tests := []struct {
-		name     string
-		pair     scoredPair
-		strategy AssignmentStrategy
-		contains string
-	}{
-		{
-			name:     "dependency with blockers",
-			pair:     scoredPair{bead: &bv.TriageRecommendation{UnblocksIDs: []string{"a", "b"}}},
-			strategy: StrategyDependency,
-			contains: "unblocks 2 tasks",
-		},
-		{
-			name:     "quality strategy",
-			pair:     scoredPair{bead: &bv.TriageRecommendation{}},
-			strategy: StrategyQuality,
-			contains: "best capability match",
-		},
-		{
-			name:     "agent type bonus",
-			pair:     scoredPair{bead: &bv.TriageRecommendation{}, breakdown: AssignmentScoreBreakdown{AgentTypeBonus: 0.15}},
-			strategy: StrategyBalanced,
-			contains: "agent type bonus",
-		},
-		{
-			name:     "profile tags",
-			pair:     scoredPair{bead: &bv.TriageRecommendation{}, breakdown: AssignmentScoreBreakdown{ProfileTagBonus: 0.1}},
-			strategy: StrategyBalanced,
-			contains: "matching profile tags",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reason := buildAssignmentReason(tt.pair, tt.strategy)
-			if !strings.Contains(reason, tt.contains) {
-				t.Errorf("reason %q should contain %q", reason, tt.contains)
-			}
-		})
-	}
-}
-
-// Tests for selectBalanced with assignment tracking (bd-1g5t8)
-
-func TestSelectBalancedFewerAssignmentsFirst(t *testing.T) {
-	// Agent 1 has 3 active assignments, Agent 2 has 0
-	// Agent 2 should be preferred despite same score
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", Status: robot.StateWaiting, Assignments: 3},
-		{PaneID: "%2", AgentType: "cc", Status: robot.StateWaiting, Assignments: 0},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.5},
-	}
-
-	// Build pairs with same score
-	pairs := []scoredPair{
-		{agent: agents[0], bead: beads[0], score: 1.0},
-		{agent: agents[1], bead: beads[0], score: 1.0},
-	}
-
-	selected := selectBalanced(pairs, 2, 1)
-
-	if len(selected) != 1 {
-		t.Fatalf("expected 1 selection, got %d", len(selected))
-	}
-
-	// Agent 2 (fewer assignments) should win
-	if selected[0].agent.PaneID != "%2" {
-		t.Errorf("expected agent %%2 (fewer assignments) to be selected, got %s", selected[0].agent.PaneID)
-	}
-}
-
-func TestSelectBalancedIdleStatusTieBreaker(t *testing.T) {
-	// Same assignment count, but agent 1 is idle, agent 2 is generating
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1},
-		{PaneID: "%2", AgentType: "cc", Status: robot.StateGenerating, Assignments: 1},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.5},
-	}
-
-	pairs := []scoredPair{
-		{agent: agents[0], bead: beads[0], score: 1.0},
-		{agent: agents[1], bead: beads[0], score: 1.0},
-	}
-
-	selected := selectBalanced(pairs, 2, 1)
-
-	if len(selected) != 1 {
-		t.Fatalf("expected 1 selection, got %d", len(selected))
-	}
-
-	// Agent 1 (idle) should win
-	if selected[0].agent.PaneID != "%1" {
-		t.Errorf("expected agent %%1 (idle) to be selected, got %s", selected[0].agent.PaneID)
-	}
-}
-
-func TestSelectBalancedLastAssignedTimeTieBreaker(t *testing.T) {
-	now := time.Now()
-	// Same assignments and status, but agent 2 was assigned work more recently
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1, LastAssignedAt: now.Add(-1 * time.Hour)},
-		{PaneID: "%2", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1, LastAssignedAt: now.Add(-5 * time.Minute)},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.5},
-	}
-
-	pairs := []scoredPair{
-		{agent: agents[0], bead: beads[0], score: 1.0},
-		{agent: agents[1], bead: beads[0], score: 1.0},
-	}
-
-	selected := selectBalanced(pairs, 2, 1)
-
-	if len(selected) != 1 {
-		t.Fatalf("expected 1 selection, got %d", len(selected))
-	}
-
-	// Agent 1 (earlier LastAssignedAt) should win
-	if selected[0].agent.PaneID != "%1" {
-		t.Errorf("expected agent %%1 (least recently assigned) to be selected, got %s", selected[0].agent.PaneID)
-	}
-}
-
-func TestSelectBalancedScoreTieBreaker(t *testing.T) {
-	// Same assignments, status, and timestamp - higher score wins
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1},
-		{PaneID: "%2", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.5},
-	}
-
-	pairs := []scoredPair{
-		{agent: agents[0], bead: beads[0], score: 0.8},
-		{agent: agents[1], bead: beads[0], score: 1.2},
-	}
-
-	selected := selectBalanced(pairs, 2, 1)
-
-	if len(selected) != 1 {
-		t.Fatalf("expected 1 selection, got %d", len(selected))
-	}
-
-	// Agent 2 (higher score) should win
-	if selected[0].agent.PaneID != "%2" {
-		t.Errorf("expected agent %%2 (higher score) to be selected, got %s", selected[0].agent.PaneID)
-	}
-}
-
-func TestSelectBalancedDeterministicOrdering(t *testing.T) {
-	// All tie-breakers equal - should use PaneID for deterministic ordering
-	agents := []*AgentState{
-		{PaneID: "%2", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1},
-		{PaneID: "%1", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.5},
-	}
-
-	pairs := []scoredPair{
-		{agent: agents[0], bead: beads[0], score: 1.0},
-		{agent: agents[1], bead: beads[0], score: 1.0},
-	}
-
-	// Run multiple times to verify determinism
-	for i := 0; i < 5; i++ {
-		selected := selectBalanced(pairs, 2, 1)
-
-		if len(selected) != 1 {
-			t.Fatalf("run %d: expected 1 selection, got %d", i, len(selected))
-		}
-
-		// Agent %1 should always win (lower PaneID)
-		if selected[0].agent.PaneID != "%1" {
-			t.Errorf("run %d: expected agent %%1 (deterministic by PaneID) to be selected, got %s", i, selected[0].agent.PaneID)
+	for _, s := range []string{"internal/coordinator/assign.go", "docs/README.md", "cmd/ntm", ".github/workflows"} {
+		if !isFilePath(s) {
+			t.Errorf("isFilePath(%q) = false, want true", s)
 		}
 	}
 }
 
-func TestSelectBalancedFallbackWhenTrackingUnavailable(t *testing.T) {
-	// Assignments = -1 means tracking unavailable, should fall back to 0
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", Status: robot.StateWaiting, Assignments: -1},
-		{PaneID: "%2", AgentType: "cc", Status: robot.StateWaiting, Assignments: -1},
+// TestCoordinatorDispatchRetryBackoff pins the spacing applied to retries of a
+// pre-actuation dispatch failure (ntm#294): retryable is not the same as
+// retry-immediately-every-cycle.
+func TestCoordinatorDispatchRetryBackoff(t *testing.T) {
+	now := time.Now().UTC()
+	recorded := &assignmentstore.Assignment{
+		DispatchState: assignmentstore.DispatchPending, DispatchAttempts: 1,
+		DispatchStartedAt: &now, LastDispatchError: "composer not ready",
+	}
+	if coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryInitial-time.Millisecond)) {
+		t.Fatal("first retry became eligible before the initial backoff")
+	}
+	if !coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryInitial)) {
+		t.Fatal("first retry did not become eligible at the initial backoff")
 	}
 
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.5},
-		{ID: "ntm-002", Title: "Task 2", Type: "task", Status: "open", Score: 0.6},
+	recorded.DispatchAttempts = 9
+	if coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryMaximum-time.Millisecond)) {
+		t.Fatal("retry became eligible before the capped backoff")
+	}
+	if !coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryMaximum)) {
+		t.Fatal("retry did not become eligible at the capped backoff")
 	}
 
-	pairs := []scoredPair{
-		{agent: agents[0], bead: beads[0], score: 1.0},
-		{agent: agents[1], bead: beads[0], score: 1.0},
-		{agent: agents[0], bead: beads[1], score: 1.0},
-		{agent: agents[1], bead: beads[1], score: 1.0},
+	// A row that has not failed yet is never held back.
+	if !coordinatorDispatchRetryReady(&assignmentstore.Assignment{DispatchStartedAt: &now}, now) {
+		t.Fatal("a row with no recorded dispatch error must not be delayed")
 	}
-
-	// Should not panic and should select based on other tie-breakers
-	selected := selectBalanced(pairs, 2, 2)
-
-	if len(selected) != 2 {
-		t.Fatalf("expected 2 selections, got %d", len(selected))
-	}
-
-	// Both agents should get one task each
-	agentCounts := make(map[string]int)
-	for _, s := range selected {
-		agentCounts[s.agent.PaneID]++
-	}
-
-	if agentCounts["%1"] != 1 || agentCounts["%2"] != 1 {
-		t.Errorf("expected balanced distribution, got %v", agentCounts)
-	}
-}
-
-func TestSelectBalancedMultipleBeads(t *testing.T) {
-	// Test that balanced selection spreads work evenly
-	now := time.Now()
-	agents := []*AgentState{
-		{PaneID: "%1", AgentType: "cc", Status: robot.StateWaiting, Assignments: 0, LastAssignedAt: now.Add(-1 * time.Hour)},
-		{PaneID: "%2", AgentType: "cc", Status: robot.StateWaiting, Assignments: 2, LastAssignedAt: now.Add(-30 * time.Minute)},
-		{PaneID: "%3", AgentType: "cc", Status: robot.StateWaiting, Assignments: 1, LastAssignedAt: now.Add(-45 * time.Minute)},
-	}
-
-	beads := []*bv.TriageRecommendation{
-		{ID: "ntm-001", Title: "Task 1", Type: "task", Status: "open", Score: 0.5},
-		{ID: "ntm-002", Title: "Task 2", Type: "task", Status: "open", Score: 0.6},
-		{ID: "ntm-003", Title: "Task 3", Type: "task", Status: "open", Score: 0.7},
-	}
-
-	// Create all combinations
-	var pairs []scoredPair
-	for _, agent := range agents {
-		for _, bead := range beads {
-			pairs = append(pairs, scoredPair{agent: agent, bead: bead, score: 1.0})
-		}
-	}
-
-	selected := selectBalanced(pairs, 3, 3)
-
-	if len(selected) != 3 {
-		t.Fatalf("expected 3 selections, got %d", len(selected))
-	}
-
-	// Each agent should get exactly one task
-	agentCounts := make(map[string]int)
-	beadCounts := make(map[string]int)
-	for _, s := range selected {
-		agentCounts[s.agent.PaneID]++
-		beadCounts[s.bead.ID]++
-	}
-
-	for id, count := range agentCounts {
-		if count != 1 {
-			t.Errorf("agent %s got %d tasks, expected 1", id, count)
-		}
-	}
-
-	for id, count := range beadCounts {
-		if count != 1 {
-			t.Errorf("bead %s assigned %d times, expected 1", id, count)
-		}
-	}
-
-	// First selected should be agent %1 (fewest assignments)
-	if selected[0].agent.PaneID != "%1" {
-		t.Errorf("expected first selection to be agent %%1 (0 assignments), got %s", selected[0].agent.PaneID)
+	if !coordinatorDispatchRetryReady(nil, now) {
+		t.Fatal("a nil row must not be delayed")
 	}
 }

@@ -16,6 +16,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/approval"
+	"github.com/Dicklesworthstone/ntm/internal/audit"
+	"github.com/Dicklesworthstone/ntm/internal/coordinator"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/reservationsim"
 	"github.com/Dicklesworthstone/ntm/internal/worktrees"
 )
@@ -207,11 +211,11 @@ func runLocksCheck(ctx context.Context, session, path string, pane int, taskID s
 
 	client := newAgentMailClient(projectKey)
 	if !client.IsAvailable() {
-		result.Error = "Agent Mail server unavailable"
+		result.Error = agentMailUnavailableMessage(client)
 		if IsJSONOutput() {
 			return emitResult(result)
 		}
-		return fmt.Errorf("agent mail server unavailable")
+		return agentMailUnavailableCLIError(client)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -455,7 +459,10 @@ func newLocksCheckAuditToken(projectKey, path, observedAt string) string {
 }
 
 func newLocksListCmd() *cobra.Command {
-	var allAgents bool
+	var (
+		allAgents      bool
+		checkDeadlocks bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "list <session>",
@@ -463,17 +470,19 @@ func newLocksListCmd() *cobra.Command {
 		Long: `Display file path reservations for this session or all agents in the project.
 
 Examples:
-  ntm locks list myproject               # Show session's reservations
-  ntm locks list myproject --all-agents  # Show all project reservations
-  ntm locks list myproject --json        # JSON output for scripts`,
+  ntm locks list myproject                    # Show session's reservations
+  ntm locks list myproject --all-agents       # Show all project reservations
+  ntm locks list myproject --json             # JSON output for scripts
+  ntm locks list myproject --check-deadlocks  # Detect reservation wait-for cycles`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			session := args[0]
-			return runLocks(cmd.Context(), session, allAgents)
+			return runLocks(cmd.Context(), session, allAgents, checkDeadlocks)
 		},
 	}
 
 	cmd.Flags().BoolVar(&allAgents, "all-agents", false, "Show reservations for all agents")
+	cmd.Flags().BoolVar(&checkDeadlocks, "check-deadlocks", false, "Analyze all project reservations for deadlock cycles (adds 'deadlocks' to --json output)")
 
 	return cmd
 }
@@ -558,7 +567,7 @@ func runLocksAdvise(ctx context.Context, session string, allAgents bool) error {
 	client := newAgentMailClient(projectKey)
 	if !client.IsAvailable() {
 		agentMailUnavailable = true
-		agentMailErr = "Agent Mail server unavailable"
+		agentMailErr = agentMailUnavailableMessage(client)
 		warnings = append(warnings, agentMailErr)
 	} else {
 		mailCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -755,6 +764,11 @@ type LocksResult struct {
 	// tell an Agent Mail lock-list *timeout* apart from an auth failure or a
 	// down server — without scraping the human-readable Error string.
 	ReasonCode string `json:"reason_code,omitempty"`
+	// Deadlocks is populated only when --check-deadlocks was passed: the
+	// stable robot-readable DeadlockReport over the project's active
+	// reservations (C7, bd-ws2-wire-or-delete-ykmcz.8). Additive and
+	// omitempty so existing envelope consumers are unaffected.
+	Deadlocks *coordinator.DeadlockReport `json:"deadlocks,omitempty"`
 }
 
 // classifyLocksFailure maps a lock-list failure to a stable reason_code.
@@ -782,7 +796,7 @@ func classifyLocksFailure(err error) string {
 	}
 }
 
-func runLocks(ctx context.Context, session string, allAgents bool) error {
+func runLocks(ctx context.Context, session string, allAgents, checkDeadlocks bool) error {
 	session, projectKey, err := resolveAgentMailScope(ctx, session)
 	if err != nil {
 		return err
@@ -813,7 +827,7 @@ func runLocks(ctx context.Context, session string, allAgents bool) error {
 	client := newAgentMailClient(projectKey)
 	if !client.IsAvailable() {
 		if IsJSONOutput() {
-			result := LocksResult{Success: false, Session: session, Agent: agentName, ProjectKey: projectKey, Error: "Agent Mail server unavailable", ReasonCode: "agentmail_unavailable"}
+			result := LocksResult{Success: false, Session: session, Agent: agentName, ProjectKey: projectKey, Error: agentMailUnavailableMessage(client), ReasonCode: "agentmail_unavailable"}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
 			if encErr := enc.Encode(result); encErr != nil {
@@ -821,7 +835,7 @@ func runLocks(ctx context.Context, session string, allAgents bool) error {
 			}
 			return jsonFailureExit()
 		}
-		return fmt.Errorf("agent mail server unavailable")
+		return agentMailUnavailableCLIError(client)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -845,6 +859,24 @@ func runLocks(ctx context.Context, session string, allAgents bool) error {
 		result.Success = true
 	}
 
+	if checkDeadlocks && result.Success {
+		// Deadlock cycles span agents, so the analysis always runs over
+		// the full project scope even when the listing is session-scoped.
+		analysisReservations := reservations
+		if !allAgents {
+			analysisReservations, err = fetchActiveReservations(ctx, client, projectKey, "", true)
+			if err != nil {
+				result.Success = false
+				result.Error = err.Error()
+				result.ReasonCode = classifyLocksFailure(err)
+			}
+		}
+		if result.Success {
+			report := locksDeadlockReport(analysisReservations, time.Now())
+			result.Deadlocks = &report
+		}
+	}
+
 	if IsJSONOutput() {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -858,6 +890,22 @@ func runLocks(ctx context.Context, session string, allAgents bool) error {
 	}
 
 	return printLocksResult(result, allAgents)
+}
+
+// locksDeadlockReport runs the coordinator's deadlock detector over raw
+// reservations: derive the wait-for graph, then find every cycle. Pure
+// and deterministic given (reservations, now) so tests and the robot
+// envelope get byte-stable output.
+func locksDeadlockReport(reservations []agentmail.FileReservation, now time.Time) coordinator.DeadlockReport {
+	edges := coordinator.WaitEdgesFromReservations(reservations, now)
+	return coordinator.DetectDeadlocks(edges, coordinator.DetectDeadlockOptions{
+		Now: func() time.Time { return now },
+		Sources: []coordinator.SourceStatus{{
+			Name:      "agentmail_reservations",
+			Available: true,
+			Edges:     len(edges),
+		}},
+	})
 }
 
 func fetchActiveReservations(ctx context.Context, client *agentmail.Client, projectKey, agentName string, allAgents bool) ([]agentmail.FileReservation, error) {
@@ -887,6 +935,7 @@ func printLocksResult(result LocksResult, allAgents bool) error {
 			fmt.Printf("   Agent: %s\n", result.Agent)
 		}
 		fmt.Printf("   Project: %s\n", result.ProjectKey)
+		printLocksDeadlockSection(result.Deadlocks)
 		fmt.Println("\nTip: Use 'ntm lock <session> <pattern>' to reserve files")
 		return nil
 	}
@@ -911,7 +960,43 @@ func printLocksResult(result LocksResult, allAgents bool) error {
 		fmt.Println(strings.Repeat("-", 60))
 	}
 
+	printLocksDeadlockSection(result.Deadlocks)
+
 	return nil
+}
+
+// printLocksDeadlockSection renders the --check-deadlocks analysis for
+// humans. Nil report means the check did not run; an empty cycle list is
+// an explicit all-clear.
+func printLocksDeadlockSection(report *coordinator.DeadlockReport) {
+	if report == nil {
+		return
+	}
+	fmt.Println()
+	if len(report.Cycles) == 0 {
+		fmt.Printf("Deadlock check: no reservation cycles detected (%d nodes, %d edges)\n",
+			report.NodeCount, report.EdgeCount)
+		return
+	}
+	// "Possible", not "DETECTED": the wait-for graph is built from a
+	// creation-order heuristic over ADVISORY reservations, which has known
+	// false positives (interleaved non-overlapping work) and false negatives
+	// (middle holders of 3+-holder groups) — over-claiming certainty here
+	// trains users to bulk-release healthy reservations (bd-izuqq.4).
+	fmt.Printf("POSSIBLE DEADLOCK: %d reservation wait cycle(s) (advisory creation-order heuristic; confirm with the holders before releasing)\n", len(report.Cycles))
+	for _, c := range report.Cycles {
+		cycle := strings.Join(c.Participants, " -> ")
+		if len(c.Participants) > 1 {
+			cycle += " -> " + c.Participants[0]
+		}
+		fmt.Printf("   Cycle: %s\n", cycle)
+		if len(c.Resources) > 0 {
+			fmt.Printf("   Contested: %s\n", strings.Join(c.Resources, ", "))
+		}
+		if c.Suggestion != "" {
+			fmt.Printf("   Suggestion: %s\n", c.Suggestion)
+		}
+	}
 }
 
 func formatLockDuration(d time.Duration) string {
@@ -941,6 +1026,7 @@ func newLocksForceReleaseCmd() *cobra.Command {
 		note        string
 		noNotify    bool
 		skipConfirm bool
+		newApproval string
 	)
 
 	cmd := &cobra.Command{
@@ -971,13 +1057,14 @@ Examples:
 				return fmt.Errorf("invalid reservation ID '%s': must be a positive number", reservationIDStr)
 			}
 
-			return runForceRelease(cmd.Context(), session, reservationID, note, !noNotify, skipConfirm)
+			return runForceRelease(cmd.Context(), session, reservationID, note, !noNotify, skipConfirm, newApproval)
 		},
 	}
 
 	cmd.Flags().StringVar(&note, "note", "", "Explanation for the force-release")
 	cmd.Flags().BoolVar(&noNotify, "no-notify", false, "Don't notify the previous holder")
 	cmd.Flags().BoolVarP(&skipConfirm, "yes", "y", false, "Skip confirmation prompt")
+	cmd.Flags().StringVar(&newApproval, "new-approval", "", "Request a new authorization after this consumed, denied, expired, or changed-target approval ID")
 
 	return cmd
 }
@@ -995,40 +1082,120 @@ type ForceReleaseResult struct {
 	PathPattern     string     `json:"path_pattern,omitempty"`
 	ReleasedAt      *time.Time `json:"released_at,omitempty"`
 	Notified        bool       `json:"notified,omitempty"`
+	ApprovalID      string     `json:"approval_id,omitempty"`
+	ApprovalStatus  string     `json:"approval_status,omitempty"`
 	Error           string     `json:"error,omitempty"`
 }
 
-func runForceRelease(ctx context.Context, session string, reservationID int, note string, notify, skipConfirm bool) error {
+// forceReleaseGateError reports a gate infrastructure failure (policy or
+// approval store unavailable) with JSON envelope parity, matching how the
+// rest of runForceRelease emits errors.
+func forceReleaseGateError(session string, reservationID int, err error, decisions ...approval.ForceReleaseDecision) error {
+	if IsJSONOutput() {
+		result := ForceReleaseResult{Success: false, Session: session, ReservationID: reservationID, Error: err.Error()}
+		if len(decisions) > 0 {
+			result.ApprovalID = decisions[0].ApprovalID
+			result.ApprovalStatus = decisions[0].ApprovalStatus
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if encErr := enc.Encode(result); encErr != nil {
+			return encErr
+		}
+		return jsonFailureExit()
+	}
+	return err
+}
+
+func runForceRelease(ctx context.Context, session string, reservationID int, note string, notify, skipConfirm bool, newApproval string) error {
 	session, projectKey, err := resolveAgentMailScope(ctx, session)
 	if err != nil {
 		return err
 	}
-
-	sessionAgent, err := loadResolvedSessionAgent(session, projectKey)
+	projectKey = agentmail.CanonicalProjectKey(projectKey)
+	pol, err := policy.LoadOrDefault()
 	if err != nil {
-		return fmt.Errorf("loading session agent: %w", err)
+		return forceReleaseGateError(session, reservationID, fmt.Errorf("loading policy for force-release gate: %w", err))
 	}
-
+	requester := getCurrentApprover()
 	agentName := ""
-	if sessionAgent != nil {
-		agentName = sessionAgent.AgentName
-	} else {
-		if IsJSONOutput() {
-			result := ForceReleaseResult{Success: false, Session: session, ReservationID: reservationID, Error: "Session has no Agent Mail identity"}
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			if encErr := enc.Encode(result); encErr != nil {
-				return encErr
-			}
-			return jsonFailureExit()
-		}
-		return fmt.Errorf("session '%s' has no Agent Mail identity", session)
-	}
-
 	client := newAgentMailClient(projectKey)
-	if !client.IsAvailable() {
+	if pol.ForceReleasePolicy() != "never" {
+		sessionAgent, err := loadResolvedSessionAgent(session, projectKey)
+		if err != nil {
+			return forceReleaseGateError(session, reservationID, fmt.Errorf("loading session agent: %w", err))
+		}
+		if sessionAgent == nil || sessionAgent.AgentName == "" {
+			return forceReleaseGateError(session, reservationID, fmt.Errorf("session '%s' has no Agent Mail identity", session))
+		}
+		agentName = sessionAgent.AgentName
+		if pol.ForceReleasePolicy() == "auto" && !client.IsAvailable() {
+			return forceReleaseGateError(session, reservationID, agentMailUnavailableCLIError(client))
+		}
+
+		// Confirm before spending an approval. --yes and --json skip this
+		// local prompt, but never bypass the shared policy/approval gate.
+		if !skipConfirm && !IsJSONOutput() {
+			fmt.Printf("Force release reservation #%d?\n", reservationID)
+			fmt.Printf("  This will notify the previous holder: %v\n", notify)
+			if note != "" {
+				fmt.Printf("  Note: %s\n", note)
+			}
+			fmt.Print("\nContinue? [y/N] ")
+			var response string
+			fmt.Scanln(&response)
+			if response != "y" && response != "Y" {
+				fmt.Println("Cancelled.")
+				return nil
+			}
+		}
+	}
+
+	operation := approval.ForceReleaseOperation{
+		ProjectKey: projectKey, ReservationID: reservationID, RequestedBy: requester,
+		AgentName: agentName, Note: note, NotifyPrevious: notify,
+	}
+	opKey := operation.CorrelationKey()
+	resource := fmt.Sprintf("reservation #%d (session %s, project %s, actor %s)", reservationID, session, projectKey, agentName)
+	gateCtx, gateCancel := context.WithTimeout(ctx, 10*time.Second)
+	decision, gateErr := func() (approval.ForceReleaseDecision, error) {
+		if pol.ForceReleasePolicy() == "never" || pol.ForceReleasePolicy() == "auto" {
+			return evaluateForceReleaseGate(gateCtx, pol, nil, operation, newApproval, client)
+		}
+		engine, store, err := getApprovalEngine()
+		if err != nil {
+			return approval.ForceReleaseDecision{}, fmt.Errorf("opening approval store: %w", err)
+		}
+		defer store.Close()
+		return evaluateForceReleaseGate(gateCtx, pol, engine, operation, newApproval, client)
+	}()
+	gateCancel()
+	if decision.OperationKey != "" {
+		opKey = decision.OperationKey
+	}
+	if gateErr != nil {
+		if decision.ApprovalID != "" {
+			gateErr = fmt.Errorf("%w (approval %s, status %s)", gateErr, decision.ApprovalID, decision.ApprovalStatus)
+		}
+		return forceReleaseGateError(session, reservationID, gateErr, decision)
+	}
+
+	if decision.Created {
+		_ = audit.LogEvent(session, audit.EventTypeStateChange, audit.ActorUser, "locks.force_release.approval_requested", map[string]interface{}{
+			"approval_id": decision.ApprovalID, "operation_key": opKey,
+			"resource": resource, "requested_by": requester,
+		}, nil)
+	}
+	if !decision.Allowed {
+		_ = audit.LogEvent(session, audit.EventTypeStateChange, audit.ActorUser, "locks.force_release.blocked", map[string]interface{}{
+			"operation_key": opKey, "resource": resource, "requested_by": requester,
+			"approval_id": decision.ApprovalID, "approval_status": decision.ApprovalStatus, "reason": decision.Message,
+		}, nil)
 		if IsJSONOutput() {
-			result := ForceReleaseResult{Success: false, Session: session, Agent: agentName, ReservationID: reservationID, Error: "Agent Mail server unavailable"}
+			result := ForceReleaseResult{
+				Success: false, Session: session, ReservationID: reservationID,
+				ApprovalID: decision.ApprovalID, ApprovalStatus: decision.ApprovalStatus, Error: decision.Message,
+			}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
 			if encErr := enc.Encode(result); encErr != nil {
@@ -1036,49 +1203,34 @@ func runForceRelease(ctx context.Context, session string, reservationID int, not
 			}
 			return jsonFailureExit()
 		}
-		return fmt.Errorf("agent mail server unavailable")
+		return errors.New(decision.Message)
 	}
 
-	// Confirmation prompt (unless skipped or JSON mode)
-	if !skipConfirm && !IsJSONOutput() {
-		fmt.Printf("Force release reservation #%d?\n", reservationID)
-		fmt.Printf("  This will notify the previous holder: %v\n", notify)
-		if note != "" {
-			fmt.Printf("  Note: %s\n", note)
-		}
-		fmt.Print("\nContinue? [y/N] ")
-
-		var response string
-		fmt.Scanln(&response)
-		if response != "y" && response != "Y" {
-			fmt.Println("Cancelled.")
-			return nil
-		}
+	if decision.ApprovalStatus == "consumed" {
+		_ = audit.LogEvent(session, audit.EventTypeStateChange, audit.ActorUser, "locks.force_release.approval_consumed", map[string]interface{}{
+			"approval_id": decision.ApprovalID, "operation_key": opKey,
+			"resource": resource, "consumed_by": requester,
+		}, nil)
+	}
+	if !IsJSONOutput() && decision.Message != "" {
+		fmt.Println(decision.Message)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	releaseCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-
-	opts := agentmail.ForceReleaseOptions{
-		ProjectKey:     projectKey,
-		AgentName:      agentName,
-		ReservationID:  reservationID,
-		Note:           note,
-		NotifyPrevious: notify,
-	}
-
-	releaseResult, err := client.ForceReleaseReservation(ctx, opts)
-
+	releaseResult, err := client.ForceReleaseReservation(releaseCtx, agentmail.ForceReleaseOptions{
+		ProjectKey: projectKey, AgentName: agentName, ReservationID: reservationID,
+		Note: note, NotifyPrevious: notify,
+	})
 	result := ForceReleaseResult{
-		Session:       session,
-		Agent:         agentName,
-		ReservationID: reservationID,
+		Session: session, Agent: agentName, ReservationID: reservationID,
+		ApprovalID: decision.ApprovalID, ApprovalStatus: decision.ApprovalStatus,
 	}
-
 	if err != nil {
-		result.Success = false
 		result.Error = err.Error()
-	} else if releaseResult != nil {
+	} else if releaseResult == nil {
+		result.Error = "force-release returned no result"
+	} else {
 		// An id that was already released leaves the same end state.
 		result.Success = releaseResult.Success || releaseResult.AlreadyReleased
 		result.AlreadyReleased = releaseResult.AlreadyReleased
@@ -1096,7 +1248,15 @@ func runForceRelease(ctx context.Context, session string, reservationID int, not
 			result.Error = fmt.Sprintf("Agent Mail released nothing for reservation #%d", reservationID)
 		}
 	}
+	if !result.Success && decision.ApprovalStatus == "consumed" {
+		result.Error += "; approval " + decision.ApprovalID + " remains consumed: inspect the reservation before deliberately retrying with --new-approval " + decision.ApprovalID
+	}
 
+	_ = audit.LogEvent(session, audit.EventTypeStateChange, audit.ActorUser, "locks.force_release.executed", map[string]interface{}{
+		"operation_key": opKey, "resource": resource, "requested_by": requester,
+		"approval_id": decision.ApprovalID, "approval_status": decision.ApprovalStatus,
+		"success": result.Success, "previous_holder": result.PreviousHolder,
+	}, nil)
 	if IsJSONOutput() {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -1108,7 +1268,6 @@ func runForceRelease(ctx context.Context, session string, reservationID int, not
 		}
 		return nil
 	}
-
 	if result.AlreadyReleased {
 		if result.ReleasedAt != nil {
 			fmt.Printf("Reservation #%d was already released at %s\n", reservationID, result.ReleasedAt.Format(time.RFC3339))
@@ -1130,7 +1289,6 @@ func runForceRelease(ctx context.Context, session string, reservationID int, not
 		}
 		return nil
 	}
-
 	if result.Error != "" {
 		return fmt.Errorf("%s", result.Error)
 	}
@@ -1207,7 +1365,7 @@ func runRenewLocks(ctx context.Context, session string, extendMinutes int) error
 	client := newAgentMailClient(projectKey)
 	if !client.IsAvailable() {
 		if IsJSONOutput() {
-			result := RenewResult{Success: false, Session: session, Agent: agentName, Error: "Agent Mail server unavailable"}
+			result := RenewResult{Success: false, Session: session, Agent: agentName, Error: agentMailUnavailableMessage(client)}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
 			if encErr := enc.Encode(result); encErr != nil {
@@ -1215,7 +1373,7 @@ func runRenewLocks(ctx context.Context, session string, extendMinutes int) error
 			}
 			return jsonFailureExit()
 		}
-		return fmt.Errorf("agent mail server unavailable")
+		return agentMailUnavailableCLIError(client)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

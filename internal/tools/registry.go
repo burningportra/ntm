@@ -13,11 +13,15 @@ type Registry struct {
 
 // HealthReport summarizes tool health across the registry.
 type HealthReport struct {
-	Total     int               `json:"total"`
-	Healthy   int               `json:"healthy"`
-	Unhealthy int               `json:"unhealthy"`
-	Missing   int               `json:"missing"`
-	Tools     map[ToolName]bool `json:"tools"`
+	Total     int `json:"total"`
+	Healthy   int `json:"healthy"`
+	Unhealthy int `json:"unhealthy"`
+	Missing   int `json:"missing"`
+	// Disabled counts tools the configuration turned off, which are never
+	// probed and so are neither healthy, unhealthy, nor known-missing
+	// (ntm#313). Total = Healthy + Unhealthy + Missing + Disabled.
+	Disabled int               `json:"disabled,omitempty"`
+	Tools    map[ToolName]bool `json:"tools"`
 }
 
 // globalRegistry is the default registry instance
@@ -26,13 +30,6 @@ var (
 		adapters: make(map[ToolName]Adapter),
 	}
 )
-
-// NewRegistry creates a new adapter registry
-func NewRegistry() *Registry {
-	return &Registry{
-		adapters: make(map[ToolName]Adapter),
-	}
-}
 
 // Register adds an adapter to the registry
 func (r *Registry) Register(adapter Adapter) {
@@ -49,48 +46,20 @@ func (r *Registry) Get(name ToolName) (Adapter, bool) {
 	return adapter, ok
 }
 
-// All returns all registered adapters
-func (r *Registry) All() []Adapter {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	adapters := make([]Adapter, 0, len(r.adapters))
-	for _, a := range r.adapters {
-		adapters = append(adapters, a)
-	}
-	return adapters
-}
-
-// Detected returns all adapters for installed tools
-func (r *Registry) Detected() []Adapter {
-	r.mu.RLock()
-	adapters := make([]Adapter, 0, len(r.adapters))
-	for _, a := range r.adapters {
-		adapters = append(adapters, a)
-	}
-	r.mu.RUnlock()
-
-	detected := make([]Adapter, 0, len(adapters))
-	for _, a := range adapters {
-		if _, installed := a.Detect(); installed {
-			detected = append(detected, a)
-		}
-	}
-	return detected
-}
-
-// Names returns the names of all registered adapters
-func (r *Registry) Names() []ToolName {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	names := make([]ToolName, 0, len(r.adapters))
-	for name := range r.adapters {
-		names = append(names, name)
-	}
-	return names
-}
-
 // GetAllInfo returns ToolInfo for all registered tools
 func (r *Registry) GetAllInfo(ctx context.Context) []*ToolInfo {
+	return r.GetAllInfoExcept(ctx, nil)
+}
+
+// GetAllInfoExcept returns ToolInfo for all registered tools, reporting every
+// tool named in disabled as a not-probed entry instead of running its
+// detection, version, and health subprocesses.
+//
+// A disabled integration must not execute its binary just to fill in an
+// inventory row: a `[cass] enabled = false` snapshot used to spend five
+// seconds shelling out to `cass health --json` anyway (ntm#313). A nil or
+// empty disabled map probes everything, which is the default.
+func (r *Registry) GetAllInfoExcept(ctx context.Context, disabled map[ToolName]bool) []*ToolInfo {
 	r.mu.RLock()
 	adapters := make([]Adapter, 0, len(r.adapters))
 	for _, a := range r.adapters {
@@ -102,7 +71,21 @@ func (r *Registry) GetAllInfo(ctx context.Context) []*ToolInfo {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	// Disabled tools are recorded FIRST, before any probing goroutine exists.
+	// Appending them inside the spawn loop instead would have this goroutine
+	// writing the shared slice while probe goroutines write it under the
+	// mutex — a data race, and the caller sorts the result anyway, so there is
+	// nothing to gain from interleaving them.
 	for _, a := range adapters {
+		if disabled[a.Name()] {
+			infos = append(infos, DisabledToolInfo(a.Name()))
+		}
+	}
+
+	for _, a := range adapters {
+		if disabled[a.Name()] {
+			continue // recorded above; never probed
+		}
 		wg.Add(1)
 		go func(adapter Adapter) {
 			defer wg.Done()
@@ -119,8 +102,11 @@ func (r *Registry) GetAllInfo(ctx context.Context) []*ToolInfo {
 	return infos
 }
 
-// GetHealthReport returns a health summary for all registered tools
-func (r *Registry) GetHealthReport(ctx context.Context) *HealthReport {
+// GetHealthReportExcept returns a health summary for all registered tools,
+// skipping the probes for every tool named in disabled. Disabled tools are
+// counted in Total and reported unhealthy-but-unprobed in Tools, so the
+// summary's arithmetic still covers the whole registry (ntm#313).
+func (r *Registry) GetHealthReportExcept(ctx context.Context, disabled map[ToolName]bool) *HealthReport {
 	r.mu.RLock()
 	adapters := make([]Adapter, 0, len(r.adapters))
 	for _, a := range r.adapters {
@@ -134,7 +120,22 @@ func (r *Registry) GetHealthReport(ctx context.Context) *HealthReport {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	// Counted FIRST, before any probing goroutine exists: report.Tools is a
+	// plain map, and writing it here while a probe goroutine writes it under
+	// the mutex is a concurrent map write, which panics rather than merely
+	// racing.
 	for _, a := range adapters {
+		if disabled[a.Name()] {
+			report.Total++
+			report.Disabled++
+			report.Tools[a.Name()] = false
+		}
+	}
+
+	for _, a := range adapters {
+		if disabled[a.Name()] {
+			continue // counted above; never probed
+		}
 		wg.Add(1)
 		go func(adapter Adapter) {
 			defer wg.Done()
@@ -182,36 +183,19 @@ func Get(name ToolName) (Adapter, bool) {
 	return globalRegistry.Get(name)
 }
 
-// GetAll returns all adapters from the global registry
-func GetAll() []Adapter {
-	return globalRegistry.All()
-}
-
-// GetDetected returns all detected tools from the global registry
-func GetDetected() []Adapter {
-	return globalRegistry.Detected()
-}
-
-// GetInfo returns tool info from the global registry
-func GetInfo(ctx context.Context, name ToolName) (*ToolInfo, error) {
-	adapter, ok := globalRegistry.Get(name)
-	if !ok {
-		return nil, ErrToolNotInstalled
-	}
-	return adapter.Info(ctx)
-}
-
 // GetAllInfo returns all tool info from the global registry
 func GetAllInfo(ctx context.Context) []*ToolInfo {
 	return globalRegistry.GetAllInfo(ctx)
 }
 
-// GetHealthReport returns health report from the global registry
-func GetHealthReport(ctx context.Context) *HealthReport {
-	return globalRegistry.GetHealthReport(ctx)
+// GetAllInfoExcept returns all tool info from the global registry without
+// probing the tools named in disabled.
+func GetAllInfoExcept(ctx context.Context, disabled map[ToolName]bool) []*ToolInfo {
+	return globalRegistry.GetAllInfoExcept(ctx, disabled)
 }
 
-// GlobalRegistry returns the global registry instance
-func GlobalRegistry() *Registry {
-	return globalRegistry
+// GetHealthReportExcept returns a health report from the global registry
+// without probing the tools named in disabled.
+func GetHealthReportExcept(ctx context.Context, disabled map[ToolName]bool) *HealthReport {
+	return globalRegistry.GetHealthReportExcept(ctx, disabled)
 }

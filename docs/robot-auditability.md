@@ -155,7 +155,7 @@ Operators and agents need to answer trust questions: "Who acknowledged this?", "
 │  reservation_created │ File reservation acquired             │
 │  reservation_released│ File reservation released             │
 │  conflict_detected   │ File conflict detected                │
-│  conflict_resolved   │ File conflict resolved                │
+│  conflict_release_requested │ Release requested (not verified) │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -371,14 +371,14 @@ All transports expose audit trail consistently:
 ### CLI
 
 ```bash
-# Query audit trail for target
-ntm audit --robot --target alert:agent_stuck:pane-abc123 --last 24h
+# Query audit trail for target (machine-readable)
+ntm audit search --target='alert:agent_stuck:*' --days=1 --json "agent_stuck"
 
 # Query by actor
-ntm audit --robot --actor PeachPond --last 24h
+ntm audit search --actor=PeachPond --days=1 --json "."
 
 # Query by event type
-ntm audit --robot --type incident_opened --last 7d
+ntm audit search --type=incident_opened --days=7 --json "."
 ```
 
 ### REST

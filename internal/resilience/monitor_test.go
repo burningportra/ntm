@@ -2,17 +2,27 @@ package resilience
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/health"
+	"github.com/Dicklesworthstone/ntm/internal/notify"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
+
+// RegisterAgent registers a pane with no launch binding: test shorthand for
+// the production RegisterAgentWithBinding path (cli/monitor.go).
+func (m *Monitor) RegisterAgent(paneID string, paneIndex int, shellPID int, agentType, model, command string) {
+	m.RegisterAgentWithBinding(paneID, paneIndex, shellPID, agentType, model, command, nil)
+}
 
 // saveHooks saves all original hooks and returns a restore function.
 // Uses hooksMu to synchronize with spawned goroutines that read hooks.
@@ -20,21 +30,133 @@ func saveHooks() func() {
 	hooksMu.Lock()
 	origSend := sendKeysFn
 	origBuild := buildPaneCmdFn
+	origPrepare := prepareLaunchCommandFn
+	origReadSpec := readPaneLaunchSpecFn
+	origPrepareSpec := prepareAgentLaunchSpecFn
+	origWorkingDir := paneWorkingDirFn
 	origSleep := sleepFn
 	origCheckSession := checkSessionFn
 	origDisplayMessage := displayMessageFn
 	origIsChildAlive := isChildAliveFn
+	origFindPane := findPaneFn
+	origRecordLifecycle := recordLifecycleEventFn
+	// Default for tests: the pane exists. Tests exercising the stale-binding
+	// guard override this explicitly.
+	findPaneFn = func(_ context.Context, _, paneID string) (*tmux.Pane, error) {
+		return &tmux.Pane{ID: paneID, Index: 1}, nil
+	}
+	// Crash/restart fixtures must never append to the developer's real
+	// analytics event log; tests asserting the record install a recorder.
+	recordLifecycleEventFn = func(events.EventType, string, interface{}) {}
+	// Existing fixtures represent legacy sessions with no durable pane option.
+	// Tests for recorded launches provide a physical pane ID and a saved spec.
+	readPaneLaunchSpecFn = func(context.Context, string) (*tmux.AgentLaunchSpec, error) { return nil, nil }
 	hooksMu.Unlock()
 
 	return func() {
 		hooksMu.Lock()
 		sendKeysFn = origSend
 		buildPaneCmdFn = origBuild
+		prepareLaunchCommandFn = origPrepare
+		readPaneLaunchSpecFn = origReadSpec
+		prepareAgentLaunchSpecFn = origPrepareSpec
+		paneWorkingDirFn = origWorkingDir
 		sleepFn = origSleep
 		checkSessionFn = origCheckSession
 		displayMessageFn = origDisplayMessage
 		isChildAliveFn = origIsChildAlive
+		findPaneFn = origFindPane
+		recordLifecycleEventFn = origRecordLifecycle
 		hooksMu.Unlock()
+	}
+}
+
+// TestRestartAgentStalePaneBindingRetiredWithoutKeys: a pane ID that no longer
+// exists in the session must never receive restart keystrokes (after a tmux
+// server restart the same ID can belong to a different agent), and the dead
+// binding is retired so the monitor stops retrying it.
+func TestRestartAgentStalePaneBindingRetiredWithoutKeys(t *testing.T) {
+	restore := saveHooks()
+	defer restore()
+
+	var mu sync.Mutex
+	sendCalls := 0
+	setHooksLocked(func() {
+		findPaneFn = func(context.Context, string, string) (*tmux.Pane, error) { return nil, nil }
+		sendKeysFn = func(context.Context, string, string, bool) error {
+			mu.Lock()
+			defer mu.Unlock()
+			sendCalls++
+			return nil
+		}
+		buildPaneCmdFn = func(string, string) (string, error) { return "codex", nil }
+	})
+
+	cfg := config.Default()
+	cfg.Resilience.RestartDelaySeconds = 0
+	m := NewMonitor("test-session", "/tmp/project", cfg, true)
+	m.RegisterAgent("%404", 4, 0, "cod", "gpt-5", "codex")
+	m.mu.Lock()
+	agent := m.agents["%404"]
+	agent.Healthy = false
+	m.mu.Unlock()
+
+	m.restartAgent(context.Background(), agent)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if sendCalls != 0 {
+		t.Fatalf("sendKeys calls = %d, want 0 for a stale pane binding", sendCalls)
+	}
+	m.mu.RLock()
+	_, retained := m.agents["%404"]
+	m.mu.RUnlock()
+	if retained {
+		t.Fatal("stale pane binding still registered after retirement")
+	}
+}
+
+// TestRestartAgentMembershipCheckErrorSkipsButKeepsBinding: when the pane
+// query itself fails (tmux briefly unreachable), the restart is skipped
+// fail-closed but the binding survives for the next cycle.
+func TestRestartAgentMembershipCheckErrorSkipsButKeepsBinding(t *testing.T) {
+	restore := saveHooks()
+	defer restore()
+
+	var mu sync.Mutex
+	sendCalls := 0
+	setHooksLocked(func() {
+		findPaneFn = func(context.Context, string, string) (*tmux.Pane, error) { return nil, fmt.Errorf("tmux unreachable") }
+		sendKeysFn = func(context.Context, string, string, bool) error {
+			mu.Lock()
+			defer mu.Unlock()
+			sendCalls++
+			return nil
+		}
+		buildPaneCmdFn = func(string, string) (string, error) { return "codex", nil }
+	})
+
+	cfg := config.Default()
+	cfg.Resilience.RestartDelaySeconds = 0
+	m := NewMonitor("test-session", "/tmp/project", cfg, true)
+	m.RegisterAgent("%405", 5, 0, "cod", "gpt-5", "codex")
+	m.mu.Lock()
+	agent := m.agents["%405"]
+	agent.Healthy = false
+	m.mu.Unlock()
+
+	m.restartAgent(context.Background(), agent)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if sendCalls != 0 {
+		t.Fatalf("sendKeys calls = %d, want 0 when membership cannot be verified", sendCalls)
+	}
+	m.mu.RLock()
+	_, retained := m.agents["%405"]
+	m.mu.RUnlock()
+	if !retained {
+		t.Fatal("binding was retired on a transient membership-check error")
 	}
 }
 
@@ -54,7 +176,7 @@ func TestRestartAgentUsesBuiltPaneCommandAndSendKeys(t *testing.T) {
 	var mu sync.Mutex
 	var capturedCmd string
 	setHooksLocked(func() {
-		sendKeysFn = func(paneID, cmd string, enter bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
 			mu.Lock()
 			defer mu.Unlock()
 			capturedCmd = cmd
@@ -100,24 +222,36 @@ func TestRestartAgentUsesBuiltPaneCommandAndSendKeys(t *testing.T) {
 	}
 }
 
-func TestRestartAgentRejectsGrokBeforeLifecycleMutation(t *testing.T) {
+// GH#251 phase 2: grok agents are now valid automated-restart targets, so
+// restartAgent rebuilds and re-sends the grok launch command like claude/codex.
+func TestRestartAgentRestartsGrokLikeOtherAgents(t *testing.T) {
 	restore := saveHooks()
 	defer restore()
 
+	var mu sync.Mutex
 	buildCalls := 0
 	sendCalls := 0
 	setHooksLocked(func() {
 		buildPaneCmdFn = func(string, string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
 			buildCalls++
 			return "grok --always-approve", nil
 		}
-		sendKeysFn = func(string, string, bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
+			mu.Lock()
+			defer mu.Unlock()
 			sendCalls++
+			if paneID != "pane-1" || cmd != "grok --always-approve" || !enter {
+				t.Errorf("sendKeys(%q, %q, %v), want grok relaunch on pane-1", paneID, cmd, enter)
+			}
 			return nil
 		}
+		sleepFn = func(time.Duration) {}
 	})
 
 	cfg := config.Default()
+	cfg.Resilience.AutoRestart = true
 	cfg.Resilience.RestartDelaySeconds = 0
 	m := NewMonitor("test-session", "/tmp/project", cfg, true)
 	m.RegisterAgent("pane-1", 1, 0, "grok-build", "grok-3", "grok --always-approve")
@@ -125,40 +259,55 @@ func TestRestartAgentRejectsGrokBeforeLifecycleMutation(t *testing.T) {
 	m.agents["pane-1"].Healthy = false
 	m.mu.Unlock()
 
-	if err := validateAutomatedMonitorRestart("xai_grok_build"); !errors.Is(err, agent.ErrAutomatedRelaunchNotImplemented) {
-		t.Fatalf("validateAutomatedMonitorRestart() error = %v, want relaunch sentinel", err)
+	if err := validateAutomatedMonitorRestart("xai_grok_build"); err != nil {
+		t.Fatalf("validateAutomatedMonitorRestart() error = %v, want grok accepted", err)
 	}
 	m.restartAgent(context.Background(), m.agents["pane-1"])
 
-	if buildCalls != 0 || sendCalls != 0 {
-		t.Fatalf("restart hooks called before Grok rejection: build=%d send=%d", buildCalls, sendCalls)
+	mu.Lock()
+	gotBuild, gotSend := buildCalls, sendCalls
+	mu.Unlock()
+	if gotBuild != 1 || gotSend != 1 {
+		t.Fatalf("restart hooks: build=%d send=%d, want 1 and 1", gotBuild, gotSend)
 	}
 	m.mu.RLock()
 	state := *m.agents["pane-1"]
 	m.mu.RUnlock()
-	if state.RestartCount != 0 || state.Healthy {
-		t.Fatalf("Grok restart mutated state: count=%d healthy=%v", state.RestartCount, state.Healthy)
+	if state.RestartCount != 1 || !state.Healthy {
+		t.Fatalf("Grok restart state: count=%d healthy=%v, want restarted and healthy", state.RestartCount, state.Healthy)
 	}
 }
 
-func TestHandleCrashDoesNotScheduleGrokRestart(t *testing.T) {
+// GH#251 phase 2: a crashed grok agent is now scheduled for auto-restart
+// exactly like claude/codex agents.
+func TestHandleCrashSchedulesGrokRestart(t *testing.T) {
 	restore := saveHooks()
 	defer restore()
 
+	var mu sync.Mutex
 	buildCalls := 0
 	sendCalls := 0
 	setHooksLocked(func() {
 		buildPaneCmdFn = func(string, string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
 			buildCalls++
 			return "grok --always-approve", nil
 		}
-		sendKeysFn = func(string, string, bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
+			mu.Lock()
+			defer mu.Unlock()
 			sendCalls++
+			if paneID != "pane-1" || cmd != "grok --always-approve" || !enter {
+				t.Errorf("sendKeys(%q, %q, %v), want grok relaunch on pane-1", paneID, cmd, enter)
+			}
 			return nil
 		}
+		sleepFn = func(time.Duration) {}
 	})
 
 	cfg := config.Default()
+	cfg.Resilience.AutoRestart = true
 	cfg.Resilience.MaxRestarts = 3
 	cfg.Resilience.RestartDelaySeconds = 0
 	m := NewMonitor("test-session", "/tmp/project", cfg, true)
@@ -167,11 +316,103 @@ func TestHandleCrashDoesNotScheduleGrokRestart(t *testing.T) {
 	m.handleCrash(context.Background(), m.agents["pane-1"], "test crash")
 	m.wg.Wait()
 
-	if buildCalls != 0 || sendCalls != 0 {
-		t.Fatalf("Grok crash scheduled restart hooks: build=%d send=%d", buildCalls, sendCalls)
+	mu.Lock()
+	gotBuild, gotSend := buildCalls, sendCalls
+	mu.Unlock()
+	if gotBuild != 1 || gotSend != 1 {
+		t.Fatalf("Grok crash restart hooks: build=%d send=%d, want 1 and 1", gotBuild, gotSend)
 	}
-	if count := m.GetRestartCount("pane-1"); count != 0 {
-		t.Fatalf("Grok crash restart count = %d, want zero", count)
+	m.mu.RLock()
+	count := m.agents["pane-1"].RestartCount
+	m.mu.RUnlock()
+	if count != 1 {
+		t.Fatalf("Grok crash restart count = %d, want 1", count)
+	}
+}
+
+// A crash and the restart that follows are recorded durably in the analytics
+// event log, attributed to the tmux pane ID: --robot-metrics, ntm health and
+// the dashboard count restarts and crashes from these records, since the
+// webhook and attention-feed copies do not outlive the hour.
+func TestHandleCrashRecordsCrashAndRestartLifecycleEvents(t *testing.T) {
+	restore := saveHooks()
+	defer restore()
+
+	type recorded struct {
+		eventType events.EventType
+		session   string
+		data      events.AgentLifecycleData
+	}
+	var mu sync.Mutex
+	var got []recorded
+	setHooksLocked(func() {
+		buildPaneCmdFn = func(_, agentCmd string) (string, error) { return agentCmd, nil }
+		sendKeysFn = func(context.Context, string, string, bool) error { return nil }
+		sleepFn = func(time.Duration) {}
+		recordLifecycleEventFn = func(eventType events.EventType, session string, data interface{}) {
+			lifecycle, ok := data.(events.AgentLifecycleData)
+			if !ok {
+				t.Errorf("lifecycle record carried %T, want events.AgentLifecycleData", data)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, recorded{eventType: eventType, session: session, data: lifecycle})
+		}
+	})
+
+	cfg := config.Default()
+	cfg.Resilience.AutoRestart = true
+	cfg.Resilience.MaxRestarts = 3
+	cfg.Resilience.RestartDelaySeconds = 0
+	m := NewMonitor("metrics-session", "/tmp/project", cfg, true)
+	m.RegisterAgent("%7", 2, 0, "cc", "opus", "claude")
+
+	m.handleCrash(context.Background(), m.agents["%7"], "process exited")
+	m.wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("recorded %d lifecycle events (%+v), want a crash then a restart", len(got), got)
+	}
+	crash, restart := got[0], got[1]
+	if crash.eventType != events.EventAgentCrash || crash.session != "metrics-session" ||
+		crash.data.PaneID != "%7" || crash.data.AgentType != "cc" || crash.data.Reason != "process exited" {
+		t.Errorf("crash record = %+v", crash)
+	}
+	if restart.eventType != events.EventAgentRestart || restart.session != "metrics-session" ||
+		restart.data.PaneID != "%7" || restart.data.RestartCount != 1 {
+		t.Errorf("restart record = %+v", restart)
+	}
+}
+
+// A restart that never reached the pane (send failed) is not a restart.
+func TestRestartAgentSendFailureRecordsNoRestart(t *testing.T) {
+	restore := saveHooks()
+	defer restore()
+
+	var recordedTypes []events.EventType
+	setHooksLocked(func() {
+		buildPaneCmdFn = func(_, agentCmd string) (string, error) { return agentCmd, nil }
+		sendKeysFn = func(context.Context, string, string, bool) error { return fmt.Errorf("pane gone") }
+		sleepFn = func(time.Duration) {}
+		recordLifecycleEventFn = func(eventType events.EventType, _ string, _ interface{}) {
+			recordedTypes = append(recordedTypes, eventType)
+		}
+	})
+
+	cfg := config.Default()
+	cfg.Resilience.RestartDelaySeconds = 0
+	m := NewMonitor("metrics-session", "/tmp/project", cfg, true)
+	m.RegisterAgent("%8", 1, 0, "cc", "opus", "claude")
+	m.mu.Lock()
+	m.agents["%8"].Healthy = false
+	m.mu.Unlock()
+
+	m.restartAgent(context.Background(), m.agents["%8"])
+	if len(recordedTypes) != 0 {
+		t.Fatalf("a failed restart recorded %v", recordedTypes)
 	}
 }
 
@@ -179,10 +420,12 @@ func TestRegisterAgent(t *testing.T) {
 	cfg := config.Default()
 	m := NewMonitor("test-session", "/tmp/project", cfg, true)
 
-	m.RegisterAgent("pane-1", 1, 0, "cc", "opus", "claude --model opus")
-	m.RegisterAgent("pane-2", 2, 0, "gmi", "pro", "gemini --model pro")
+	m.RegisterAgentWithBinding("pane-1", 1, 0, "cc", "opus", "claude --model opus", nil)
+	m.RegisterAgentWithBinding("pane-2", 2, 0, "gmi", "pro", "gemini --model pro", nil)
 
-	states := m.GetAgentStates()
+	m.mu.RLock()
+	states := m.agents
+	m.mu.RUnlock()
 	if len(states) != 2 {
 		t.Fatalf("expected 2 agents, got %d", len(states))
 	}
@@ -210,49 +453,6 @@ func TestRegisterAgent(t *testing.T) {
 	}
 	if agent2.AgentType != "gmi" {
 		t.Errorf("expected agent type 'gmi', got %s", agent2.AgentType)
-	}
-}
-
-func TestGetRestartCount(t *testing.T) {
-	cfg := config.Default()
-	m := NewMonitor("test-session", "/tmp/project", cfg, true)
-
-	// Non-existent agent should return 0
-	if count := m.GetRestartCount("nonexistent"); count != 0 {
-		t.Errorf("expected 0 for nonexistent, got %d", count)
-	}
-
-	m.RegisterAgent("pane-1", 1, 0, "cc", "opus", "claude")
-
-	// Initial restart count should be 0
-	if count := m.GetRestartCount("pane-1"); count != 0 {
-		t.Errorf("expected 0, got %d", count)
-	}
-
-	// Manually increment to test getter
-	m.mu.Lock()
-	m.agents["pane-1"].RestartCount = 3
-	m.mu.Unlock()
-
-	if count := m.GetRestartCount("pane-1"); count != 3 {
-		t.Errorf("expected 3, got %d", count)
-	}
-}
-
-func TestGetAgentStatesReturnsCopy(t *testing.T) {
-	cfg := config.Default()
-	m := NewMonitor("test-session", "/tmp/project", cfg, true)
-
-	m.RegisterAgent("pane-1", 1, 0, "cc", "opus", "claude")
-
-	states := m.GetAgentStates()
-	// Modify the copy
-	states["pane-1"] = AgentState{PaneID: "modified"}
-
-	// Original should be unchanged
-	original := m.GetAgentStates()
-	if original["pane-1"].PaneID != "pane-1" {
-		t.Error("GetAgentStates should return a copy, not the original")
 	}
 }
 
@@ -293,6 +493,72 @@ func TestStartAndStop(t *testing.T) {
 		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop() timed out")
+	}
+}
+
+// TestStopReleasesNotifierConnections: the monitor owns its notifier, so
+// stopping the monitor closes the webhook client's idle keep-alive
+// connections instead of leaving them to the server's idle timeout.
+func TestStopReleasesNotifierConnections(t *testing.T) {
+	restore := saveHooks()
+	defer restore()
+	setHooksLocked(func() {
+		checkSessionFn = func(_ context.Context, session string) (*health.SessionHealth, error) {
+			return &health.SessionHealth{Session: session}, nil
+		}
+	})
+
+	closed := make(chan struct{}, 1)
+	hits := make(chan struct{}, 1)
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		select {
+		case hits <- struct{}{}:
+		default:
+		}
+	}))
+	ts.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	ts.Start()
+	defer ts.Close()
+
+	cfg := config.Default()
+	cfg.Resilience.HealthCheckSeconds = 1
+	cfg.Notifications = notify.Config{
+		Enabled: true,
+		Events:  []string{string(notify.EventAgentCrashed)},
+		Webhook: notify.WebhookConfig{Enabled: true, URL: ts.URL},
+	}
+	m := NewMonitor("test-session", t.TempDir(), cfg, false)
+	if m.notifier == nil {
+		t.Fatal("notifications enabled but the monitor built no notifier")
+	}
+
+	m.Start(context.Background())
+	if err := m.notifier.Notify(notify.NewAgentCrashedEvent("test-session", "%1", "cc")); err != nil {
+		t.Fatalf("webhook notify: %v", err)
+	}
+	select {
+	case <-hits:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the webhook was never delivered")
+	}
+	select {
+	case <-closed:
+		t.Fatal("the webhook connection closed before Stop; keep-alive premise does not hold")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	m.Stop()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop left the notifier's keep-alive connection open")
 	}
 }
 
@@ -376,7 +642,7 @@ func TestCheckHealthDetectsCrash(t *testing.T) {
 
 		// Don't actually restart
 		sleepFn = func(d time.Duration) {}
-		sendKeysFn = func(paneID, cmd string, enter bool) error { return nil }
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error { return nil }
 		buildPaneCmdFn = func(projectDir, agentCmd string) (string, error) {
 			return agentCmd, nil
 		}
@@ -421,7 +687,7 @@ func TestCheckHealthDetectsPaneMissing(t *testing.T) {
 		}
 
 		sleepFn = func(d time.Duration) {}
-		sendKeysFn = func(paneID, cmd string, enter bool) error { return nil }
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error { return nil }
 		buildPaneCmdFn = func(projectDir, agentCmd string) (string, error) {
 			return agentCmd, nil
 		}
@@ -660,7 +926,7 @@ func TestHandleCrashMaxRestartsExceeded(t *testing.T) {
 
 	var restartAttempted bool
 	setHooksLocked(func() {
-		sendKeysFn = func(paneID, cmd string, enter bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
 			restartAttempted = true
 			return nil
 		}
@@ -725,7 +991,7 @@ func TestRestartAgentIncreasesCount(t *testing.T) {
 
 	setHooksLocked(func() {
 		sleepFn = func(d time.Duration) {}
-		sendKeysFn = func(paneID, cmd string, enter bool) error { return nil }
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error { return nil }
 		buildPaneCmdFn = func(projectDir, agentCmd string) (string, error) {
 			return agentCmd, nil
 		}
@@ -762,7 +1028,7 @@ func TestRestartAgentSkipsIfHealthy(t *testing.T) {
 	var sendKeysCalled bool
 	setHooksLocked(func() {
 		sleepFn = func(d time.Duration) {}
-		sendKeysFn = func(paneID, cmd string, enter bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
 			sendKeysCalled = true
 			return nil
 		}
@@ -794,7 +1060,7 @@ func TestRestartAgentHandlesBuildError(t *testing.T) {
 		buildPaneCmdFn = func(projectDir, agentCmd string) (string, error) {
 			return "", fmt.Errorf("build error")
 		}
-		sendKeysFn = func(paneID, cmd string, enter bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
 			sendKeysCalled = true
 			return nil
 		}
@@ -826,7 +1092,7 @@ func TestRestartAgentHandlesSendKeysError(t *testing.T) {
 		buildPaneCmdFn = func(projectDir, agentCmd string) (string, error) {
 			return agentCmd, nil
 		}
-		sendKeysFn = func(paneID, cmd string, enter bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
 			return fmt.Errorf("send keys error")
 		}
 	})
@@ -1310,7 +1576,7 @@ func TestCheckHealthIsWorkingGuardSkipsCrash(t *testing.T) {
 		}
 
 		sleepFn = func(d time.Duration) {}
-		sendKeysFn = func(paneID, cmd string, enter bool) error {
+		sendKeysFn = func(_ context.Context, paneID, cmd string, enter bool) error {
 			restartAttempted = true
 			return nil
 		}
@@ -1345,6 +1611,73 @@ func TestCheckHealthIsWorkingGuardSkipsCrash(t *testing.T) {
 	}
 	if restartAttempted {
 		t.Error("restart should not have been attempted for actively working agent")
+	}
+}
+
+func TestCheckHealthKnownDeadPIDBypassesActiveOutputGuard(t *testing.T) {
+	restore := saveHooks()
+	defer restore()
+
+	var probedPID int
+	var restartMu sync.Mutex
+	restartAttempts := 0
+	setHooksLocked(func() {
+		checkSessionFn = func(ctx context.Context, session string) (*health.SessionHealth, error) {
+			return &health.SessionHealth{
+				Session: session,
+				Agents: []health.AgentHealth{
+					{
+						PaneID:        "pane-1",
+						ShellPID:      4242,
+						Status:        health.StatusError,
+						ProcessStatus: health.ProcessExited,
+						Activity:      health.ActivityActive,
+						Issues:        []health.Issue{{Type: "crash", Message: "Process exited"}},
+					},
+				},
+			}, nil
+		}
+		isChildAliveFn = func(pid int) bool {
+			probedPID = pid
+			return false
+		}
+		sleepFn = func(time.Duration) {}
+		buildPaneCmdFn = func(_ string, agentCmd string) (string, error) {
+			return agentCmd, nil
+		}
+		sendKeysFn = func(_ context.Context, _ string, _ string, _ bool) error {
+			restartMu.Lock()
+			restartAttempts++
+			restartMu.Unlock()
+			return nil
+		}
+	})
+
+	cfg := config.Default()
+	cfg.Resilience.AutoRestart = true
+	cfg.Resilience.MaxRestarts = 3
+	cfg.Resilience.RestartDelaySeconds = 0
+
+	m := NewMonitor("test-session", "/tmp/project", cfg, true)
+	m.RegisterAgent("pane-1", 1, 4242, "cc", "opus", "claude")
+
+	m.checkHealth(context.Background())
+	m.wg.Wait()
+
+	if probedPID != 4242 {
+		t.Fatalf("probed PID = %d, want 4242", probedPID)
+	}
+	restartMu.Lock()
+	gotRestartAttempts := restartAttempts
+	restartMu.Unlock()
+	if gotRestartAttempts != 1 {
+		t.Fatalf("restart attempts = %d, want 1 for authoritatively dead PID", gotRestartAttempts)
+	}
+	m.mu.RLock()
+	got := m.agents["pane-1"].RestartCount
+	m.mu.RUnlock()
+	if got != 1 {
+		t.Fatalf("restart count = %d, want 1", got)
 	}
 }
 
@@ -1404,5 +1737,180 @@ func TestCheckHealthFallsBackToRegisteredShellPID(t *testing.T) {
 	}
 	if consecutiveFailures != 0 {
 		t.Fatalf("consecutive failures = %d, want 0", consecutiveFailures)
+	}
+}
+
+// TestReconcileFromManifestAdoptsLaterAgents is the auto-restart coverage gap
+// regression. The monitored set is populated once, at monitor-process start,
+// from the manifest; `ntm add` appends a new agent to that manifest but cannot
+// reach the running monitor (no signal, no watch, no reload). The added pane
+// was therefore never health-checked and never auto-restarted — silently, and
+// for the life of the session.
+func TestReconcileFromManifestAdoptsLaterAgents(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	const session = "reconcile-adopt"
+	if err := SaveManifest(&SpawnManifest{
+		Session:     session,
+		ProjectDir:  t.TempDir(),
+		AutoRestart: true,
+		Agents: []AgentConfig{
+			{PaneID: "%1", PaneIndex: 1, Type: "cc", Model: "opus", Command: "claude"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveManifest: %v", err)
+	}
+
+	m := NewMonitor(session, t.TempDir(), config.Default(), true)
+	m.RegisterAgent("%1", 1, 0, "cc", "opus", "claude")
+
+	// `ntm add` appends a second agent to the manifest while the monitor runs.
+	manifest, err := LoadManifest(session)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	manifest.Agents = append(manifest.Agents, AgentConfig{
+		PaneID: "%2", PaneIndex: 2, Type: "cod", Model: "gpt", Command: "codex",
+		LaunchBinding: &LaunchBinding{Provider: "codex", Launcher: "caam", Identifier: "codex-b"},
+	})
+	if err := SaveManifest(manifest); err != nil {
+		t.Fatalf("SaveManifest(update): %v", err)
+	}
+
+	m.reconcileFromManifest()
+
+	m.mu.RLock()
+	adopted, ok := m.agents["%2"]
+	total := len(m.agents)
+	m.mu.RUnlock()
+
+	if !ok {
+		t.Fatal("agent added after monitor start was never adopted; it would never be auto-restarted")
+	}
+	if total != 2 {
+		t.Errorf("monitored agents = %d, want 2", total)
+	}
+	if adopted.AgentType != "cod" || adopted.Command != "codex" {
+		t.Errorf("adopted agent = %+v, want type cod / command codex", adopted)
+	}
+	if adopted.LaunchBinding == nil || adopted.LaunchBinding.Identifier != "codex-b" {
+		t.Errorf("adopted agent lost its launch binding: %+v; a restart would use the wrong account",
+			adopted.LaunchBinding)
+	}
+	if !adopted.Healthy {
+		t.Error("a freshly adopted agent must start healthy, not pre-failed")
+	}
+}
+
+// TestReconcileFromManifestPreservesCrashAccounting guards the reason
+// reconciliation only adds: re-registering a known pane would reset its
+// restart bookkeeping, so a crash-looping agent would never reach
+// max-restarts and would be relaunched forever.
+func TestReconcileFromManifestPreservesCrashAccounting(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	const session = "reconcile-preserve"
+	if err := SaveManifest(&SpawnManifest{
+		Session:     session,
+		ProjectDir:  t.TempDir(),
+		AutoRestart: true,
+		Agents: []AgentConfig{
+			{PaneID: "%1", PaneIndex: 1, Type: "cc", Model: "opus", Command: "claude"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveManifest: %v", err)
+	}
+
+	m := NewMonitor(session, t.TempDir(), config.Default(), true)
+	m.RegisterAgent("%1", 1, 0, "cc", "opus", "claude")
+
+	m.mu.Lock()
+	m.agents["%1"].RestartCount = 4
+	m.agents["%1"].ConsecutiveFailures = 3
+	m.agents["%1"].Healthy = false
+	m.mu.Unlock()
+
+	m.reconcileFromManifest()
+
+	m.mu.RLock()
+	got := *m.agents["%1"]
+	m.mu.RUnlock()
+
+	if got.RestartCount != 4 || got.ConsecutiveFailures != 3 {
+		t.Errorf("reconcile reset crash accounting: RestartCount=%d ConsecutiveFailures=%d, want 4/3",
+			got.RestartCount, got.ConsecutiveFailures)
+	}
+	if got.Healthy {
+		t.Error("reconcile flipped an unhealthy agent back to healthy")
+	}
+}
+
+// TestReconcileFromManifestToleratesMissingManifest: a monitor whose manifest
+// is absent or unreadable must keep health-checking what it already watches.
+func TestReconcileFromManifestToleratesMissingManifest(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	m := NewMonitor("no-manifest-here", t.TempDir(), config.Default(), true)
+	m.RegisterAgent("%1", 1, 0, "cc", "opus", "claude")
+
+	m.reconcileFromManifest() // must not panic or drop anything
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.agents) != 1 {
+		t.Errorf("monitored agents = %d, want the pre-existing 1", len(m.agents))
+	}
+}
+
+// TestReconcileFromManifestDoesNotResurrectRetiredPanes guards the interaction
+// between manifest reconciliation and the stale-binding retirement.
+//
+// When a tracked pane is verifiably gone from the session the monitor deletes
+// it "so the monitor stops retrying a pane that will never come back". Nothing
+// prunes the manifest, so reconciliation would re-adopt that pane on the very
+// next tick, health-check it, fail, retire it again — forever — turning a
+// one-time retirement into a permanent loop.
+func TestReconcileFromManifestDoesNotResurrectRetiredPanes(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	const session = "reconcile-retired"
+	if err := SaveManifest(&SpawnManifest{
+		Session:     session,
+		ProjectDir:  t.TempDir(),
+		AutoRestart: true,
+		Agents: []AgentConfig{
+			{PaneID: "%1", PaneIndex: 1, Type: "cc", Model: "opus", Command: "claude"},
+			{PaneID: "%dead", PaneIndex: 2, Type: "cod", Model: "gpt", Command: "codex"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveManifest: %v", err)
+	}
+
+	m := NewMonitor(session, t.TempDir(), config.Default(), true)
+	m.RegisterAgent("%1", 1, 0, "cc", "opus", "claude")
+	m.RegisterAgent("%dead", 2, 0, "cod", "gpt", "codex")
+
+	// The monitor verifies %dead is gone from the session and retires it.
+	m.mu.Lock()
+	delete(m.agents, "%dead")
+	m.retired = map[string]struct{}{"%dead": {}}
+	m.mu.Unlock()
+
+	// Several ticks must not bring it back, even though the manifest still
+	// lists it.
+	for i := 0; i < 3; i++ {
+		m.reconcileFromManifest()
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, back := m.agents["%dead"]; back {
+		t.Error("reconciliation resurrected a deliberately retired pane; the monitor would retry it every tick forever")
+	}
+	if _, ok := m.agents["%1"]; !ok {
+		t.Error("reconciliation dropped a live agent")
+	}
+	if len(m.agents) != 1 {
+		t.Errorf("monitored agents = %d, want 1", len(m.agents))
 	}
 }

@@ -119,6 +119,146 @@ question = "Ticket or issue number?"
 required = true
 ```
 
+### Run a Template
+
+`ntm workflow run <name-or-path>` executes a template's coordination loop
+against a live session:
+
+```bash
+# Builtins by name (red-green, review-pipeline, specialist-team, parallel-explore)
+ntm workflow run red-green --var feature="parser rewrite"
+
+# User/project templates by name (same search order as `ntm workflows list`)
+ntm workflow run my-review-flow --session myproj --var ticket=BUG-123
+
+# Any workflow TOML by explicit path (a path separator or .toml suffix)
+ntm workflow run ./flows/my-flow.toml --session myproj
+
+# Drive manual transitions automatically (unattended runs)
+ntm workflow run specialist-team --var project="billing" --fire-manual
+```
+
+How a run works:
+
+1. The template resolves by explicit path when the argument contains a path
+   separator or ends in `.toml`; otherwise by name with the standard
+   precedence (builtin < `~/.config/ntm/workflows/` < `.ntm/workflows/`).
+   An unknown name is an error that lists the builtin names — there is no
+   fallback.
+2. Required setup prompts without defaults must be supplied with
+   `--var key=value`; defaults fill the rest.
+3. Template roles map onto the session's agent panes in pane order (the
+   session needs at least as many agent panes as the template declares).
+4. Each stage's prompt is delivered through the same gated dispatch path as
+   `ntm send` (dead-pane gate + composer-verified submission), and the
+   template's triggers advance the stages. A stage engages the role with the
+   same name; otherwise the role the routing table maps for the stage, the
+   role named by an outgoing transition's trigger, or the first declared
+   role. Parallel coordination (and `parallel_within_stage`) engages every
+   pane of the acting role.
+5. The run ends when the flow reaches a stage with no outgoing transitions,
+   after `--max-transitions` stage changes, at `--timeout`, or when the
+   template's error handling pauses or aborts it (see
+   [Agent Crashes, Errors, and Timeouts](#agent-crashes-errors-and-timeouts)).
+   `--json` emits a machine-readable result (stages visited, transitions,
+   role→pane mapping, agent faults and restarts).
+
+Useful flags: `--fire-manual` fires `manual` triggers automatically,
+`--interval` sets the trigger poll cadence, `--trigger-timeout` bounds
+command triggers, `--project-root` anchors file/command triggers, and
+`--resume` continues the saved stage, including a paused checkpoint recorded
+by the template's `error_handling` pause action. Confirmed prompt deliveries
+are retained, and unfinished deliveries keep their original pane plan.
+
+For TOML orchestration templates, `agent_says` observes output from configured
+workflow participants with the transition's role, added after the current
+stage's saved pane boundary. An empty transition role includes all configured
+participants. Old verdicts in scrollback do not
+complete a new stage or a later visit to the same stage. Review gates count
+distinct eligible panes separately for each outgoing verdict pattern:
+`changes requested` cannot contribute toward an `approved` quorum. Observed
+votes are checkpointed, so a partial review survives a pause or restart even
+after its text scrolls out of the retained response buffer. `--resume` also
+observes responses produced while the runner was stopped without sending
+confirmed prompts again.
+
+A review gate requiring several replies must prompt those reviewers: use
+`parallel_within_stage = true` or stage-to-role routing that selects the full
+reviewer role. A stage named exactly after its role otherwise uses the
+coordinator's round-robin selection for a single pane.
+
+Each capture and prepared dispatch is bound to the original physical pane
+and positive process ID. A missing pane, changed process, failed capture, or
+lost output boundary stops automatic advancement. Evidence captures cover
+200 scrollback lines and at most 512 KiB per pane; unmatched response text is
+retained exactly, up to 64 KiB. The runner pauses if this limit is exceeded
+before the pane's applicable verdicts have been observed, because trimming
+the response could change an anchored pattern's meaning. Recorded votes no
+longer require their response text. A missing overlap after a screen redraw
+or extensive scrollback loss is also reported explicitly. Inspect that stage before choosing
+an intentional `--restart`; the runner never interprets the whole replacement
+screen as a fresh response.
+
+An outgoing prompt must not match its own `agent_says` pattern. For example,
+putting the literal verdict phrase in a description or `--var` can make the
+terminal's prompt echo look like an agent response. Such a prompt is refused
+before transport, including when enrichment introduces the phrase. Use a
+distinct response pattern and keep it out of the outgoing prompt. Older
+checkpoints that lack a boundary for an already-dispatched `agent_says` stage
+are refused on resume rather than reconstructed from historical output.
+
+Note: `ntm spawn -t <template>` uses only the template's agent COUNTS to
+size a new session — it does not run the coordination. Spawn the session
+first, then `ntm workflow run <template>` inside it.
+
+### Agent Crashes, Errors, and Timeouts
+
+A template's `[workflows.error_handling]` table tells `ntm workflow run` what
+to do when an agent fails or a stage stalls:
+
+```toml
+[workflows.error_handling]
+on_agent_crash = "restart_agent"
+on_agent_error = "pause"
+stage_timeout_minutes = 60
+on_timeout = "notify"
+max_retries_per_stage = 2
+```
+
+While a flow runs, every poll checks all of the workflow's agent panes, not
+only the panes the current stage prompted:
+
+- **Agent crash** (`on_agent_crash`): the pane left the session, its process
+  died (`pane_dead`), or its shell has no live child process, meaning the
+  agent CLI exited back to the shell. These are process facts, so a crash is
+  raised on the first poll that sees it. On a remote (SSH) tmux server, pane
+  PIDs cannot be inspected, so only a missing or dead pane counts.
+- **Agent error** (`on_agent_error`): the classification `ntm health` reports:
+  the agent is rate limited, has an authentication error, is waiting on an
+  interactive gate such as a trust or login dialog, or the status detector
+  reports an error state. These come from pane text, so the state must last
+  for `[resilience] crash_threshold` consecutive polls (default 3).
+
+A fault is raised once per episode. The same fault is raised again only after
+the pane recovers or is restarted. Each raised fault is recorded in the
+checkpoint's `errors` list and in the `faults` list of the `--json` result
+(pane, role, stage, type, reason, action).
+
+| Action | Effect |
+|--------|--------|
+| `restart_agent` | Restarts the faulted pane with the same engine as `ntm respawn`: respawns the pane, replays its saved launch command, and waits until the agent is ready. The run then binds to the replacement process. If the pane had already received the current stage's prompt, the prompt is sent again, and any verdict the previous process gave in this stage is discarded. Each pane may restart at most `[resilience] max_restarts` times per run (default 3); the next fault aborts the run, so a crash loop cannot restart forever. If a restart does not end with a ready agent, the run stops with reason `restart-failed`. Not valid for `on_timeout`, because a timeout names no agent. |
+| `pause` | Saves a paused checkpoint and stops with reason `paused`. Continue with `--resume` once the agent is healthy. |
+| `abort` | Stops with reason `aborted`. |
+| `notify` | Reports the fault and keeps running. An unset `on_agent_crash` or `on_agent_error` behaves the same way. |
+| `skip_stage` | Leaves the current stage through its first usable outgoing transition. |
+| `retry` | Sends the current stage prompt to its panes again, up to `max_retries_per_stage` times, then aborts. It does not restart a crashed agent. |
+
+`stage_timeout_minutes` starts a timer for each stage. If the stage is still
+current when the timer expires, `on_timeout` runs; it accepts any action
+except `restart_agent`. A `parallel` template without a flow sends its
+prompts once and completes, so its agents are checked once, just before that
+dispatch, and that single check acts only on confirmed crashes.
+
 ### Best Practices
 
 - Start with a built-in template and change one coordination concern at a time.
@@ -134,7 +274,8 @@ required = true
 
 - **Workflow not found:** ensure the file ends in `.toml` and is in
   `.ntm/workflows/` or `~/.config/ntm/workflows/`; use `ntm workflows list`
-  to see the effective source.
+  to see the effective source. `ntm workflow run` fails closed on an unknown
+  name and lists the builtin names in its error.
 - **Template fails to load:** use `ntm workflows show <name>` to surface TOML,
   unknown-field, or validation errors. Pipeline flows need stages and every
   flow needs at least one valid transition.
@@ -144,6 +285,10 @@ required = true
 - **Flow does not advance:** check that the trigger type has all required
   fields (for example `idle_minutes` for `all_agents_idle`) and that the
   trigger's role matches the stage role.
+- **Run aborted after agent restarts:** a pane used up its
+  `[resilience] max_restarts` restart budget. Check the `faults` list in the
+  `--json` result (or the checkpoint's `errors`) to find the agent that keeps
+  crashing before you start the workflow again.
 
 ## Root Structure
 
@@ -243,6 +388,17 @@ settings:
   mail_recipient: user         # Agent mail recipient
 ```
 
+Notifications fire only for the events you enable: `notify_on_complete` covers a
+successful finish and `notify_on_error` a failed one. Cancellation does not
+notify. A channel with nothing to send is skipped — `webhook` without
+`webhook_url`, or `mail` without `mail_recipient` — and unrecognized channel
+names are ignored. Delivery is best-effort under a 10s budget: a webhook that
+hangs or errors is not allowed to fail or delay the run.
+
+The `mail` channel sends as `ntm-pipeline`, using the workflow's working
+directory as the Agent Mail project key (the same key `mail_send` steps take
+explicitly as `project_key`).
+
 ### Error Actions
 
 | Action | Behavior |
@@ -325,10 +481,17 @@ Agent types:
   prompt: Write tests
 ```
 
-Routing strategies:
+Routing strategies (the same router `ntm send --route` uses):
 - `least-loaded` - Choose agent with lowest context usage
 - `first-available` - Choose first idle agent
 - `round-robin` - Rotate through agents
+- `round-robin-available` - Rotate through agents, skipping busy ones
+- `random` - Pick a random available agent
+- `sticky` - Prefer the agent that handled the previous routed step
+- `affinity` - Prefer the agent holding Agent Mail reservations on files the
+  prompt names (falls back to least-loaded when none does)
+
+`explicit` is not a route: name the pane with `pane:` instead.
 
 ## Wait Configuration
 

@@ -9,6 +9,13 @@ func TestGetContextLimit_ExactMatch(t *testing.T) {
 	}{
 		{"claude-opus-4", 200000},
 		{"claude-sonnet-4-5", 200000},
+		{"claude-haiku-4-5", 200000},
+		// Current Claude models run a 1M window (GH #338).
+		{"claude-opus-5-5", 1000000},
+		{"claude-sonnet-5-5", 1000000},
+		{"claude-fable-5-1", 1000000},
+		{"claude-opus-4-8", 1000000},
+		{"claude-sonnet-4-6", 1000000},
 		{"gpt-4", 128000},
 		{"gpt-5", 256000},
 		{"gpt-5-codex", 256000},
@@ -147,5 +154,60 @@ func TestApplyOverridesRejectsNonPositiveLimits(t *testing.T) {
 	ApplyOverrides(map[string]int{"claude-opus-4": 12345})
 	if got := GetContextLimit("claude-opus-4"); got != 12345 {
 		t.Fatalf("valid override not applied: limit = %d, want 12345", got)
+	}
+}
+
+func TestKnownModel(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{"", false},
+		{"claude-opus-5", true},          // exact
+		{"opus-5", true},                 // alias
+		{"Claude-Opus-5", true},          // case-insensitive
+		{"claude-opus-5-20260101", true}, // date suffix strip
+		{"claude-opus-4-8", true},        // prefix match on claude-opus-4
+		{"claude-opus5", false},          // typo: not resolvable
+		{"totally-custom-model", false},
+	}
+	for _, tt := range tests {
+		if got := KnownModel(tt.model); got != tt.want {
+			t.Errorf("KnownModel(%q) = %v, want %v", tt.model, got, tt.want)
+		}
+	}
+}
+
+func TestSuggestModel(t *testing.T) {
+	tests := []struct {
+		model string
+		want  string
+	}{
+		{"", ""},
+		{"claude-opus-5", ""}, // known: no suggestion
+		{"opus-5", ""},        // known alias: no suggestion
+		{"claude-opus5", "claude-opus-5"},
+		{"claude-sonet-5", "claude-sonnet-5"},
+		{"gpt5-codex", "gpt-5-codex"},
+		{"fabel-5", "claude-fable-5"},               // alias near-miss resolves to canonical
+		{"totally-unrelated-model-name-xyz-42", ""}, // no confident match
+		{"x", ""},  // tiny input: rewriting the whole ID is noise, not a near miss
+		{"zz", ""}, // tiny input with no distance-1 registry neighbor
+	}
+	for _, tt := range tests {
+		if got := SuggestModel(tt.model); got != tt.want {
+			t.Errorf("SuggestModel(%q) = %q, want %q", tt.model, got, tt.want)
+		}
+	}
+}
+
+func TestSuggestModelDeterministicTies(t *testing.T) {
+	// Repeated calls must return the same suggestion despite map iteration
+	// order (ties break by longest common prefix, then lexicographically).
+	first := SuggestModel("claude-opus5")
+	for i := 0; i < 20; i++ {
+		if got := SuggestModel("claude-opus5"); got != first {
+			t.Fatalf("SuggestModel non-deterministic: %q then %q", first, got)
+		}
 	}
 }

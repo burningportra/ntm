@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -12,11 +13,15 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 func TestNewAgentLifecycleFailureResponseClassifiesPromptFailureAndMutation(t *testing.T) {
@@ -219,6 +224,71 @@ func TestNewAddCmd_RegistersOllamaFlag(t *testing.T) {
 	}
 }
 
+func TestAddPersistsAgentTypeAcrossWrapperTitleRewrite(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	workDir := t.TempDir()
+	sessionName := fmt.Sprintf("ntm-test-add-identity-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(sessionName, workDir); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(sessionName) })
+
+	oldCfg, oldJSONOutput := cfg, jsonOutput
+	t.Cleanup(func() {
+		cfg = oldCfg
+		jsonOutput = oldJSONOutput
+	})
+	cfg = newTmuxIntegrationTestConfig(workDir)
+	cfg.Agents.Codex = testAgentCodexCommandTemplate
+	cfg.Checkpoints.Enabled = false
+	cfg.CASS.Context.Enabled = false
+	jsonOutput = false
+
+	if err := executeAdd(t.Context(), AddOptions{
+		Session: sessionName,
+		Agents: AgentSpecs{{
+			Type:  AgentTypeCodex,
+			Count: 1,
+		}},
+		NoCassContext: true,
+	}, false); err != nil {
+		t.Fatalf("executeAdd: %v", err)
+	}
+
+	panes, err := tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanes: %v", err)
+	}
+	var codexPaneID string
+	for _, pane := range panes {
+		if pane.Type == tmux.AgentCodex {
+			codexPaneID = pane.ID
+			break
+		}
+	}
+	if codexPaneID == "" {
+		t.Fatalf("added Codex pane not found: %+v", panes)
+	}
+	if err := tmux.SetPaneTitle(codexPaneID, "caam | title replaced by wrapper"); err != nil {
+		t.Fatalf("rewrite added pane title: %v", err)
+	}
+	spec, err := tmux.ReadPaneLaunchSpecContext(t.Context(), codexPaneID)
+	if err != nil || spec == nil || spec.AgentType != tmux.AgentCodex || spec.Command == "" {
+		t.Fatalf("added launch specification lost after title rewrite: spec=%+v err=%v", spec, err)
+	}
+	panes, err = tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanes after title rewrite: %v", err)
+	}
+	for _, pane := range panes {
+		if pane.ID == codexPaneID && pane.Type == tmux.AgentCodex {
+			return
+		}
+	}
+	t.Fatalf("added pane %s lost its durable Codex type after title rewrite: %+v", codexPaneID, panes)
+}
+
 // TestAddThreadsReasoningEffort is the ntm#195 regression guard. The `add`
 // command parses the `:effort` segment of `--cc=N:model:effort` into the
 // AgentSpec/FlatAgent, but runAdd previously omitted ReasoningEffort from the
@@ -390,8 +460,8 @@ func TestAddRegistersAgentsWithAgentMail(t *testing.T) {
 	// The six fields registerSpawnedAgents needs to create (or reuse) an
 	// identity: anything missing here silently degrades the registration.
 	wantFields := map[string]bool{
-		"paneIndex": false, "paneID": false, "paneTitle": false,
-		"agentType": false, "model": false, "resolvedModel": false,
+		"PaneIndex": false, "PaneID": false, "PaneTitle": false,
+		"AgentType": false, "Model": false, "ResolvedModel": false,
 	}
 	ast.Inspect(executeAddDecl, func(node ast.Node) bool {
 		switch n := node.(type) {
@@ -400,8 +470,11 @@ func TestAddRegistersAgentsWithAgentMail(t *testing.T) {
 				registerCalls++
 			}
 		case *ast.CompositeLit:
-			ident, ok := n.Type.(*ast.Ident)
-			if !ok || ident.Name != "spawnedAgentInfo" {
+			sel, ok := n.Type.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Agent" {
+				return true
+			}
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "spawnidentity" {
 				return true
 			}
 			for _, elt := range n.Elts {
@@ -426,7 +499,7 @@ func TestAddRegistersAgentsWithAgentMail(t *testing.T) {
 	}
 	for field, seen := range wantFields {
 		if !seen {
-			t.Errorf("executeAdd does not populate spawnedAgentInfo.%s for added panes", field)
+			t.Errorf("executeAdd does not populate spawnidentity.Agent.%s for added panes", field)
 		}
 	}
 }
@@ -438,7 +511,7 @@ func TestAddResponseCarriesAgentMailStatus(t *testing.T) {
 	data, err := json.Marshal(output.AddResponse{
 		TotalAdded: 1,
 		NewPanes:   []output.PaneResponse{{PaneID: "%42", Title: "proj__cc_2", Type: "cc"}},
-		AgentMail: &output.AgentMailSpawnStatus{
+		AgentMail: &spawnidentity.AgentMailSpawnStatus{
 			Available:         true,
 			ProjectRegistered: true,
 			AgentsRegistered:  1,

@@ -149,6 +149,24 @@ var DefaultCapabilities = map[tmux.AgentType]map[TaskType]float64{
 		TaskChore:         0.85,
 		TaskEpic:          0.60,
 	},
+	// Oh My Pi (omp) is a model-agnostic frontier coding harness: its
+	// strengths follow whichever model its model roles select (Claude,
+	// GPT-class, and other frontier models behind one TUI), so no single
+	// vendor's skew applies. Basis: the per-task midpoint of the Claude and
+	// Codex profiles above, the two frontier CLI agents it is deployed
+	// alongside (rounded half up to two decimals).
+	tmux.AgentOmp: {
+		TaskRefactor:      0.85, // (0.95 + 0.75) / 2
+		TaskAnalysis:      0.80, // (0.90 + 0.70) / 2
+		TaskDocs:          0.78, // (0.85 + 0.70) / 2
+		TaskDocumentation: 0.78,
+		TaskBug:           0.85, // (0.80 + 0.90) / 2
+		TaskFeature:       0.88, // (0.85 + 0.90) / 2
+		TaskTesting:       0.80, // (0.75 + 0.85) / 2
+		TaskTask:          0.83, // (0.80 + 0.85) / 2
+		TaskChore:         0.75, // (0.70 + 0.80) / 2
+		TaskEpic:          0.75, // (0.90 + 0.60) / 2
+	},
 	tmux.AgentOllama: {
 		TaskRefactor:      0.70,
 		TaskAnalysis:      0.75,
@@ -221,42 +239,6 @@ func (m *CapabilityMatrix) GetScore(agentType tmux.AgentType, taskType TaskType)
 	return 0.5 // Default for unknown combinations
 }
 
-// SetOverride sets a configuration override for a specific agent/task.
-func (m *CapabilityMatrix) SetOverride(agentType tmux.AgentType, taskType TaskType, score float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.overrides[agentType] == nil {
-		m.overrides[agentType] = make(map[TaskType]float64)
-	}
-	m.overrides[agentType][taskType] = clampScore(score)
-}
-
-// SetLearned sets a learned score adjustment based on agent performance.
-func (m *CapabilityMatrix) SetLearned(agentType tmux.AgentType, taskType TaskType, score float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.learned[agentType] == nil {
-		m.learned[agentType] = make(map[TaskType]float64)
-	}
-	m.learned[agentType][taskType] = clampScore(score)
-}
-
-// ClearLearned removes all learned scores.
-func (m *CapabilityMatrix) ClearLearned() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.learned = make(map[tmux.AgentType]map[TaskType]float64)
-}
-
-// ClearOverrides removes all configuration overrides.
-func (m *CapabilityMatrix) ClearOverrides() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.overrides = make(map[tmux.AgentType]map[TaskType]float64)
-}
-
 // clampScore ensures score is within [0.0, 1.0].
 func clampScore(s float64) float64 {
 	if s < 0.0 {
@@ -271,12 +253,6 @@ func clampScore(s float64) float64 {
 // Global matrix instance for convenience functions.
 var globalMatrix = NewCapabilityMatrix()
 
-// GetAgentScore returns the score for a given agent type and task type
-// using the global capability matrix.
-func GetAgentScore(agentType tmux.AgentType, taskType TaskType) float64 {
-	return globalMatrix.GetScore(agentType, taskType)
-}
-
 // GetAgentScoreByString returns the score using string identifiers,
 // useful for integration with existing code that uses strings.
 func GetAgentScoreByString(agentType string, taskType string) float64 {
@@ -284,7 +260,7 @@ func GetAgentScoreByString(agentType string, taskType string) float64 {
 }
 
 // ParseAgentType converts a string to AgentType.
-// Supports both short codes (cc, cod, gmi, pi, kimi, muse) and full names (claude, codex, gemini, pi, kimi, muse).
+// Supports both short codes (cc, cod, gmi, pi, kimi, muse, omp) and full names (claude, codex, gemini, pi, kimi, muse, omp).
 func ParseAgentType(s string) tmux.AgentType {
 	trimmed := strings.TrimSpace(s)
 	switch agent.AgentType(trimmed).Canonical() {
@@ -302,6 +278,8 @@ func ParseAgentType(s string) tmux.AgentType {
 		return tmux.AgentKimi
 	case agent.AgentTypeMuse:
 		return tmux.AgentMuse
+	case agent.AgentTypeOmp:
+		return tmux.AgentOmp
 	case agent.AgentTypeCursor:
 		return tmux.AgentCursor
 	case agent.AgentTypeWindsurf:

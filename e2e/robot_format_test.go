@@ -428,7 +428,10 @@ func TestE2ERobotCapabilitiesBuiltBinaryBudgets(t *testing.T) {
 		}
 	}
 
-	full := run(t, 400_000, "--robot-capabilities", "--robot-format=json")
+	// The full catalog was ~431 KB when surfaces[] repeated every command
+	// entry; with surfaces[] carrying only surface-level metadata it is
+	// ~236 KB, so this budget now catches that duplication coming back.
+	full := run(t, 300_000, "--robot-capabilities", "--robot-format=json")
 	compact := run(t, 50_000, "--robot-capabilities", "--capability-compact")
 	exact := run(t, 4_000, "--robot-capabilities", "--capability-command=send", "--capability-compact")
 	search := run(t, 50_000, "--robot-capabilities", "--capability-search=interrupt", "--capability-compact")
@@ -1100,13 +1103,20 @@ func TestE2EAtomicRestartBeadPolicyAndDurabilityBuiltProcess(t *testing.T) {
 	}
 	agentLog := filepath.Join(fixture.root, "restart-agent.log")
 	agentPath := filepath.Join(fakeBin, "restart-codex")
+	// The fake codex must be a non-shell foreground process: the respawned
+	// pane's prompt dispatch crosses the PANE_AGENT_DEAD liveness gate
+	// (ntm-0g0b), and a `#!/bin/sh` fake reports pane_current_command "bash"
+	// on macOS. The wrapper execs the fakeshell fixture (bd-h4t0j), which
+	// renders the codex composer glyph "›" for the bd-dp9oy visibility gate
+	// and appends every submitted line to the agent log like the historical
+	// script did.
+	fakeshellBin, fakeshellErr := ensureFakeshellBin()
+	if fakeshellErr != nil {
+		t.Fatalf("build fakeshell fixture: %v", fakeshellErr)
+	}
 	agentScript := fmt.Sprintf(`#!/bin/sh
-printf 'Codex> \n100%%%% context left\n'
-while IFS= read -r line; do
-  if [ -n "$line" ]; then printf '%%s\n' "$line" >> %s; fi
-  printf 'Codex> \n100%%%% context left\n'
-done
-`, tmux.ShellQuote(agentLog))
+exec %s --mode=echo --tty-noecho --log=%s --prompt='Codex> › ' --banner='100%% context left'
+`, tmux.ShellQuote(fakeshellBin), tmux.ShellQuote(agentLog))
 	if err := os.WriteFile(agentPath, []byte(agentScript), 0o700); err != nil {
 		t.Fatalf("write restart agent: %v", err)
 	}
@@ -1781,14 +1791,13 @@ exec "$NTM_E2E_REAL_TMUX" "$@"
 	lateRelaunchDone := filepath.Join(fixture.root, "late-relaunch-send-return")
 	lateRelaunchAgentLog := filepath.Join(fixture.root, "late-relaunch-agent.log")
 	lateRelaunchAgentPath := filepath.Join(fakeBin, "late-relaunch-codex")
+	// Same PANE_AGENT_DEAD constraint as restart-codex above: the relaunched
+	// agent must be a non-shell foreground process (fakeshell) or the
+	// follow-up prompt readiness gate refuses to type into the pane.
 	lateRelaunchAgentScript := fmt.Sprintf(`#!/bin/sh
 : > %s
-printf 'Codex> \n100%%%% context left\n'
-while IFS= read -r line; do
-  if [ -n "$line" ]; then printf '%%s\n' "$line" >> %s; fi
-  printf 'Codex> \n100%%%% context left\n'
-done
-`, tmux.ShellQuote(lateRelaunchStarted), tmux.ShellQuote(lateRelaunchAgentLog))
+exec %s --mode=echo --tty-noecho --log=%s --prompt='Codex> › ' --banner='100%% context left'
+`, tmux.ShellQuote(lateRelaunchStarted), tmux.ShellQuote(fakeshellBin), tmux.ShellQuote(lateRelaunchAgentLog))
 	if err := os.WriteFile(lateRelaunchAgentPath, []byte(lateRelaunchAgentScript), 0o700); err != nil {
 		t.Fatalf("write late relaunch agent: %v", err)
 	}

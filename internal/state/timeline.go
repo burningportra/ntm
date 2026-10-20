@@ -5,10 +5,13 @@ package state
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/audit"
+	"github.com/Dicklesworthstone/ntm/internal/status"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // TimelineState represents the operational state of an agent in the timeline.
@@ -279,54 +282,6 @@ func (t *TimelineTracker) RecordEvent(event AgentEvent) AgentEvent {
 	return event
 }
 
-// GetEvents returns events matching the given criteria.
-// If since is zero, all events within retention period are returned.
-// Results are sorted chronologically (oldest first).
-func (t *TimelineTracker) GetEvents(since time.Time) []AgentEvent {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	// Use retention cutoff if since is zero
-	cutoff := since
-	if cutoff.IsZero() {
-		cutoff = time.Now().Add(-t.config.RetentionDuration)
-	}
-
-	result := make([]AgentEvent, 0, len(t.allEvents))
-	for _, event := range t.allEvents {
-		if event.Timestamp.After(cutoff) || event.Timestamp.Equal(cutoff) {
-			result = append(result, event)
-		}
-	}
-
-	return result
-}
-
-// GetEventsForAgent returns events for a specific agent since the given time.
-func (t *TimelineTracker) GetEventsForAgent(agentID string, since time.Time) []AgentEvent {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	timeline, exists := t.timelines[agentID]
-	if !exists {
-		return nil
-	}
-
-	cutoff := since
-	if cutoff.IsZero() {
-		cutoff = time.Now().Add(-t.config.RetentionDuration)
-	}
-
-	result := make([]AgentEvent, 0, len(timeline.events))
-	for _, event := range timeline.events {
-		if event.Timestamp.After(cutoff) || event.Timestamp.Equal(cutoff) {
-			result = append(result, event)
-		}
-	}
-
-	return result
-}
-
 // GetAllEventsForSession returns every retained event for a session, ignoring
 // the retention window.
 //
@@ -380,30 +335,6 @@ func (t *TimelineTracker) GetCurrentState(agentID string) TimelineState {
 		return ""
 	}
 	return timeline.currentState
-}
-
-// GetAgentStates returns the current state of all tracked agents.
-func (t *TimelineTracker) GetAgentStates() map[string]TimelineState {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	states := make(map[string]TimelineState, len(t.timelines))
-	for agentID, timeline := range t.timelines {
-		states[agentID] = timeline.currentState
-	}
-	return states
-}
-
-// GetLastSeen returns when the agent was last seen (last event timestamp).
-func (t *TimelineTracker) GetLastSeen(agentID string) time.Time {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	timeline, exists := t.timelines[agentID]
-	if !exists {
-		return time.Time{}
-	}
-	return timeline.lastSeen
 }
 
 // OnStateChange registers a callback to be called when an agent's state changes.
@@ -516,112 +447,6 @@ func (t *TimelineTracker) backgroundPrune() {
 	}
 }
 
-// Stop stops the background pruning goroutine and cleans up resources.
-func (t *TimelineTracker) Stop() {
-	t.stopOnce.Do(func() {
-		close(t.stopPrune)
-	})
-	t.pruneWg.Wait()
-}
-
-// Clear removes all tracked events and resets the tracker.
-func (t *TimelineTracker) Clear() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.timelines = make(map[string]*agentTimeline)
-	t.allEvents = make([]AgentEvent, 0, 1000)
-}
-
-// RemoveAgent removes all events for a specific agent.
-func (t *TimelineTracker) RemoveAgent(agentID string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.timelines, agentID)
-
-	// Remove from global list
-	newAllEvents := make([]AgentEvent, 0, len(t.allEvents))
-	for _, event := range t.allEvents {
-		if event.AgentID != agentID {
-			newAllEvents = append(newAllEvents, event)
-		}
-	}
-	t.allEvents = newAllEvents
-}
-
-// ComputeStateDurations calculates how long each agent spent in each state
-// within the given time range.
-func (t *TimelineTracker) ComputeStateDurations(agentID string, since, until time.Time) map[TimelineState]time.Duration {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	timeline, exists := t.timelines[agentID]
-	if !exists {
-		return nil
-	}
-
-	durations := make(map[TimelineState]time.Duration)
-
-	if until.IsZero() {
-		until = time.Now()
-	}
-
-	events := timeline.events
-	if len(events) == 0 {
-		return durations
-	}
-
-	for i, event := range events {
-		// Determine the start time for this state segment within our window
-		segmentStart := event.Timestamp
-		if segmentStart.Before(since) {
-			segmentStart = since
-		}
-
-		// Determine the end time for this state
-		var segmentEnd time.Time
-		if i+1 < len(events) {
-			segmentEnd = events[i+1].Timestamp
-		} else {
-			segmentEnd = until
-		}
-
-		// Clamp end time to our window
-		if segmentEnd.After(until) {
-			segmentEnd = until
-		}
-
-		// Only add if the segment is within our window
-		if segmentEnd.After(since) && segmentEnd.After(segmentStart) {
-			durations[event.State] += segmentEnd.Sub(segmentStart)
-		}
-	}
-
-	return durations
-}
-
-// GetStateTransitions returns the count of transitions between states.
-func (t *TimelineTracker) GetStateTransitions(agentID string) map[string]int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	timeline, exists := t.timelines[agentID]
-	if !exists {
-		return nil
-	}
-
-	transitions := make(map[string]int)
-	for _, event := range timeline.events {
-		if event.PreviousState != "" {
-			key := string(event.PreviousState) + "->" + string(event.State)
-			transitions[key]++
-		}
-	}
-
-	return transitions
-}
-
 // AddMarker adds a discrete event marker to the timeline.
 // Returns the marker with its assigned ID.
 func (t *TimelineTracker) AddMarker(marker TimelineMarker) TimelineMarker {
@@ -662,52 +487,6 @@ func (t *TimelineTracker) AddMarker(marker TimelineMarker) TimelineMarker {
 	return marker
 }
 
-// GetMarkers returns all markers within the given time range.
-// If since is zero, uses retention cutoff. If until is zero, uses now.
-func (t *TimelineTracker) GetMarkers(since, until time.Time) []TimelineMarker {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if since.IsZero() {
-		since = time.Now().Add(-t.config.RetentionDuration)
-	}
-	if until.IsZero() {
-		until = time.Now()
-	}
-
-	result := make([]TimelineMarker, 0, len(t.markers))
-	for _, m := range t.markers {
-		if (m.Timestamp.After(since) || m.Timestamp.Equal(since)) &&
-			(m.Timestamp.Before(until) || m.Timestamp.Equal(until)) {
-			result = append(result, m)
-		}
-	}
-	return result
-}
-
-// GetMarkersForAgent returns markers for a specific agent within the time range.
-func (t *TimelineTracker) GetMarkersForAgent(agentID string, since, until time.Time) []TimelineMarker {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if since.IsZero() {
-		since = time.Now().Add(-t.config.RetentionDuration)
-	}
-	if until.IsZero() {
-		until = time.Now()
-	}
-
-	result := make([]TimelineMarker, 0)
-	for _, m := range t.markers {
-		if m.AgentID == agentID &&
-			(m.Timestamp.After(since) || m.Timestamp.Equal(since)) &&
-			(m.Timestamp.Before(until) || m.Timestamp.Equal(until)) {
-			result = append(result, m)
-		}
-	}
-	return result
-}
-
 // GetMarkersForSession returns markers for all agents in a session within the time range.
 func (t *TimelineTracker) GetMarkersForSession(sessionID string, since, until time.Time) []TimelineMarker {
 	t.mu.RLock()
@@ -729,13 +508,6 @@ func (t *TimelineTracker) GetMarkersForSession(sessionID string, since, until ti
 		}
 	}
 	return result
-}
-
-// OnMarkerAdd registers a callback to be called when a marker is added.
-func (t *TimelineTracker) OnMarkerAdd(callback func(marker TimelineMarker)) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.onMarkerAdd = append(t.onMarkerAdd, callback)
 }
 
 // PruneMarkers removes markers older than the retention duration.
@@ -769,27 +541,97 @@ func (t *TimelineTracker) PruneMarkers() int {
 	return pruned
 }
 
-// ClearMarkers removes all markers.
-func (t *TimelineTracker) ClearMarkers() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.markers = make([]TimelineMarker, 0)
+// RecordAgentStatus records an observed pane status as a timeline event when
+// the agent's state changed, with the start, completion and error markers
+// that transition implies. It is the one mapping from pane status to the
+// timeline, shared by the dashboard and the session's internal monitor (the
+// long-lived process that persists the timeline). It reports whether an
+// event was recorded.
+func (t *TimelineTracker) RecordAgentStatus(session string, pane tmux.Pane, st status.AgentStatus) bool {
+	if t == nil || session == "" {
+		return false
+	}
+	agentType := timelineAgentType(pane, st.AgentType)
+	if agentType == tmux.AgentUnknown || agentType == tmux.AgentUser {
+		return false
+	}
+	agentID := timelineAgentID(pane, st.AgentType, st.PaneID)
+	if agentID == "" {
+		return false
+	}
+
+	nextState := timelineStateFromStatus(st)
+	currentState := t.GetCurrentState(agentID)
+	if currentState == nextState {
+		return false
+	}
+	recorded := t.RecordEvent(AgentEvent{
+		AgentID:   agentID,
+		AgentType: AgentType(agentType),
+		SessionID: session,
+		State:     nextState,
+		Timestamp: st.UpdatedAt,
+	})
+
+	if currentState == "" {
+		t.AddMarker(TimelineMarker{AgentID: agentID, SessionID: session, Type: MarkerStart, Timestamp: recorded.Timestamp})
+	}
+	if currentState == TimelineWorking && nextState == TimelineIdle {
+		t.AddMarker(TimelineMarker{AgentID: agentID, SessionID: session, Type: MarkerCompletion, Timestamp: recorded.Timestamp})
+	}
+	if nextState == TimelineError {
+		errMsg := ""
+		if st.ErrorType != "" {
+			errMsg = st.ErrorType.String()
+		}
+		t.AddMarker(TimelineMarker{AgentID: agentID, SessionID: session, Type: MarkerError, Timestamp: recorded.Timestamp, Message: errMsg})
+	}
+	return true
 }
 
-// StateFromAgentStatus converts an AgentStatus to TimelineState.
-func StateFromAgentStatus(status AgentStatus) TimelineState {
-	switch status {
-	case AgentIdle:
-		return TimelineIdle
-	case AgentWorking:
+func timelineStateFromStatus(st status.AgentStatus) TimelineState {
+	switch st.State {
+	case status.StateWorking:
 		return TimelineWorking
-	case AgentError:
+	case status.StateError:
 		return TimelineError
-	case AgentCrashed:
-		return TimelineStopped
 	default:
 		return TimelineIdle
 	}
+}
+
+func timelineAgentID(pane tmux.Pane, fallbackType, fallbackID string) string {
+	if pane.NTMIndex > 0 && pane.Type != tmux.AgentUnknown && pane.Type != tmux.AgentUser {
+		return fmt.Sprintf("%s_%d", pane.Type, pane.NTMIndex)
+	}
+	if pane.Title != "" {
+		if suffix := tmux.PaneTitleSuffix(pane.Title); suffix != "" {
+			return suffix
+		}
+		return pane.Title
+	}
+	if fallbackType == "" {
+		return fallbackID
+	}
+	suffix := strings.TrimPrefix(fallbackID, "%")
+	if suffix == "" {
+		suffix = "0"
+	}
+	return fmt.Sprintf("%s_%s", fallbackType, suffix)
+}
+
+func timelineAgentType(pane tmux.Pane, fallbackType string) tmux.AgentType {
+	if pane.Type != tmux.AgentUnknown && pane.Type != tmux.AgentUser && pane.Type != "" {
+		return pane.Type
+	}
+	if fallbackType == "" {
+		return tmux.AgentUnknown
+	}
+	t := tmux.AgentType(fallbackType)
+	if t.IsValid() && t != tmux.AgentUser {
+		return t
+	}
+	return tmux.AgentUnknown
 }
 
 // Global singleton TimelineTracker for session-wide event tracking.

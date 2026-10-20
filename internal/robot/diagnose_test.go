@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -231,6 +230,23 @@ func TestBuildRateLimitRecommendation(t *testing.T) {
 	}
 }
 
+// TestBuildRateLimitRecommendation_SwitchNamesProvider: caam cannot switch
+// without a provider, so the hint names the pane's provider via ntm.
+func TestBuildRateLimitRecommendation_SwitchNamesProvider(t *testing.T) {
+	for agentType, want := range map[string]string{
+		"cod":    "ntm --robot-switch-account=openai",
+		"claude": "ntm --robot-switch-account=claude",
+		"gmi":    "ntm --robot-switch-account=gemini",
+		"user":   "ntm --robot-switch-account=PROVIDER",
+	} {
+		check := &HealthCheck{AgentType: agentType, ErrorCheck: &ErrorCheckResult{RateLimited: true}}
+		rec := buildRateLimitRecommendation(0, "0", "s", check)
+		if !strings.HasPrefix(rec.FixCommand, want+" ") {
+			t.Errorf("agent %q: FixCommand = %q, want prefix %q", agentType, rec.FixCommand, want)
+		}
+	}
+}
+
 func TestBuildRateLimitRecommendation_FixCommandFormat(t *testing.T) {
 	// Test that fix command contains correct session and pane info
 	check := &HealthCheck{
@@ -303,7 +319,9 @@ func TestDiagnoseRecommendation_JSONStructure(t *testing.T) {
 	}
 }
 
-func TestValidateDiagnoseFixTargetsRejectsGrokBeforeMixedBatch(t *testing.T) {
+// GH#251 phase 2: grok supports automated relaunch, so a mixed batch with
+// mutating actions on a grok pane passes the fix-target preflight.
+func TestValidateDiagnoseFixTargetsAcceptsGrokInMixedBatch(t *testing.T) {
 	diag := DiagnoseOutput{Recommendations: []DiagnoseRecommendation{
 		{Pane: 1, Action: "restart", AutoFixable: true},
 		{Pane: 2, Action: "interrupt", AutoFixable: true},
@@ -312,9 +330,8 @@ func TestValidateDiagnoseFixTargetsRejectsGrokBeforeMixedBatch(t *testing.T) {
 		{ID: "%1", Index: 1, Type: tmux.AgentClaude},
 		{ID: "%2", Index: 2, Type: tmux.AgentGrok},
 	}
-	err := validateDiagnoseFixTargets(diag, panes)
-	if !errors.Is(err, agent.ErrAutomatedRelaunchNotImplemented) {
-		t.Fatalf("validateDiagnoseFixTargets() error = %v, want Grok relaunch sentinel", err)
+	if err := validateDiagnoseFixTargets(diag, panes); err != nil {
+		t.Fatalf("validateDiagnoseFixTargets() error = %v, want nil (grok relaunch is supported)", err)
 	}
 }
 
@@ -788,9 +805,6 @@ func TestDiagnoseOptions_Defaults(t *testing.T) {
 	if opts.Fix {
 		t.Error("Default Fix should be false")
 	}
-	if opts.Brief {
-		t.Error("Default Brief should be false")
-	}
 }
 
 func TestDiagnoseOptions_PaneFiltering(t *testing.T) {
@@ -966,16 +980,26 @@ func TestValidateDiagnoseFixTargetsDistinguishesPanesAcrossWindows(t *testing.T)
 		t.Fatalf("restarting window 0's claude pane was rejected: %v", err)
 	}
 
-	// Targeting window 1's grok pane must be refused.
+	// GH#251 phase 2: grok relaunch is supported, so window 1's grok pane is
+	// also a valid target. The window-disambiguation coverage now lives in the
+	// target-keyed lookup itself: each window's pane 1 must resolve to its own
+	// agent type instead of one overwriting the other.
 	grok := DiagnoseOutput{Recommendations: []DiagnoseRecommendation{
 		{Pane: 1, PaneTarget: "1.1", Action: "restart", AutoFixable: true},
 	}}
-	err := validateDiagnoseFixTargets(grok, panes)
-	if !errors.Is(err, agent.ErrAutomatedRelaunchNotImplemented) {
-		t.Fatalf("restarting window 1's grok pane error = %v, want the Grok relaunch sentinel", err)
+	if err := validateDiagnoseFixTargets(grok, panes); err != nil {
+		t.Fatalf("restarting window 1's grok pane error = %v, want nil (grok relaunch is supported)", err)
 	}
-	if !strings.Contains(err.Error(), "1.1") {
-		t.Fatalf("error should name the unambiguous target, got %q", err.Error())
+	multiWindow := tmux.PanesSpanMultipleWindows(panes)
+	if !multiWindow {
+		t.Fatal("panes should span multiple windows")
+	}
+	byTarget := map[string]string{}
+	for _, p := range panes {
+		byTarget[paneTargetKey(p, multiWindow)] = detectAgentTypeFromPane(p)
+	}
+	if byTarget["0.1"] != "claude" || byTarget["1.1"] != "grok" {
+		t.Fatalf("target-keyed agent types = %v, want 0.1=claude and 1.1=grok", byTarget)
 	}
 }
 

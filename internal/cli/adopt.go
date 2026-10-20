@@ -11,6 +11,7 @@ import (
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -67,6 +68,7 @@ var supportedAdoptTypes = []adoptTypeSpec{
 	{Flag: "windsurf", AgentType: agentpkg.AgentTypeWindsurf, Description: "Windsurf agents", Example: "7"},
 	{Flag: "aider", AgentType: agentpkg.AgentTypeAider, Description: "Aider agents", Example: "8"},
 	{Flag: "oc", AgentType: agentpkg.AgentTypeOpencode, Description: "Opencode agents", Example: "9"},
+	{Flag: "omp", AgentType: agentpkg.AgentTypeOmp, Description: "Oh My Pi (omp) agents", Example: "9"},
 	{Flag: "ollama", AgentType: agentpkg.AgentTypeOllama, Description: "Ollama agents", Example: "10"},
 	{Flag: "user", AgentType: agentpkg.AgentTypeUser, Description: "User panes", Example: "10"},
 }
@@ -92,8 +94,13 @@ for use with NTM by setting appropriate pane titles and registering
 agent types. After adoption, all NTM commands (send, status, list, etc.)
 will work with the session.
 
-Panes are specified by their pane index (0-based from tmux). Use commas to
-specify multiple panes per agent type. Ranges like "0-5" are supported.
+Panes are specified by their tmux pane index, exactly as tmux reports it.
+That means your base-index / pane-base-index settings are honoured: indices
+start at 0 by default, or at 1 if your tmux.conf configures
+"pane-base-index 1" (the ACFS tmux.conf does). Check the real indices with:
+  tmux list-panes -s -t <session> -F '#{window_index}.#{pane_index} #{pane_title}'
+Use commas to specify multiple panes per agent type. Ranges like "0-5" are
+supported.
 
 For window-per-agent layouts (one pane per window, all sharing pane index 0),
 address panes with "window.pane" syntax (e.g. "2.0") so each pane is uniquely
@@ -106,6 +113,9 @@ Examples:
 
   # Adopt with mixed agent types
   ntm adopt my_session --cc=0,1,2 --cod=3,4 --gmi=5 --grok=6 --kimi=7 --muse=8 --cursor=9
+
+  # Adopt panes already running omp (Oh My Pi)
+  ntm adopt my_session --omp=1,2,3,4
 
   # Window-per-agent layout: address each window's pane explicitly
   ntm adopt my_session --cc=1.0,2.0 --cod=3.0
@@ -237,12 +247,13 @@ type AdoptedAgentCounts struct {
 	Windsurf int `json:"windsurf"`
 	Aider    int `json:"aider"`
 	Opencode int `json:"oc"`
+	Omp      int `json:"omp"`
 	Ollama   int `json:"ollama"`
 	User     int `json:"user"`
 }
 
 func (a AdoptedAgentCounts) Total() int {
-	return a.CC + a.Cod + a.Gmi + a.Pi + a.Kimi + a.Muse + a.Agy + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Ollama + a.User
+	return a.CC + a.Cod + a.Gmi + a.Pi + a.Kimi + a.Muse + a.Agy + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Omp + a.Ollama + a.User
 }
 
 func (a AdoptedAgentCounts) Summary() string {
@@ -285,6 +296,8 @@ func (a *AdoptedAgentCounts) increment(agentType agentpkg.AgentType) {
 		a.Aider++
 	case agentpkg.AgentTypeOpencode:
 		a.Opencode++
+	case agentpkg.AgentTypeOmp:
+		a.Omp++
 	case agentpkg.AgentTypeOllama:
 		a.Ollama++
 	case agentpkg.AgentTypeUser:
@@ -318,6 +331,8 @@ func (a AdoptedAgentCounts) countFor(agentType agentpkg.AgentType) int {
 		return a.Aider
 	case agentpkg.AgentTypeOpencode:
 		return a.Opencode
+	case agentpkg.AgentTypeOmp:
+		return a.Omp
 	case agentpkg.AgentTypeOllama:
 		return a.Ollama
 	case agentpkg.AgentTypeUser:
@@ -485,6 +500,20 @@ func runAdopt(opts AdoptOptions) error {
 					return fmt.Errorf("failed to set title for pane %s: %v", req, err)
 				}
 			}
+			// Record the type on the pane itself, independent of the title.
+			// Some agents (OpenCode) re-assert their own pane title
+			// continuously, so a title-only registration is undone within
+			// seconds and every type-filtered surface (activity, context,
+			// send --oc) stops seeing the pane (ntm#266). The pane option is
+			// consulted first by the pane parser and cannot be overwritten by
+			// the program in the pane. Best-effort: pane options need tmux
+			// 3.0+, and the title-based path still works where they are
+			// unavailable.
+			if !opts.DryRun {
+				if err := tmux.SetPaneAgentType(pane.ID, canonicalType); err != nil && !jsonOutput {
+					output.PrintWarningf("Could not record agent type on pane %s (%v); type detection will rely on the pane title", req, err)
+				}
+			}
 
 			adoptedPanes = append(adoptedPanes, info)
 			ntmIndex[canonicalType]++
@@ -518,6 +547,12 @@ func runAdopt(opts AdoptOptions) error {
 				output.PrintWarningf("Agent Mail registration skipped for adopted panes: %v", dirErr)
 			}
 		} else {
+			// Adopted sessions were created outside ntm, so unlike add they have
+			// never had a session-level coordinator identity: register it first,
+			// mirroring spawn, so LoadBestSessionAgent-based flows (mail, git,
+			// handoff) resolve for adopted sessions too (bd-vb7s3). Both helpers
+			// are gated and best-effort.
+			registerSessionAgent(context.Background(), opts.Session, projectDir)
 			registerSpawnedAgents(context.Background(), projectDir, opts.Session, adoptedAgentMailRegistrations(adoptedPanes, opts.AutoName))
 		}
 	}
@@ -529,8 +564,8 @@ func runAdopt(opts AdoptOptions) error {
 // registration input used by spawn and add. Adopt does not launch an agent, so
 // its model is intentionally unknown; the canonical pane ID and effective
 // title are sufficient to create and persist a resolvable Agent Mail identity.
-func adoptedAgentMailRegistrations(adopted []AdoptedPaneInfo, autoName bool) []spawnedAgentInfo {
-	registrations := make([]spawnedAgentInfo, 0, len(adopted))
+func adoptedAgentMailRegistrations(adopted []AdoptedPaneInfo, autoName bool) []spawnidentity.Agent {
+	registrations := make([]spawnidentity.Agent, 0, len(adopted))
 	for _, pane := range adopted {
 		if pane.AgentType == agentpkg.AgentTypeUser.String() {
 			continue
@@ -539,11 +574,11 @@ func adoptedAgentMailRegistrations(adopted []AdoptedPaneInfo, autoName bool) []s
 		if autoName {
 			title = pane.NewTitle
 		}
-		registrations = append(registrations, spawnedAgentInfo{
-			paneIndex: pane.PaneIndex,
-			paneID:    pane.PaneID,
-			paneTitle: title,
-			agentType: pane.AgentType,
+		registrations = append(registrations, spawnidentity.Agent{
+			PaneIndex: pane.PaneIndex,
+			PaneID:    pane.PaneID,
+			PaneTitle: title,
+			AgentType: pane.AgentType,
 		})
 	}
 	return registrations
@@ -622,43 +657,6 @@ func adoptFlagList() string {
 		return parts[0]
 	}
 	return strings.Join(parts[:len(parts)-1], ", ") + ", or " + parts[len(parts)-1]
-}
-
-// parsePaneList parses a comma-separated list of pane indices
-func parsePaneList(s string) []int {
-	if s == "" {
-		return nil
-	}
-
-	var result []int
-	parts := strings.Split(s, ",")
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-
-		// Support ranges like "0-5"
-		if strings.Contains(p, "-") {
-			rangeParts := strings.Split(p, "-")
-			if len(rangeParts) == 2 {
-				start, err1 := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				end, err2 := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-				if err1 == nil && err2 == nil && start <= end {
-					for i := start; i <= end; i++ {
-						result = append(result, i)
-					}
-					continue
-				}
-			}
-		}
-
-		if idx, err := strconv.Atoi(p); err == nil {
-			result = append(result, idx)
-		}
-	}
-
-	return result
 }
 
 // parsePaneSpecs parses a comma-separated pane specification into paneSpecs.

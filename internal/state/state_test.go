@@ -2,6 +2,7 @@ package state
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1268,6 +1269,84 @@ func TestGetMigrationFiles(t *testing.T) {
 	if !strings.HasPrefix(files[0], "001_") {
 		t.Errorf("First migration should be 001_*, got %q", files[0])
 	}
+	// _migrations is keyed by version alone, so two files sharing a number
+	// (as two branches each adding their own 017 would) leave the second one
+	// unapplied on databases that recorded the first, and fail the INSERT on
+	// fresh ones.
+	seen := make(map[int]string, len(files))
+	for _, filename := range files {
+		var version int
+		if n, _ := fmt.Sscanf(filename, "%03d_", &version); n != 1 {
+			t.Fatalf("migration %q has no NNN_ version prefix", filename)
+		}
+		if prior, dup := seen[version]; dup {
+			t.Errorf("migrations %q and %q share version %d", prior, filename, version)
+		}
+		seen[version] = filename
+	}
+}
+
+// A database upstream's binary left at version 27 still has runtime_work keyed
+// by bead_id and runtime_coordination keyed by agent_name. 028 and 029 must
+// rekey both by project without touching the project-keyed
+// runtime_work_snapshots table 024 added.
+func TestRuntimeProjectionProjectMigrationsUpgradeVersion27(t *testing.T) {
+	store := sendOperationStoreAtMigration(t, 27)
+	db := store.db
+
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO runtime_work (bead_id, title, status, stale_after) VALUES ('bd-old', 'old', 'open', ?)`, now.Add(time.Hour)); err != nil {
+		t.Fatalf("seed bead-keyed runtime_work: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO runtime_coordination (agent_name, stale_after) VALUES ('BlueLake', ?)`, now.Add(time.Hour)); err != nil {
+		t.Fatalf("seed agent-keyed runtime_coordination: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO runtime_work_snapshots (project_dir, revision, collected_at_ns, stale_after_ns, payload) VALUES ('/proj/a', ?, 1, 2, x'01')`, strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("seed runtime_work_snapshots: %v", err)
+	}
+
+	if err := ApplyMigrations(db); err != nil {
+		t.Fatalf("ApplyMigrations from 27: %v", err)
+	}
+
+	for version, name := range map[int]string{28: "028_runtime_work_project.sql", 29: "029_runtime_coordination_project.sql"} {
+		var got string
+		if err := db.QueryRow(`SELECT name FROM _migrations WHERE version = ?`, version).Scan(&got); err != nil || got != name {
+			t.Fatalf("_migrations version %d = (%q, %v), want %q", version, got, err, name)
+		}
+	}
+	var snapshots int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM runtime_work_snapshots`).Scan(&snapshots); err != nil || snapshots != 1 {
+		t.Fatalf("runtime_work_snapshots rows after upgrade = (%d, %v), want 1", snapshots, err)
+	}
+
+	// Rows that name no project are dropped; the next refresh refills them.
+	if rows, err := store.ListRuntimeWork(""); err != nil || len(rows) != 0 {
+		t.Fatalf("ListRuntimeWork(\"\") after upgrade = (%+v, %v), want no rows", rows, err)
+	}
+
+	for _, project := range []string{"/proj/a", "/proj/b"} {
+		if err := store.UpsertRuntimeWork(&RuntimeWork{
+			ProjectDir: project, BeadID: "bd-1", Title: project, Status: "open",
+			CollectedAt: now, StaleAfter: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("UpsertRuntimeWork(%s): %v", project, err)
+		}
+		if err := store.UpsertRuntimeCoordination(&RuntimeCoordination{
+			ProjectDir: project, AgentName: "BlueLake",
+			CollectedAt: now, StaleAfter: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("UpsertRuntimeCoordination(%s): %v", project, err)
+		}
+	}
+	work, err := store.ListRuntimeWork("/proj/a")
+	if err != nil || len(work) != 1 || work[0].Title != "/proj/a" {
+		t.Fatalf("ListRuntimeWork(/proj/a) = (%+v, %v), want only /proj/a's bd-1", work, err)
+	}
+	coord, err := store.ListFreshRuntimeCoordination("/proj/b")
+	if err != nil || len(coord) != 1 || coord[0].ProjectDir != "/proj/b" {
+		t.Fatalf("ListFreshRuntimeCoordination(/proj/b) = (%+v, %v), want only /proj/b's BlueLake", coord, err)
+	}
 }
 
 func TestReadMigration(t *testing.T) {
@@ -1809,7 +1888,7 @@ func TestRunGCPrunesStaleRuntimeData(t *testing.T) {
 		t.Fatalf("AppendAttentionEvent(live): %v", err)
 	}
 
-	result, err := store.RunGC(DefaultRuntimeGCConfig())
+	result, err := store.RunGC(RuntimeGCConfig{ProjectionGracePeriod: DefaultRuntimeProjectionGCGrace, SourceHealthRetention: DefaultSourceHealthRetention, ResolvedIncidentRetention: DefaultResolvedIncidentRetention})
 	if err != nil {
 		t.Fatalf("RunGC() error: %v", err)
 	}

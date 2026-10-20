@@ -160,11 +160,34 @@ func TestNewAuditExportCmd_Flags(t *testing.T) {
 
 // --- Integration tests that override newAuditSearcherFunc (NOT parallel) ---
 
+// newTestSearcher builds an audit.Searcher rooted at dir. The dedicated
+// NewSearcherWithPath constructor was removed as dead code, so redirect the
+// default constructor's home-derived path ($HOME/.local/share/ntm/audit)
+// at dir via HOME plus a symlink.
+func newTestSearcher(t *testing.T, dir string) *audit.Searcher {
+	t.Helper()
+	home := t.TempDir()
+	parent := filepath.Join(home, ".local", "share", "ntm")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatalf("mkdir audit parent: %v", err)
+	}
+	if err := os.Symlink(dir, filepath.Join(parent, "audit")); err != nil {
+		t.Fatalf("symlink audit dir: %v", err)
+	}
+	t.Setenv("HOME", home)
+	s, err := audit.NewSearcher()
+	if err != nil {
+		t.Fatalf("NewSearcher: %v", err)
+	}
+	return s
+}
+
 func withTestSearcher(t *testing.T, dir string) {
 	t.Helper()
+	searcher := newTestSearcher(t, dir)
 	origFunc := newAuditSearcherFunc
 	newAuditSearcherFunc = func() (*audit.Searcher, error) {
-		return audit.NewSearcherWithPath(dir), nil
+		return searcher, nil
 	}
 	t.Cleanup(func() { newAuditSearcherFunc = origFunc })
 }
@@ -389,7 +412,7 @@ func TestRunAuditShow_WithEntries(t *testing.T) {
 	writeTestAuditLog(t, tmpDir, "show_test", 5)
 	withTestSearcher(t, tmpDir)
 
-	err := runAuditShow("show_test", "", "", "", 10)
+	err := runAuditShow("show_test", "", "", "", 10, 0)
 	if err != nil {
 		t.Errorf("show should not error: %v", err)
 	}
@@ -400,7 +423,7 @@ func TestRunAuditShow_WithTimeFilter(t *testing.T) {
 	writeTestAuditLog(t, tmpDir, "time_test", 5)
 	withTestSearcher(t, tmpDir)
 
-	err := runAuditShow("time_test", "1h", "", "", 10)
+	err := runAuditShow("time_test", "1h", "", "", 10, 0)
 	if err != nil {
 		t.Errorf("show with --since should not error: %v", err)
 	}
@@ -411,7 +434,7 @@ func TestRunAuditShow_WithTypeFilter(t *testing.T) {
 	writeTestAuditLog(t, tmpDir, "filter_test", 5)
 	withTestSearcher(t, tmpDir)
 
-	err := runAuditShow("filter_test", "", "", "command", 10)
+	err := runAuditShow("filter_test", "", "", "command", 10, 0)
 	if err != nil {
 		t.Errorf("show with type filter should not error: %v", err)
 	}
@@ -422,7 +445,7 @@ func TestRunAuditSearch_Pattern(t *testing.T) {
 	writeTestAuditLog(t, tmpDir, "search_test", 5)
 	withTestSearcher(t, tmpDir)
 
-	err := runAuditSearch("target", "", "", "", "", 30, 50)
+	err := runAuditSearch("target", "", "", "", "", 30, 50, 0)
 	if err != nil {
 		t.Errorf("search should not error: %v", err)
 	}
@@ -433,7 +456,7 @@ func TestRunAuditSearch_NoResults(t *testing.T) {
 	writeTestAuditLog(t, tmpDir, "noresult_test", 3)
 	withTestSearcher(t, tmpDir)
 
-	err := runAuditSearch("xyznonexistent999", "", "", "", "", 30, 50)
+	err := runAuditSearch("xyznonexistent999", "", "", "", "", 30, 50, 0)
 	if err != nil {
 		t.Errorf("search with no results should not error: %v", err)
 	}
@@ -444,7 +467,7 @@ func TestRunAuditSearch_WithFilters(t *testing.T) {
 	writeTestAuditLog(t, tmpDir, "filtered_search", 5)
 	withTestSearcher(t, tmpDir)
 
-	err := runAuditSearch("target", "filtered_search", "command", "user", "target_*", 30, 50)
+	err := runAuditSearch("target", "filtered_search", "command", "user", "target_*", 30, 50, 0)
 	if err != nil {
 		t.Errorf("search with filters should not error: %v", err)
 	}

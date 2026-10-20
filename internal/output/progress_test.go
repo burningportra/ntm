@@ -46,20 +46,6 @@ func TestStepsFail(t *testing.T) {
 	}
 }
 
-func TestStepsSkip(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	steps := NewStepsWriter(&buf)
-
-	steps.Start("Optional step").Skip()
-
-	out := buf.String()
-	if !strings.Contains(out, "[SKIP]") {
-		t.Error("expected [SKIP] marker")
-	}
-}
-
 func TestStepsWarn(t *testing.T) {
 	t.Parallel()
 
@@ -71,24 +57,6 @@ func TestStepsWarn(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "[WARN]") {
 		t.Error("expected [WARN] marker")
-	}
-}
-
-func TestStepsWithTotal(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	steps := NewStepsWriter(&buf).SetTotal(3)
-
-	steps.Start("Step one").Done()
-	steps.Start("Step two").Done()
-
-	out := buf.String()
-	if !strings.Contains(out, "[1/3]") {
-		t.Error("expected [1/3] in output")
-	}
-	if !strings.Contains(out, "[2/3]") {
-		t.Error("expected [2/3] in output")
 	}
 }
 
@@ -108,41 +76,6 @@ func TestStepsAutoComplete(t *testing.T) {
 	count := strings.Count(out, "[OK]")
 	if count != 2 {
 		t.Errorf("expected 2 [OK] markers (auto-complete + explicit), got %d", count)
-	}
-}
-
-func TestStepsStatus(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	steps := NewStepsWriter(&buf)
-
-	if steps.Status() != StepPending {
-		t.Error("expected pending status before any step")
-	}
-
-	steps.Start("Test")
-	if steps.Status() != StepRunning {
-		t.Error("expected running status after Start")
-	}
-
-	steps.Done()
-	if steps.Status() != StepSuccess {
-		t.Error("expected success status after Done")
-	}
-}
-
-func TestStepsIndent(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	steps := NewStepsWriter(&buf).SetIndent("    ")
-
-	steps.Start("Indented").Done()
-
-	out := buf.String()
-	if !strings.HasPrefix(out, "    ") {
-		t.Error("expected custom indent")
 	}
 }
 
@@ -177,20 +110,6 @@ func TestProgressMsgWarning(t *testing.T) {
 	}
 }
 
-func TestProgressMsgError(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf)
-
-	p.Error("Something failed")
-
-	out := buf.String()
-	if !strings.Contains(out, "✗") {
-		t.Error("expected ✗ in error message")
-	}
-}
-
 func TestProgressMsgInfo(t *testing.T) {
 	t.Parallel()
 
@@ -205,23 +124,6 @@ func TestProgressMsgInfo(t *testing.T) {
 	}
 }
 
-func TestProgressMsgPrint(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf)
-
-	p.Print("Plain message")
-
-	out := buf.String()
-	if !strings.Contains(out, "Plain message") {
-		t.Error("expected plain message")
-	}
-	if strings.Contains(out, "✓") || strings.Contains(out, "⚠") {
-		t.Error("plain message should not have icons")
-	}
-}
-
 func TestProgressMsgFormatted(t *testing.T) {
 	t.Parallel()
 
@@ -233,88 +135,6 @@ func TestProgressMsgFormatted(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "Created 5 files") {
 		t.Error("expected formatted message")
-	}
-}
-
-func TestProgressMsgIndent(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	p := ProgressWriter(&buf).SetIndent(">>> ")
-
-	p.Success("Indented")
-
-	out := buf.String()
-	if !strings.HasPrefix(out, ">>>") {
-		t.Error("expected custom indent prefix")
-	}
-}
-
-func TestOperationBasic(t *testing.T) {
-	t.Parallel()
-
-	op := NewOperation("Build")
-
-	if op.HasErrors() {
-		t.Error("new operation should not have errors")
-	}
-	if op.HasWarnings() {
-		t.Error("new operation should not have warnings")
-	}
-}
-
-func TestOperationWithErrors(t *testing.T) {
-	t.Parallel()
-
-	op := NewOperation("Deploy")
-	op.AddError("Connection timeout")
-	op.AddError("Auth failed")
-
-	if !op.HasErrors() {
-		t.Error("expected HasErrors to be true")
-	}
-	if op.HasWarnings() {
-		t.Error("expected HasWarnings to be false")
-	}
-}
-
-func TestOperationWithWarnings(t *testing.T) {
-	t.Parallel()
-
-	op := NewOperation("Setup")
-	op.AddWarning("Deprecated config")
-
-	if op.HasErrors() {
-		t.Error("expected HasErrors to be false")
-	}
-	if !op.HasWarnings() {
-		t.Error("expected HasWarnings to be true")
-	}
-}
-
-func TestFormatStepList(t *testing.T) {
-	t.Parallel()
-
-	steps := []string{"Init", "Build", "Deploy"}
-	out := FormatStepList(steps)
-
-	if !strings.Contains(out, "1. Init") {
-		t.Error("expected numbered step 1")
-	}
-	if !strings.Contains(out, "2. Build") {
-		t.Error("expected numbered step 2")
-	}
-	if !strings.Contains(out, "3. Deploy") {
-		t.Error("expected numbered step 3")
-	}
-}
-
-func TestFormatStepListEmpty(t *testing.T) {
-	t.Parallel()
-
-	out := FormatStepList(nil)
-	if out != "" {
-		t.Error("expected empty string for nil steps")
 	}
 }
 

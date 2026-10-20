@@ -39,15 +39,35 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
-var (
-	errServeTestAgentSpawnDisabled = errors.New("agent spawning disabled in serve unit tests")
-	errServeTestAgentMailDisabled  = errors.New("agent mail disabled in serve unit tests")
-)
+var errServeTestAgentSpawnDisabled = errors.New("agent spawning disabled in serve unit tests")
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
+// deadAgentMailClient returns a client whose base URL points at a closed
+// local port so every call fails immediately (agent mail disabled in serve
+// unit tests). The former transport-injection option WithHTTPClient was
+// removed as dead code.
+func deadAgentMailClient(t *testing.T) *agentmail.Client {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	ts.Close()
+	return agentmail.NewClient(agentmail.WithBaseURL(ts.URL + "/"))
+}
 
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
+// setForceReleasePolicy points HOME at a hermetic dir whose policy pins
+// automation.force_release to the given value, so force-release handler tests
+// exercise a chosen gate verdict (bd-2y2on) instead of inheriting the
+// developer's real ~/.ntm/policy.yaml.
+func setForceReleasePolicy(t *testing.T, value string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".ntm")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir hermetic .ntm: %v", err)
+	}
+	yaml := fmt.Sprintf("version: 1\nautomation:\n  force_release: %s\n", value)
+	if err := os.WriteFile(filepath.Join(dir, "policy.yaml"), []byte(yaml), 0o644); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
 }
 
 // unreachableAgentMailURL is a closed local port. TestMain points
@@ -114,15 +134,7 @@ func setupTestServer(t *testing.T) (*Server, *state.Store) {
 		EventBus:   eventBus,
 		StateStore: store,
 	})
-	srv.mailClient = agentmail.NewClient(
-		agentmail.WithBaseURL("http://agentmail.test/"),
-		agentmail.WithHTTPClient(&http.Client{
-			Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-				return nil, errServeTestAgentMailDisabled
-			}),
-			Timeout: time.Second,
-		}),
-	)
+	srv.mailClient = deadAgentMailClient(t)
 	srv.projectDir = t.TempDir()
 	srv.spawnAgents = func(context.Context, robot.SpawnOptions) (*robot.SpawnOutput, error) {
 		return nil, errServeTestAgentSpawnDisabled
@@ -227,7 +239,13 @@ func TestRobotErrorHTTPStatus(t *testing.T) {
 		{code: robot.ErrCodePaneNotFound, want: http.StatusNotFound},
 		{code: robot.ErrCodeNotFound, want: http.StatusNotFound},
 		{code: robot.ErrCodePermissionDenied, want: http.StatusForbidden},
+		{code: robot.ErrCodeDestructiveCommandBlocked, want: http.StatusForbidden},
+		{code: "SENSITIVE_DATA_BLOCKED", want: http.StatusForbidden},
 		{code: robot.ErrCodeResourceBusy, want: http.StatusConflict},
+		{code: robot.ErrCodeStaleWorkCoordination, want: http.StatusConflict},
+		{code: robot.ErrCodeIdempotencyConflict, want: http.StatusConflict},
+		{code: robot.ErrCodeOperationInProgress, want: http.StatusConflict},
+		{code: robot.ErrCodeOperationOutcomeUnknown, want: http.StatusConflict},
 		{code: robot.ErrCodeTimeout, want: http.StatusGatewayTimeout},
 		{code: robot.ErrCodeNotImplemented, want: http.StatusNotImplemented},
 		{code: robot.ErrCodeDependencyMissing, want: http.StatusServiceUnavailable},
@@ -341,17 +359,9 @@ func newMockAgentMailMCPClient(
 ) *agentmail.Client {
 	t.Helper()
 	handler := newMockAgentMailMCPHandler(t, handlers)
-	return agentmail.NewClient(
-		agentmail.WithBaseURL("http://agentmail.test/"),
-		agentmail.WithHTTPClient(&http.Client{
-			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				rec := httptest.NewRecorder()
-				handler.ServeHTTP(rec, req)
-				return rec.Result(), nil
-			}),
-			Timeout: time.Second,
-		}),
-	)
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return agentmail.NewClient(agentmail.WithBaseURL(ts.URL + "/"))
 }
 
 func TestNew(t *testing.T) {
@@ -359,15 +369,15 @@ func TestNew(t *testing.T) {
 	if srv == nil {
 		t.Fatal("New returned nil")
 	}
-	if srv.Port() != 7337 {
-		t.Errorf("Default port = %d, want 7337", srv.Port())
+	if srv.port != 7337 {
+		t.Errorf("Default port = %d, want 7337", srv.port)
 	}
 }
 
 func TestNewWithCustomPort(t *testing.T) {
 	srv := New(Config{Port: 8080})
-	if srv.Port() != 8080 {
-		t.Errorf("Port = %d, want 8080", srv.Port())
+	if srv.port != 8080 {
+		t.Errorf("Port = %d, want 8080", srv.port)
 	}
 }
 
@@ -2016,6 +2026,7 @@ func TestHandleRespondContact_NotFound(t *testing.T) {
 }
 
 func TestHandleForceReleaseReservation_ReturnsMCPResultFields(t *testing.T) {
+	setForceReleasePolicy(t, "auto")
 
 	releasedAt := "2026-03-23T01:02:03Z"
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
@@ -2071,7 +2082,54 @@ func TestHandleForceReleaseReservation_ReturnsMCPResultFields(t *testing.T) {
 	}
 }
 
+func TestHandleForceReleaseReservation_DeniedReturnsConflict(t *testing.T) {
+	setForceReleasePolicy(t, "auto")
+
+	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
+		"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+			// Neither server sends this (both refuse a live reservation with a
+			// tool error), so it pins the handler's fallback for a reply that
+			// released nothing yet names the reservation.
+			return json.RawMessage(`{"released":0,"reservation":{"agent":"BlueLake","path_pattern":"internal/serve/*","notified":false}}`), nil
+		},
+	})
+
+	srv, _ := setupTestServer(t)
+	srv.projectDir = t.TempDir()
+	srv.mailClient = mailClient
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/reservations/17/force-release", strings.NewReader(`{"agent_name":"RedStone","notify_previous":true}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "17")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	srv.handleForceReleaseReservation(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+
+	var resp APIError
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.ErrorCode != ErrCodeConflict {
+		t.Fatalf("error_code = %q, want %q", resp.ErrorCode, ErrCodeConflict)
+	}
+	if resp.Details["previous_holder"] != "BlueLake" {
+		t.Fatalf("previous_holder = %#v, want BlueLake", resp.Details["previous_holder"])
+	}
+	if resp.Details["path_pattern"] != "internal/serve/*" {
+		t.Fatalf("path_pattern = %#v, want internal/serve/*", resp.Details["path_pattern"])
+	}
+	if resp.Details["execution_status"] != "refused" {
+		t.Fatalf("execution_status = %#v, want refused", resp.Details["execution_status"])
+	}
+}
+
 func TestHandleForceReleaseReservation_AlreadyReleasedReportsIt(t *testing.T) {
+	setForceReleasePolicy(t, "auto")
 
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
 		"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
@@ -2109,6 +2167,70 @@ func TestHandleForceReleaseReservation_AlreadyReleasedReportsIt(t *testing.T) {
 	}
 	if resp["reservation_id"] != float64(17) {
 		t.Fatalf("reservation_id = %#v, want 17", resp["reservation_id"])
+	}
+}
+
+// TestHandleForceReleaseReservation_PolicyGate: bd-2y2on — the HTTP surface
+// must honor automation.force_release exactly like the CLI gate. "never"
+// refuses outright; "approval" creates a durable review request after
+// inspecting the lease, without calling force-release before approval.
+func TestHandleForceReleaseReservation_PolicyGate(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		policy     string // "" = no policy file at all (default policy applies)
+		wantSubstr string
+	}{
+		{name: "never_refuses", policy: "never", wantSubstr: "automation.force_release=never"},
+		{name: "approval_fails_closed", policy: "approval", wantSubstr: "requires approval"},
+		{name: "default_policy_fails_closed", policy: "", wantSubstr: "requires approval"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.policy == "" {
+				// Hermetic empty HOME: LoadOrDefault falls back to
+				// DefaultPolicy(), whose force_release is "approval".
+				t.Setenv("HOME", t.TempDir())
+			} else {
+				setForceReleasePolicy(t, tc.policy)
+			}
+
+			// A mail client whose transport fails the test if the handler
+			// ever consults Agent Mail past a refusing gate.
+			mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
+				"list_file_reservations": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+					return []agentmail.FileReservation{{ID: 17, AgentName: "BlueLake", PathPattern: "internal/serve/*"}}, nil
+				},
+				"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+					t.Error("gate bypassed: force_release_file_reservation was called")
+					return agentmail.ForceReleaseResult{Success: true}, nil
+				},
+			})
+
+			srv, _ := setupTestServer(t)
+			srv.projectDir = t.TempDir()
+			srv.mailClient = mailClient
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/reservations/17/force-release", strings.NewReader(`{"agent_name":"RedStone"}`))
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("id", "17")
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+			srv.handleForceReleaseReservation(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusForbidden, rec.Body.String())
+			}
+			var resp APIError
+			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if resp.ErrorCode != ErrCodeForbidden {
+				t.Fatalf("error_code = %q, want %q", resp.ErrorCode, ErrCodeForbidden)
+			}
+			if !strings.Contains(resp.Error, tc.wantSubstr) {
+				t.Fatalf("error = %q, want substring %q", resp.Error, tc.wantSubstr)
+			}
+		})
 	}
 }
 
@@ -3953,155 +4075,6 @@ func TestAttentionItemStatePinAndEscalateSetFlags(t *testing.T) {
 	}
 }
 
-func TestCORSMiddleware(t *testing.T) {
-	srv := New(Config{})
-	handler := srv.corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	// Test preflight OPTIONS request
-	req := httptest.NewRequest(http.MethodOptions, "/", nil)
-	req.Header.Set("Origin", "http://localhost:3000")
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
-		t.Error("Expected CORS allowlist header")
-	}
-	if methods := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(methods, http.MethodPatch) {
-		t.Fatalf("expected PATCH in Access-Control-Allow-Methods, got %q", methods)
-	}
-	if headers := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(headers, "Idempotency-Key") {
-		t.Fatalf("expected Idempotency-Key in Access-Control-Allow-Headers, got %q", headers)
-	}
-	if rec.Code != http.StatusOK {
-		t.Errorf("OPTIONS Status = %d, want %d", rec.Code, http.StatusOK)
-	}
-}
-
-func TestCORSMiddlewareRejectsOrigin(t *testing.T) {
-	srv := New(Config{})
-	handler := srv.corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Origin", "http://evil.example.com")
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusForbidden {
-		t.Errorf("Status = %d, want %d", rec.Code, http.StatusForbidden)
-	}
-}
-
-func TestLoggingMiddleware(t *testing.T) {
-	handler := loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("Status = %d, want %d", rec.Code, http.StatusOK)
-	}
-}
-
-func TestAuthMiddlewareAPIKey(t *testing.T) {
-	srv := New(Config{
-		Auth: AuthConfig{
-			Mode:   AuthModeAPIKey,
-			APIKey: "secret",
-		},
-	})
-	handler := srv.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("missing api key status = %d, want %d", rec.Code, http.StatusUnauthorized)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("valid api key status = %d, want %d", rec.Code, http.StatusOK)
-	}
-}
-
-func TestAuthMiddlewareOIDC(t *testing.T) {
-	issuer := "https://issuer.example.com"
-	audience := "ntm"
-	key := mustGenerateKey(t)
-	jwksURL := startJWKS(t, key, "kid1")
-	token := signJWT(t, key, "kid1", issuer, audience, time.Now().Add(1*time.Hour))
-
-	srv := New(Config{
-		Auth: AuthConfig{
-			Mode: AuthModeOIDC,
-			OIDC: OIDCConfig{
-				Issuer:   issuer,
-				Audience: audience,
-				JWKSURL:  jwksURL,
-			},
-		},
-	})
-	handler := srv.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("missing oidc token status = %d, want %d", rec.Code, http.StatusUnauthorized)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("valid oidc token status = %d, want %d", rec.Code, http.StatusOK)
-	}
-}
-
-func TestAuthMiddlewareMTLS(t *testing.T) {
-	srv := New(Config{
-		Auth: AuthConfig{
-			Mode: AuthModeMTLS,
-		},
-	})
-	handler := srv.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("missing mtls cert status = %d, want %d", rec.Code, http.StatusUnauthorized)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{}}}
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("valid mtls cert status = %d, want %d", rec.Code, http.StatusOK)
-	}
-}
-
 func TestCheckWSOriginAllowsConfiguredOrigin(t *testing.T) {
 	srv := New(Config{
 		Auth: AuthConfig{
@@ -4455,7 +4428,7 @@ func TestListJobsEndpoint(t *testing.T) {
 func TestCreateJobEndpoint(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
-	body := `{"type": "spawn", "session": "test-session"}`
+	body := `{"type": "pipeline_run", "params": {"workflow_file": "missing.yaml", "session": "endpointjob1"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -4480,13 +4453,14 @@ func TestCreateJobEndpoint(t *testing.T) {
 		t.Fatal("Expected job object in response")
 	}
 
-	if job["type"] != "spawn" {
-		t.Errorf("Job type = %v, want spawn", job["type"])
+	if job["type"] != "pipeline_run" {
+		t.Errorf("Job type = %v, want pipeline_run", job["type"])
 	}
-	// Status can be "pending" or "running" due to the goroutine race
+	// The dispatched job races the assertion: it can still be pending/running,
+	// or already failed for real (the workflow file does not exist).
 	status, _ := job["status"].(string)
-	if status != "pending" && status != "running" {
-		t.Errorf("Job status = %v, want pending or running", job["status"])
+	if status != "pending" && status != "running" && status != "failed" {
+		t.Errorf("Job status = %v, want pending, running, or failed", job["status"])
 	}
 }
 
@@ -4500,8 +4474,9 @@ func TestCreateJobInvalidType(t *testing.T) {
 
 	srv.Router().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("Status = %d, want %d", rec.Code, http.StatusBadRequest)
+	// D5b: non-allow-listed job types are honestly NOT_IMPLEMENTED.
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("Status = %d, want %d", rec.Code, http.StatusNotImplemented)
 	}
 }
 
@@ -4573,9 +4548,9 @@ func TestIdempotencyStore(t *testing.T) {
 	store := NewIdempotencyStore(time.Hour)
 
 	// Test set and get
-	store.Set("key1", []byte(`{"test": true}`), 200, nil)
+	store.SetWithFingerprint("key1", "", []byte(`{"test": true}`), 200, nil)
 
-	resp, status, _, ok := store.Get("key1")
+	resp, status, _, _, ok := store.GetWithFingerprint("key1")
 	if !ok {
 		t.Fatal("Expected to find key1")
 	}
@@ -4587,7 +4562,7 @@ func TestIdempotencyStore(t *testing.T) {
 	}
 
 	// Test non-existent key
-	_, _, _, ok = store.Get("nonexistent")
+	_, _, _, _, ok = store.GetWithFingerprint("nonexistent")
 	if ok {
 		t.Error("Expected not to find nonexistent key")
 	}
@@ -4597,7 +4572,7 @@ func TestIdempotencyMiddleware(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
 	// First request
-	body := `{"type": "spawn"}`
+	body := `{"type": "pipeline_run", "params": {"workflow_file": "missing.yaml", "session": "idemjob1"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "test-key-123")
@@ -4685,24 +4660,6 @@ func TestRecovererMiddleware(t *testing.T) {
 // WebSocket Hub Tests
 // =============================================================================
 
-func TestWSHub(t *testing.T) {
-	hub := NewWSHub()
-	go hub.Run()
-	defer hub.Stop()
-
-	// Check initial state
-	if hub.ClientCount() != 0 {
-		t.Errorf("ClientCount = %d, want 0", hub.ClientCount())
-	}
-
-	// Test nextSeq
-	seq1 := hub.nextSeq()
-	seq2 := hub.nextSeq()
-	if seq2 != seq1+1 {
-		t.Errorf("nextSeq not incrementing: got %d, want %d", seq2, seq1+1)
-	}
-}
-
 func TestWSHubRegisterClientAfterStop(t *testing.T) {
 	hub := NewWSHub()
 	hub.Stop()
@@ -4740,35 +4697,6 @@ func TestWSHubUnregisterClientAfterStopDoesNotBlock(t *testing.T) {
 	case <-done:
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("UnregisterClient() blocked after hub stop")
-	}
-}
-
-func TestWSHubStopClosesClientChannelsAndClearsClients(t *testing.T) {
-	hub := NewWSHub()
-	client := &WSClient{
-		id:     "stop-client",
-		hub:    hub,
-		send:   make(chan []byte, 1),
-		topics: make(map[string]struct{}),
-	}
-
-	hub.clientsMu.Lock()
-	hub.clients[client] = struct{}{}
-	hub.clientsMu.Unlock()
-
-	hub.Stop()
-
-	if got := hub.ClientCount(); got != 0 {
-		t.Fatalf("ClientCount() after Stop = %d, want 0", got)
-	}
-
-	select {
-	case _, ok := <-client.send:
-		if ok {
-			t.Fatal("client send channel still open after Stop")
-		}
-	default:
-		t.Fatal("client send channel was not closed by Stop")
 	}
 }
 
@@ -4969,7 +4897,7 @@ func TestExecPipelineInline_UsesServerProjectDir(t *testing.T) {
 	output := srv.execPipelineInline(context.Background(), &pipeline.Workflow{
 		SchemaVersion: pipeline.SchemaVersion,
 		Name:          "inline-project-dir",
-		Steps:         nil,
+		Steps:         []pipeline.Step{{ID: "noop", Command: "true"}},
 	}, "inline-session", nil, false)
 
 	if !output.Success {
@@ -5097,7 +5025,18 @@ func TestHandleCleanupPipelines_UsesServerProjectDir(t *testing.T) {
 }
 
 func TestApprovals_WebSocketEvents(t *testing.T) {
-	srv := New(Config{})
+	// WS approval events are sourced from durable transitions (bd-d2uxt), so
+	// the server needs a state store for its approval engine.
+	store, err := state.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	srv := New(Config{StateStore: store})
 	srv.ensureWSHubRunning()
 	defer srv.wsHub.Stop()
 
@@ -5111,11 +5050,6 @@ func TestApprovals_WebSocketEvents(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	approvalsLock.Lock()
-	approvals = make(map[string]*Approval)
-	approvalIDSeq = 0
-	approvalsLock.Unlock()
-
 	reqBody := strings.NewReader(`{"action":"git status","resource":"repo","reason":"test"}`)
 	req := httptest.NewRequest(http.MethodPost, "/approvals/request", reqBody)
 	req = req.WithContext(withRoleContext(req.Context(), &RoleContext{
@@ -5126,6 +5060,16 @@ func TestApprovals_WebSocketEvents(t *testing.T) {
 	srv.handleApprovalRequestV1(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("handleApprovalRequestV1 status=%d, want %d", rec.Code, http.StatusOK)
+	}
+	var createResp struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &createResp); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	approvalID := createResp.ID
+	if approvalID == "" {
+		t.Fatalf("no approval id in response: %s", rec.Body.String())
 	}
 
 	var ev1 struct {
@@ -5144,13 +5088,13 @@ func TestApprovals_WebSocketEvents(t *testing.T) {
 	if ev1.EventType != "approval.requested" {
 		t.Fatalf("event_type=%q, want %q", ev1.EventType, "approval.requested")
 	}
-	if got, _ := ev1.Data["approval_id"].(string); got != "apr-1" {
-		t.Fatalf("approval_id=%q, want %q", got, "apr-1")
+	if got, _ := ev1.Data["approval_id"].(string); got != approvalID {
+		t.Fatalf("approval_id=%q, want %q", got, approvalID)
 	}
 
-	req2 := httptest.NewRequest(http.MethodPost, "/approvals/apr-1/approve", nil)
+	req2 := httptest.NewRequest(http.MethodPost, "/approvals/"+approvalID+"/approve", nil)
 	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", "apr-1")
+	rctx.URLParams.Add("id", approvalID)
 	req2 = req2.WithContext(context.WithValue(req2.Context(), chi.RouteCtxKey, rctx))
 	req2 = req2.WithContext(withRoleContext(req2.Context(), &RoleContext{
 		Role:   RoleAdmin,
@@ -5178,43 +5122,14 @@ func TestApprovals_WebSocketEvents(t *testing.T) {
 	if ev2.EventType != "approval.resolved" {
 		t.Fatalf("event_type=%q, want %q", ev2.EventType, "approval.resolved")
 	}
-	if got, _ := ev2.Data["approval_id"].(string); got != "apr-1" {
-		t.Fatalf("approval_id=%q, want %q", got, "apr-1")
+	if got, _ := ev2.Data["approval_id"].(string); got != approvalID {
+		t.Fatalf("approval_id=%q, want %q", got, approvalID)
 	}
 	if got, _ := ev2.Data["decision"].(string); got != "approved" {
 		t.Fatalf("decision=%q, want %q", got, "approved")
 	}
 
 	srv.wsHub.UnregisterClient(testClient)
-}
-
-func TestHandleWebSocket_StartsHubWithoutStart(t *testing.T) {
-
-	srv := New(Config{})
-	defer srv.Stop()
-
-	httpSrv := httptest.NewServer(srv.Router())
-	defer httpSrv.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http") + "/api/v1/ws"
-	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		if resp != nil && resp.Body != nil {
-			resp.Body.Close()
-		}
-		t.Fatalf("dial websocket: %v", err)
-	}
-	defer conn.Close()
-
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if srv.WSHub().ClientCount() == 1 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	t.Fatalf("expected hub client count 1, got %d", srv.WSHub().ClientCount())
 }
 
 func TestWSHubPublish(t *testing.T) {
@@ -5274,62 +5189,6 @@ func TestWSHub_PaneOutputSequence(t *testing.T) {
 	}
 
 	t.Logf("WS_STREAMING_TEST: hub assigned sequences 1-%d for 10 pane output events", finalSeq)
-}
-
-func TestWSHub_MultiClientFanOut(t *testing.T) {
-	hub := NewWSHub()
-	go hub.Run()
-	defer hub.Stop()
-
-	time.Sleep(10 * time.Millisecond)
-
-	// Create simulated clients
-	clients := make([]*WSClient, 3)
-	for i := 0; i < 3; i++ {
-		clients[i] = &WSClient{
-			id:     "client-" + string(rune('A'+i)),
-			hub:    hub,
-			send:   make(chan []byte, 100),
-			topics: make(map[string]struct{}),
-		}
-		// Subscribe to pane output
-		clients[i].Subscribe([]string{"panes:*"})
-
-		// Register with hub
-		requireRegisterWSClient(t, hub, clients[i])
-	}
-
-	time.Sleep(20 * time.Millisecond)
-
-	// Verify client count
-	if hub.ClientCount() != 3 {
-		t.Errorf("expected 3 clients, got %d", hub.ClientCount())
-	}
-
-	// Publish an event
-	hub.Publish("panes:test:0", "pane.output", map[string]interface{}{
-		"lines": []string{"test output"},
-	})
-
-	time.Sleep(50 * time.Millisecond)
-
-	// Each client should receive the message
-	for i, client := range clients {
-		select {
-		case msg := <-client.send:
-			if len(msg) == 0 {
-				t.Errorf("client %d received empty message", i)
-			}
-			t.Logf("WS_STREAMING_TEST: client %s received %d bytes", client.id, len(msg))
-		default:
-			t.Errorf("client %d did not receive message", i)
-		}
-	}
-
-	// Cleanup
-	for _, client := range clients {
-		hub.UnregisterClient(client)
-	}
 }
 
 func TestWSHub_TopicFiltering(t *testing.T) {
@@ -5856,40 +5715,6 @@ func TestExtractAPIKey(t *testing.T) {
 			t.Errorf("extractAPIKey() = %q, want empty", got)
 		}
 	})
-}
-
-func TestIsWebSocketUpgrade(t *testing.T) {
-
-	tests := []struct {
-		name       string
-		upgrade    string
-		connection string
-		want       bool
-	}{
-		{"valid websocket", "websocket", "Upgrade", true},
-		{"case insensitive upgrade", "WebSocket", "upgrade", true},
-		{"missing upgrade header", "", "Upgrade", false},
-		{"wrong upgrade", "http2", "Upgrade", false},
-		{"missing connection", "websocket", "", false},
-		{"connection without upgrade", "websocket", "keep-alive", false},
-		{"connection with multiple values", "websocket", "keep-alive, Upgrade", true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r, _ := http.NewRequest("GET", "/ws", nil)
-			if tc.upgrade != "" {
-				r.Header.Set("Upgrade", tc.upgrade)
-			}
-			if tc.connection != "" {
-				r.Header.Set("Connection", tc.connection)
-			}
-			got := isWebSocketUpgrade(r)
-			if got != tc.want {
-				t.Errorf("isWebSocketUpgrade(upgrade=%q, connection=%q) = %v, want %v", tc.upgrade, tc.connection, got, tc.want)
-			}
-		})
-	}
 }
 
 func TestParseJWT(t *testing.T) {
@@ -6817,34 +6642,6 @@ func TestWriteErrorResponse_HintOnlyDetail(t *testing.T) {
 // ---------------------------------------------------------------------------
 // loggingMiddleware (75.0% → covers reqID branch)
 // ---------------------------------------------------------------------------
-
-func TestLoggingMiddleware_WithRequestID(t *testing.T) {
-	called := false
-	handler := loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-	}))
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	ctx := context.WithValue(req.Context(), requestIDKey, "test-req-id")
-	req = req.WithContext(ctx)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if !called {
-		t.Error("next handler should be called")
-	}
-}
-
-func TestLoggingMiddleware_WithoutRequestID(t *testing.T) {
-	called := false
-	handler := loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-	}))
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if !called {
-		t.Error("next handler should be called")
-	}
-}
 
 type fakeAttentionStreamFeed struct {
 	stats        robot.JournalStats

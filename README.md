@@ -7,7 +7,7 @@
 <div align="center">
 
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg)
-![Go Version](https://img.shields.io/badge/go-1.26.3+-00ADD8.svg)
+![Go Version](https://img.shields.io/badge/go-1.26.9+-00ADD8.svg)
 ![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)
 ![Release](https://img.shields.io/github/v/release/Dicklesworthstone/ntm?include_prereleases)
 
@@ -65,7 +65,7 @@ NTM gives you a single local system for:
 NTM is a pure Go project, but the runtime experience is intentionally integration-heavy.
 
 - Required: `tmux`
-- Required for agent spawning: whichever CLIs you want to run, typically Claude Code, Codex, Gemini CLI, Antigravity CLI, Grok Build, Pi, Kimi, and/or Muse Code
+- Required for agent spawning: whichever CLIs you want to run, typically Claude Code, Codex, Antigravity CLI, Oh My Pi (`omp`), Grok Build, Pi, Kimi, and/or Muse Code (Gemini CLI is supported as legacy)
 - Optional but powerful: `br`, `bv`, Agent Mail, `cass`, `dcg`, `pt`
 - Sanity check everything with `ntm deps -v`
 
@@ -124,6 +124,13 @@ ntm zoom payments 3
 ntm attach payments
 ```
 
+A bare `--cc=N` passes no `--model`, so Claude Code starts with its own default
+or saved model and context setting. Pin one with `--cc=N:MODEL` (the built-in
+aliases `opus`, `sonnet`, and `haiku` pass Claude Code's own family aliases,
+which track the newest model) or set `[models] default_claude` in
+`~/.config/ntm/config.toml`; `default_claude = ""` restores the delegate
+behaviour.
+
 Use labels when you want multiple coordinated swarms on the same project while
 keeping a shared project directory:
 
@@ -134,7 +141,7 @@ ntm spawn payments --label frontend --cc=2
 ntm add payments --label frontend --cc=1
 ```
 
-#### Grok Build (phase one)
+#### Grok Build
 
 NTM recognizes the official xAI Grok Build CLI as the canonical `grok` agent
 type. Install it using [xAI's current instructions](https://docs.x.ai/build/overview),
@@ -159,13 +166,151 @@ ntm --robot-spawn=research --spawn-grok=1
 ```
 
 NTM launches Grok Build with its official `--always-approve` automation flag.
-Phase one intentionally covers configuration, model and `--effort` arguments,
-launch, adopt, exact process discovery, status/count/schema/doctor projections,
-and topology-only saved-session restore. Authenticated fullscreen-TUI readiness,
-automated prompt delivery/assignment, interrupt-with-message, restart, and
-restore-time process relaunch are not yet claimed. Those operations fail closed
-before pane mutation; interact with an authenticated Grok pane directly. Robot
-`--spawn-wait` and `--spawn-assign-work` also fail closed for Grok panes.
+Phase 2 (GH#251) implements the interactive TUI protocol against live Grok Build
+captures: readiness and working-state detection, composer-gated and
+submission-verified prompt delivery (send, assign, `--robot-spawn --spawn-wait`
+and `--spawn-assign-work`), interrupt, restart, and restore-time relaunch. The
+one deliberate refusal is personas: the Grok Build CLI has no system-prompt
+flag or environment variable, so a persona on a Grok agent fails the launch
+instead of being silently dropped.
+
+#### Oh My Pi (`omp`)
+
+NTM operates [Oh My Pi](https://omp.sh) as the built-in `omp` agent type (panes
+are named `session__omp_N`; `oh-my-pi` is accepted as an alias). Finish omp's
+own setup once before the first spawn, otherwise the first prompt lands in the
+setup wizard:
+
+```bash
+omp setup
+ntm deps -v                               # probes the omp binary
+ntm spawn swarm --omp=8                   # omp picks its default model
+ntm spawn swarm --omp=2:MODEL             # pins MODEL (omp fuzzy-matches it)
+ntm spawn swarm --omp=2:MODEL:high        # also sets the thinking level (or MODEL@high)
+ntm add swarm --omp=1
+ntm adopt swarm --omp=1,2,3               # adopt existing omp panes
+ntm --robot-spawn=swarm --spawn-omp=8 --spawn-wait
+ntm send swarm --omp "Run the test suite and report failures"
+```
+
+The launch command is `omp --auto-approve`, plus `--model`, `--thinking`, and
+`--append-system-prompt <file>` (personas) when requested. Override it with
+`[agents] omp = "..."` (a template; keep `{{.ReasoningEffort}}` if you want
+effort specs honoured, otherwise NTM rejects them rather than dropping them),
+set `[models] default_omp` or `[models.omp]` aliases, and `[prompts]
+omp_default`. `[spawn_pacing.agent_caps] omp_max_concurrent` (default 8) is
+omp's share of the host-wide agent budget robot spawn admission enforces
+(running plus requested agents may not exceed the sum of all agent caps);
+launches are never serialized per type, and the default admits a full
+`--spawn-omp=8` swarm alongside the default Claude/Codex/Gemini budget.
+
+Everything NTM does to an omp pane is derived from omp's live TUI (v18.2.3,
+across its nerd, unicode and ascii symbol presets):
+
+- **Ready / working / idle.** omp keeps a bordered composer at the bottom of the
+  pane. A turn in flight shows a spinner and elapsed timer in the composer's top
+  border (`╭── ⠧ 1s`), an Esc-hint activity line above it (`⎋ Working…` or an
+  intent label), a queued `Steering · N` block, or a ` Subagents` panel listing
+  running subagents. A ` TODO` tree alone is not read as working, since a plan
+  can outlive its turn. A quiet composer with nothing below it is idle.
+- **Delivery.** Enter submits. A message sent to a busy pane is queued by omp
+  as steering; delivery is confirmed when the payload leaves the composer. A
+  staged large paste (`#1` token) is reported by `--robot-dialogs` as paste
+  limbo and cleared with Ctrl+C.
+- **Interrupt and exit.** omp interrupts on **Escape** (Ctrl+C only clears the
+  draft, and a double Ctrl+C quits), so `ntm interrupt`, `--robot-interrupt`,
+  restart, and the REST interrupt send Escape to omp panes. Graceful exit is
+  Escape, Ctrl+C, then Ctrl+D.
+- **Context.** `--robot-context`, `--robot-snapshot`, `ntm status`, and the
+  coordinator's context-rotation trigger read omp's own context gauge from the
+  composer border (`7%` … `262K`), reported as `source: "status_bar"`, so the
+  reading stays per-pane even when many omp panes share one directory. Compaction
+  uses native `/compact` and verifies a fresh reduction in the context gauge.
+- **Sessions.** `ntm sessions save` binds each pane to its omp session (omp
+  holds its transcript under `~/.omp/agent/sessions/` open, so the binding is
+  exact per pane; profile, XDG and `PI_CODING_AGENT_*` stores are honoured), and
+  resume relaunches with `omp --auto-approve --resume <id>`.
+- **Errors.** A failed turn leaves a provider-error block framed by rules
+  directly above the quiet composer (`server_error: ERROR`, `401 Invalid API
+  Key`, then `Dismissed when you send your next message.`). NTM reports it as
+  an error, never as idle-after-completion: `--robot-is-working` returns
+  `ERROR_STATE` with `indicator_basis: "provider_error"` and a retry hint, the
+  status observation and coordinator report an error (`auth` for 401/403,
+  otherwise generic), and assignment will not feed the pane new work. An
+  `F5 to Retry` hint may sit between the block and the input box. Press `F5`
+  (omp's retry key) to re-run the failed turn, or send any message, such as a
+  continue prompt, which dismisses the block and retries.
+  `Error: No model selected.` is an error too. No omp rate-limit screen has
+  been captured yet, so omp panes are never marked rate-limited from
+  transcript text; a provider 429 surfaces as a provider error.
+- **Quota.** omp has no quota or usage command. `ntm quota` lists omp panes as
+  "no quota API (provider-error classification)", `ntm rotate all-limited`
+  skips them with that reason, and `--robot-quota-check --provider=omp` answers
+  `NOT_IMPLEMENTED` (exit 2) naming the same fallback.
+- **Palette, assignment, boot checks.** In `ntm palette`, key `7` targets omp
+  panes (`6` still picks individual agents). `--assign` scores omp with the
+  per-task midpoint of the Claude and Codex capability profiles, since omp's
+  strengths follow whichever model it runs. `--verify-boot` counts a pane as
+  booted when it is idle, or when it received a spawn prompt (recovery context,
+  CASS context, or your prompt) and is working on it.
+
+#### OpenCode (`oc`)
+
+[OpenCode](https://opencode.ai) panes are named `session__oc_N`. The model is
+OpenCode's `provider/model` form; with no model, OpenCode uses its own default.
+
+```bash
+ntm spawn swarm --oc=2                          # OpenCode picks its default model
+ntm spawn swarm --oc=2:opencode/big-pickle      # pins the model
+ntm add swarm --oc=1
+ntm --robot-spawn=swarm --spawn-oc=2:opencode/big-pickle --spawn-wait
+ntm send swarm --oc "Run the test suite and report failures"
+```
+
+The launch command is `opencode --model <model>`. There is no effort knob: the
+TUI has no `--variant` flag (only `opencode run` does), so an effort in the
+spec is ignored. Override the command with `[agents] oc = "..."` (a template;
+keep `{{if .Model}} --model {{shellQuote .Model}}{{end}}` if you want model
+specs honoured), and set `[models] default_opencode` or `[models.opencode]`
+aliases. Prompts are delivered with bracketed paste and verified against the
+composer: a prompt the TUI drops fails the send instead of reporting success.
+
+**Unattended panes and permissions.** OpenCode asks before actions its
+permission config marks `ask` (by default this includes paths outside the
+project, `external_directory`). With nobody at the pane, the request is
+auto-rejected and the turn stops. Two ways to pre-approve:
+
+- Launch with `--auto` (OpenCode 1.18.0+), which approves every request that
+  is not explicitly denied, for that pane only:
+
+  ```toml
+  [agents]
+  oc = "opencode --auto{{if .Model}} --model {{shellQuote .Model}}{{end}}"
+  ```
+
+  `deny` rules still apply, so you can pair `--auto` with deny rules for
+  anything a pane must never do.
+- Set OpenCode's own `"permission"` config. It is global for every OpenCode
+  session that reads it, not per pane: `~/.config/opencode/opencode.json`, a
+  project `opencode.json`, or the `OPENCODE_CONFIG` /
+  `OPENCODE_CONFIG_CONTENT` environment variables. Each key takes `allow`,
+  `ask` or `deny`, and `"permission": "allow"` sets them all at once:
+
+  ```json
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+      "edit": "allow",
+      "bash": "allow",
+      "external_directory": { "~/shared/fixtures/**": "allow" }
+    }
+  }
+  ```
+
+  Path patterns support `*`, `?` and a leading `~`. Use `**` to cover a
+  directory tree: OpenCode may check the parent directory's glob rather than
+  the exact path it touches, so a pattern for one leaf directory can still be
+  rejected.
 
 #### Muse Code
 
@@ -185,6 +330,32 @@ ntm --robot-spawn=research --spawn-muse=1
 
 Override the launch command with `[agents] muse`, the default model with
 `[models] default_muse`, and the aliases under `[models.muse]`.
+
+#### Staggered prompts (thundering-herd prevention)
+
+When several agents boot together and all pick work from `bv`/`br` at once,
+they race for the same bead. Stagger their initial prompts so each agent has
+claimed something before the next one starts looking:
+
+```bash
+ntm spawn payments --cc=3 --prompt="Read AGENTS.md, then pick ready work" --stagger-mode=fixed --stagger-delay=90s
+ntm spawn payments --cc=5 --prompt="..." --stagger-mode=smart   # learned rate-limit spacing
+ntm --robot-spawn=payments --spawn-cc=3 --spawn-prompt="Read AGENTS.md, then pick ready work" \
+    --spawn-stagger-mode=fixed --spawn-stagger-delay=90s
+```
+
+The agent at position `i` receives its prompt `i × interval` after the first.
+`--robot-spawn --spawn-prompt` (or `--spawn-prompt-file`, `-` for stdin)
+waits for readiness, delivers through robot send's dispatch path, and reports
+`stagger.schedule[]` and per-agent `prompt_deliveries[]`; the same
+`--spawn-stagger-*` flags pace `--spawn-assign-work` prompts. Set defaults for
+both commands in `~/.config/ntm/config.toml` (flags still win):
+
+```toml
+[spawn]
+stagger_mode = "fixed"   # none (default), fixed, or smart
+stagger_delay = "90s"    # fixed-mode interval, 0-5m (default 30s)
+```
 
 #### Worktree isolation and reservations
 
@@ -206,6 +377,13 @@ and give operators an auditable ownership record; worktrees provide the separate
 checkout boundary. Merge reviewed agent branches into `main`, then clean the
 session's worktrees when that session is finished.
 
+Reservations are enforced at commit time: the pre-commit hook `ntm init`
+installs runs `ntm guards check --staged`, which refuses a commit touching files
+another agent holds an exclusive reservation on and names the holder (when Agent
+Mail is unreachable it warns and records a degraded run for `ntm doctor`; set
+`NTM_GUARD_STRICT=1` to fail closed). `ntm guards install` adds the check to a
+repository without that hook, or updates an older `ntm init` hook in place.
+
 ### 2. Dispatch, Monitoring, and Recovery
 
 Humans can broadcast prompts, interrupt panes, stream output, inspect health, compare
@@ -223,6 +401,28 @@ ntm diff payments cc_1 cod_1
 ntm grep "timeout" payments -C 3
 ntm analytics --days 7
 ```
+
+Pending context rotations can be acted on directly:
+
+```bash
+ntm rotate context pending
+ntm rotate context confirm payments__cc_1 --action=rotate
+ntm rotate context confirm payments__cc_1 --action=compact
+```
+
+CLI and dashboard confirmation execute the selected action and report its actual
+result. Rotation verifies the original process, requests a fresh handoff, and
+delivers it to a ready replacement before retiring the old pane. Confirmation
+ownership and results survive process interruption: repeating a completed choice
+returns its saved result, while a failed or interrupted choice remains visible in
+`pending`. Inspect the affected panes before using the same action with `--retry`.
+Native compaction preserves the conversation and requires fresh provider context
+accounting to prove a reduction; it does not automatically clear history. Claude
+compaction reads the transcript the pane's own Claude process names in its
+session record, so it works when many Claude panes share one project directory.
+Without that binding it falls back to the directory's newest transcript and
+refuses ambiguous scope, including another Claude pane in a different session
+using the same transcript directory.
 
 ### 3. Work Graph Triage and Assignment
 
@@ -331,13 +531,106 @@ ntm coordinator enable digest --interval=30m
 ntm coordinator disable conflict-negotiate
 ```
 
+`ntm locks force-release` is approval-gated by default (`automation.force_release:
+approval`): the first invocation files a durable approval request, a second operator
+grants it with `ntm approve <id>` (self-approval is rejected), and re-running the
+command consumes that approval and executes exactly once. Use
+`ntm policy automation --force-release auto` to allow unattended force-release, or
+`never` to disable it entirely; the serve HTTP endpoint and the dashboard conflict
+action honor the same policy setting.
+
+#### Pane identity badges
+
+In a mixed session, pane titles name the harness (`payments__cc_1`) while
+coordination happens under Agent Mail names (`BlueLake`). NTM can show each managed
+pane's assigned name in its tmux pane border next to the existing title:
+
+```toml
+[agent_mail]
+enabled = true
+pane_badges = true                        # default false (opt-in)
+# pane_badge_format = "[{name}{drift}]{lifecycle}"
+```
+
+The badge is NTM's assigned identity (the session agent registry, keyed by stable
+pane id), never whatever a later process wrote to the pane identity file. At every
+reconciliation NTM compares the assignment with the canonical Agent Mail identity
+file (legacy plain-text name or the structured record Agent Mail >= 0.3.31 writes)
+and caches the outcome in per-pane tmux user options
+(`@ntm_agent_mail_name`, `@ntm_agent_mail_state`, `@ntm_agent_mail_lifecycle`,
+`@ntm_agent_mail_label`); the window's `pane-border-format` gains a fragment that
+renders only the cached label, so tmux never calls Agent Mail while drawing.
+
+| Border | Meaning |
+|---|---|
+| `[BlueLake]` | current assignment; names agree (binding verified, or a legacy file that cannot be verified) |
+| `[BlueLake!]` | current assignment; the identity file disagrees (`name-disagreement`), is `missing-file` / `unreadable-file` / `invalid-file`, or its binding is `binding-unverifiable` / `binding-stale` — the assigned name is retained |
+| `[?!]` | no current assignment: `assignment-stale` (pane generation changed), `assignment-unobservable` (tmux unreadable) or `assignment-unregistered` |
+| `… (starting)`, `… (exited)`, `… (unknown)` | lifecycle observed at the last reconciliation; running agents carry no marker |
+
+Badges are written alongside identity assignment before the agent launches
+(`(starting)`) and reconciled on `ntm spawn`, `ntm add`, `ntm adopt`, restart/respawn
+and on explicit refresh with `ntm mapping --session <session>`, which also prints the
+discrepancy report (assigned vs resolved name, source path, assignment/observation
+state, `last_attempt_at` / `last_success_at`) and carries the same data under
+`identity` and `discrepancies` in `--json`. They describe the last reconciliation, not
+continuous liveness. Badge failures warn and never block a launch or change an
+assignment.
+
+Set `pane_badges = false` and run `ntm mapping --session <session>` to withdraw the
+pane options and restore the window's previous `pane-border-format` (including
+inheritance). Opt a single session out with
+`tmux set-option -t =<session>: @ntm_agent_mail_badges off`. A `pane-border-format`
+you wrote yourself that references `@ntm_agent_mail_*` is left untouched, and windows
+linked into several sessions are skipped with a diagnostic.
+
+Every session started by `ntm spawn` runs the coordinator inside its session
+monitor; `ntm coordinator status` shows it under Runtime (`runtime` in
+`--json`). The monitor always maintains assignment leases: it renews the file
+reservations of in-progress assignments, including those taken by a one-shot
+`ntm assign`, before their one-hour leases lapse, and releases them when the
+assigned bead closes. Every other coordinator action (`auto-assign`, `digest`,
+`conflict-negotiate`, `mail-nudge`) is off until enabled. `conflict-notify`
+never runs in the session monitor, only under `ntm coordinator run`: older
+`ntm config init` files set it to true, and it mails every holder of
+overlapping reservations in the project (`ntm coordinator status` notes when it
+is set). A foreground `ntm coordinator run` or a reservation-maintaining
+`ntm assign --watch` pauses the monitor's coordinator while it runs, so a
+session is never coordinated twice.
+
 `coordinator enable` and `disable` persist the selected `--config` file, or the
 global config by default, without replacing unrelated settings or comments.
-Restart an already running `ntm coordinator run` daemon to apply a toggle.
+Session monitors apply a toggle within 15 seconds; restart an already running
+foreground `ntm coordinator run` to apply it there.
 The selected file may use a `[coordinator]` table or root dotted assignments
 such as `coordinator.auto_assign = false`. A whole-section inline assignment
 such as `coordinator = { auto_assign = false }` is rejected without changing
 the file; convert it to either supported form before toggling a feature.
+
+`ntm assign <session> --watch --reserve-files` maintains the saved file
+reservations for active assignments immediately on startup and every 30 seconds,
+including while scans or completion handlers are busy. Each maintenance pass is
+bounded to 30 seconds. The watcher renews the exact recorded leases only after
+verifying the current task claim and pane owner, and releases recorded leases
+when the task is confirmed terminal. It does not recreate expired or missing
+leases; failures remain visible, including under `--quiet`, and are retried.
+
+The monitor-hosted coordinator and `ntm coordinator run` use the same
+maintenance path before admitting new work.
+If one pane cannot be observed, independently verified healthy assignments can
+still renew and confirmed terminal work can still be cleaned up. Unverified
+assignments remain in the ledger, and a degraded coordinator cycle reports an
+error without dispatching new work. Watch mode checks the current saved ledger
+before exiting with `--stop-when-done`.
+
+The coordinator also recovers a delivered assignment when its original physical
+pane disappears. It verifies absence across the entire tmux server, rereads agent
+registries to rule out a moved or rebound owner, and checks the exact current
+Beads claim and recorded reservations. Only then does it persist task failure,
+release that assignment's leases, and reopen its claim for ordinary reassignment.
+Incomplete observations, a remaining pane, changed ownership, or failed cleanup
+keep the assignment protected. Interrupted cleanup resumes from its durable
+record; the previous prompt remains recorded as sent and is not replayed.
 
 ### 5. Safety Policy and Approvals
 
@@ -362,12 +655,32 @@ ntm approve abc123
 ntm approve deny abc123 --reason "wrong target branch"
 ```
 
+Every Claude agent NTM launches (spawn, add, robot spawn, restart, restore, rotation,
+swarm) gets a Claude Code `PreToolUse` hook through `--settings` that checks each Bash
+command against this policy and refuses blocked ones (`[safety] claude_policy_hook`,
+default on). Claude Code runs `PreToolUse` hooks even under
+`--dangerously-skip-permissions`, and runs only hooks a settings file or `--settings`
+lists, so `ntm safety install` also registers its hook script in
+`~/.claude/settings.json` for Claude sessions started outside NTM, and `ntm safety status`
+reports the hook as installed only when it is registered. dcg and rch hooks ride on the
+same `--settings` when those integrations are enabled and installed. A custom
+`[agents] claude` command whose last shell command is not the `claude` invocation (a
+pipe, a subshell, a wrapper script) must place the hooks itself with
+`--settings {{shellQuote .ClaudeSettings}}`; otherwise NTM launches it without them and
+warns at every launch.
+
+With `[integrations.dcg] enabled = true`, command lines in messages bound for non-Claude
+agents are checked by dcg before delivery. `ntm send`, `--robot-send` (including `--track`)
+and REST sends all refuse a blocked command — robot callers get `DESTRUCTIVE_COMMAND_BLOCKED`
+— and each refusal counts toward `ntm metrics` destructive-command incidents. A missing dcg
+binary skips the check; a check that errors or is interrupted refuses the send instead.
+
 ### 6. Pipelines, Templates, Recipes, and Workflow Assets
 
 NTM supports several layers of reusable automation:
 
 - `recipes`: reusable session presets
-- `workflows`: orchestration patterns such as pipeline, ping-pong, and review-gate
+- `workflows`: runnable orchestration patterns such as pipeline, ping-pong, and review-gate — `ntm workflow run <name>` executes a template's coordination loop against a live session (`ntm spawn -t <name>` only uses a template's agent counts to size a session)
 - `template`: prompt templates and substitutions
 - `pipeline`: executable multi-step agent workflows with variables, dependencies, resume, and cleanup
 - `session-templates`: higher-level session layouts
@@ -377,8 +690,11 @@ ntm recipes list
 ntm recipes show full-stack
 ntm workflows list
 ntm workflows show red-green
+ntm workflow run red-green --var feature="parser rewrite"
+ntm workflow run ./my-flow.toml --session payments
 ntm template list
 ntm template show fix-bug
+ntm send payments --cc -t marching_orders --bead bd-123   # rendered per pane: own {{agent_num}}/{{agent_type}}
 
 ntm pipeline run .ntm/pipelines/review.yaml --session payments
 ntm pipeline status run-20241230-123456-abcd
@@ -387,10 +703,21 @@ ntm pipeline resume run-20241230-123456-abcd --mode=continue
 ntm pipeline cleanup --older=7d
 ```
 
-Pipeline resume preserves completed step outputs by default and re-runs the first incomplete
-step or loop iteration. Commands, templates, and foreach/loop iteration bodies should be
-idempotent when resumed, or operators should resume with `--keep-state=false` or
-`--mode=force-iter --step-id=<id> --iteration=<n>` to deliberately re-run work.
+Pipeline resume preserves completed step outputs. Prompt and template steps also
+save their delivery and response evidence: `--mode=continue` resumes observing a
+confirmed request on its original tmux host and physical pane without submitting
+it again. Partial output survives interruption, and a completed response can be
+restored even if the process stopped before saving the enclosing step result.
+Recognized composer and footer redraws are excluded from response evidence; an
+idle pane showing only the submitted prompt is not counted as completed work.
+
+Unknown submission outcomes, replaced pane processes or hosts, and missing output
+boundaries stop recovery with the receipt preserved. Inspect the original pane
+before using `--mode=restart-failed` to deliberately resend failed or interrupted
+agent work; that mode still preserves completed delivery receipts. Use
+`--keep-state=false` or `--mode=force-iter --step-id=<id> --iteration=<n>` for an
+intentional reset or iteration replay. Incomplete command steps retain their
+existing rerun behavior and should be idempotent.
 
 ### 7. Durable State, Audit, and Recovery
 
@@ -402,14 +729,117 @@ for analysis or resumption.
 ntm checkpoint save payments -m "pre-migration"
 ntm checkpoint list payments
 ntm checkpoint restore payments
+ntm checkpoint restore payments last --as payments-recovered --directory /path/to/recovery-worktree
+
+ntm sessions save payments
+ntm sessions restore payments --name payments-restored --launch
+ntm sessions resume payments --name payments-resumed
 
 ntm timeline list
 ntm timeline show <session-id>
 ntm history search "authentication error"
 ntm audit show payments
-ntm changes conflicts payments
+ntm conflicts payments
 ntm resume payments
 ```
+
+Ordinary `ntm spawn payments --cc=2` also restores the latest readable local handoff for
+that session from the resolved project directory. The previous goal, immediate
+task, decisions, and next steps are delivered before the new user prompt through
+the same readiness and submission checks as other spawn prompts. This works
+without Beads, Agent Mail, or CM being installed. The handoff uses a bounded
+recovery budget, and JSON output reports its source as `recovery.handoff_path`.
+`--no-recovery`, `recovery.enabled = false`, or
+`recovery.auto_inject_on_spawn = false` disables this injection. The shared
+handoff reader can fall back to an older readable file if the newest is corrupt;
+the reported source identifies the file actually used. If no handoff can be read,
+or its session or project does not match, spawn reports partial recovery and can
+proceed with its other available context.
+Remote tmux sessions skip local handoffs and report that source as unavailable;
+NTM does not treat a matching local path as proof of the remote project's identity.
+
+Checkpoint restoration accepts `--as` to recover into a different tmux session
+without replacing the source session or rewriting its checkpoint. The REST
+restore endpoint accepts the same option as `target_session`. A separate session
+still uses the checkpoint's working directory unless `--directory` (REST:
+`custom_directory`) selects another working tree. Restores honor cancellation;
+JSON responses retain the last restore stage, pane count, warnings, and
+interruption status so partially restored sessions can be inspected before retrying.
+
+Newly spawned agents also record their rendered launch command independently of
+the pane title. Checkpoints preserve that command and its model, persona,
+reasoning effort, and account-profile reference. Restore validates these inputs
+before replacing an existing session, then recreates any configured Claude
+credential isolation for the destination pane. Prepared persona prompt files
+remain external references: a missing file or changed contents stops automatic
+replay. Explicit pane or plugin environment values are not copied into this
+record; recovery reports missing inputs instead of silently substituting the
+current environment. Older panes without a launch record retain the existing
+command-reconstruction path.
+
+Saved sessions preserve each pane's working directory and the same recorded
+launch settings, so panes in separate worktrees return to their own directories.
+`sessions restore --launch` replays those settings; `sessions resume` also
+replaces the native conversation selector when the save contains a fresh
+provider binding. Recorded commands keep their model, reasoning, persona, and
+account settings instead of taking current defaults. Native resume refuses
+ambiguous shell commands or conflicting conversation selectors before `--force`
+replaces a live session. Older saves without a recorded command retain the
+existing CASR preference. Missing worktrees, changed persona files, unavailable
+profiles, and omitted environment inputs prevent automatic relaunch. Agent
+counts report successful command dispatch; they do not assert that an agent has
+finished starting.
+
+### 8. Multi-Project Swarm Execution
+
+`ntm swarm --json` launches the requested swarm and returns an execution receipt.
+Use `swarm plan` or `--dry-run` to preview allocations without creating sessions.
+
+```bash
+ntm swarm plan --scan-dir=/projects --json
+ntm swarm --scan-dir=/projects --json --wait-ready
+ntm swarm --scan-dir=/projects --json --prompt="Run the tests and report failures"
+```
+
+The receipt distinguishes planned allocations, created sessions and physical
+panes, agent launches, initial prompt delivery, and optional readiness results.
+Partial failures and cancellation return a nonzero exit status while retaining
+the actual outcomes. Prompts go only to successfully launched agents that pass
+readiness and identity checks; surviving sessions remain available for inspection.
+
+`--auto-rotate-accounts` starts an acknowledged resident monitor for eligible
+local Claude and Codex panes. It checks CAAM account availability and the actual
+configured launch commands before creating sessions. JSON receipts identify
+eligible panes, declined providers, and each monitor's PID and generation;
+`swarm status --json` checks the resident's live process and heartbeat.
+If monitor startup partially fails, the command returns a nonzero exit status
+and preserves launched agents, successful monitors, and their startup receipts.
+
+```bash
+ntm swarm --scan-dir=/projects --auto-rotate-accounts --json
+ntm swarm --scan-dir=/projects --auto-rotate-accounts --force-global-auth-clobber --json
+```
+
+This recovery lane requires Linux, default global credentials, and a live
+provider process with a verifiable open main conversation transcript. Codex
+also requires consent through the global-auth flag above or
+`swarm.force_global_auth_clobber = true` in the configuration. Scoped profiles,
+isolated credentials, custom credential homes or providers, and ambiguous
+commands for otherwise eligible panes fail preflight before session creation.
+Unsupported or excluded providers and Codex without global-auth consent can
+launch unmonitored, provided at least one eligible pane remains. A temporary
+lack of transcript evidence defers recovery until another observation; NTM does
+not infer a conversation from the newest file in a worktree. Configured provider
+restrictions and reset horizons still apply.
+
+Recovery preserves the recorded command and native conversation, verifies the
+replacement process and conversation, and reports account activation separately
+from successful conversation recovery. A provider lock and durable activation
+receipt coordinate multiple sessions: stalled sibling panes can resume using
+the already activated account without repeatedly switching the global account.
+Local session kill and forced checkpoint or saved-session replacement wait for
+their resident to finish any in-flight recovery before destroying the session.
+Remote tmux operations leave local monitors and processes untouched.
 
 ## Robot Mode and Local API
 
@@ -429,7 +859,7 @@ ntm --robot-status
 ntm --robot-snapshot
 ntm --robot-plan
 ntm --robot-dashboard
-ntm --robot-markdown --md-compact
+ntm --robot-markdown --compact
 ntm --robot-terse
 ```
 
@@ -437,11 +867,25 @@ Common task-specific surfaces:
 
 ```bash
 ntm --robot-send=payments --msg="Summarize current blockers." --type=claude
-ntm --robot-ack=payments --ack-timeout=30s
+ntm --robot-ack=payments --timeout=30s
 ntm --robot-tail=payments --lines=50
 ntm --robot-mail-check --mail-project=payments --urgent-only
 ntm --robot-cass-search="authentication error"
 ```
+
+Optional CM memory injection (`--with-memory` or `memory.send_injection`) uses
+the selected panes' verified project directory and the target session's daemon.
+Running the command from another checkout cannot select that checkout's memory,
+including when both projects have the same directory name. The JSON memory
+receipt identifies the queried workspace or explains why injection was skipped.
+Remote sessions and unresolved or mixed project scopes skip local CM retrieval
+and continue ordinary prompt delivery. Context-pack builds use the same explicit
+workspace scope.
+
+With `--track`, successful acknowledgment reports memory feedback to the daemon
+that supplied the rules. Changing daemon PID records while the send is pending
+does not redirect that feedback. Canceling the command stops pending memory
+retrieval and acknowledgment tracking.
 
 ### REST, SSE, WebSocket, and OpenAPI
 
@@ -455,7 +899,7 @@ Important surfaces:
 
 - REST API under `/api/v1`
 - server-sent events at `/events`
-- WebSocket subscriptions at `/ws`
+- WebSocket subscriptions at `/api/v1/ws`
 - health check at `/health`
 - generated OpenAPI spec at [`docs/openapi.json`](docs/openapi.json)
 
@@ -501,8 +945,10 @@ Project-local assets live under `.ntm/` and override built-ins and user defaults
 - `.ntm/pipelines/`
 - `.ntm/personas.toml`
 - `.ntm/recipes.toml`
-- `.ntm/checkpoints/`
 - `.ntm/config.toml` for project-scoped settings such as additional assignment approval labels
+
+Checkpoints are per user, not per project: they live under
+`~/.local/share/ntm/checkpoints/<session>/`.
 
 Useful config commands:
 
@@ -520,6 +966,97 @@ Configuration loading is strict: unknown fields are errors. The unused TOML
 `[resilience]` (`auto_restart`, `max_restarts`, `restart_delay_seconds`,
 `health_check_seconds`, and `crash_threshold`). The `ntm health` command remains
 available and is unrelated to that removed config section.
+
+### CAAM Seat Selection (opt-in, default off)
+
+If you run several interchangeable subscription seats through
+[CAAM](https://github.com/Dicklesworthstone/caam) — three Codex Pro logins, say
+— NTM can choose which one a new pane launches on instead of leaving that to
+whatever your agent command template pins:
+
+```toml
+[integrations.caam]
+seat_selection = true
+```
+
+With the key on, a `spawn`/`add` pane that carries **no** persona asks
+`caam limits <provider> --rank earliest-reset-headroom` and launches under the
+matching `codex-<profile>` / `claude-<profile>` persona. The rank spends the
+included allowance that refreshes **soonest while it still has headroom** and
+preserves the later-resetting reserve seat. (It is deliberately not
+`caam precheck --best`, which ranks lowest utilization and would pick the idle
+reserve — the opposite of the policy.)
+
+The semantics, exactly:
+
+- **A pin always wins.** `--persona=codex-acme`, `--profile-set`, and recipe
+  personas are never re-ranked and never overridden. Only a pane with no
+  persona at all is placed.
+- **One query per provider per command.** `ntm add --cod=4` shells out to caam
+  once, not four times; the ranked seat is a property of the pool.
+- **Later `ntm add`s re-rank.** A pane added to a running swarm is a new pane
+  and gets the seat that is right now, not the one that was right at spawn.
+  (Answers are memoized for 20 seconds, so two adds in quick succession share
+  one ranking — provider windows do not move on that timescale.) Credentials
+  inside an already-running pane are never rotated.
+- **An unreadable pool skips those panes, loudly.** If caam is missing, times
+  out, or ranks the pool and finds nothing with included headroom, no agent is
+  launched into the affected panes and the reason is printed (and reported in
+  `seat_skips` under `--json`). In `ntm add` the pane is never created at all;
+  in `ntm spawn` the panes were already split before seats were resolved, so a
+  refused one is left as a plain shell and named in the warning. Siblings on a
+  provider that answered still come up: `ntm add --cod=2 --cc=2` with an
+  exhausted Codex pool brings up the two Claude panes. A skipped pane never
+  falls through to a static profile pin — that fallthrough is the failure this
+  exists to prevent.
+- **`ntm scale` honors it too.** Scale-up reports the number of panes that
+  actually launched, not the number requested, and surfaces each refusal.
+- **Only Claude and Codex are affected.** `caam limits` answers for no other
+  provider, so gemini/grok/ollama/plugin panes are untouched.
+
+`seat_selection` is unrelated to `auto_failover` in the same table, despite
+sitting next to it: `auto_failover` swaps the **host** credential mid-session
+for a pane that hit a rate limit; `seat_selection` only chooses which account a
+**new** pane launches under. Enabling one does not enable the other, and
+`seat_selection` starts no caam subprocess when it is off.
+
+Requires caam >= v0.1.19 (the release that added the
+`earliest-reset-headroom` rank mode).
+
+### Rano Network Activity
+
+[rano](https://github.com/Dicklesworthstone/rano)'s monitor records each agent
+process's connect/close events into an SQLite database. ntm reads that history
+(`rano export`) for `--robot-rano-stats`, the dashboard's Network Activity panel
+and the process-triage monitor's network signal; it never starts the monitor.
+Point ntm at the database the monitor writes (rano's default is
+`observer.sqlite` in the monitor's working directory):
+
+```toml
+[integrations.rano]
+sqlite_path = "/path/to/observer.sqlite"   # what you pass as `rano --sqlite`
+```
+
+The counts are connections, not requests or bytes. With no database at that
+path, `--robot-rano-stats` fails with `DEPENDENCY_MISSING` and the panel shows
+why, instead of reporting zero traffic. Details: `docs/rano-stats.md`.
+
+### Agent Plugins
+
+Custom agent types load from the `agents/` directory that sits next to the
+selected config file: `~/.config/ntm/agents/*.toml` by default,
+`$XDG_CONFIG_HOME/ntm/agents/` under an XDG override, or
+`<dir-of-config>/agents/` with an explicit `--config`. Each TOML declares a
+name/alias (which become `--<name>`/`--<alias>` spawn and `send` selectors), a
+command template, and optional `[agent.readiness]` regexes that drive
+idle/working/error classification for `status`, `--robot-tail`, and
+`--verify-boot` exactly like the built-in agents. NTM never modifies files in
+`agents/` — an existing preset you have customised is yours.
+
+Oh My Pi is now a built-in agent type (see [Oh My Pi](#oh-my-pi-omp)), so the
+former `examples/agents/omp.toml` plugin preset is no longer needed. A leftover
+`~/.config/ntm/agents/omp.toml` is harmless: built-in flags and the built-in
+omp detectors take precedence over a plugin of the same name.
 
 ## Design Principles
 
@@ -604,6 +1141,17 @@ brew install dicklesworthstone/tap/ntm
 
 ### Docker
 
+Multi-arch images (`linux/amd64`, `linux/arm64`) are pushed to GitHub Container
+Registry by the release workflow, tagged by semver (`1`, `1.22`, `1.22.0`) and
+commit SHA:
+
+```bash
+docker pull ghcr.io/dicklesworthstone/ntm:1
+docker run --rm -it ghcr.io/dicklesworthstone/ntm:1
+```
+
+Or build locally:
+
 ```bash
 docker build -t ntm .
 docker run --rm -it ntm
@@ -614,8 +1162,11 @@ docker run --rm -it ntm
 ```bash
 git clone https://github.com/Dicklesworthstone/ntm.git
 cd ntm
-go install ./cmd/ntm
+go install -tags ensemble_experimental ./cmd/ntm   # or: make build
 ```
+
+The `ensemble_experimental` tag matches the release binaries; without it
+`ntm ensemble <name> "<question>"` only reports that it needs a tagged build.
 
 ## Troubleshooting
 
@@ -716,7 +1267,7 @@ of the normal product model.
 - NTM is intentionally `tmux`-centric.
 - Linux and macOS are the primary environments.
 - Some advanced workflows depend on external tools such as Agent Mail, `br`, `bv`, `cass`, or worktree helpers.
-- Grok Build support is currently phase one: launch/discovery/counting work, while authenticated TUI readiness, automated prompt delivery/assignment, interrupt-with-message, restart, and restore-time relaunch are deliberately unsupported and fail closed.
+- Grok Build agents cannot take personas (the Grok Build CLI has no system-prompt mechanism); a persona on a Grok agent fails the launch.
 - The system is local-first. It is not a hosted SaaS control plane.
 
 ## Development

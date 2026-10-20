@@ -14,9 +14,10 @@ import (
 )
 
 // exitAgent exits the current agent with its exit keys, the ones
-// tmux.SendAgentExitKeys keeps for every agent type. win is the pane's tmux
-// window index (#172) so the exit keys target the correct window on
-// multi-window / window-per-agent layouts rather than always window 1.
+// tmux.SendAgentExitKeys keeps for every agent type (omp's Escape, Ctrl+C,
+// Ctrl+D included). win is the pane's tmux window index (#172) so the exit
+// keys target the correct window on multi-window / window-per-agent layouts
+// rather than always window 1.
 func exitAgent(ctx context.Context, session string, win, pane int, agentType string, seq *RestartSequence) error {
 	method, err := tmux.SendAgentExitKeys(ctx, formatTargetWin(session, win, pane), tmux.AgentType(agentType))
 	seq.ExitMethod = method
@@ -28,18 +29,13 @@ func sendKeys(ctx context.Context, session string, win, pane int, keys string) e
 	return runTmuxCommand(ctx, "send-keys", "-t", formatTargetWin(session, win, pane), "-l", keys)
 }
 
-// formatTarget creates a tmux target string for a session and pane, assuming
-// window 1 (the historical single-window NTM layout). Retained for callers and
-// tests that do not carry a window index.
-func formatTarget(session string, pane int) string {
-	return formatTargetWin(session, 1, pane)
-}
-
 // formatTargetWin creates a tmux target string for an explicit session,
 // window, and pane address (#172). tmux window indexes may start at zero, so
 // this helper must preserve the caller's window index exactly.
 func formatTargetWin(session string, win, pane int) string {
-	return session + ":" + strconv.Itoa(win) + "." + strconv.Itoa(pane)
+	// Exact-match the session portion so a sibling session that shares the
+	// name as a prefix (e.g. midas_edge vs midas_edge_api) can never be hit.
+	return tmux.ExactTarget(session) + ":" + strconv.Itoa(win) + "." + strconv.Itoa(pane)
 }
 
 // runTmuxCommand executes a tmux command.
@@ -132,7 +128,7 @@ func hardKillAgent(ctx context.Context, session string, win, pane int, seq *Rest
 // win is the pane's exact tmux window index (#172).
 func getShellPID(ctx context.Context, session string, win, pane int) (int, error) {
 	target := session + ":" + strconv.Itoa(win)
-	cmd := exec.CommandContext(ctx, tmux.BinaryPath(), "list-panes", "-t", target, "-F", "#{pane_index} #{pane_pid}")
+	cmd := exec.CommandContext(ctx, tmux.BinaryPath(), "list-panes", "-t", tmux.ExactTarget(target), "-F", "#{pane_index} #{pane_pid}")
 	output, err := cmd.Output()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

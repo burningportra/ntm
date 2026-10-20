@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,15 @@ import (
 // and the durable assignment ledger under an isolated HOME. The agent panes
 // run cat with terminal echo disabled so one transport submission produces
 // exactly one observable marker.
+
+// atomicAgentPaneCommand is the command every fixture agent pane runs. The
+// panes emulate agent TUIs with `cat` (echo disabled, one transport
+// submission -> exactly one observable marker). Panes start with an EMPTY
+// screen on purpose: dispatch's composer gate (bd-dp9oy) fails open on
+// empty captures, and distribution eligibility stays with the panes a test
+// explicitly primes via primeEndpointForSafeDispatch, which renders the
+// pane's own composer glyph ("❯" for Claude, "›" for codex).
+const atomicAgentPaneCommand = `bash --noprofile --norc -c 'stty -echo; exec cat'`
 
 type atomicAssignmentCLIFixture struct {
 	ntmPath    string
@@ -426,6 +436,7 @@ func (s *atomicAssignmentMailStub) handle(w http.ResponseWriter, r *http.Request
 		Method  string `json:"method"`
 		Params  struct {
 			Name      string         `json:"name"`
+			URI       string         `json:"uri"`
 			Arguments map[string]any `json:"arguments"`
 		} `json:"params"`
 	}
@@ -438,6 +449,16 @@ func (s *atomicAssignmentMailStub) handle(w http.ResponseWriter, r *http.Request
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 	}
 	if request.JSONRPC == "2.0" && request.Method == "resources/read" {
+		if writeAgentMailReadbackResource(w, request.ID, request.Params.URI, s.projectDir, func() []map[string]any {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if strings.HasPrefix(request.Params.URI, "resource://file_reservations/") {
+				s.listCalls++
+			}
+			return append([]map[string]any(nil), s.active...)
+		}) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"jsonrpc": "2.0", "id": request.ID,
@@ -570,17 +591,75 @@ func (s *atomicAssignmentMailStub) handle(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// writeAgentMailReadbackResource answers the read-only resources that Agent
+// Mail serves and that ntm reads to verify every reservation grant before it
+// trusts the receipt: resource://project/{key} (numeric identity) and
+// resource://file_reservations/{key}?... (the live rows, paginated with
+// limit/offset). active returns the rows the stub's list tool would return.
+// It reports false for any other resource URI.
+func writeAgentMailReadbackResource(w http.ResponseWriter, id any, uri, projectDir string, active func() []map[string]any) bool {
+	var payload any
+	switch {
+	case strings.HasPrefix(uri, "resource://project/"):
+		key, err := url.PathUnescape(strings.TrimPrefix(uri, "resource://project/"))
+		if err != nil || key != projectDir {
+			return false
+		}
+		payload = map[string]any{"id": 1, "slug": "atomic-e2e", "human_key": projectDir, "agents": []any{}}
+	case strings.HasPrefix(uri, "resource://file_reservations/"):
+		parsed, err := url.Parse(uri)
+		if err != nil {
+			return false
+		}
+		key, err := url.PathUnescape(strings.TrimPrefix(strings.SplitN(uri, "?", 2)[0], "resource://file_reservations/"))
+		if err != nil || key != projectDir {
+			return false
+		}
+		rows := active()
+		offset, _ := strconv.Atoi(parsed.Query().Get("offset"))
+		limit, _ := strconv.Atoi(parsed.Query().Get("limit"))
+		if limit <= 0 {
+			limit = 20
+		}
+		page := make([]map[string]any, 0, limit)
+		for index := offset; index >= 0 && index < len(rows) && len(page) < limit; index++ {
+			page = append(page, rows[index])
+		}
+		payload = page
+	default:
+		return false
+	}
+	text, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"jsonrpc": "2.0", "id": id,
+		"result": map[string]any{"contents": []map[string]any{{"uri": uri, "mimeType": "application/json", "text": string(text)}}},
+	})
+	return true
+}
+
 func TestE2EAtomicAssignmentIsolatedEnvScrubsHostOverrides(t *testing.T) {
 	for _, key := range []string{"BR_DB", "BD_DB", "BEADS_DB", "GIT_DIR", "GIT_WORK_TREE", "AGENT_NAME", "PWD", "OLDPWD", "NTM_TEST_ASSIGNMENT_SAVE_FAIL_AFTER_BACKUP", "NTM_TEST_COMPLETION_ACK_FAIL_ONCE", "NTM_TEST_COMPLETION_LEASE_DURATION", "NTM_TEST_COMPLETION_HANDLER_DELAY"} {
 		t.Setenv(key, "/should/not/escape")
 	}
+	t.Setenv("BR_NO_DAEMON", "0") // host value must not survive either
 	env := atomicAssignmentIsolatedEnv(map[string]string{"HOME": t.TempDir()})
+	daemonPins := map[string]string{}
 	for _, entry := range env {
-		key, _, _ := strings.Cut(entry, "=")
+		key, value, _ := strings.Cut(entry, "=")
 		switch key {
 		case "BR_DB", "BD_DB", "BEADS_DB", "GIT_DIR", "GIT_WORK_TREE", "AGENT_NAME", "PWD", "OLDPWD", "NTM_TEST_ASSIGNMENT_SAVE_FAIL_AFTER_BACKUP", "NTM_TEST_COMPLETION_ACK_FAIL_ONCE", "NTM_TEST_COMPLETION_LEASE_DURATION", "NTM_TEST_COMPLETION_HANDLER_DELAY":
 			t.Fatalf("isolated process environment retained %s", key)
+		case "BR_NO_DAEMON", "BD_NO_DAEMON":
+			daemonPins[key] = value
 		}
+	}
+	// Hermetic br: the fixture environment must pin daemons off (#263).
+	if daemonPins["BR_NO_DAEMON"] != "1" || daemonPins["BD_NO_DAEMON"] != "1" {
+		t.Fatalf("daemon pins = %v, want BR_NO_DAEMON=1 and BD_NO_DAEMON=1", daemonPins)
 	}
 }
 
@@ -1073,6 +1152,7 @@ func TestE2EAtomicAssignmentReservationRecoveryBuiltProcess(t *testing.T) {
 			Method  string `json:"method"`
 			Params  struct {
 				Name      string         `json:"name"`
+				URI       string         `json:"uri"`
 				Arguments map[string]any `json:"arguments"`
 			} `json:"params"`
 		}
@@ -1081,6 +1161,17 @@ func TestE2EAtomicAssignmentReservationRecoveryBuiltProcess(t *testing.T) {
 			return
 		}
 		if request.JSONRPC == "2.0" && request.Method == "resources/read" {
+			if writeAgentMailReadbackResource(w, request.ID, request.Params.URI, fixture.projectDir, func() []map[string]any {
+				stubMu.Lock()
+				defer stubMu.Unlock()
+				var active []map[string]any
+				for _, reservations := range activeReservations {
+					active = append(active, reservations...)
+				}
+				return active
+			}) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0", "id": request.ID,
@@ -1936,6 +2027,10 @@ func TestE2EAtomicAssignmentTerminalGenerationBuiltProcess(t *testing.T) {
 	fixture.mustBR(t, "reopen", beadID, "--reason=terminal-generation-e2e", "--json")
 	fixture.assertBead(t, beadID, "open", firstRecord.ClaimActor)
 
+	// The first delivery left prompt text on the pane; re-render the
+	// composer glyph so the bd-dp9oy delivery gate accepts a second typed
+	// send (a real agent shows its composer again once it finishes).
+	fixture.primePaneForSafeDispatch(t, 0)
 	secondResult := fixture.runNTM(t, nil, args...)
 	if secondResult.exitCode != 0 || len(bytes.TrimSpace(secondResult.stderr)) != 0 {
 		t.Fatalf("second generation exit=%d stdout=%s stderr=%s", secondResult.exitCode, secondResult.stdout, secondResult.stderr)
@@ -2087,6 +2182,9 @@ func TestE2EAtomicAssignmentCloseForceClearReopenGeneration(t *testing.T) {
 
 	fixture.mustBR(t, "reopen", beadID, "--reason=close-clear-reopen-e2e", "--json")
 	fixture.assertBead(t, beadID, "open", "")
+	// Earlier delivery left prompt text on the pane; re-render the composer
+	// glyph so the bd-dp9oy delivery gate accepts the reopened send.
+	fixture.primePaneForSafeDispatch(t, 0)
 	secondResult := fixture.runNTM(t, nil, args...)
 	if secondResult.exitCode != 0 || len(bytes.TrimSpace(secondResult.stderr)) != 0 {
 		t.Fatalf("reopened lifecycle assignment exit=%d stdout=%s stderr=%s", secondResult.exitCode, secondResult.stdout, secondResult.stderr)
@@ -2260,6 +2358,9 @@ func TestE2EAtomicAssignmentClearPaneLeaseFailureIsDurable(t *testing.T) {
 		t.Fatalf("recovered clear retained assignment %s: %+v", beadID, ledger.Assignments[beadID])
 	}
 
+	// Earlier delivery left prompt text on the pane; re-render the composer
+	// glyph so the bd-dp9oy delivery gate accepts the post-clear send.
+	fixture.primePaneForSafeDispatch(t, 0)
 	reassigned := fixture.runNTM(t, nil, atomicDirectArgs(fixture, beadID, prompt, false)...)
 	if reassigned.exitCode != 0 || len(bytes.TrimSpace(reassigned.stderr)) != 0 {
 		t.Fatalf("post-clear reassignment exit=%d stdout=%s stderr=%s", reassigned.exitCode, reassigned.stdout, reassigned.stderr)
@@ -2406,6 +2507,9 @@ func TestE2EAtomicCompletionOutboxRestartReplayAckRetryAndFinalAckBuiltProcess(t
 		t.Helper()
 		beadID := fixture.createBead(t, title)
 		prompt := fmt.Sprintf("NTM_ATOMIC_COMPLETION_OUTBOX_%d", time.Now().UnixNano())
+		// Prior seeds left prompt text on the pane; re-render the composer
+		// glyph so the bd-dp9oy delivery gate accepts each new typed send.
+		fixture.primePaneForSafeDispatch(t, 0)
 		seed := fixture.runNTM(t, nil, atomicDirectArgs(fixture, beadID, prompt, false)...)
 		if seed.exitCode != 0 || len(bytes.TrimSpace(seed.stderr)) != 0 {
 			t.Fatalf("seed completion outbox assignment exit=%d stdout=%s stderr=%s", seed.exitCode, seed.stdout, seed.stderr)
@@ -3074,6 +3178,10 @@ func TestE2EAtomicAssignmentObservationDeadlineContracts(t *testing.T) {
 		beadID := fixture.createBead(t, "Delayed assignment observation")
 		prompt := fmt.Sprintf("NTM_ATOMIC_DELAYED_OBSERVATION_%d", time.Now().UnixNano())
 		tmuxBinary, reached := fixture.armTMUXCaptureDelay(t, 2500*time.Millisecond)
+		// Every capture-pane takes 2.5s here. Delivery captures the pane for
+		// the workspace-trust gate (d6d088e9) and again for composer readiness,
+		// on top of the pre-claim observation, so the command budget must
+		// cover four slow captures; 8s only ever covered three.
 		result := fixture.runNTM(t, map[string]string{"NTM_TMUX_BINARY": tmuxBinary},
 			"assign", fixture.session,
 			"--repo="+fixture.projectDir,
@@ -3083,7 +3191,7 @@ func TestE2EAtomicAssignmentObservationDeadlineContracts(t *testing.T) {
 			"--force",
 			"--ignore-deps",
 			"--reserve-files=false",
-			"--timeout=8s",
+			"--timeout=15s",
 			"--json",
 		)
 		if result.exitCode != 0 || len(bytes.TrimSpace(result.stderr)) != 0 {
@@ -3678,6 +3786,7 @@ esac
 			Method string `json:"method"`
 			Params struct {
 				Name      string         `json:"name"`
+				URI       string         `json:"uri"`
 				Arguments map[string]any `json:"arguments"`
 			} `json:"params"`
 		}
@@ -3699,6 +3808,13 @@ esac
 			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": map[string]any{}})
 			return
 		}
+		if request.Method == "resources/read" && writeAgentMailReadbackResource(w, request.ID, request.Params.URI, fixture.projectDir, func() []map[string]any {
+			reservationMu.Lock()
+			defer reservationMu.Unlock()
+			return append([]map[string]any(nil), activeCoordinatorReservations...)
+		}) {
+			return
+		}
 		if request.Method != "tools/call" {
 			http.Error(w, "unexpected Agent Mail method", http.StatusNotFound)
 			return
@@ -3718,14 +3834,6 @@ esac
 			recipients, _ := request.Params.Arguments["to"].([]any)
 			if len(recipients) != 1 {
 				http.Error(w, "expected one recipient", http.StatusBadRequest)
-				return
-			}
-			if request.Method == "resources/read" {
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"jsonrpc": "2.0", "id": request.ID,
-					"error": map[string]any{"code": -32601, "message": "resource view not supported"},
-				})
 				return
 			}
 			recipient, _ := recipients[0].(string)
@@ -4351,17 +4459,29 @@ func TestE2EAtomicAssignmentEligibleBelowFormerPlanCapBuiltProcess(t *testing.T)
 	labelRows := make([]map[string]any, 0, 102)
 	gatedIDs := make(map[string]struct{}, 101)
 	for index := 0; index < 101; index++ {
-		beadID := fmt.Sprintf("ntm-e2e-gated-%03d", index)
+		// The gated rows must exist in the canonical tracker: candidates that
+		// are absent from .beads/issues.jsonl are excluded as source_missing
+		// before assignment (5c3aae2e) and would never reach the gate check.
+		title := fmt.Sprintf("Operator-gated plan row %03d", index)
+		output := fixture.mustBR(t, "create", title, "--type=task", "--priority=1", "--labels=operator-gated", "--silent")
+		beadID := strings.TrimSpace(string(output))
+		if beadID == "" || strings.ContainsAny(beadID, " \t\r\n") {
+			t.Fatalf("unexpected gated br create output %q", output)
+		}
 		gatedIDs[beadID] = struct{}{}
 		planItems = append(planItems, map[string]any{
 			"id":       beadID,
-			"title":    fmt.Sprintf("Operator-gated plan row %03d", index),
+			"title":    title,
 			"status":   "open",
 			"priority": 1,
 		})
+		// issue_type is required since ntm-e165/GH#242: without verified
+		// type evidence the classifier must assume a plan item could be an
+		// epic and refuse automated dispatch.
 		labelRows = append(labelRows, map[string]any{
-			"id":     beadID,
-			"labels": []string{"operator-gated"},
+			"id":         beadID,
+			"issue_type": "task",
+			"labels":     []string{"operator-gated"},
 		})
 	}
 	planItems = append(planItems, map[string]any{
@@ -4371,8 +4491,9 @@ func TestE2EAtomicAssignmentEligibleBelowFormerPlanCapBuiltProcess(t *testing.T)
 		"priority": 2,
 	})
 	labelRows = append(labelRows, map[string]any{
-		"id":     eligibleID,
-		"labels": []string{},
+		"id":         eligibleID,
+		"issue_type": "task",
+		"labels":     []string{},
 	})
 
 	planPayload, err := json.Marshal(map[string]any{
@@ -5058,12 +5179,17 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 		`for arg in "$@"; do`,
 		`  case "$arg" in ready|list) command="$arg"; break ;; esac`,
 		`done`,
+		`for arg in "$@"; do`,
+		`  [ "$arg" = "--all" ] && [ "$command" = "list" ] && command=list_all`,
+		`done`,
 		`case "$NTM_E2E_BR_MODE:$command" in`,
 		`  ready_failure:ready) printf 'injected br ready failure\n' >&2; exit 70 ;;`,
 		`  list_failure:list) printf 'injected br list failure\n' >&2; exit 71 ;;`,
 		`  malformed_ready:ready) printf '{\n'; exit 0 ;;`,
 		`  malformed_list:list) printf '{\n'; exit 0 ;;`,
-		`  absent:ready|absent:list) printf '[]\n'; exit 0 ;;`,
+		`  absent:ready|absent:list|absent:list_all) printf '[]\n'; exit 0 ;;`,
+		`  stale_closed:ready|stale_closed:list) printf '[]\n'; exit 0 ;;`,
+		`  stale_closed:list_all) printf '[{"id":"%s","status":"closed"}]\n' "$NTM_E2E_BEAD_ID"; exit 0 ;;`,
 		"esac",
 		"real_br=" + tmux.ShellQuote(fixture.brPath),
 		`exec "$real_br" "$@"`,
@@ -5084,6 +5210,7 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 		mode              string
 		wantDiagnostic    string
 		wantBRInvocations []string
+		wantStaleSkip     bool
 	}{
 		{
 			name: "br ready failure", mode: "ready_failure",
@@ -5106,9 +5233,22 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 			wantBRInvocations: []string{"--lock-timeout 5000 ready --json --limit 100000", "--lock-timeout 5000 list --json --status open --limit 100000"},
 		},
 		{
-			name: "plan item absent from both label sources", mode: "absent",
-			wantDiagnostic:    "absent from both br ready and br list --status open",
-			wantBRInvocations: []string{"--lock-timeout 5000 ready --json --limit 100000", "--lock-timeout 5000 list --json --status open --limit 100000"},
+			name: "plan item absent from every tracker surface", mode: "absent",
+			wantDiagnostic: "absent from br ready, br list --status open, and br list --all",
+			wantBRInvocations: []string{
+				"--lock-timeout 5000 ready --json --limit 100000",
+				"--lock-timeout 5000 list --json --status open --limit 100000",
+				"--lock-timeout 5000 list --json --all --limit 100000",
+			},
+		},
+		{
+			name: "plan item closed since the bv snapshot is skipped", mode: "stale_closed",
+			wantStaleSkip: true,
+			wantBRInvocations: []string{
+				"--lock-timeout 5000 ready --json --limit 100000",
+				"--lock-timeout 5000 list --json --status open --limit 100000",
+				"--lock-timeout 5000 list --json --all --limit 100000",
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5146,6 +5286,7 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 			env["NTM_E2E_PLAN_PAYLOAD"] = planPath
 			env["NTM_E2E_BR_TRACE"] = brTrace
 			env["NTM_E2E_BR_MODE"] = tc.mode
+			env["NTM_E2E_BEAD_ID"] = beadID
 			result := fixture.runNTM(t, env,
 				"--json", "assign", fixture.session,
 				"--repo="+fixture.projectDir,
@@ -5158,10 +5299,29 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 				"--timeout=15s",
 				"--quiet",
 			)
-			code, message := assertAtomicAssignmentSingleFailureJSON(t, result)
-			if code != "ASSIGN_ERROR" || !strings.Contains(message, "actionable bead labels could not be verified") ||
-				!strings.Contains(message, tc.wantDiagnostic) {
-				t.Fatalf("label-enrichment failure code=%q message=%q, want ASSIGN_ERROR containing %q", code, message, tc.wantDiagnostic)
+			if tc.wantStaleSkip {
+				// A plan row that Beads reports closed is satisfied, not an
+				// error: the run must succeed cleanly with zero assignments.
+				if result.exitCode != 0 || len(bytes.TrimSpace(result.stderr)) != 0 {
+					t.Fatalf("stale-skip exit=%d stdout=%s stderr=%s, want clean success", result.exitCode, result.stdout, result.stderr)
+				}
+				var envelope struct {
+					Success bool `json:"success"`
+					Summary struct {
+						Assigned int `json:"assigned"`
+						Failed   int `json:"failed"`
+					} `json:"summary"`
+				}
+				decodeAtomicAssignmentJSON(t, result.stdout, &envelope)
+				if !envelope.Success || envelope.Summary.Assigned != 0 || envelope.Summary.Failed != 0 {
+					t.Fatalf("stale-skip envelope=%+v raw=%s", envelope, result.stdout)
+				}
+			} else {
+				code, message := assertAtomicAssignmentSingleFailureJSON(t, result)
+				if code != "ASSIGN_ERROR" || !strings.Contains(message, "actionable bead labels could not be verified") ||
+					!strings.Contains(message, tc.wantDiagnostic) {
+					t.Fatalf("label-enrichment failure code=%q message=%q, want ASSIGN_ERROR containing %q", code, message, tc.wantDiagnostic)
+				}
 			}
 
 			trace, err := os.ReadFile(brTrace)
@@ -5951,7 +6111,7 @@ func TestE2EAtomicExplicitSessionMixedLiveRootsFailsBeforeAssignmentBuiltProcess
 			t.Fatalf("create mixed-root fixture directory %s: %v", dir, err)
 		}
 	}
-	agentCommand := "bash --noprofile --norc -c 'stty -echo; exec cat'"
+	agentCommand := atomicAgentPaneCommand
 	fixture.mustTMUX(t, "new-window", "-d", "-t", fixture.session+":1", "-c", otherProject, agentCommand)
 	fixture.mustTMUX(t, "select-pane", "-t", fixture.session+":1.0", "-T", fixture.session+"__cod_mixed_root")
 
@@ -6221,7 +6381,7 @@ func TestE2EAtomicAssignmentPendingRetryRefusesChangedPhysicalPane(t *testing.T)
 	// consumes the former physical pane ID while leaving the production session
 	// with the same window-local pane indexes.
 	dummySession := fixture.session + "-pane-id-shift"
-	agentCommand := "bash --noprofile --norc -c 'stty -echo; exec cat'"
+	agentCommand := atomicAgentPaneCommand
 	fixture.mustTMUX(t, "-f", fixture.tmuxConfig, "new-session", "-d", "-s", dummySession, "-x", "80", "-y", "24", "-c", fixture.projectDir, agentCommand)
 	fixture.startAgentPanes(t)
 	if fixture.panes[0].ID == originalPaneID {
@@ -6778,6 +6938,7 @@ func TestE2EAtomicAssignmentReassignTransfersReservation(t *testing.T) {
 			Method  string `json:"method"`
 			Params  struct {
 				Name      string         `json:"name"`
+				URI       string         `json:"uri"`
 				Arguments map[string]any `json:"arguments"`
 			} `json:"params"`
 		}
@@ -6790,6 +6951,13 @@ func TestE2EAtomicAssignmentReassignTransfersReservation(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 		}
 		if request.Method == "resources/read" {
+			if writeAgentMailReadbackResource(w, request.ID, request.Params.URI, fixture.projectDir, func() []map[string]any {
+				reservationMu.Lock()
+				defer reservationMu.Unlock()
+				return append([]map[string]any(nil), activeReservations...)
+			}) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0", "id": request.ID,
@@ -8143,6 +8311,7 @@ func TestE2EAtomicBulkAssignmentCanonicalMultiWindow(t *testing.T) {
 			"--robot-bulk-assign=" + fixture.session,
 			"--allocation=" + string(encoded),
 			"--template=" + templatePath,
+			"--reserve-files=false",
 		}
 		args = append(args, extra...)
 		result := fixture.runNTM(tb, nil, args...)
@@ -8475,6 +8644,9 @@ func TestE2EAtomicBulkAssignmentCanonicalMultiWindow(t *testing.T) {
 		beadID := fixture.createBead(t, "Canonical direct assignment")
 		target := panes["1.0"]
 		prompt := fmt.Sprintf("NTM_ATOMIC_DIRECT_MULTI_%d", time.Now().UnixNano())
+		// Earlier bulk sends left prompt text on this pane; re-render the
+		// composer glyph so the bd-dp9oy delivery gate accepts the send.
+		fixture.primeEndpointForSafeDispatch(t, target)
 		firstResult := fixture.runNTM(t, nil, atomicDirectArgsForSelector(fixture, target.Target, beadID, prompt, false)...)
 		if firstResult.exitCode != 0 || len(bytes.TrimSpace(firstResult.stderr)) != 0 {
 			t.Fatalf("direct W.P assignment exit=%d stdout=%s stderr=%s", firstResult.exitCode, firstResult.stdout, firstResult.stderr)
@@ -8902,6 +9074,7 @@ func TestE2EAtomicRobotBulkSecretSafety(t *testing.T) {
 			"--robot-bulk-assign="+fixture.session,
 			"--allocation="+string(allocation),
 			"--template="+templatePath,
+			"--reserve-files=false",
 		)
 		if result.exitCode != 0 || len(bytes.TrimSpace(result.stderr)) != 0 {
 			t.Fatalf("robot title-secret assignment exit=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
@@ -8993,6 +9166,13 @@ func newAtomicAssignmentCLIFixture(t *testing.T) *atomicAssignmentCLIFixture {
 	}
 
 	root := t.TempDir()
+	// macOS t.TempDir() lives under /var, a symlink to /private/var. The
+	// production coordinator resolves the project path before calling Agent
+	// Mail ensure_project, so the fixture must hold the resolved form or the
+	// mail stubs' human_key/project_key comparisons reject with HTTP 400.
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	tmuxRoot := testutil.ShortTmuxTempDir(t)
 	fixture := &atomicAssignmentCLIFixture{
 		ntmPath:    ntmPath,
@@ -9297,6 +9477,9 @@ func (f *atomicAssignmentCLIFixture) createClaimedPendingViaTmuxOutage(t *testin
 	return beadID, pending
 }
 
+// atomicBulkArgs opts out of the default file reservation, as the `ntm
+// assign` scenarios here pass --reserve-files=false: these beads name no
+// files and most scenarios run without Agent Mail.
 func atomicBulkArgs(f *atomicAssignmentCLIFixture, beadID, templatePath string) []string {
 	allocation, _ := json.Marshal(map[string]string{"1": beadID})
 	return []string{
@@ -9304,6 +9487,7 @@ func atomicBulkArgs(f *atomicAssignmentCLIFixture, beadID, templatePath string) 
 		"--robot-bulk-assign=" + f.session,
 		"--allocation=" + string(allocation),
 		"--template=" + templatePath,
+		"--reserve-files=false",
 	}
 }
 
@@ -10009,7 +10193,7 @@ func assertAtomicAssignmentSingleFailureJSON(t *testing.T, result atomicAssignme
 
 func (f *atomicAssignmentCLIFixture) startAgentPanes(t *testing.T) {
 	t.Helper()
-	agentCommand := "bash --noprofile --norc -c 'stty -echo; exec cat'"
+	agentCommand := atomicAgentPaneCommand
 	f.mustTMUX(t, "-f", f.tmuxConfig, "new-session", "-d", "-s", f.session, "-x", "160", "-y", "48", "-c", f.projectDir, agentCommand)
 	f.mustTMUX(t, "split-window", "-d", "-t", f.session+":0", "-c", f.projectDir, agentCommand)
 	f.mustTMUX(t, "select-pane", "-t", f.session+":0.0", "-T", f.session+"__cod_1")
@@ -10058,7 +10242,7 @@ func (f *atomicAssignmentCLIFixture) waitForPanes(t *testing.T) {
 
 func (f *atomicAssignmentCLIFixture) addSecondAgentWindow(t *testing.T) map[string]atomicAssignmentPane {
 	t.Helper()
-	agentCommand := "bash --noprofile --norc -c 'stty -echo; exec cat'"
+	agentCommand := atomicAgentPaneCommand
 	f.mustTMUX(t, "new-window", "-d", "-t", f.session+":1", "-c", f.projectDir, agentCommand)
 	f.mustTMUX(t, "split-window", "-d", "-t", f.session+":1", "-c", f.projectDir, agentCommand)
 	f.mustTMUX(t, "select-pane", "-t", f.session+":1.0", "-T", f.session+"__cod_3")
@@ -10107,9 +10291,14 @@ func (f *atomicAssignmentCLIFixture) waitForTopology(t *testing.T, want int) map
 
 func (f *atomicAssignmentCLIFixture) primeEndpointForSafeDispatch(t *testing.T, pane atomicAssignmentPane) {
 	t.Helper()
-	prompt := "claude>"
+	// Render the pane's own live-composer glyph ("❯" Claude, "›" codex).
+	// Dispatch refuses to type into a Claude/codex pane whose non-empty
+	// capture shows neither the composer marker nor working-state chrome
+	// (bd-dp9oy), so the historical ASCII "claude>"/"codex>" idle prompts
+	// no longer count as delivery-ready.
+	prompt := "❯"
 	if strings.Contains(pane.Title, "__cod_") {
-		prompt = "codex>"
+		prompt = "›"
 	}
 	f.mustTMUX(t, "send-keys", "-t", pane.ID, "-l", prompt)
 	f.mustTMUX(t, "send-keys", "-t", pane.ID, "Enter")
@@ -10837,8 +11026,15 @@ func waitForAtomicAssignmentPath(t *testing.T, path string, pid int) {
 		} else if !os.IsNotExist(err) {
 			t.Fatalf("inspect cancellation sentinel %s: %v", path, err)
 		}
-		if _, err := os.Stat(filepath.Join("/proc", fmt.Sprintf("%d", pid))); os.IsNotExist(err) {
-			t.Fatalf("ntm process %d exited before reaching cancellation sentinel %s", pid, path)
+		// Liveness probe: signal 0 works on every Unix, unlike /proc which
+		// does not exist on macOS (stat("/proc/<pid>") there reported every
+		// process as exited and failed these subtests unconditionally). The
+		// probe is best-effort: an un-reaped child zombie still counts as
+		// alive, in which case the deadline below reports the failure.
+		if proc, findErr := os.FindProcess(pid); findErr == nil {
+			if sigErr := proc.Signal(syscall.Signal(0)); errors.Is(sigErr, os.ErrProcessDone) {
+				t.Fatalf("ntm process %d exited before reaching cancellation sentinel %s", pid, path)
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("ntm process %d did not reach cancellation sentinel %s", pid, path)
@@ -11095,6 +11291,7 @@ func atomicAssignmentIsolatedEnv(overrides map[string]string) []string {
 	replaced := map[string]struct{}{
 		"HOME": {}, "XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_STATE_HOME": {}, "XDG_CACHE_HOME": {}, "PWD": {}, "OLDPWD": {},
 		"GIT_DIR": {}, "GIT_WORK_TREE": {}, "BR_DB": {}, "BD_DB": {}, "BEADS_DB": {}, "AGENT_NAME": {},
+		"BR_NO_DAEMON": {}, "BD_NO_DAEMON": {},
 		"TMUX": {}, "TMUX_PANE": {}, "TMUX_TMPDIR": {},
 		"NTM_CONFIG": {}, "NTM_OUTPUT_FORMAT": {}, "NTM_ROBOT_FORMAT": {}, "NTM_TEST_ASSIGNMENT_SAVE_FAIL_AFTER_BACKUP": {}, "NTM_TEST_COMPLETION_ACK_FAIL_ONCE": {}, "NTM_TEST_COMPLETION_LEASE_DURATION": {}, "NTM_TEST_COMPLETION_HANDLER_DELAY": {}, "TOON_DEFAULT_FORMAT": {},
 		"AGENT_MAIL_URL": {}, "AGENT_MAIL_TOKEN": {},
@@ -11112,6 +11309,19 @@ func atomicAssignmentIsolatedEnv(overrides map[string]string) []string {
 	}
 	for key, value := range overrides {
 		result = append(result, key+"="+value)
+	}
+	// Hermetic br: host-level br daemons must not answer reads for beads the
+	// fixture seeded through its own isolated state — on hosts running an
+	// older br (0.3.x/0.4.x) daemon, seeded beads came back invisible to
+	// `br ready`/`br list` and the assign-family e2e suites failed (#263).
+	// br >=0.5 documents BR_NO_DAEMON as an effective no-op, so pinning it is
+	// free there and the discriminator where it matters. Both the seeding
+	// writes (mustBR) and the built ntm process run with this environment.
+	if _, ok := overrides["BR_NO_DAEMON"]; !ok {
+		result = append(result, "BR_NO_DAEMON=1")
+	}
+	if _, ok := overrides["BD_NO_DAEMON"]; !ok {
+		result = append(result, "BD_NO_DAEMON=1")
 	}
 	sort.Strings(result)
 	return result

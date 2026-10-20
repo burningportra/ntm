@@ -9,23 +9,22 @@ import (
 func TestCollectorBasicOperations(t *testing.T) {
 	// Create collector without store
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	// Test RecordAPICall
-	c.RecordAPICall("bv", "triage")
-	c.RecordAPICall("bv", "triage")
-	c.RecordAPICall("bd", "create")
+	recordAPICallForTest(c, "bv", "triage")
+	recordAPICallForTest(c, "bv", "triage")
+	recordAPICallForTest(c, "bd", "create")
 
 	// Test RecordLatency
-	c.RecordLatency("cm_query", 50*time.Millisecond)
-	c.RecordLatency("cm_query", 100*time.Millisecond)
-	c.RecordLatency("cm_query", 75*time.Millisecond)
+	recordLatencyForTest(c, "cm_query", 50*time.Millisecond)
+	recordLatencyForTest(c, "cm_query", 100*time.Millisecond)
+	recordLatencyForTest(c, "cm_query", 75*time.Millisecond)
 
 	// Test RecordBlockedCommand
 	c.RecordBlockedCommand("agent-1", "rm -rf /", "destructive")
 
-	// Test RecordFileConflict
-	c.RecordFileConflict("agent-1", "agent-2", "*.go")
+	// One file conflict, reported by the tracker rather than a local counter.
+	stubFileConflicts(t, 1)
 
 	// Generate report
 	report, err := c.GenerateReport()
@@ -89,7 +88,6 @@ func TestLatencyStatistics(t *testing.T) {
 
 func TestTargetComparison(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	// Should start meeting targets (no incidents)
 	report, _ := c.GenerateReport()
@@ -125,7 +123,6 @@ func TestTargetComparison(t *testing.T) {
 
 func TestCompareSnapshots(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	// Baseline: latency 500ms
 	baseline := &MetricsReport{
@@ -138,7 +135,7 @@ func TestCompareSnapshots(t *testing.T) {
 	}
 
 	// Current: latency improved to 50ms
-	c.RecordLatency("cm_query", 50*time.Millisecond)
+	recordLatencyForTest(c, "cm_query", 50*time.Millisecond)
 	current, _ := c.GenerateReport()
 
 	result := c.CompareSnapshots(baseline, current)
@@ -156,9 +153,8 @@ func TestCompareSnapshots(t *testing.T) {
 
 func TestExportFormats(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
-	c.RecordLatency("test_op", 100*time.Millisecond)
+	recordLatencyForTest(c, "test_op", 100*time.Millisecond)
 
 	report, err := c.GenerateReport()
 	if err != nil {
@@ -247,11 +243,10 @@ func TestGetTargetStatus(t *testing.T) {
 
 func TestGenerateTargetComparisons_WithLatency(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	// Add CM query latency samples
-	c.RecordLatency("cm_query", 40*time.Millisecond)
-	c.RecordLatency("cm_query", 60*time.Millisecond)
+	recordLatencyForTest(c, "cm_query", 40*time.Millisecond)
+	recordLatencyForTest(c, "cm_query", 60*time.Millisecond)
 
 	report, err := c.GenerateReport()
 	if err != nil {
@@ -287,7 +282,6 @@ func TestGenerateTargetComparisons_WithLatency(t *testing.T) {
 
 func TestGenerateTargetComparisons_NoLatency(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	report, err := c.GenerateReport()
 	if err != nil {
@@ -308,7 +302,6 @@ func TestGenerateTargetComparisons_NoLatency(t *testing.T) {
 
 func TestCompareSnapshots_Regressions(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	baseline := &MetricsReport{
 		SessionID:       "baseline",
@@ -370,7 +363,6 @@ func TestCompareSnapshots_Regressions(t *testing.T) {
 
 func TestCompareSnapshots_NoChanges(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	report := &MetricsReport{
 		SessionID:       "same",
@@ -423,24 +415,6 @@ func TestTier0Constants(t *testing.T) {
 		if _, ok := Tier0Targets[key]; !ok {
 			t.Errorf("Tier0Baselines has key %q not found in Tier0Targets", key)
 		}
-	}
-}
-
-func TestLatencySampleCap(t *testing.T) {
-	c := NewCollector(nil, "test-session")
-	defer c.Close()
-
-	// Record more than 1000 latency samples
-	for i := 0; i < 1100; i++ {
-		c.RecordLatency("test_op", time.Millisecond)
-	}
-
-	c.mu.RLock()
-	count := len(c.latencies["test_op"])
-	c.mu.RUnlock()
-
-	if count > 1000 {
-		t.Errorf("expected at most 1000 samples, got %d", count)
 	}
 }
 
@@ -605,7 +579,6 @@ func TestCalculateLatencyStats_EdgeCases(t *testing.T) {
 
 func TestSaveSnapshot_NilStore(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	// Should return nil (no-op) when store is nil
 	err := c.SaveSnapshot("test-snapshot")
@@ -616,7 +589,6 @@ func TestSaveSnapshot_NilStore(t *testing.T) {
 
 func TestLoadSnapshot_NilStore(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	// Should return error when store is nil
 	_, err := c.LoadSnapshot("test-snapshot")
@@ -626,19 +598,6 @@ func TestLoadSnapshot_NilStore(t *testing.T) {
 	if !containsHelper(err.Error(), "no store configured") {
 		t.Errorf("expected 'no store configured' error, got %v", err)
 	}
-}
-
-func TestClose_MultipleCallsSafe(t *testing.T) {
-	c := NewCollector(nil, "test-session")
-
-	// First close
-	c.Close()
-
-	// Second close should not panic
-	c.Close()
-
-	// Third close should not panic
-	c.Close()
 }
 
 func TestGetTargetStatus_EdgeCases(t *testing.T) {
@@ -707,10 +666,9 @@ func TestExportCSV_MultipleOperations(t *testing.T) {
 
 func TestExportJSON_ValidJSON(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
-	c.RecordAPICall("test", "op")
-	c.RecordLatency("test_op", 100*time.Millisecond)
+	recordAPICallForTest(c, "test", "op")
+	recordLatencyForTest(c, "test_op", 100*time.Millisecond)
 
 	report, err := c.GenerateReport()
 	if err != nil {
@@ -739,7 +697,6 @@ func TestExportJSON_ValidJSON(t *testing.T) {
 
 func TestCompareSnapshots_MissingBaselineOperation(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	// Baseline has no operations
 	baseline := &MetricsReport{
@@ -763,31 +720,8 @@ func TestCompareSnapshots_MissingBaselineOperation(t *testing.T) {
 	}
 }
 
-func TestRecordLatency_MaintainsOrder(t *testing.T) {
-	c := NewCollector(nil, "test-session")
-	defer c.Close()
-
-	// Record latencies in specific order
-	c.RecordLatency("test", 100*time.Millisecond)
-	c.RecordLatency("test", 200*time.Millisecond)
-	c.RecordLatency("test", 300*time.Millisecond)
-
-	c.mu.RLock()
-	samples := c.latencies["test"]
-	c.mu.RUnlock()
-
-	// Should maintain insertion order
-	if len(samples) != 3 {
-		t.Fatalf("expected 3 samples, got %d", len(samples))
-	}
-	if samples[0] != 100 || samples[1] != 200 || samples[2] != 300 {
-		t.Errorf("samples = %v, want [100, 200, 300]", samples)
-	}
-}
-
 func TestGenerateReport_EmptyCollector(t *testing.T) {
 	c := NewCollector(nil, "empty-session")
-	defer c.Close()
 
 	report, err := c.GenerateReport()
 	if err != nil {
@@ -813,7 +747,6 @@ func TestGenerateReport_EmptyCollector(t *testing.T) {
 
 func TestMetricsReport_GeneratedAtIsRecent(t *testing.T) {
 	c := NewCollector(nil, "test-session")
-	defer c.Close()
 
 	before := time.Now().UTC()
 	report, err := c.GenerateReport()
@@ -827,3 +760,22 @@ func TestMetricsReport_GeneratedAtIsRecent(t *testing.T) {
 			report.GeneratedAt, before, after)
 	}
 }
+
+// Test-local recorders standing in for removed production record methods;
+// they seed the collector's in-memory aggregates for report/snapshot tests.
+func recordAPICallForTest(c *Collector, tool, operation string) {
+	c.mu.Lock()
+	c.apiCalls[tool+":"+operation]++
+	c.mu.Unlock()
+}
+
+func recordLatencyForTest(c *Collector, operation string, d time.Duration) {
+	ms := float64(d.Nanoseconds()) / 1e6
+	c.mu.Lock()
+	c.latencies[operation] = append(c.latencies[operation], ms)
+	c.mu.Unlock()
+}
+
+// File conflicts are no longer a counter on the Collector — GenerateReport
+// counts them from the tracker — so tests stub the source instead; see
+// stubFileConflicts in collector_conflicts_test.go.

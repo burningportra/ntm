@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func TestNewPaneLauncher(t *testing.T) {
@@ -35,53 +38,6 @@ func TestNewPaneLauncher(t *testing.T) {
 
 	if launcher.Logger == nil {
 		t.Error("expected non-nil Logger")
-	}
-}
-
-func TestPaneLauncherChaining(t *testing.T) {
-	launcher := NewPaneLauncher()
-
-	// Test WithCDDelay
-	result := launcher.WithCDDelay(200 * time.Millisecond)
-	if result != launcher {
-		t.Error("WithCDDelay should return the same launcher for chaining")
-	}
-	if launcher.CDDelay != 200*time.Millisecond {
-		t.Errorf("expected CDDelay of 200ms, got %v", launcher.CDDelay)
-	}
-
-	// Test WithValidatePaths
-	result = launcher.WithValidatePaths(false)
-	if result != launcher {
-		t.Error("WithValidatePaths should return the same launcher for chaining")
-	}
-	if launcher.ValidatePaths {
-		t.Error("expected ValidatePaths to be false")
-	}
-
-	// Test WithLogger
-	result = launcher.WithLogger(nil)
-	if result != launcher {
-		t.Error("WithLogger should return the same launcher for chaining")
-	}
-
-	// Test WithCmdBuilder
-	builder := NewLaunchCommandBuilder()
-	result = launcher.WithCmdBuilder(builder)
-	if result != launcher {
-		t.Error("WithCmdBuilder should return the same launcher for chaining")
-	}
-	if launcher.CmdBuilder != builder {
-		t.Error("expected CmdBuilder to be set")
-	}
-}
-
-func TestPaneLauncherTmuxClientHelper(t *testing.T) {
-	launcher := NewPaneLauncher()
-	client := launcher.tmuxClient()
-
-	if client == nil {
-		t.Error("expected non-nil client from tmuxClient()")
 	}
 }
 
@@ -117,8 +73,9 @@ func TestChangeDirectoryCommandQuotesShellSyntaxLiterally(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := changeDirectoryCommand(tc.path); got != tc.want {
-				t.Errorf("changeDirectoryCommand(%q) = %q, want %q", tc.path, got, tc.want)
+			got, err := tmux.BuildPaneCommand(tc.path, "cod")
+			if err != nil || got != tc.want+" && cod" {
+				t.Errorf("BuildPaneCommand(%q) = %q, %v; want guarded literal directory change", tc.path, got, err)
 			}
 		})
 	}
@@ -254,40 +211,6 @@ func TestValidateProjectPath(t *testing.T) {
 					tt.path, err, tt.wantErr)
 			}
 		})
-	}
-}
-
-func TestPaneLauncherLaunchSwarmNilPlan(t *testing.T) {
-	launcher := NewPaneLauncher()
-	result, err := launcher.LaunchSwarm(context.Background(), nil, 0)
-
-	if err == nil {
-		t.Error("expected error for nil plan")
-	}
-	if result != nil {
-		t.Error("expected nil result for nil plan")
-	}
-}
-
-func TestPaneLauncherLaunchSwarmEmptyPlan(t *testing.T) {
-	launcher := NewPaneLauncher().WithValidatePaths(false)
-	plan := &SwarmPlan{
-		Sessions:    []SessionSpec{},
-		TotalAgents: 0,
-	}
-
-	result, err := launcher.LaunchSwarm(context.Background(), plan, 0)
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
-	if result.TotalPanes != 0 {
-		t.Errorf("expected TotalPanes of 0, got %d", result.TotalPanes)
-	}
-	if result.Successful != 0 {
-		t.Errorf("expected Successful of 0, got %d", result.Successful)
 	}
 }
 
@@ -462,5 +385,117 @@ func TestIsCodexProvider(t *testing.T) {
 				t.Errorf("isCodexProvider(%q) = %v, want %v", tc.agentType, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPaneLauncherLaunchSwarmEmptyPlan(t *testing.T) {
+	launcher := NewPaneLauncher().WithValidatePaths(false)
+	plan := &SwarmPlan{
+		Sessions:    []SessionSpec{},
+		TotalAgents: 0,
+	}
+
+	result, err := launcher.LaunchSwarm(context.Background(), plan, 0)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.TotalPanes != 0 {
+		t.Errorf("expected TotalPanes of 0, got %d", result.TotalPanes)
+	}
+	if result.Successful != 0 {
+		t.Errorf("expected Successful of 0, got %d", result.Successful)
+	}
+}
+
+func TestPaneLauncherLaunchSwarmNilPlan(t *testing.T) {
+	launcher := NewPaneLauncher()
+	result, err := launcher.LaunchSwarm(context.Background(), nil, 0)
+
+	if err == nil {
+		t.Error("expected error for nil plan")
+	}
+	if result != nil {
+		t.Error("expected nil result for nil plan")
+	}
+}
+
+func TestPaneLauncherTmuxClientHelper(t *testing.T) {
+	launcher := NewPaneLauncher()
+	client := launcher.tmuxClient()
+
+	if client == nil {
+		t.Error("expected non-nil client from tmuxClient()")
+	}
+}
+
+func TestPaneLauncherChaining(t *testing.T) {
+	launcher := NewPaneLauncher()
+
+	// Test WithCDDelay
+	result := launcher.WithCDDelay(200 * time.Millisecond)
+	if result != launcher {
+		t.Error("WithCDDelay should return the same launcher for chaining")
+	}
+	if launcher.CDDelay != 200*time.Millisecond {
+		t.Errorf("expected CDDelay of 200ms, got %v", launcher.CDDelay)
+	}
+
+	// Test WithValidatePaths
+	result = launcher.WithValidatePaths(false)
+	if result != launcher {
+		t.Error("WithValidatePaths should return the same launcher for chaining")
+	}
+	if launcher.ValidatePaths {
+		t.Error("expected ValidatePaths to be false")
+	}
+
+	// Test WithLogger
+	result = launcher.WithLogger(nil)
+	if result != launcher {
+		t.Error("WithLogger should return the same launcher for chaining")
+	}
+
+	// Test WithCmdBuilder
+	builder := NewLaunchCommandBuilder()
+	result = launcher.WithCmdBuilder(builder)
+	if result != launcher {
+		t.Error("WithCmdBuilder should return the same launcher for chaining")
+	}
+	if launcher.CmdBuilder != builder {
+		t.Error("expected CmdBuilder to be set")
+	}
+}
+
+// Each pane's Codex cooldown comes from its own project's history: a swarm
+// spans projects, and one shared tracker gated on (and saved over) the wrong
+// project's state.
+func TestPaneLauncherCodexCooldownIsPerProject(t *testing.T) {
+	limited, clear := t.TempDir(), t.TempDir()
+	recorded := ratelimit.NewRateLimitTracker(limited)
+	recorded.RecordRateLimitWithCooldown("openai", "send", 60)
+	if err := recorded.SaveToDir(limited); err != nil {
+		t.Fatal(err)
+	}
+
+	launcher := NewPaneLauncher()
+	if got := launcher.codexCooldown(PaneSpec{AgentType: "cod", Project: limited}); got != 0 {
+		t.Fatalf("cooldown with RateLimitHistory off = %s, want 0", got)
+	}
+
+	launcher.RateLimitHistory = true
+	if got := launcher.codexCooldown(PaneSpec{AgentType: "cod", Project: limited}); got < 50*time.Second {
+		t.Fatalf("codex cooldown in the rate-limited project = %s, want the recorded ~60s", got)
+	}
+	if got := launcher.codexCooldown(PaneSpec{AgentType: "cod", Project: clear}); got != 0 {
+		t.Fatalf("codex cooldown in another project = %s, want 0", got)
+	}
+	if got := launcher.codexCooldown(PaneSpec{AgentType: "cc", Project: limited}); got != 0 {
+		t.Fatalf("claude cooldown = %s, want 0: only Codex is gated", got)
+	}
+	if _, err := os.Stat(filepath.Join(clear, ".ntm", "rate_limits.json")); !os.IsNotExist(err) {
+		t.Fatalf("checking a cooldown wrote history into the other project: %v", err)
 	}
 }

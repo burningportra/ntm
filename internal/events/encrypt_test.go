@@ -23,7 +23,7 @@ func TestSetEncryptionConfig_Events(t *testing.T) {
 
 	t.Run("nil disables", func(t *testing.T) {
 		SetEncryptionConfig(nil)
-		if GetEncryptionEnabled() {
+		if encryptionEnabledForTest() {
 			t.Error("expected disabled")
 		}
 	})
@@ -35,7 +35,7 @@ func TestSetEncryptionConfig_Events(t *testing.T) {
 			EncryptKey:  key,
 			DecryptKeys: [][]byte{key},
 		})
-		if !GetEncryptionEnabled() {
+		if !encryptionEnabledForTest() {
 			t.Error("expected enabled")
 		}
 	})
@@ -61,7 +61,7 @@ func TestEncryptedEventLogRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLogger: %v", err)
 	}
-	defer logger.Close()
+	defer closeLogger(logger)
 
 	// Write encrypted events
 	event1 := NewEvent(EventSessionCreate, "test-session", map[string]interface{}{
@@ -79,7 +79,7 @@ func TestEncryptedEventLogRoundTrip(t *testing.T) {
 	}
 
 	// Read them back
-	events, err := logger.Since(time.Time{})
+	events, err := ReadSince(logger.path, time.Time{})
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestReadSince_DecryptsEncryptedLog(t *testing.T) {
 	if err := logger.Log(NewEvent(EventSessionCreate, "read-since", map[string]interface{}{"agents": 2})); err != nil {
 		t.Fatalf("Log: %v", err)
 	}
-	if err := logger.Close(); err != nil {
+	if err := closeLogger(logger); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
@@ -140,6 +140,52 @@ func TestReadSince_DecryptsEncryptedLog(t *testing.T) {
 	}
 	if len(blind) != 0 {
 		t.Fatalf("got %d events without keys, want 0", len(blind))
+	}
+}
+
+// ReadTypesSince returns only the requested types — from plaintext and
+// encrypted lines alike — and never a line that merely quotes a type name.
+func TestReadTypesSince_FiltersByDecodedType(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+	logger, err := NewLogger(LoggerOptions{Path: logPath, RetentionDays: 30, Enabled: true})
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	crash := AgentLifecycleData{PaneID: "%3", PaneIndex: 1, AgentType: "cc", Reason: "process exited"}
+	if err := logger.LogEvent(EventAgentCrash, "proj", crash); err != nil {
+		t.Fatalf("Log crash: %v", err)
+	}
+	// A prompt whose payload quotes the marker must not pass as a crash.
+	if err := logger.LogEvent(EventPromptSend, "proj", map[string]interface{}{"template": `"type":"agent_crash"`}); err != nil {
+		t.Fatalf("Log prompt: %v", err)
+	}
+
+	key := evtTestKey(t)
+	SetEncryptionConfig(&EncryptionConfig{Enabled: true, EncryptKey: key, DecryptKeys: [][]byte{key}})
+	defer SetEncryptionConfig(nil)
+	if err := logger.LogEvent(EventAgentRestart, "proj", AgentLifecycleData{PaneID: "%3", RestartCount: 1}); err != nil {
+		t.Fatalf("Log restart: %v", err)
+	}
+	if err := closeLogger(logger); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := ReadTypesSince(logPath, time.Time{}, EventAgentCrash, EventAgentRestart)
+	if err != nil {
+		t.Fatalf("ReadTypesSince: %v", err)
+	}
+	if len(got) != 2 || got[0].Type != EventAgentCrash || got[1].Type != EventAgentRestart {
+		t.Fatalf("got %+v, want the crash then the (encrypted) restart", got)
+	}
+	if got[0].Data["pane_id"] != "%3" || got[0].Data["reason"] != "process exited" || got[1].Data["restart_count"] != float64(1) {
+		t.Fatalf("lifecycle payloads = %v / %v", got[0].Data, got[1].Data)
+	}
+
+	if later, err := ReadTypesSince(logPath, time.Now().Add(time.Hour), EventAgentCrash); err != nil || len(later) != 0 {
+		t.Fatalf("since bound: %+v, %v", later, err)
+	}
+	if none, err := ReadTypesSince(logPath, time.Time{}); err != nil || len(none) != 0 {
+		t.Fatalf("no types requested: %+v, %v", none, err)
 	}
 }
 
@@ -183,7 +229,7 @@ func TestMixedPlaintextAndEncryptedEvents(t *testing.T) {
 	if err := logger.Log(encEvt); err != nil {
 		t.Fatal(err)
 	}
-	logger.Close()
+	closeLogger(logger)
 
 	// Re-open and read all
 	logger2, err := NewLogger(LoggerOptions{
@@ -194,9 +240,9 @@ func TestMixedPlaintextAndEncryptedEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer logger2.Close()
+	defer closeLogger(logger2)
 
-	events, err := logger2.Since(time.Time{})
+	events, err := ReadSince(logger2.path, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,41 +251,9 @@ func TestMixedPlaintextAndEncryptedEvents(t *testing.T) {
 	}
 }
 
-func TestLastEventEncrypted(t *testing.T) {
-	tmpDir := t.TempDir()
-	logPath := filepath.Join(tmpDir, "events.jsonl")
-
-	key := evtTestKey(t)
-	SetEncryptionConfig(&EncryptionConfig{
-		Enabled:     true,
-		EncryptKey:  key,
-		DecryptKeys: [][]byte{key},
-	})
-	defer SetEncryptionConfig(nil)
-
-	logger, err := NewLogger(LoggerOptions{
-		Path:          logPath,
-		RetentionDays: 30,
-		Enabled:       true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer logger.Close()
-
-	evt := NewEvent(EventAgentSpawn, "sess", map[string]interface{}{"name": "claude_1"})
-	if err := logger.Log(evt); err != nil {
-		t.Fatal(err)
-	}
-
-	last, err := logger.LastEvent()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if last == nil {
-		t.Fatal("expected non-nil last event")
-	}
-	if last.Type != EventAgentSpawn {
-		t.Errorf("last event type = %q, want %q", last.Type, EventAgentSpawn)
-	}
+// encryptionEnabledForTest reports whether encryption is currently enabled.
+func encryptionEnabledForTest() bool {
+	encryptMu.RLock()
+	defer encryptMu.RUnlock()
+	return encryptionEnabled
 }

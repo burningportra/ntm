@@ -1108,6 +1108,7 @@ func TestNormalizeAgentType(t *testing.T) {
 		{"openai", "codex"},
 		{"openai-codex", "codex"},
 		{" codex-cli ", "codex"},
+		{"OH_MY_PI", "omp"},
 		{"gemini", "gemini"},
 		{"gmi", "gemini"},
 		{"google", "gemini"},
@@ -1172,6 +1173,8 @@ func TestIsValidAgentType(t *testing.T) {
 		{"windsurf", true},
 		{"aider", true},
 		{"ollama", true},
+		{"omp", true},
+		{"oh-my-pi", true},
 		// Case-insensitive handling
 		{"Claude", true},
 		{"CLAUDE", true},
@@ -1302,6 +1305,13 @@ func TestIsValidRoute(t *testing.T) {
 		{RouteLeastLoaded, true},
 		{RouteFirstAvailable, true},
 		{RouteRoundRobin, true},
+		// Every router strategy `ntm send --route` takes, not just three.
+		{RoutingStrategy("round-robin-available"), true},
+		{RoutingStrategy("random"), true},
+		{RoutingStrategy("sticky"), true},
+		{RoutingStrategy("affinity"), true},
+		// explicit names a pane; a step's pane field does that.
+		{RoutingStrategy("explicit"), false},
 		{RoutingStrategy("unknown"), false},
 		{RoutingStrategy(""), false},
 	}

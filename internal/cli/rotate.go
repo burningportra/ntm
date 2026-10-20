@@ -338,11 +338,23 @@ func rotateAllLimited(ctx context.Context, session, targetAccount string, dryRun
 			fmt.Printf("Error: %v\n", err)
 			continue
 		}
+		if info != nil && info.Unsupported != "" {
+			// No quota reading exists; never report such a pane as "OK".
+			fmt.Printf("SKIPPED (%s)\n", info.Unsupported)
+			continue
+		}
 
-		if info.IsLimited {
-			fmt.Printf("LIMITED\n")
+		// [rotation.thresholds] governs the classification (WS6-wire): a pane
+		// is rotation-eligible when the provider reports a hard limit OR its
+		// usage is at/over critical_percent; warning_percent surfaces panes
+		// approaching the limit without rotating them.
+		switch quota.ClassifyRotation(info) {
+		case quota.RotationLimited:
+			fmt.Printf("LIMITED (usage %.0f%%)\n", info.HighestUsage())
 			limitedPanes = append(limitedPanes, p)
-		} else {
+		case quota.RotationWarning:
+			fmt.Printf("WARNING (usage %.0f%%)\n", info.HighestUsage())
+		default:
 			fmt.Printf("OK\n")
 		}
 	}
@@ -571,8 +583,9 @@ func executeReauthRotation(session string, paneIdx int, paneID, provider string,
 	// Step 1: Send login command
 	fmt.Printf("Step 1/3: Sending %s command...\n", prov.LoginCommand())
 
-	// Only Claude has specialized auth flow implementation for now
-	// For others, we might need generic flow or specific implementations
+	// Claude is the only provider with a specialized re-auth flow; other
+	// providers get an explicit pending error below and are covered by the
+	// restart strategy instead.
 	if prov.Name() != "Claude" {
 		return fmt.Errorf("re-auth flow implementation pending for %s", prov.Name())
 	}
@@ -590,35 +603,19 @@ func executeReauthRotation(session string, paneIdx int, paneID, provider string,
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := authFlow.MonitorAuth(ctx, paneID)
-	if err != nil {
+	if err := authFlow.WaitForAuth(ctx, paneID, func(result auth.AuthResult) {
+		switch result.State {
+		case auth.AuthNeedsBrowser:
+			fmt.Printf("\n  Browser auth URL: %s\n", result.URL)
+			fmt.Println("  Complete the authentication in your browser...")
+		case auth.AuthNeedsChallenge:
+			fmt.Println("  Challenge code required (SSH/remote mode)")
+			fmt.Println("  Enter the code displayed in the browser into the agent pane")
+		}
+	}); err != nil {
 		return fmt.Errorf("monitoring auth: %w", err)
 	}
-
-	switch result.State {
-	case auth.AuthSuccess:
-		fmt.Println("  ✓ Authentication successful!")
-	case auth.AuthNeedsBrowser:
-		fmt.Printf("\n  Browser auth URL: %s\n", result.URL)
-		fmt.Println("  Complete the authentication in your browser...")
-		// Continue monitoring
-		result, err = authFlow.MonitorAuth(ctx, paneID)
-		if err != nil || result.State != auth.AuthSuccess {
-			return fmt.Errorf("authentication failed or timed out")
-		}
-		fmt.Println("  ✓ Authentication successful!")
-	case auth.AuthNeedsChallenge:
-		fmt.Println("  Challenge code required (SSH/remote mode)")
-		fmt.Println("  Enter the code displayed in the browser into the agent pane")
-		// Continue monitoring
-		result, err = authFlow.MonitorAuth(ctx, paneID)
-		if err != nil || result.State != auth.AuthSuccess {
-			return fmt.Errorf("authentication failed or timed out")
-		}
-		fmt.Println("  ✓ Authentication successful!")
-	case auth.AuthFailed:
-		return fmt.Errorf("authentication failed: %v", result.Error)
-	}
+	fmt.Println("  ✓ Authentication successful!")
 
 	// Step 3: Send continuation prompt
 	fmt.Println("\nStep 3/3: Sending continuation prompt...")
@@ -636,9 +633,9 @@ func executeReauthRotation(session string, paneIdx int, paneID, provider string,
 	return nil
 }
 
-// openAccountsPage opens the Google accounts page in the default browser
+// openAccountsPage prints the Google accounts URL as a tip. Deliberately does
+// not auto-open a browser: rotation often runs over SSH or inside tmux where
+// stealing focus (or having no display) would be worse than a printed link.
 func openAccountsPage() {
-	// Use 'open' on macOS, 'xdg-open' on Linux
-	// For now, just print the URL
 	fmt.Println("  Tip: Visit https://accounts.google.com to switch accounts")
 }

@@ -52,7 +52,10 @@ const (
 	TargetGemini
 	TargetAntigravity
 	TargetSelected // explicit per-pane selection (#205)
-	TargetType     // every pane of the agent type picked under 7 (bd-eccc9)
+	// TargetOmp is appended (key 7) so existing target values and the
+	// documented "6 = pick agents" binding stay stable.
+	TargetOmp
+	TargetType // every pane of the agent type picked under 8 (bd-eccc9)
 )
 
 // ReloadMsg is emitted when palette commands are reloaded from config changes.
@@ -66,6 +69,7 @@ type paneCounts struct {
 	codex       int
 	gemini      int
 	antigravity int
+	omp         int
 
 	// Representative pane titles per target (best-effort, used for UI clarity).
 	allSamples         []string
@@ -73,6 +77,7 @@ type paneCounts struct {
 	codexSamples       []string
 	geminiSamples      []string
 	antigravitySamples []string
+	ompSamples         []string
 
 	// Agent types with panes, for the "By type…" target row.
 	types []typeTarget
@@ -218,146 +223,21 @@ type Model struct {
 	agentCursor  int             // cursor position within agentPanes
 	agentChecked map[string]bool // pane ID -> selected for send
 
-	// "By type…" picker state (bd-eccc9), loaded when the user presses 7 in
+	// "By type…" picker state (bd-eccc9), loaded when the user presses 8 in
 	// the target phase. targetType is the type a TargetType send reaches.
 	typeTargets []typeTarget
 	typeCursor  int
 	targetType  agent.AgentType
 }
 
-// KeyMap defines the keybindings
-type KeyMap struct {
-	Up             key.Binding
-	Down           key.Binding
-	PageUp         key.Binding
-	PageDown       key.Binding
-	HalfPageUp     key.Binding
-	HalfPageDown   key.Binding
-	Home           key.Binding
-	End            key.Binding
-	Select         key.Binding
-	Back           key.Binding
-	Quit           key.Binding
-	Help           key.Binding
-	TogglePin      key.Binding
-	ToggleFavorite key.Binding
-	XFSearch       key.Binding
-	Compose        key.Binding
-	Target1        key.Binding
-	Target2        key.Binding
-	Target3        key.Binding
-	Target4        key.Binding
-	Target5        key.Binding
-	Edit           key.Binding
-	ConfirmEdit    key.Binding
-	Num1           key.Binding
-	Num2           key.Binding
-	Num3           key.Binding
-	Num4           key.Binding
-	Num5           key.Binding
-	Num6           key.Binding
-	Num7           key.Binding
-	Num8           key.Binding
-	Num9           key.Binding
-}
-
-var keys = KeyMap{
-	Up: key.NewBinding(
-		key.WithKeys("up", "k"),
-		key.WithHelp("↑/k", "up"),
-	),
-	Down: key.NewBinding(
-		key.WithKeys("down", "j"),
-		key.WithHelp("↓/j", "down"),
-	),
-	PageUp: key.NewBinding(
-		key.WithKeys("pgup"),
-		key.WithHelp("pgup", "page up"),
-	),
-	PageDown: key.NewBinding(
-		key.WithKeys("pgdown"),
-		key.WithHelp("pgdn", "page down"),
-	),
-	HalfPageUp: key.NewBinding(
-		key.WithKeys("ctrl+u"),
-		key.WithHelp("ctrl+u", "half page up"),
-	),
-	HalfPageDown: key.NewBinding(
-		key.WithKeys("ctrl+d"),
-		key.WithHelp("ctrl+d", "half page down"),
-	),
-	Home: key.NewBinding(
-		key.WithKeys("home", "g"),
-		key.WithHelp("home/g", "top"),
-	),
-	End: key.NewBinding(
-		key.WithKeys("end", "G"),
-		key.WithHelp("end/G", "bottom"),
-	),
-	Select: key.NewBinding(
-		key.WithKeys("enter"),
-		key.WithHelp("enter", "select"),
-	),
-	Back: key.NewBinding(
-		key.WithKeys("esc"),
-		key.WithHelp("esc", "back/quit"),
-	),
-	Quit: key.NewBinding(
-		key.WithKeys("q", "ctrl+c"),
-		key.WithHelp("q", "quit"),
-	),
-	Help: key.NewBinding(
-		key.WithKeys("?", "f1"),
-		key.WithHelp("?", "help"),
-	),
-	TogglePin: key.NewBinding(
-		key.WithKeys("ctrl+p"),
-		key.WithHelp("ctrl+p", "pin"),
-	),
-	ToggleFavorite: key.NewBinding(
-		key.WithKeys("ctrl+f"),
-		key.WithHelp("ctrl+f", "favorite"),
-	),
-	XFSearch: key.NewBinding(
-		key.WithKeys("ctrl+k"),
-		key.WithHelp("ctrl+k", "xf search"),
-	),
-	Compose: key.NewBinding(
-		key.WithKeys("ctrl+n"),
-		key.WithHelp("ctrl+n", "custom message"),
-	),
-	Target1: key.NewBinding(key.WithKeys("1")),
-	Target2: key.NewBinding(key.WithKeys("2")),
-	Target3: key.NewBinding(key.WithKeys("3")),
-	Target4: key.NewBinding(key.WithKeys("4")),
-	Target5: key.NewBinding(key.WithKeys("5")),
-	Edit: key.NewBinding(
-		key.WithKeys("e"),
-		key.WithHelp("e", "edit prompt"),
-	),
-	ConfirmEdit: key.NewBinding(
-		key.WithKeys("ctrl+s"),
-		key.WithHelp("ctrl+s", "save & continue"),
-	),
-	Num1: key.NewBinding(key.WithKeys("1")),
-	Num2: key.NewBinding(key.WithKeys("2")),
-	Num3: key.NewBinding(key.WithKeys("3")),
-	Num4: key.NewBinding(key.WithKeys("4")),
-	Num5: key.NewBinding(key.WithKeys("5")),
-	Num6: key.NewBinding(key.WithKeys("6")),
-	Num7: key.NewBinding(key.WithKeys("7")),
-	Num8: key.NewBinding(key.WithKeys("8")),
-	Num9: key.NewBinding(key.WithKeys("9")),
-}
+// The palette keybindings live in keymap.go as per-phase keymaps
+// (commandKeys, targetKeys, selectAgentsKeys, selectTypeKeys, editKeys,
+// xfSearchKeys, xfResultsKeys). Both the Update handlers and every help surface consume the
+// same binding values, so help cannot advertise keys Update does not handle.
 
 type Options struct {
 	PaletteState     config.PaletteState
 	PaletteStatePath string
-}
-
-// New creates a new palette model.
-func New(session string, commands []config.PaletteCmd) Model {
-	return NewWithOptions(session, commands, Options{})
 }
 
 // customMessageKey is the reserved key for the synthetic "Custom message"
@@ -537,6 +417,9 @@ func (m Model) fetchPaneCounts() tea.Cmd {
 			case tmux.AgentAntigravity:
 				counts.antigravity++
 				addSample(&counts.antigravitySamples, title, maxTypeSamples)
+			case tmux.AgentOmp:
+				counts.omp++
+				addSample(&counts.ompSamples, title, maxTypeSamples)
 			}
 		}
 
@@ -735,13 +618,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		// Help overlay: Esc or ?/F1 closes it; otherwise ignore input.
 		if m.showHelp {
-			if msg.String() == "esc" || key.Matches(msg, keys.Help) {
+			if msg.String() == "esc" || key.Matches(msg, targetKeys.Help) {
 				m.showHelp = false
 			}
 			return m, nil
 		}
 
-		if (m.phase == PhaseTarget || m.phase == PhaseXFResults) && key.Matches(msg, keys.Help) {
+		// Open the help overlay with each phase's Help binding. The command
+		// phase keeps the filter focused, so its binding is f1 only ('?' must
+		// type into the search box); target/xf-results also accept '?'.
+		switch {
+		case m.phase == PhaseCommand && key.Matches(msg, commandKeys.Help):
+			m.showHelp = true
+			return m, nil
+		case m.phase == PhaseTarget && key.Matches(msg, targetKeys.Help):
+			m.showHelp = true
+			return m, nil
+		case m.phase == PhaseXFResults && key.Matches(msg, xfResultsKeys.Help):
 			m.showHelp = true
 			return m, nil
 		}
@@ -803,15 +696,15 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch {
-	case key.Matches(msg, keys.Quit):
+	case key.Matches(msg, commandKeys.Quit):
 		m.quitting = true
 		return *m, tea.Quit
 
-	case key.Matches(msg, keys.Back):
+	case key.Matches(msg, commandKeys.Back):
 		m.quitting = true
 		return *m, tea.Quit
 
-	case key.Matches(msg, keys.Up):
+	case key.Matches(msg, commandKeys.Up):
 		if len(m.visualOrder) > 0 {
 			if pos := m.cursorVisualPos(); pos > 0 {
 				m.cursor = m.visualOrder[pos-1]
@@ -819,7 +712,7 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case key.Matches(msg, keys.Down):
+	case key.Matches(msg, commandKeys.Down):
 		if len(m.visualOrder) > 0 {
 			if pos := m.cursorVisualPos(); pos < len(m.visualOrder)-1 {
 				m.cursor = m.visualOrder[pos+1]
@@ -827,7 +720,7 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case key.Matches(msg, keys.PageUp):
+	case key.Matches(msg, commandKeys.PageUp):
 		// Move cursor up by approximately one page worth of items
 		if len(m.visualOrder) > 0 {
 			pos := m.cursorVisualPos()
@@ -844,7 +737,7 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ensureCursorVisible()
 		}
 
-	case key.Matches(msg, keys.PageDown):
+	case key.Matches(msg, commandKeys.PageDown):
 		// Move cursor down by approximately one page worth of items
 		if len(m.visualOrder) > 0 {
 			pos := m.cursorVisualPos()
@@ -860,7 +753,7 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ensureCursorVisible()
 		}
 
-	case key.Matches(msg, keys.HalfPageUp):
+	case key.Matches(msg, commandKeys.HalfPageUp):
 		// Move cursor up by half a page worth of items
 		if len(m.visualOrder) > 0 {
 			pos := m.cursorVisualPos()
@@ -876,7 +769,7 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ensureCursorVisible()
 		}
 
-	case key.Matches(msg, keys.HalfPageDown):
+	case key.Matches(msg, commandKeys.HalfPageDown):
 		// Move cursor down by half a page worth of items
 		if len(m.visualOrder) > 0 {
 			pos := m.cursorVisualPos()
@@ -892,21 +785,21 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ensureCursorVisible()
 		}
 
-	case key.Matches(msg, keys.Home):
+	case key.Matches(msg, commandKeys.Home):
 		// Jump to first item
 		if len(m.visualOrder) > 0 {
 			m.cursor = m.visualOrder[0]
 			m.listViewport.GotoTop()
 		}
 
-	case key.Matches(msg, keys.End):
+	case key.Matches(msg, commandKeys.End):
 		// Jump to last item
 		if len(m.visualOrder) > 0 {
 			m.cursor = m.visualOrder[len(m.visualOrder)-1]
 			m.listViewport.GotoBottom()
 		}
 
-	case key.Matches(msg, keys.TogglePin):
+	case key.Matches(msg, commandKeys.TogglePin):
 		if len(m.filtered) > 0 {
 			selectedKey := strings.TrimSpace(m.filtered[m.cursor].Key)
 			if selectedKey != "" {
@@ -921,7 +814,7 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case key.Matches(msg, keys.ToggleFavorite):
+	case key.Matches(msg, commandKeys.ToggleFavorite):
 		if len(m.filtered) > 0 {
 			selectedKey := strings.TrimSpace(m.filtered[m.cursor].Key)
 			if selectedKey != "" {
@@ -937,11 +830,11 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case key.Matches(msg, keys.XFSearch):
+	case key.Matches(msg, commandKeys.XFSearch):
 		m.enterXFSearch()
 		return *m, nil
 
-	case key.Matches(msg, keys.Compose):
+	case key.Matches(msg, commandKeys.Compose):
 		// Compose a free-text message from scratch (#206) without needing to pick
 		// a pre-baked command first. Uses a synthetic selection with an empty
 		// prompt and jumps straight into the editor.
@@ -951,7 +844,7 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		editCmd := m.enterEditPhase()
 		return *m, editCmd
 
-	case key.Matches(msg, keys.Select):
+	case key.Matches(msg, commandKeys.Select):
 		if len(m.filtered) > 0 {
 			cmd := m.filtered[m.cursor]
 			if cmd.Key == "xf-search" {
@@ -963,43 +856,9 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.phase = PhaseTarget
 		}
 
-	// Quick select with numbers 1-9
-	case key.Matches(msg, keys.Num1):
-		if m.selectByNumber(1) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num2):
-		if m.selectByNumber(2) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num3):
-		if m.selectByNumber(3) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num4):
-		if m.selectByNumber(4) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num5):
-		if m.selectByNumber(5) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num6):
-		if m.selectByNumber(6) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num7):
-		if m.selectByNumber(7) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num8):
-		if m.selectByNumber(8) {
-			m.phase = PhaseTarget
-		}
-	case key.Matches(msg, keys.Num9):
-		if m.selectByNumber(9) {
-			m.phase = PhaseTarget
-		}
+	// NOTE: there is deliberately no 1-9 quick-select here. The filter input is
+	// always focused, so digits type into the search box; quick-select was
+	// REJECTED per the recorded H3 decision (bd-ws7-docs-ux-truth-tqh3l.3).
 
 	default:
 		// Let the textinput handle it
@@ -1013,58 +872,49 @@ func (m *Model) updateCommandPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return *m, nil
 }
 
-func (m *Model) selectByNumber(n int) bool {
-	visualPos := n - 1 // Convert 1-based to 0-based
-	if visualPos >= 0 && visualPos < len(m.visualOrder) {
-		// Map visual position to actual index in filtered slice
-		idx := m.visualOrder[visualPos]
-		m.cursor = idx
-		m.selected = &m.filtered[idx]
-		m.editDraft = ""
-		return true
-	}
-	return false
-}
-
 func (m *Model) updateTargetPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, keys.Back):
+	case key.Matches(msg, targetKeys.Back):
 		m.phase = PhaseCommand
 		m.selected = nil
 		m.editDraft = ""
 
-	case key.Matches(msg, keys.Quit):
+	case key.Matches(msg, targetKeys.Quit):
 		m.quitting = true
 		return *m, tea.Quit
 
-	case key.Matches(msg, keys.Edit):
+	case key.Matches(msg, targetKeys.Edit):
 		cmd := m.enterEditPhase()
 		return *m, cmd
 
-	case key.Matches(msg, keys.Target1):
+	case key.Matches(msg, targetKeys.Target1):
 		m.target = TargetAll
 		return m.send()
 
-	case key.Matches(msg, keys.Target2):
+	case key.Matches(msg, targetKeys.Target2):
 		m.target = TargetClaude
 		return m.send()
 
-	case key.Matches(msg, keys.Target3):
+	case key.Matches(msg, targetKeys.Target3):
 		m.target = TargetCodex
 		return m.send()
 
-	case key.Matches(msg, keys.Target4):
+	case key.Matches(msg, targetKeys.Target4):
 		m.target = TargetGemini
 		return m.send()
 
-	case key.Matches(msg, keys.Target5):
+	case key.Matches(msg, targetKeys.Target5):
 		m.target = TargetAntigravity
 		return m.send()
 
-	case key.Matches(msg, keys.Num6):
+	case key.Matches(msg, targetKeys.TargetOmp):
+		m.target = TargetOmp
+		return m.send()
+
+	case key.Matches(msg, targetKeys.SelectAgents):
 		return m.enterSelectAgentsPhase()
 
-	case key.Matches(msg, keys.Num7):
+	case key.Matches(msg, targetKeys.ByType):
 		return m.enterSelectTypePhaseWith(tmux.GetPanes)
 	}
 
@@ -1091,33 +941,31 @@ func (m *Model) enterSelectTypePhaseWith(getPanes func(string) ([]tmux.Pane, err
 func (m *Model) updateSelectTypePhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	row := -1
 	switch {
-	case key.Matches(msg, keys.Back):
+	case key.Matches(msg, selectTypeKeys.Back):
 		m.phase = PhaseTarget
 		return *m, nil
 
-	case key.Matches(msg, keys.Quit):
+	case key.Matches(msg, selectTypeKeys.Quit):
 		m.quitting = true
 		return *m, tea.Quit
 
-	case key.Matches(msg, keys.Up):
+	case key.Matches(msg, selectTypeKeys.Up):
 		if m.typeCursor > 0 {
 			m.typeCursor--
 		}
 		return *m, nil
 
-	case key.Matches(msg, keys.Down):
+	case key.Matches(msg, selectTypeKeys.Down):
 		if m.typeCursor < len(m.typeTargets)-1 {
 			m.typeCursor++
 		}
 		return *m, nil
 
-	case key.Matches(msg, keys.Select):
+	case key.Matches(msg, selectTypeKeys.Select):
 		row = m.typeCursor
 
-	default:
-		if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
-			row = int(s[0] - '1')
-		}
+	case key.Matches(msg, selectTypeKeys.Row):
+		row = int(msg.String()[0] - '1')
 	}
 
 	if m.selectTypeTarget(row) {
@@ -1169,46 +1017,46 @@ func (m *Model) enterSelectAgentsPhase() (tea.Model, tea.Cmd) {
 // updateSelectAgentsPhase handles key events in the granular agent selector.
 func (m *Model) updateSelectAgentsPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, keys.Back):
+	case key.Matches(msg, selectAgentsKeys.Back):
 		m.phase = PhaseTarget
 		return *m, nil
 
-	case key.Matches(msg, keys.Quit):
+	case key.Matches(msg, selectAgentsKeys.Quit):
 		m.quitting = true
 		return *m, tea.Quit
 
-	case key.Matches(msg, keys.Up):
+	case key.Matches(msg, selectAgentsKeys.Up):
 		if m.agentCursor > 0 {
 			m.agentCursor--
 		}
 		return *m, nil
 
-	case key.Matches(msg, keys.Down):
+	case key.Matches(msg, selectAgentsKeys.Down):
 		if m.agentCursor < len(m.agentPanes)-1 {
 			m.agentCursor++
 		}
 		return *m, nil
 
-	case msg.String() == " ":
+	case key.Matches(msg, selectAgentsKeys.Toggle):
 		if m.agentCursor >= 0 && m.agentCursor < len(m.agentPanes) {
 			id := m.agentPanes[m.agentCursor].ID
 			m.agentChecked[id] = !m.agentChecked[id]
 		}
 		return *m, nil
 
-	case msg.String() == "a":
+	case key.Matches(msg, selectAgentsKeys.All):
 		for _, p := range m.agentPanes {
 			m.agentChecked[p.ID] = true
 		}
 		return *m, nil
 
-	case msg.String() == "n":
+	case key.Matches(msg, selectAgentsKeys.None):
 		for _, p := range m.agentPanes {
 			m.agentChecked[p.ID] = false
 		}
 		return *m, nil
 
-	case key.Matches(msg, keys.Select):
+	case key.Matches(msg, selectAgentsKeys.Select):
 		// Only send if at least one pane is checked; otherwise stay put.
 		for _, p := range m.agentPanes {
 			if m.agentChecked[p.ID] {
@@ -1280,18 +1128,20 @@ func (m *Model) enterEditPhase() tea.Cmd {
 // updateEditPhase handles key events in the prompt-edit phase.
 func (m *Model) updateEditPhase(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, keys.ConfirmEdit):
+	case key.Matches(msg, editKeys.ConfirmEdit):
 		// Save the draft and return to target selection.
 		m.editDraft = m.editInput.Value()
 		m.phase = PhaseTarget
 		return *m, nil
 
-	case key.Matches(msg, keys.Back):
+	case key.Matches(msg, editKeys.Back):
 		// Discard unsaved changes and return to target selection.
 		m.phase = PhaseTarget
 		return *m, nil
 
-	case key.Matches(msg, keys.Quit):
+	// ctrl+c only: the textarea is focused, so a 'q' binding here would quit
+	// the palette mid-prompt whenever the text contains the letter q.
+	case key.Matches(msg, editKeys.Quit):
 		m.quitting = true
 		return *m, tea.Quit
 	}
@@ -1601,11 +1451,13 @@ func (m *Model) sendWith(
 			shouldSend = p.Type == tmux.AgentGemini
 		case TargetAntigravity:
 			shouldSend = p.Type == tmux.AgentAntigravity
+		case TargetOmp:
+			shouldSend = p.Type.Canonical() == tmux.AgentOmp
 		case TargetSelected:
 			// Explicit per-pane selection (#205): send only to checked agent panes.
 			shouldSend = p.Type != tmux.AgentUser && m.agentChecked[p.ID]
 		case TargetType:
-			// Every pane of the type picked under 7, resolved as the picker
+			// Every pane of the type picked under 8, resolved as the picker
 			// counted it (bd-eccc9).
 			shouldSend = components.PaneAgentType(p.Type) == m.targetType
 		}
@@ -1742,7 +1594,7 @@ func (m Model) View() string {
 
 		helpOverlay := components.HelpOverlay(components.HelpOverlayOptions{
 			Title:    "Palette Shortcuts",
-			Sections: components.PaletteHelpSections(),
+			Sections: paletteHelpSections(),
 			MaxWidth: maxWidth,
 		})
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, helpOverlay)
@@ -1804,6 +1656,10 @@ func (m Model) viewQuitting() string {
 			targetName = "Antigravity"
 			targetColor = string(t.Lavender)
 			targetIcon = ic.Gemini
+		case TargetOmp:
+			targetName = "Oh My Pi"
+			targetColor = string(t.Sky)
+			targetIcon = ic.Robot
 		case TargetSelected:
 			targetName = "selected agents"
 			targetColor = string(t.Mauve)
@@ -2270,6 +2126,8 @@ func (m Model) samplePaneTitlesForTargetKey(key string, max int) []string {
 	case "5":
 		src = m.paneCounts.antigravitySamples
 	case "7":
+		src = m.paneCounts.ompSamples
+	case "8":
 		// The types "By type…" offers, with their pane counts.
 		for _, tt := range m.paneCounts.types {
 			src = append(src, fmt.Sprintf("%s %d", components.AgentCountLabel(tt.agentType), tt.count))
@@ -2352,7 +2210,10 @@ func (m Model) renderSafetyNudges(prompt string, lineCount, charCount int) strin
 	return styles.BadgeGroup(badges...)
 }
 
-func (m Model) renderHelpBar() string {
+// renderHelpEntries renders a keymap-generated help bar in the palette's
+// standard badge style. All phase help bars go through this single renderer so
+// their content stays keymap-derived (see keymap.go).
+func (m Model) renderHelpEntries(entries []helpEntry) string {
 	t := m.theme
 
 	keyStyle := lipgloss.NewStyle().
@@ -2364,65 +2225,17 @@ func (m Model) renderHelpBar() string {
 	descStyle := lipgloss.NewStyle().
 		Foreground(t.Overlay)
 
-	items := []struct {
-		key  string
-		desc string
-	}{
-		{"↑/↓", "navigate"},
-		{"1-9", "quick select"},
-		{"Enter", "select"},
-		{"ctrl+n", "custom msg"},
-		{"Esc", "back"},
-	}
-
-	// Show scroll hint if there are more items than visible
-	if m.tier >= layout.TierSplit && m.listViewport.TotalLineCount() > m.listViewport.Height {
-		items = append(items, struct {
-			key  string
-			desc string
-		}{"pgup/dn", "scroll"})
-	}
-
-	if m.tier >= layout.TierWide {
-		items = append(items,
-			struct {
-				key  string
-				desc string
-			}{"ctrl+p", "pin"},
-			struct {
-				key  string
-				desc string
-			}{"ctrl+f", "favorite"},
-			struct {
-				key  string
-				desc string
-			}{"q/ctrl+c", "quit"},
-			struct {
-				key  string
-				desc string
-			}{"?", "help"},
-		)
-	}
-
-	if m.tier >= layout.TierUltra {
-		items = append(items,
-			struct {
-				key  string
-				desc string
-			}{"Enter→", "targets 1-7"},
-			struct {
-				key  string
-				desc string
-			}{"type", "filter commands"},
-		)
-	}
-
 	var parts []string
-	for _, item := range items {
-		parts = append(parts, keyStyle.Render(item.key)+" "+descStyle.Render(item.desc))
+	for _, e := range entries {
+		parts = append(parts, keyStyle.Render(e.label)+" "+descStyle.Render(e.desc))
 	}
 
 	return strings.Join(parts, "  ")
+}
+
+func (m Model) renderHelpBar() string {
+	canScroll := m.tier >= layout.TierSplit && m.listViewport.TotalLineCount() > m.listViewport.Height
+	return m.renderHelpEntries(commandHelpEntries(m.tier, canScroll))
 }
 
 // targetDialogWidth is the responsive width of the target step and its pickers.
@@ -2491,12 +2304,13 @@ func (m Model) viewTargetPhase() string {
 		{"3", ic.Codex, "Codex (cod)", "OpenAI agents", t.Codex, t.Surface0},
 		{"4", ic.Gemini, "Gemini (gmi)", "Google agents (legacy)", t.Gemini, t.Surface0},
 		{"5", ic.Gemini, "Antigravity (agy)", "Google agents", t.Lavender, t.Surface0},
+		{"7", ic.Robot, "Oh My Pi (omp)", "omp agents", t.Sky, t.Surface0},
 		{"6", ic.Target, "Select agents…", "pick specific panes", t.Mauve, t.Surface0},
-		{"7", ic.Filter, "By type…", "pick one agent type", t.Teal, t.Surface0},
+		{"8", ic.Filter, "By type…", "pick one agent type", t.Teal, t.Surface0},
 	}
 
 	for _, target := range targets {
-		if target.key == "7" && m.paneCountsKnown {
+		if target.key == "8" && m.paneCountsKnown {
 			target.desc = fmt.Sprintf("%d types present", len(m.paneCounts.types))
 			if len(m.paneCounts.types) == 1 {
 				target.desc = "1 type present"
@@ -2517,6 +2331,8 @@ func (m Model) viewTargetPhase() string {
 				countSuffix = fmt.Sprintf(" (%d)", m.paneCounts.gemini)
 			case "5":
 				countSuffix = fmt.Sprintf(" (%d)", m.paneCounts.antigravity)
+			case "7":
+				countSuffix = fmt.Sprintf(" (%d)", m.paneCounts.omp)
 			case "6":
 				countSuffix = fmt.Sprintf(" (%d)", m.paneCounts.totalAgents)
 			}
@@ -2605,36 +2421,7 @@ func (m Model) viewTargetPhase() string {
 }
 
 func (m Model) renderTargetHelpBar() string {
-	t := m.theme
-
-	keyStyle := lipgloss.NewStyle().
-		Background(t.Surface0).
-		Foreground(t.Text).
-		Bold(true).
-		Padding(0, 1)
-
-	descStyle := lipgloss.NewStyle().
-		Foreground(t.Overlay)
-
-	items := []struct {
-		key  string
-		desc string
-	}{
-		{"1-5", "select target"},
-		{"6", "pick agents"},
-		{"7", "by type"},
-		{"e", "edit prompt"},
-		{"?", "help"},
-		{"Esc", "back"},
-		{"q", "quit"},
-	}
-
-	var parts []string
-	for _, item := range items {
-		parts = append(parts, keyStyle.Render(item.key)+" "+descStyle.Render(item.desc))
-	}
-
-	return strings.Join(parts, "  ")
+	return m.renderHelpEntries(targetHelpEntries())
 }
 
 // viewSelectAgentsPhase renders the granular per-agent multi-select dialog (#205).
@@ -2723,35 +2510,7 @@ func (m Model) viewSelectAgentsPhase() string {
 }
 
 func (m Model) renderSelectAgentsHelpBar() string {
-	t := m.theme
-
-	keyStyle := lipgloss.NewStyle().
-		Background(t.Surface0).
-		Foreground(t.Text).
-		Bold(true).
-		Padding(0, 1)
-
-	descStyle := lipgloss.NewStyle().
-		Foreground(t.Overlay)
-
-	items := []struct {
-		key  string
-		desc string
-	}{
-		{"↑/↓", "move"},
-		{"space", "toggle"},
-		{"a", "all"},
-		{"n", "none"},
-		{"Enter", "send"},
-		{"Esc", "back"},
-	}
-
-	var parts []string
-	for _, item := range items {
-		parts = append(parts, keyStyle.Render(item.key)+" "+descStyle.Render(item.desc))
-	}
-
-	return strings.Join(parts, "  ")
+	return m.renderHelpEntries(selectAgentsHelpEntries())
 }
 
 // viewSelectTypePhase renders the "By type…" picker (bd-eccc9): one row per
@@ -2867,37 +2626,7 @@ func (m Model) viewSelectTypePhase() string {
 }
 
 func (m Model) renderSelectTypeHelpBar() string {
-	t := m.theme
-
-	keyStyle := lipgloss.NewStyle().
-		Background(t.Surface0).
-		Foreground(t.Text).
-		Bold(true).
-		Padding(0, 1)
-
-	descStyle := lipgloss.NewStyle().
-		Foreground(t.Overlay)
-
-	type item struct {
-		key  string
-		desc string
-	}
-	var items []item
-	if len(m.typeTargets) > 0 {
-		digits := "1"
-		if n := min(len(m.typeTargets), 9); n > 1 {
-			digits = fmt.Sprintf("1-%d", n)
-		}
-		items = append(items, item{"↑/↓", "move"}, item{digits, "send to type"}, item{"Enter", "send"})
-	}
-	items = append(items, item{"Esc", "back"}, item{"q", "quit"})
-
-	var parts []string
-	for _, it := range items {
-		parts = append(parts, keyStyle.Render(it.key)+" "+descStyle.Render(it.desc))
-	}
-
-	return strings.Join(parts, "  ")
+	return m.renderHelpEntries(selectTypeHelpEntries(len(m.typeTargets)))
 }
 
 // viewEditPhase renders the prompt-editing screen.
@@ -2941,32 +2670,7 @@ func (m Model) viewEditPhase() string {
 }
 
 func (m Model) renderEditHelpBar() string {
-	t := m.theme
-
-	keyStyle := lipgloss.NewStyle().
-		Background(t.Surface0).
-		Foreground(t.Text).
-		Bold(true).
-		Padding(0, 1)
-
-	descStyle := lipgloss.NewStyle().
-		Foreground(t.Overlay)
-
-	items := []struct {
-		key  string
-		desc string
-	}{
-		{"ctrl+s", "save & pick target"},
-		{"Esc", "cancel"},
-		{"ctrl+c", "quit"},
-	}
-
-	var parts []string
-	for _, item := range items {
-		parts = append(parts, keyStyle.Render(item.key)+" "+descStyle.Render(item.desc))
-	}
-
-	return strings.Join(parts, "  ")
+	return m.renderHelpEntries(editHelpEntries())
 }
 
 // Result returns the send result after the program exits

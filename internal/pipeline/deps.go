@@ -3,10 +3,21 @@ package pipeline
 import (
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 )
 
 // DependencyGraph represents step dependencies for execution ordering
 type DependencyGraph struct {
+	// mu guards the runtime-mutable scheduling fields (ready, executed,
+	// executedCount, remainingDeps, failed). The structural fields (steps,
+	// edges, reverse, inDegree, container) are immutable after
+	// NewDependencyGraph returns, so structure-only readers skip the lock.
+	// Needed since bd-jio7h: worker goroutines call HasFailedDependency /
+	// GetFailedDependencies while the scheduler calls MarkExecuted /
+	// MarkFailed concurrently.
+	mu            sync.RWMutex
 	steps         map[string]*Step    // step ID -> step
 	edges         map[string][]string // step ID -> steps it depends on
 	reverse       map[string][]string // step ID -> steps that depend on it
@@ -22,6 +33,11 @@ type DependencyGraph struct {
 	// would otherwise let downstream steps unblock before the container
 	// itself ran the nested body.
 	container map[string]string
+	// Post-pipeline hooks share persisted step/output namespaces but are not
+	// scheduled in the main graph. Retain their structure for resume only.
+	postPipelineSteps []Step
+	onCancelSteps     []Step
+	parallelErrors    []DependencyError
 }
 
 // DependencyError represents an error in the dependency graph
@@ -46,14 +62,16 @@ type ExecutionPlan struct {
 // NewDependencyGraph creates a dependency graph from workflow steps
 func NewDependencyGraph(workflow *Workflow) *DependencyGraph {
 	g := &DependencyGraph{
-		steps:         make(map[string]*Step),
-		edges:         make(map[string][]string),
-		reverse:       make(map[string][]string),
-		inDegree:      make(map[string]int),
-		remainingDeps: make(map[string]int),
-		executed:      make(map[string]bool),
-		failed:        make(map[string]bool),
-		container:     make(map[string]string),
+		steps:             make(map[string]*Step),
+		edges:             make(map[string][]string),
+		reverse:           make(map[string][]string),
+		inDegree:          make(map[string]int),
+		remainingDeps:     make(map[string]int),
+		executed:          make(map[string]bool),
+		failed:            make(map[string]bool),
+		container:         make(map[string]string),
+		postPipelineSteps: workflow.PostPipelineSteps,
+		onCancelSteps:     workflow.Settings.OnCancel,
 	}
 
 	// Add all steps including parallel sub-steps
@@ -87,6 +105,8 @@ func NewDependencyGraph(workflow *Workflow) *DependencyGraph {
 	}
 
 	addSteps(workflow.Steps, "")
+	g.parallelErrors = g.resolveParallelChildDependencies(workflow)
+	g.inheritContainerDependencies()
 	for id, remaining := range g.remainingDeps {
 		if remaining == 0 {
 			g.addReady(id)
@@ -95,9 +115,54 @@ func NewDependencyGraph(workflow *Workflow) *DependencyGraph {
 	return g
 }
 
+// A container, not the outer scheduler, dispatches its inline children. A
+// child's edge to a top-level producer must therefore gate every enclosing
+// container as well; marking a flat child placeholder ready does not protect
+// the actual dispatch. Keep these effective edges only in the graph so frozen
+// workflow definitions and command/delivery hashes remain unchanged.
+func (g *DependencyGraph) inheritContainerDependencies() {
+	ids := make([]string, 0, len(g.container))
+	for id := range g.container {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		for _, dep := range g.edges[id] {
+			if _, exists := g.steps[dep]; !exists || g.container[dep] != "" {
+				// Missing/cross-container references retain their existing
+				// validation errors. Sibling edges stay inside their body.
+				continue
+			}
+			visited := make(map[string]bool)
+			for owner := g.container[id]; owner != "" && !visited[owner]; owner = g.container[owner] {
+				visited[owner] = true
+				found := false
+				for _, existing := range g.edges[owner] {
+					if existing == dep {
+						found = true
+						break
+					}
+				}
+				if found {
+					continue
+				}
+				// edges initially shares the author's slice, which can have
+				// spare capacity. Copy before extending; never mutate it.
+				g.edges[owner] = append(append([]string(nil), g.edges[owner]...), dep)
+				g.inDegree[owner]++
+				g.remainingDeps[owner]++
+				g.reverse[dep] = append(g.reverse[dep], owner)
+				// Deliberately keep an edge back to the owning root. It is a
+				// real execution cycle and the ordinary validator rejects it.
+			}
+		}
+	}
+}
+
 // Validate checks the dependency graph for errors
 func (g *DependencyGraph) Validate() []DependencyError {
-	var errors []DependencyError
+	errors := append([]DependencyError(nil), g.parallelErrors...)
+	errors = append(errors, g.validatePhaseOwnership(nil)...)
 
 	// Check for missing dependencies and cross-container references.
 	// bd-mb6rd: a step inside a parallel/loop body must not be depended on
@@ -217,9 +282,9 @@ func (g *DependencyGraph) detectCycles() [][]string {
 
 // findUnreachable finds steps that can never be executed
 func (g *DependencyGraph) findUnreachable() []string {
-	// A step is unreachable if it has dependencies that don't exist
-	// or if all paths to it go through a cycle
-	// For now, we check for missing dependencies (cycles detected separately)
+	// A step is unreachable if it has dependencies that don't exist.
+	// Steps trapped behind a cycle are reported by the separate cycle
+	// detection pass, so this pass only checks missing dependencies.
 	var unreachable []string
 
 	for id, deps := range g.edges {
@@ -316,6 +381,8 @@ func (g *DependencyGraph) Resolve() ExecutionPlan {
 
 // GetReadySteps returns steps that are ready to execute
 func (g *DependencyGraph) GetReadySteps() []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	ready := make([]string, len(g.ready))
 	copy(ready, g.ready)
 	return ready
@@ -326,6 +393,8 @@ func (g *DependencyGraph) MarkExecuted(id string) error {
 	if _, exists := g.steps[id]; !exists {
 		return fmt.Errorf("step %q not found", id)
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.executed[id] {
 		return nil
 	}
@@ -345,11 +414,15 @@ func (g *DependencyGraph) MarkExecuted(id string) error {
 
 // IsExecuted returns whether a step has been executed
 func (g *DependencyGraph) IsExecuted(id string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.executed[id]
 }
 
 // ExecutedCount returns the number of executed steps.
 func (g *DependencyGraph) ExecutedCount() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.executedCount
 }
 
@@ -358,17 +431,28 @@ func (g *DependencyGraph) MarkFailed(id string) error {
 	if _, exists := g.steps[id]; !exists {
 		return fmt.Errorf("step %q not found", id)
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.failed[id] = true
 	return nil
 }
 
 // IsFailed returns whether a step has failed
 func (g *DependencyGraph) IsFailed(id string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.failed[id]
 }
 
 // HasFailedDependency returns true if any of the step's dependencies failed
 func (g *DependencyGraph) HasFailedDependency(id string) bool {
+	// Direct composite execution may have no outer scheduling graph. Its
+	// child lifecycle still enforces conditions, retries and checkpoints.
+	if g == nil {
+		return false
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	for _, dep := range g.edges[id] {
 		if g.failed[dep] {
 			return true
@@ -379,6 +463,8 @@ func (g *DependencyGraph) HasFailedDependency(id string) bool {
 
 // GetFailedDependencies returns the list of failed dependencies for a step
 func (g *DependencyGraph) GetFailedDependencies(id string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	var failed []string
 	for _, dep := range g.edges[id] {
 		if g.failed[dep] {
@@ -395,6 +481,16 @@ func (g *DependencyGraph) GetStep(id string) (*Step, bool) {
 }
 
 func (g *DependencyGraph) ResolveScopedRuntimeStep(id string) (*Step, string, bool) {
+	if step, canonicalID, ok := g.resolveMainRuntimeStep(id); ok {
+		return step, canonicalID, true
+	}
+	if step, ok := g.resolvePostPipelineRuntimeStep(id); ok {
+		return step, id, true
+	}
+	return nil, "", false
+}
+
+func (g *DependencyGraph) resolveMainRuntimeStep(id string) (*Step, string, bool) {
 	parentIDs := make([]string, 0, len(g.steps))
 	for parentID := range g.steps {
 		parentIDs = append(parentIDs, parentID)
@@ -408,20 +504,252 @@ func (g *DependencyGraph) ResolveScopedRuntimeStep(id string) (*Step, string, bo
 
 	for _, parentID := range parentIDs {
 		parent := g.steps[parentID]
-		if child, canonicalID, ok := resolveScopedRuntimeStepFromSteps(parentID, id, parent.Parallel.Steps); ok {
-			return child, canonicalID, true
-		}
-		if child, canonicalID, ok := resolveScopedRuntimeBranchStep(parentID, id, parent.Branches); ok {
+		if child, canonicalID, ok := resolveScopedRuntimeChildren(parentID, id, parent); ok {
+			// Dynamic bodies are not necessarily nodes in the scheduling
+			// graph. An authored name can coincide with an unrelated top-level
+			// step; only the exact structural node may inherit completion.
+			// Returning the runtime ID otherwise lets resume retain its output
+			// without marking that unrelated authored step as executed.
+			if node, exists := g.steps[canonicalID]; !exists || node != child {
+				canonicalID = id
+			}
 			return child, canonicalID, true
 		}
 	}
 	return nil, "", false
 }
 
+func (g *DependencyGraph) resolvePostPipelineRuntimeStep(id string) (*Step, bool) {
+	for i := range g.postPipelineSteps {
+		if step, ok := resolveHookRuntimeStep(&g.postPipelineSteps[i], "post_pipeline", i+1, id); ok {
+			return step, true
+		}
+	}
+	return nil, false
+}
+
+func resolveHookRuntimeStep(root *Step, prefix string, ordinal int, id string) (*Step, bool) {
+	rootID := root.ID
+	if rootID == "" {
+		rootID = fmt.Sprintf("%s_%d", prefix, ordinal)
+	}
+	if id == rootID {
+		return root, true
+	}
+	step, _, ok := resolveScopedRuntimeChildren(rootID, id, root)
+	return step, ok
+}
+
+// All phases store results and launch receipts under the same runtime IDs.
+// Reject ambiguous ownership before resume can adopt or clear any evidence.
+// Persisted IDs also cover dynamic iteration names that do not exist as
+// independently scheduled nodes in the main dependency graph.
+func (g *DependencyGraph) validatePhaseOwnership(state *ExecutionState) []DependencyError {
+	if len(g.postPipelineSteps) == 0 {
+		return nil
+	}
+	ids := make(map[string]bool)
+	for id := range g.steps {
+		ids[id] = true
+	}
+	for _, phase := range []struct {
+		steps  []Step
+		prefix string
+	}{{g.postPipelineSteps, "post_pipeline"}, {g.onCancelSteps, "on_cancel"}} {
+		for i, step := range phase.steps {
+			id := step.ID
+			if id == "" {
+				id = fmt.Sprintf("%s_%d", phase.prefix, i+1)
+			}
+			ids[id] = true
+		}
+	}
+	if state != nil {
+		for id := range state.Steps {
+			ids[id] = true
+		}
+		for id := range state.CommandExecutions {
+			ids[id] = true
+		}
+		for id := range state.AgentDeliveries {
+			ids[id] = true
+		}
+		for id := range state.InFlightSteps {
+			ids[id] = true
+		}
+		for id := range state.ForeachState {
+			ids[id] = true
+		}
+		for id := range state.ParallelState {
+			ids[id] = true
+		}
+	}
+	ordered := make([]string, 0, len(ids))
+	for id := range ids {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	var errors []DependencyError
+	for _, id := range ordered {
+		var owners []string
+		postOwned := false
+		_, main := g.steps[id]
+		if _, _, scoped := g.resolveMainRuntimeStep(id); main || scoped {
+			owners = append(owners, "steps")
+		}
+		for _, phase := range []struct {
+			steps  []Step
+			prefix string
+		}{{g.postPipelineSteps, "post_pipeline"}, {g.onCancelSteps, "on_cancel"}} {
+			for i := range phase.steps {
+				if _, owned := resolveHookRuntimeStep(&phase.steps[i], phase.prefix, i+1, id); owned {
+					postOwned = postOwned || phase.prefix == "post_pipeline"
+					owners = append(owners, fmt.Sprintf("%s[%d]", phase.prefix, i))
+				}
+			}
+		}
+		if postOwned && len(owners) > 1 {
+			errors = append(errors, DependencyError{
+				Type: "ambiguous_step_id", Steps: []string{id},
+				Message: fmt.Sprintf("step id %q is shared by workflow phases %s; use distinct step IDs", id, strings.Join(owners, ", ")),
+			})
+		}
+	}
+	return errors
+}
+
+// resolveScopedRuntimeChildren follows the same namespaces as the dispatchers.
+// Recovery must recognize iteration leaves too: dropping them as orphans loses
+// completed outputs and prevents the legacy agent-delivery guard from knowing
+// that an unfinished prompt could already have reached its pane.
+func resolveScopedRuntimeChildren(parentID, runtimeID string, parent *Step) (*Step, string, bool) {
+	if decision, canonicalID, ok := branchDecisionRuntimeStep(parentID, runtimeID, parent); ok {
+		return decision, canonicalID, true
+	}
+	for i := range parent.OnSuccess {
+		child := &parent.OnSuccess[i]
+		childID := onSuccessChildStepID(parentID, child.ID, i+1)
+		if runtimeID == childID {
+			return child, child.ID, true
+		}
+		if strings.HasPrefix(runtimeID, childID+"_") || strings.HasPrefix(runtimeID, childID+".") {
+			if nested, canonical, ok := resolveScopedRuntimeChildren(childID, runtimeID, child); ok {
+				return nested, canonical, true
+			}
+		}
+	}
+	if child, canonicalID, ok := resolveScopedRuntimeStepFromSteps(parentID, runtimeID, parent.Parallel.Steps); ok {
+		return child, canonicalID, true
+	}
+	if child, canonicalID, ok := resolveScopedRuntimeBranchStep(parentID, runtimeID, parent.Branches); ok {
+		return child, canonicalID, true
+	}
+	if parent.Loop != nil {
+		if child, canonicalID, ok := resolveScopedRuntimeIterationStep(parentID, runtimeID, parent.Loop.Steps, nil); ok {
+			return child, canonicalID, true
+		}
+	}
+	for _, config := range []*ForeachConfig{parent.Foreach, parent.ForeachPane} {
+		if config == nil {
+			continue
+		}
+		// Reuse the dispatcher's body selection, including body aliases and
+		// template shorthand. Recovery must not invent a second schema.
+		body, err := foreachBodySteps(parent, config)
+		if err != nil {
+			continue
+		}
+		if child, canonicalID, ok := resolveScopedRuntimeIterationStep(parentID, runtimeID, body, config); ok {
+			return child, canonicalID, true
+		}
+	}
+	return nil, "", false
+}
+
+func resolveScopedRuntimeIterationStep(parentID, runtimeID string, steps []Step, config *ForeachConfig) (*Step, string, bool) {
+	iterationID, ok := scopedRuntimeOrdinal(runtimeID, parentID+"_iter", 0)
+	if !ok || !strings.HasPrefix(runtimeID, iterationID+"_") {
+		return nil, "", false
+	}
+	// Multi-round foreach appends _round<N> AFTER the body ID. Use the
+	// configured dialect so an authored leaf_round3 cannot steal leaf's
+	// third-round receipt. Expression-driven round counts can use either
+	// dialect; reject an ambiguous match rather than guessing ownership.
+	plain := config == nil || config.MaxRounds.Expr != "" || config.MaxRounds.Value <= 1
+	rounded := config != nil && (config.MaxRounds.Expr != "" || config.MaxRounds.Value > 1)
+	var found *Step
+	var foundID string
+	for pass := 0; pass < 2; pass++ {
+		if (pass == 0 && !plain) || (pass == 1 && !rounded) {
+			continue
+		}
+		for i := range steps {
+			name := steps[i].ID
+			if name == "" && config != nil {
+				name = fmt.Sprintf("step%d", i)
+			}
+			scopedID := iterationID + "_" + name
+			if pass == 1 {
+				var roundOK bool
+				scopedID, roundOK = scopedRuntimeOrdinal(runtimeID, scopedID+"_round", 1)
+				if !roundOK {
+					continue
+				}
+			}
+			var child *Step
+			var canonicalID string
+			if scopedID == runtimeID {
+				child, canonicalID = &steps[i], steps[i].ID
+			} else if strings.HasPrefix(runtimeID, scopedID+"_") || strings.HasPrefix(runtimeID, scopedID+".") {
+				child, canonicalID, _ = resolveScopedRuntimeChildren(scopedID, runtimeID, &steps[i])
+			}
+			if child != nil {
+				if found != nil {
+					return nil, "", false
+				}
+				found, foundID = child, canonicalID
+			}
+		}
+	}
+	return found, foundID, found != nil
+}
+
+// scopedRuntimeOrdinal consumes only the canonical nonnegative decimal IDs
+// produced by fmt.Sprintf in the iteration/round dispatchers. It is an identity
+// parser, not an assertion that an iteration or round has completed.
+func scopedRuntimeOrdinal(runtimeID, prefix string, minimum int) (string, bool) {
+	if !strings.HasPrefix(runtimeID, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(runtimeID, prefix)
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 || (end < len(rest) && rest[end] != '_' && rest[end] != '.') {
+		return "", false
+	}
+	ordinal, err := strconv.Atoi(rest[:end])
+	if err != nil || ordinal < minimum || strconv.Itoa(ordinal) != rest[:end] {
+		return "", false
+	}
+	return prefix + rest[:end], true
+}
+
 func resolveScopedRuntimeStepFromSteps(parentID, runtimeID string, steps []Step) (*Step, string, bool) {
 	for i := range steps {
-		if scopedChildStepID(parentID, steps[i].ID, i+1) == runtimeID {
+		scopedID := scopedChildStepID(parentID, steps[i].ID, i+1)
+		if scopedID == runtimeID {
 			return &steps[i], steps[i].ID, true
+		}
+		// A nested container keeps the enclosing runtime
+		// namespace, not just its authored ID. Without this descent, resume
+		// drops completed grandchildren as orphans and repeats their work.
+		if !strings.HasPrefix(runtimeID, scopedID+"_") && !strings.HasPrefix(runtimeID, scopedID+".") {
+			continue
+		}
+		if child, canonicalID, ok := resolveScopedRuntimeChildren(scopedID, runtimeID, &steps[i]); ok {
+			return child, canonicalID, true
 		}
 	}
 	return nil, "", false
@@ -461,12 +789,6 @@ func (g *DependencyGraph) GetDependents(id string) []string {
 // Size returns the number of steps in the graph
 func (g *DependencyGraph) Size() int {
 	return len(g.steps)
-}
-
-// ResolveWorkflow is a convenience function to create a graph and resolve it
-func ResolveWorkflow(workflow *Workflow) ExecutionPlan {
-	graph := NewDependencyGraph(workflow)
-	return graph.Resolve()
 }
 
 func (g *DependencyGraph) addReady(id string) {

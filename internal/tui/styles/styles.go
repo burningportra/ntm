@@ -233,69 +233,6 @@ func GradientText(text string, colors ...string) string {
 	return result.String()
 }
 
-// GradientBar creates a gradient-colored bar
-func GradientBar(width int, colors ...string) string {
-	if width <= 0 {
-		return ""
-	}
-	if len(colors) < 2 {
-		return strings.Repeat("█", width)
-	}
-	return GradientText(strings.Repeat("█", width), colors...)
-}
-
-// GradientBorder creates a box with gradient border
-func GradientBorder(content string, width int, colors ...string) string {
-	if width < 4 {
-		return ""
-	}
-	if len(colors) < 2 {
-		colors = defaultGradient()
-	}
-
-	// Box drawing characters
-	topLeft := "╭"
-	topRight := "╮"
-	bottomLeft := "╰"
-	bottomRight := "╯"
-	horizontal := "─"
-	vertical := "│"
-
-	lines := strings.Split(content, "\n")
-	contentWidth := width - 4 // Account for borders and padding
-
-	// Create gradient for horizontal lines
-	topBorder := GradientText(topLeft+strings.Repeat(horizontal, width-2)+topRight, colors...)
-	bottomBorder := GradientText(bottomLeft+strings.Repeat(horizontal, width-2)+bottomRight, colors...)
-
-	var result strings.Builder
-	result.WriteString(topBorder + "\n")
-
-	for _, line := range lines {
-		// Pad line to content width
-		paddedLine := line
-		visibleLen := lipgloss.Width(line)
-		if visibleLen < contentWidth {
-			paddedLine = line + strings.Repeat(" ", contentWidth-visibleLen)
-		}
-
-		// Apply gradient to vertical borders
-		leftBorder := GradientText(vertical, colors...)
-		rightBorder := GradientText(vertical, colors[len(colors)-1], colors[0])
-
-		result.WriteString(leftBorder + " " + paddedLine + " " + rightBorder + "\n")
-	}
-
-	result.WriteString(bottomBorder)
-	return result.String()
-}
-
-// Glow creates a glowing text effect using color gradients
-func Glow(text string, baseColor, glowColor string) string {
-	// Create a subtle glow by using the glow color
-	return GradientText(text, glowColor, baseColor, baseColor, glowColor)
-}
-
 // Shimmer creates an animated shimmer effect (returns frame for given tick)
 func Shimmer(text string, tick int, colors ...string) string {
 	if reducedMotionEnabled() {
@@ -344,20 +281,6 @@ func Shimmer(text string, tick int, colors ...string) string {
 	}
 
 	return result.String()
-}
-
-// Rainbow applies rainbow colors to text
-func Rainbow(text string) string {
-	t := theme.Current()
-	return GradientText(text,
-		string(t.Red),
-		string(t.Peach),
-		string(t.Yellow),
-		string(t.Green),
-		string(t.Sky),
-		string(t.Blue),
-		string(t.Mauve),
-	)
 }
 
 // Pulse creates a pulsing brightness effect (returns style for given tick)
@@ -480,14 +403,6 @@ var BounceSpinnerFrames = []string{
 	"⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈",
 }
 
-// GetSpinnerFrame returns the spinner frame for the given tick
-func GetSpinnerFrame(tick int, frames []string) string {
-	if len(frames) == 0 {
-		return "⠋" // default fallback
-	}
-	return frames[tick%len(frames)]
-}
-
 // BoxChars defines box drawing characters
 type BoxChars struct {
 	TopLeft     string
@@ -548,60 +463,6 @@ var HeavyBox = BoxChars{
 	Cross:       "╋",
 }
 
-// RenderBox renders content inside a box
-func RenderBox(content string, width int, box BoxChars, borderColor lipgloss.Color) string {
-	if width < 4 {
-		return ""
-	}
-	style := lipgloss.NewStyle().Foreground(borderColor)
-
-	lines := strings.Split(content, "\n")
-	contentWidth := width - 4
-
-	var result strings.Builder
-
-	// Top border
-	result.WriteString(style.Render(box.TopLeft + strings.Repeat(box.Horizontal, width-2) + box.TopRight))
-	result.WriteString("\n")
-
-	// Content lines
-	for _, line := range lines {
-		visLen := lipgloss.Width(line)
-		padding := ""
-		if visLen < contentWidth {
-			padding = strings.Repeat(" ", contentWidth-visLen)
-		}
-		result.WriteString(style.Render(box.Vertical) + " " + line + padding + " " + style.Render(box.Vertical) + "\n")
-	}
-
-	// Bottom border
-	result.WriteString(style.Render(box.BottomLeft + strings.Repeat(box.Horizontal, width-2) + box.BottomRight))
-
-	return result.String()
-}
-
-// Divider creates a styled divider line
-func Divider(width int, style string, color lipgloss.Color) string {
-	if width <= 0 {
-		return ""
-	}
-	var char string
-	switch style {
-	case "heavy":
-		char = "━"
-	case "double":
-		char = "═"
-	case "dotted":
-		char = "·"
-	case "dashed":
-		char = "╌"
-	default:
-		char = "─"
-	}
-
-	return lipgloss.NewStyle().Foreground(color).Render(strings.Repeat(char, width))
-}
-
 // GradientDivider creates a gradient divider
 func GradientDivider(width int, colors ...string) string {
 	if width <= 0 {
@@ -628,89 +489,6 @@ func AnimatedGradientDivider(width, tick int, colors ...string) string {
 	return Shimmer(strings.Repeat("─", width), tick, colors...)
 }
 
-// AnimatedBorderColor returns a color that smoothly cycles between two colors for shimmer border effects.
-// Uses a triangle wave for smooth round-trip animation (no discontinuous jumps).
-// [tui-upgrade: bd-28vsw] Use with BorderForeground() for animated panel borders.
-func AnimatedBorderColor(tick int, baseColor, accentColor string) lipgloss.Color {
-	if ReducedMotionEnabled() {
-		return lipgloss.Color(baseColor)
-	}
-	// Triangle wave: 0→1→0 over 20 ticks (2 seconds at 100ms tick rate)
-	mod := tick % 20
-	if mod < 0 {
-		mod += 20
-	}
-	pos := float64(mod)
-	var t float64
-	if pos < 10 {
-		t = pos / 10.0
-	} else {
-		t = (20 - pos) / 10.0
-	}
-
-	base := ParseHex(baseColor)
-	accent := ParseHex(accentColor)
-	blended := Color{
-		R: int(float64(base.R)*(1-t) + float64(accent.R)*t),
-		G: int(float64(base.G)*(1-t) + float64(accent.G)*t),
-		B: int(float64(base.B)*(1-t) + float64(accent.B)*t),
-	}
-	return blended.ToLipgloss()
-}
-
-// Badge creates a styled badge/tag
-func Badge(text string, bg, fg lipgloss.Color) string {
-	return lipgloss.NewStyle().
-		Background(bg).
-		Foreground(fg).
-		Padding(0, 1).
-		Render(text)
-}
-
-// GlowBadge creates a badge with a glow effect
-func GlowBadge(text string, color string) string {
-	base := ParseHex(color)
-	// Create slightly brighter version for glow
-	glow := Color{
-		R: clamp(base.R + 30),
-		G: clamp(base.G + 30),
-		B: clamp(base.B + 30),
-	}
-
-	return lipgloss.NewStyle().
-		Background(lipgloss.Color(color)).
-		Foreground(lipgloss.Color("#1e1e2e")).
-		Bold(true).
-		Padding(0, 1).
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(glow.ToLipgloss()).
-		Render(text)
-}
-
-// KeyHint renders a keyboard shortcut hint
-func KeyHint(key, description string, keyColor, descColor lipgloss.Color) string {
-	keyStyle := lipgloss.NewStyle().
-		Background(lipgloss.Color("#45475a")).
-		Foreground(keyColor).
-		Bold(true).
-		Padding(0, 1)
-
-	descStyle := lipgloss.NewStyle().
-		Foreground(descColor)
-
-	return keyStyle.Render(key) + " " + descStyle.Render(description)
-}
-
-// StatusDot renders a colored status indicator
-func StatusDot(color lipgloss.Color, animated bool, tick int) string {
-	if animated {
-		// Pulsing effect
-		dots := []string{"○", "◔", "◑", "◕", "●", "◕", "◑", "◔"}
-		return lipgloss.NewStyle().Foreground(color).Render(dots[tick%len(dots)])
-	}
-	return lipgloss.NewStyle().Foreground(color).Render("●")
-}
-
 // Truncate truncates text to max width with ellipsis
 func Truncate(text string, maxWidth int) string {
 	if maxWidth <= 0 {
@@ -728,13 +506,4 @@ func CenterText(text string, width int) string {
 	leftPad := (width - visLen) / 2
 	rightPad := width - visLen - leftPad
 	return strings.Repeat(" ", leftPad) + text + strings.Repeat(" ", rightPad)
-}
-
-// RightAlign right-aligns text within a given width
-func RightAlign(text string, width int) string {
-	visLen := lipgloss.Width(text)
-	if visLen >= width {
-		return text
-	}
-	return strings.Repeat(" ", width-visLen) + text
 }

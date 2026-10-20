@@ -4,9 +4,10 @@
 #
 # Usage:
 #   - `ntm palette [session]` (or press the tmux popup key after `ntm bind`, default: F6)
-#   - In the palette: type to filter, `1-9` quick-select, `Enter` select, `?` for help
-#   - Target selection: press `1-5` to choose recipients (All / Claude / Codex / Gemini / Antigravity),
-#     `6` to pick specific panes, or `7` to pick one agent type present (Pi, Kimi, Cursor, ...) by its pane count
+#   - In the palette: type to filter, `Enter` select, `F1` for help
+#   - Target selection: press `1-5` to choose recipients (All / Claude / Codex / Gemini /
+#     Antigravity), `7` for Oh My Pi (omp), `6` to pick individual agents, `8` to pick one
+#     agent type present (Pi, Kimi, Muse, Cursor, ...) by its pane count, `?` for help
 #
 # Preview pane:
 #   - Shows targets + prompt metadata (lines/chars) and lightweight warning badges.
@@ -21,7 +22,7 @@
 #   - If something is destructive (rm/git reset), make it opt-in and ask for confirmation.
 #   - Include one concrete “next command” when possible.
 #
-# NOTE: Recents/favorites/pinning are planned but may not be available in all builds yet.
+# NOTE: Recents, favorites (`ctrl+f`), and pinning (`ctrl+p`) are shipped palette features.
 
 ## Analysis & Review
 

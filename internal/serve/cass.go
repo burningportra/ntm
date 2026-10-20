@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +36,20 @@ const (
 	ErrCodeContextFailed     = "CONTEXT_FAILED"
 	ErrCodeOutcomeFailed     = "OUTCOME_FAILED"
 	ErrCodePrivacyFailed     = "PRIVACY_FAILED"
+
+	cassNotIndexedMessage = "cass has no index yet: run 'cass index --full' once to build it"
 )
+
+// writeCASSCallError reports a failed cass call. An installed cass that has
+// never indexed is unavailable (503 CASS_UNAVAILABLE, naming the index
+// command), not a server fault; any other failure keeps its 500 and code.
+func writeCASSCallError(w http.ResponseWriter, err error, code, message, reqID string) {
+	if errors.Is(err, cass.ErrNotInitialized) {
+		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeCASSUnavailable, cassNotIndexedMessage, nil, reqID)
+		return
+	}
+	writeErrorResponse(w, http.StatusInternalServerError, code, message, map[string]interface{}{"error": err.Error()}, reqID)
+}
 
 // MemoryDaemonState tracks the memory daemon status
 type MemoryDaemonState string
@@ -194,7 +208,7 @@ type CASSStatusResponse struct {
 	Installed     bool   `json:"installed"`
 	Healthy       bool   `json:"healthy"`
 	Version       string `json:"version,omitempty"`
-	IndexSize     int64  `json:"index_size,omitempty"`
+	DatabaseSize  int64  `json:"database_size,omitempty"`
 	DocCount      int64  `json:"doc_count,omitempty"`
 	LastIndexed   string `json:"last_indexed,omitempty"`
 	NeedsReindex  bool   `json:"needs_reindex,omitempty"`
@@ -285,14 +299,13 @@ func (s *Server) handleCASSStatus(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 
 		// Get full status
+		if version, err := client.Version(ctx); err == nil {
+			status.Version = version
+		}
 		if statusResp, err := client.Status(ctx); err == nil {
 			status.Healthy = statusResp.IsHealthy()
-			status.Version = statusResp.Version
-			status.IndexSize = statusResp.Index.SizeBytes
-			status.DocCount = statusResp.Index.DocCount
-			if status.DocCount == 0 {
-				status.DocCount = statusResp.Index.Documents
-			}
+			status.DatabaseSize = statusResp.Database.SizeBytes
+			status.DocCount = statusResp.Index.Documents
 			lastIndexedAt := statusResp.Index.EffectiveLastIndexedAt(statusResp.LastIndexedAt)
 			if !lastIndexedAt.IsZero() {
 				status.LastIndexed = lastIndexedAt.Format(time.RFC3339)
@@ -309,7 +322,7 @@ func (s *Server) handleCASSStatus(w http.ResponseWriter, r *http.Request) {
 		"installed":      status.Installed,
 		"healthy":        status.Healthy,
 		"version":        status.Version,
-		"index_size":     status.IndexSize,
+		"database_size":  status.DatabaseSize,
 		"doc_count":      status.DocCount,
 		"last_indexed":   status.LastIndexed,
 		"needs_reindex":  status.NeedsReindex,
@@ -334,8 +347,7 @@ func (s *Server) handleCASSCapabilities(w http.ResponseWriter, r *http.Request) 
 	caps, err := client.Capabilities(ctx)
 	if err != nil {
 		slog.Warn("failed to get cass capabilities", "error", err, "request_id", reqID)
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeCASSUnavailable,
-			"Failed to get CASS capabilities", map[string]interface{}{"error": err.Error()}, reqID)
+		writeCASSCallError(w, err, ErrCodeCASSUnavailable, "Failed to get CASS capabilities", reqID)
 		return
 	}
 
@@ -406,8 +418,7 @@ func (s *Server) handleCASSSearch(w http.ResponseWriter, r *http.Request) {
 	result, err := client.Search(ctx, opts)
 	if err != nil {
 		slog.Warn("cass search failed", "error", err, "request_id", reqID)
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeSearchFailed,
-			"Search failed", map[string]interface{}{"error": err.Error()}, reqID)
+		writeCASSCallError(w, err, ErrCodeSearchFailed, "Search failed", reqID)
 		return
 	}
 
@@ -459,11 +470,7 @@ func (s *Server) handleCASSSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if result.Aggregations != nil {
-		response["aggregations"] = map[string]interface{}{
-			"agents":     result.Aggregations.Agents,
-			"workspaces": result.Aggregations.Workspaces,
-			"tags":       result.Aggregations.Tags,
-		}
+		response["aggregations"] = result.Aggregations
 	}
 
 	// Publish search event
@@ -500,25 +507,29 @@ func (s *Server) handleCASSInsights(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("cass insights failed", "error", err, "request_id", reqID)
 		writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 			"total_documents": 0,
-			"agents":          map[string]int{},
-			"workspaces":      map[string]int{},
-			"tags":            map[string]int{},
+			"agents":          []cass.AggregationBucket{},
+			"workspaces":      []cass.AggregationBucket{},
 			"warnings":        []string{"cass insights unavailable; returning empty aggregates"},
 		}, reqID)
 		return
 	}
 
-	response := map[string]interface{}{
+	// cass returns each field's buckets largest first.
+	agents, workspaces := []cass.AggregationBucket{}, []cass.AggregationBucket{}
+	if agg := result.Aggregations; agg != nil {
+		if agg.Agent != nil {
+			agents = agg.Agent.Buckets
+		}
+		if agg.Workspace != nil {
+			workspaces = agg.Workspace.Buckets
+		}
+	}
+
+	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"total_documents": result.TotalMatches,
-	}
-
-	if result.Aggregations != nil {
-		response["agents"] = result.Aggregations.Agents
-		response["workspaces"] = result.Aggregations.Workspaces
-		response["tags"] = result.Aggregations.Tags
-	}
-
-	writeSuccessResponse(w, http.StatusOK, response, reqID)
+		"agents":          agents,
+		"workspaces":      workspaces,
+	}, reqID)
 }
 
 // handleCASSTimeline returns a timeline of recent activity
@@ -549,47 +560,44 @@ func (s *Server) handleCASSTimeline(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agent := r.URL.Query().Get("agent")
-	workspace := r.URL.Query().Get("workspace")
+	if r.URL.Query().Get("workspace") != "" {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+			"cass timeline cannot filter by workspace; filter by agent or use /cass/search", nil, reqID)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	result, err := client.Search(ctx, cass.SearchOptions{
-		Query:     "*",
-		Limit:     limit,
-		Agent:     agent,
-		Workspace: workspace,
-		Since:     since,
-		Fields:    "summary",
-	})
+	result, err := client.Timeline(ctx, since, "none", agent)
 	if err != nil {
 		slog.Warn("cass timeline failed", "error", err, "request_id", reqID)
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeCASSUnavailable,
-			"Failed to get timeline", map[string]interface{}{"error": err.Error()}, reqID)
+		writeCASSCallError(w, err, ErrCodeCASSUnavailable, "Failed to get timeline", reqID)
 		return
 	}
 
-	// Build timeline entries
-	entries := make([]map[string]interface{}, 0, len(result.Hits))
-	for _, hit := range result.Hits {
-		entry := map[string]interface{}{
-			"type":      hit.MatchType,
-			"agent":     hit.Agent,
-			"workspace": hit.Workspace,
-			"title":     hit.Title,
-			"snippet":   hit.Snippet,
-			"path":      hit.SourcePath,
-		}
-		if hit.CreatedAt != nil {
-			entry["timestamp"] = hit.CreatedAt.Format(time.RFC3339)
-		}
-		entries = append(entries, entry)
+	// Most recent sessions first, capped at limit.
+	sessions := result.Sessions
+	sort.SliceStable(sessions, func(i, j int) bool { return sessions[i].StartedAt > sessions[j].StartedAt })
+	if len(sessions) > limit {
+		sessions = sessions[:limit]
+	}
+	entries := make([]map[string]interface{}, 0, len(sessions))
+	for _, session := range sessions {
+		entries = append(entries, map[string]interface{}{
+			"agent":         session.Agent,
+			"title":         session.Title,
+			"path":          session.SourcePath,
+			"message_count": session.MessageCount,
+			"timestamp":     session.StartTime().UTC().Format(time.RFC3339),
+		})
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"entries": entries,
-		"count":   len(entries),
-		"since":   since,
+		"entries":        entries,
+		"count":          len(entries),
+		"total_sessions": result.TotalSessions,
+		"since":          since,
 	}, reqID)
 }
 
@@ -623,8 +631,7 @@ func (s *Server) handleCASSPreview(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Warn("cass preview failed", "error", err, "request_id", reqID)
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeCASSUnavailable,
-			"Failed to get preview", map[string]interface{}{"error": err.Error()}, reqID)
+		writeCASSCallError(w, err, ErrCodeCASSUnavailable, "Failed to get preview", reqID)
 		return
 	}
 
@@ -1104,8 +1111,13 @@ func (s *Server) handleMemoryContext(w http.ResponseWriter, r *http.Request) {
 				snippets := make([]map[string]interface{}, 0, len(result.HistorySnippets))
 				for _, sn := range result.HistorySnippets {
 					snippets = append(snippets, map[string]interface{}{
-						"id":      sn.ID,
-						"content": sn.Content,
+						"source_path": sn.SourcePath,
+						"line_number": sn.LineNumber,
+						"agent":       sn.Agent,
+						"workspace":   sn.Workspace,
+						"title":       sn.Title,
+						"snippet":     sn.Snippet,
+						"score":       sn.Score,
 					})
 				}
 

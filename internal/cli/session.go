@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -23,9 +20,12 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/cli/suggestions"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	sessionPkg "github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -51,6 +51,8 @@ type statusOptions struct {
 type SessionListInput struct {
 	Tags    []string `json:"tags,omitempty"`
 	Project string   `json:"project,omitempty"` // Filter by base project name (bd-3cu02.14)
+	Limit   int      `json:"limit,omitempty"`   // Page size (0 = all)
+	Offset  int      `json:"offset,omitempty"`  // Page start (D1 pagination)
 }
 
 // SessionStatusInput is the kernel input for sessions.status.
@@ -69,11 +71,19 @@ type SessionAttachInput struct {
 	Session string `json:"session"`
 }
 
+// Context usage sources, named as --robot-context reports them.
+const (
+	contextSourceStatusBar  = "status_bar"
+	contextSourceTranscript = "transcript"
+	contextSourceEstimate   = "scrollback_estimate"
+)
+
 type paneContextUsage struct {
 	Tokens  int
 	Limit   int
 	Percent float64
 	Model   string
+	Source  string
 }
 
 type contextRow struct {
@@ -82,6 +92,7 @@ type contextRow struct {
 	Tokens  int
 	Limit   int
 	Model   string
+	Source  string
 }
 
 func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (string, string) {
@@ -104,9 +115,12 @@ func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (
 	case agentpkg.AgentTypeGrok:
 		return string(th.Pink), ic.AgentIcon(string(agentpkg.AgentTypeGrok))
 	case agentpkg.AgentTypeMuse:
-		// Muse Code gets the sky accent, which no other agent type uses
-		// (matching the semantic theme palette).
+		// Muse Code shares omp's sky accent (matching the semantic theme
+		// palette); the MUSE label tells them apart.
 		return string(th.Sky), ic.AgentIcon(string(agentpkg.AgentTypeMuse))
+	case agentpkg.AgentTypeOmp:
+		// omp (Oh My Pi) gets the sky accent, matching the semantic palette.
+		return string(th.Sky), ic.AgentIcon(string(agentpkg.AgentTypeOmp))
 	case agentpkg.AgentTypeCursor:
 		return string(th.Cursor), ic.AgentIcon(string(agentpkg.AgentTypeCursor))
 	case agentpkg.AgentTypeWindsurf:
@@ -143,6 +157,7 @@ func listAgentsSummary(counts *output.AgentCountsResponse) string {
 		{counts.Antigravity, "AGY"},
 		{counts.Grok, "Grok"},
 		{counts.Muse, "Muse"},
+		{counts.Omp, "OMP"},
 		{counts.Ollama, "OLL"},
 		{counts.Cursor, "CUR"},
 		{counts.Windsurf, "WND"},
@@ -179,11 +194,12 @@ func writeStatusAgentSummary(w io.Writer, counts output.AgentCountsResponse, th 
 		{counts.Antigravity, "Antigravity", agentpkg.AgentTypeAntigravity, "instance(s)"},
 		{counts.Grok, "Grok", agentpkg.AgentTypeGrok, "instance(s)"},
 		{counts.Muse, "Muse", agentpkg.AgentTypeMuse, "instance(s)"},
+		{counts.Omp, "OMP", agentpkg.AgentTypeOmp, "instance(s)"},
+		{counts.Opencode, "OpenCode", agentpkg.AgentTypeOpencode, "instance(s)"},
 		{counts.Ollama, "Ollama", agentpkg.AgentTypeOllama, "instance(s)"},
 		{counts.Cursor, "Cursor", agentpkg.AgentTypeCursor, "instance(s)"},
 		{counts.Windsurf, "Windsurf", agentpkg.AgentTypeWindsurf, "instance(s)"},
 		{counts.Aider, "Aider", agentpkg.AgentTypeAider, "instance(s)"},
-		{counts.Opencode, "Opencode", agentpkg.AgentTypeOpencode, "instance(s)"},
 		{counts.User, "User", agentpkg.AgentTypeUser, "pane(s)"},
 		{counts.Other, "Other", agentpkg.AgentTypeUnknown, "pane(s)"},
 	} {
@@ -242,7 +258,12 @@ func init() {
 				opts = *value
 			}
 		}
-		return buildSessionListResponse(opts.Tags, opts.Project)
+		resp, err := buildSessionListResponse(opts.Tags, opts.Project)
+		if err != nil {
+			return resp, err
+		}
+		paginateSessionList(&resp, opts.Limit, opts.Offset)
+		return resp, nil
 	})
 
 	kernel.MustRegister(kernel.Command{
@@ -458,24 +479,32 @@ func runAttach(ctx context.Context, session string) error {
 func newListCmd() *cobra.Command {
 	var tags []string
 	var project string
+	var limit, offset int
 	cmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls", "l"},
 		Short:   "List all tmux sessions",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runList(tags, project)
+			return runListPaged(tags, project, limit, offset)
 		},
 	}
 	cmd.Flags().StringSliceVar(&tags, "tag", nil, "filter sessions by agent tag (shows session if any agent matches)")
 	cmd.Flags().StringVarP(&project, "project", "p", "", "filter by base project name (shows all labeled sessions for the project)")
+	cmd.Flags().IntVar(&limit, "limit", 0, "maximum sessions per page (0 = all)")
+	cmd.Flags().IntVar(&offset, "offset", 0, "pagination offset (use _agent_hints.next_offset for the next page)")
 	return cmd
 }
 
 func runList(tags []string, project ...string) error {
-	input := SessionListInput{Tags: tags}
+	proj := ""
 	if len(project) > 0 {
-		input.Project = project[0]
+		proj = project[0]
 	}
+	return runListPaged(tags, proj, 0, 0)
+}
+
+func runListPaged(tags []string, project string, limit, offset int) error {
+	input := SessionListInput{Tags: tags, Project: project, Limit: limit, Offset: offset}
 	result, err := kernel.Run(context.Background(), "sessions.list", input)
 	if err != nil {
 		if IsJSONOutput() {
@@ -644,25 +673,50 @@ func buildSessionListResponse(tags []string, project string) (output.ListRespons
 		items[i] = item
 	}
 
-	// Sort by base project, then unlabeled first, then label alphabetically (bd-3cu02.6)
+	// Sort by base project, then unlabeled first, then label alphabetically
+	// (bd-3cu02.6), then session name as a total-order tie-break. The
+	// unlabeled rule must compare BOTH sides: returning true whenever
+	// items[i].Label == "" violates strict weak ordering when two unlabeled
+	// sessions share a base project.
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].BaseProject != items[j].BaseProject {
 			return items[i].BaseProject < items[j].BaseProject
 		}
-		if items[i].Label == "" {
-			return true
+		if (items[i].Label == "") != (items[j].Label == "") {
+			return items[i].Label == ""
 		}
-		if items[j].Label == "" {
-			return false
+		if items[i].Label != items[j].Label {
+			return items[i].Label < items[j].Label
 		}
-		return items[i].Label < items[j].Label
+		return items[i].Name < items[j].Name
 	})
 
 	return output.ListResponse{
 		TimestampedResponse: output.NewTimestamped(),
 		Sessions:            items,
 		Count:               len(sessions),
+		TotalMatches:        len(sessions),
 	}, nil
+}
+
+// paginateSessionList applies the D1 offset/limit pagination contract
+// (bd-ws3-contract-breadth-psvyu.1) to a built session list response:
+// Sessions becomes one page, Count the page size, TotalMatches the pre-page
+// match count, HasMore/Pagination/_agent_hints.next_offset the continuation
+// state. limit<=0 with offset<=0 leaves the full list untouched.
+func paginateSessionList(resp *output.ListResponse, limit, offset int) {
+	if resp == nil {
+		return
+	}
+	resp.TotalMatches = len(resp.Sessions)
+	page, info := robot.ApplyPagination(resp.Sessions, robot.PaginationOptions{Limit: limit, Offset: offset})
+	resp.Sessions = page
+	resp.Count = len(page)
+	if info != nil {
+		resp.Pagination = info
+		resp.HasMore = info.HasMore
+		resp.AgentHints = robot.PaginationHints(info)
+	}
 }
 
 func coerceStatusResponse(result any) (output.StatusResponse, error) {
@@ -679,11 +733,39 @@ func coerceStatusResponse(result any) (output.StatusResponse, error) {
 	}
 }
 
-func estimatePaneContextUsage(p tmux.Pane) (paneContextUsage, bool) {
+// paneContextUsages measures every agent pane's context usage, preferring the
+// agent's own accounting: omp's composer gauge, then the transcript of the
+// session the pane's agent is writing (robot.ResolvePaneTranscripts, the same
+// resolver --robot-context uses), and only then a scrollback estimate. The
+// estimate sees only what is still on screen, so it understates any long
+// session (GH #338); it is labeled as such.
+func paneContextUsages(panes []tmux.Pane) map[string]paneContextUsage {
+	transcripts := robot.ResolvePaneTranscripts(panes)
+	usages := make(map[string]paneContextUsage, len(panes))
+	for _, p := range panes {
+		if usage, ok := estimatePaneContextUsage(p, transcripts[p.ID]); ok {
+			usages[p.ID] = usage
+		}
+	}
+	return usages
+}
+
+func estimatePaneContextUsage(p tmux.Pane, transcript *ntmctx.TranscriptUsage) (paneContextUsage, bool) {
 	if p.Type == tmux.AgentUser {
 		return paneContextUsage{}, false
 	}
+	if tmux.AgentType(p.Type).Canonical() == tmux.AgentOmp {
+		// omp reports its own context gauge ("6%…262K") in the composer's
+		// status line, which is exact where the transcript-size estimate below
+		// is not, and works without knowing omp's configured model.
+		if usage, ok := ompPaneContextUsage(p); ok {
+			return usage, true
+		}
+	}
 	modelName := modelNameForPane(p)
+	if transcript != nil {
+		return transcriptContextUsage(transcript, modelName), true
+	}
 	if modelName == "" {
 		return paneContextUsage{}, false
 	}
@@ -706,7 +788,53 @@ func estimatePaneContextUsage(p tmux.Pane) (paneContextUsage, bool) {
 		Limit:   usage.ContextLimit,
 		Percent: usage.UsagePercent,
 		Model:   usage.Model,
+		Source:  contextSourceEstimate,
 	}, true
+}
+
+// transcriptContextUsage turns a transcript's last usage record into a
+// reading. The window is the one the transcript reports (Codex) or the
+// model's; a reading over 100% means that window is wrong for this session,
+// so it is capped rather than shown as more than full.
+func transcriptContextUsage(t *ntmctx.TranscriptUsage, paneModel string) paneContextUsage {
+	model := t.Model
+	if model == "" {
+		model = paneModel
+	}
+	limit := t.ContextWindow
+	if limit <= 0 {
+		limit = tokens.GetContextLimit(model)
+	}
+	usage := paneContextUsage{Tokens: t.Tokens, Limit: limit, Model: model, Source: contextSourceTranscript, Percent: 100}
+	if limit > 0 {
+		usage.Percent = min(float64(t.Tokens)*100/float64(limit), 100)
+	}
+	return usage
+}
+
+// ompPaneContextUsage reads the context gauge omp renders in its composer's
+// status line. Tokens are derived from the gauge percentage and the window
+// omp displays next to it.
+func ompPaneContextUsage(p tmux.Pane) (paneContextUsage, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := tmux.CapturePaneVisibleContext(ctx, p.ID)
+	if err != nil || out == "" {
+		return paneContextUsage{}, false
+	}
+	usedPct, window, ok := agentpkg.OmpContextUsage(out)
+	if !ok {
+		return paneContextUsage{}, false
+	}
+	model := p.Variant
+	if model == "" {
+		model = "omp"
+	}
+	usage := paneContextUsage{Percent: usedPct, Limit: int(window), Model: model, Source: contextSourceStatusBar}
+	if window > 0 {
+		usage.Tokens = int(float64(window) * usedPct / 100)
+	}
+	return usage, true
 }
 
 func buildStatusResponse(ctx context.Context, session string, opts statusOptions) (output.StatusResponse, error) {
@@ -773,15 +901,8 @@ func buildStatusResponse(ctx context.Context, session string, opts statusOptions
 		incrementAgentCounts(&counts, p.Type)
 	}
 
-	// Estimate context usage per pane (best-effort)
-	contextByPaneID := make(map[string]paneContextUsage)
-	for _, p := range panes {
-		usage, ok := estimatePaneContextUsage(p)
-		if !ok {
-			continue
-		}
-		contextByPaneID[p.ID] = usage
-	}
+	// Context usage per pane (best-effort; see paneContextUsages for sources)
+	contextByPaneID := paneContextUsages(panes)
 
 	// Load assignments if requested (or if filtering/summary requires them)
 	var assignmentStore *assignment.AssignmentStore
@@ -831,6 +952,7 @@ func buildStatusResponse(ctx context.Context, session string, opts statusOptions
 			paneResp.ContextLimit = usage.Limit
 			paneResp.ContextPercent = usage.Percent
 			paneResp.ContextModel = usage.Model
+			paneResp.ContextSource = usage.Source
 		}
 		resp.Panes = append(resp.Panes, paneResp)
 	}
@@ -1114,15 +1236,8 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 		incrementAgentCounts(&counts, p.Type)
 	}
 
-	// Estimate context usage per pane (best-effort)
-	contextByPaneID := make(map[string]paneContextUsage)
-	for _, p := range panes {
-		usage, ok := estimatePaneContextUsage(p)
-		if !ok {
-			continue
-		}
-		contextByPaneID[p.ID] = usage
-	}
+	// Context usage per pane (best-effort; see paneContextUsages for sources)
+	contextByPaneID := paneContextUsages(panes)
 
 	// Load assignments if requested (or if filtering/summary requires them)
 	var assignmentStore *assignment.AssignmentStore
@@ -1184,7 +1299,7 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 	// Monitor status (best-effort check via pgrep)
 	monitorLabel := "not running"
 	monitorColor := subtext
-	if isMonitorAlive(session) {
+	if resilience.IsMonitorAlive(session) {
 		monitorLabel = "running"
 		monitorColor = success
 	}
@@ -1340,6 +1455,7 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 			Tokens:  usage.Tokens,
 			Limit:   usage.Limit,
 			Model:   model,
+			Source:  usage.Source,
 		})
 	}
 
@@ -1378,10 +1494,17 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 				warnMark = fmt.Sprintf(" %s%s%s", percentColor, ic.Warning, reset)
 			}
 
+			// Say when a reading is only a scrollback guess (GH #338): it
+			// sees what is on screen, not the whole session.
+			sourceMark := ""
+			if row.Source == contextSourceEstimate {
+				sourceMark = fmt.Sprintf(" %s(estimate)%s", subtext, reset)
+			}
+
 			bar := renderProgressBar(row.Percent, barWidth)
-			fmt.Fprintf(w, "    %s%-12s%s %s of %s context%s %s%s\n",
+			fmt.Fprintf(w, "    %s%-12s%s %s of %s context%s %s%s%s\n",
 				text, row.Label, reset,
-				percentText, row.Model, tokenInfo, bar, warnMark)
+				percentText, row.Model, tokenInfo, bar, warnMark, sourceMark)
 		}
 		fmt.Fprintln(w)
 	}
@@ -1761,6 +1884,14 @@ func modelNameForPane(p tmux.Pane) string {
 			if cfg.Models.DefaultOllama != "" {
 				return cfg.Models.DefaultOllama
 			}
+		case tmux.AgentOpencode:
+			if cfg.Models.DefaultOpencode != "" {
+				return cfg.Models.DefaultOpencode
+			}
+		case tmux.AgentOmp:
+			if cfg.Models.DefaultOmp != "" {
+				return cfg.Models.DefaultOmp
+			}
 		}
 	}
 	// Fall back to compiled-in defaults from config.DefaultModels() so the
@@ -1768,7 +1899,12 @@ func modelNameForPane(p tmux.Pane) string {
 	defaults := config.DefaultModels()
 	switch agentType {
 	case tmux.AgentClaude:
-		return defaults.DefaultClaude
+		if defaults.DefaultClaude != "" {
+			return defaults.DefaultClaude
+		}
+		// Launch model delegated to Claude Code (ntm#334): estimate context
+		// and cost against the Claude family rather than dropping them.
+		return config.ClaudeEstimationModel
 	case tmux.AgentCodex:
 		return defaults.DefaultCodex
 	case tmux.AgentGemini, tmux.AgentAntigravity:
@@ -1777,6 +1913,8 @@ func modelNameForPane(p tmux.Pane) string {
 		return defaults.DefaultGrok
 	case tmux.AgentMuse:
 		return defaults.DefaultMuse
+	case tmux.AgentOmp:
+		return defaults.DefaultOmp
 	case tmux.AgentOllama:
 		return defaults.DefaultOllama
 	default:
@@ -1798,14 +1936,10 @@ func museModelForVariant(variant string) string {
 	return modelsCfg.GetModelName(string(tmux.AgentMuse), alias)
 }
 
+// paneLabel derives the display label for a pane via the canonical pane-title
+// helper (internal/config/label.go, WS0-G6 single-definition contract).
 func paneLabel(session string, pane tmux.Pane) string {
-	label := strings.TrimSpace(pane.Title)
-	prefix := session + "__"
-	label = strings.TrimPrefix(label, prefix)
-	if label == "" {
-		label = fmt.Sprintf("pane %d", pane.Index)
-	}
-	return label
+	return config.PaneDisplayLabel(session, pane.Title, pane.Index)
 }
 
 func renderProgressBar(percent float64, width int) string {
@@ -1833,29 +1967,5 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// isMonitorAlive checks whether the resilience monitor process is running
-// for the given session by looking for the "internal-monitor <session>" process.
-func monitorProcessPatternForExecutable(executablePath, session string) string {
-	execName := strings.TrimSpace(filepath.Base(executablePath))
-	if execName == "" {
-		execName = "ntm"
-	}
-	return `(?:^|[[:space:]])(?:[^[:space:]]*/)?` + regexp.QuoteMeta(execName) + `[[:space:]]+internal-monitor[[:space:]]+` + regexp.QuoteMeta(session) + `(?:[[:space:]]|$)`
-}
-
-func monitorProcessPattern(session string) string {
-	executablePath, err := os.Executable()
-	if err != nil {
-		executablePath = "ntm"
-	}
-	return monitorProcessPatternForExecutable(executablePath, session)
-}
-
-func isMonitorAlive(session string) bool {
-	// Use an anchored regex pattern to avoid false positives from processes
-	// whose paths or arguments happen to contain "ntm". The pattern matches
-	// the binary name at a word boundary followed by the exact subcommand
-	// and session name.
-	err := exec.Command("pgrep", "-f", monitorProcessPattern(session)).Run()
-	return err == nil
-}
+// Monitor process detection lives in internal/resilience (shared with robot
+// spawn); see resilience.IsMonitorAlive / resilience.MonitorProcessPattern.

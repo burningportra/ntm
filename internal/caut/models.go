@@ -7,56 +7,64 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
-// Response is the top-level caut JSON structure
+// Response is caut's robot-output envelope. The field names follow caut's
+// published contract (schemas/caut-v1.schema.json in coding_agent_usage_tracker):
+// camelCase keys, and `data` is the array of provider payloads itself.
 type Response struct {
-	SchemaVersion string   `json:"schema_version"` // "caut.v1"
-	Command       string   `json:"command"`        // "usage"
-	Timestamp     string   `json:"timestamp"`
-	Data          Data     `json:"data"`
-	Errors        []string `json:"errors"`
-}
-
-// Data contains the usage payloads
-type Data struct {
-	Payloads []ProviderPayload `json:"payloads"`
+	SchemaVersion string            `json:"schemaVersion"` // "caut.v1"
+	GeneratedAt   string            `json:"generatedAt"`
+	Command       string            `json:"command"` // "usage"
+	Data          []ProviderPayload `json:"data"`
+	Errors        []string          `json:"errors"`
 }
 
 // ProviderPayload contains usage data for one provider
 type ProviderPayload struct {
 	Provider string        `json:"provider"`
 	Account  *string       `json:"account,omitempty"`
-	Source   string        `json:"source"` // "web", "cli", "api"
+	Source   string        `json:"source"` // "web", "cli", "oauth", ...
 	Status   *StatusInfo   `json:"status,omitempty"`
 	Usage    UsageSnapshot `json:"usage"`
 }
 
-// StatusInfo contains provider status page information
+// StatusInfo is the provider's status-page reading. Indicator is the
+// statuspage.io grade: none, minor, major, critical, maintenance or unknown.
 type StatusInfo struct {
-	Operational bool    `json:"operational,omitempty"`
-	Message     *string `json:"message,omitempty"`
-	URL         *string `json:"url,omitempty"`
+	Indicator   string  `json:"indicator"`
+	Description *string `json:"description,omitempty"`
+	URL         string  `json:"url,omitempty"`
+}
+
+// Operational reports whether the status page shows the provider working:
+// no incident, or only a minor one.
+func (s *StatusInfo) Operational() bool {
+	switch strings.ToLower(strings.TrimSpace(s.Indicator)) {
+	case "major", "critical":
+		return false
+	default:
+		return true
+	}
 }
 
 // UsageSnapshot contains rate window information
 type UsageSnapshot struct {
-	PrimaryRateWindow   *RateWindow `json:"primary_rate_window,omitempty"`
-	SecondaryRateWindow *RateWindow `json:"secondary_rate_window,omitempty"`
-	TertiaryRateWindow  *RateWindow `json:"tertiary_rate_window,omitempty"`
+	PrimaryRateWindow   *RateWindow `json:"primary,omitempty"`
+	SecondaryRateWindow *RateWindow `json:"secondary,omitempty"`
+	TertiaryRateWindow  *RateWindow `json:"tertiary,omitempty"`
 	Identity            *Identity   `json:"identity,omitempty"`
 }
 
 // RateWindow describes a usage rate limiting window
 type RateWindow struct {
-	UsedPercent      *float64   `json:"used_percent,omitempty"`
-	WindowMinutes    *int       `json:"window_minutes,omitempty"`
-	ResetsAt         *time.Time `json:"resets_at,omitempty"`
-	ResetDescription *string    `json:"reset_description,omitempty"`
+	UsedPercent      *float64   `json:"usedPercent,omitempty"`
+	WindowMinutes    *int       `json:"windowMinutes,omitempty"`
+	ResetsAt         *time.Time `json:"resetsAt,omitempty"`
+	ResetDescription *string    `json:"resetDescription,omitempty"`
 }
 
 // Identity contains account information
 type Identity struct {
-	AccountEmail *string `json:"account_email,omitempty"`
-	PlanName     *string `json:"plan_name,omitempty"`
+	AccountEmail *string `json:"accountEmail,omitempty"`
 }
 
 // UsageResult is the processed result for NTM consumption
@@ -115,14 +123,6 @@ func (p *ProviderPayload) GetAccountEmail() string {
 	return *p.Usage.Identity.AccountEmail
 }
 
-// GetPlanName returns the plan name if available
-func (p *ProviderPayload) GetPlanName() string {
-	if p.Usage.Identity == nil || p.Usage.Identity.PlanName == nil {
-		return ""
-	}
-	return *p.Usage.Identity.PlanName
-}
-
 // HasUsageData returns true if the payload contains any usage data
 func (p *ProviderPayload) HasUsageData() bool {
 	return p.Usage.PrimaryRateWindow != nil ||
@@ -135,22 +135,7 @@ func (p *ProviderPayload) IsOperational() bool {
 	if p.Status == nil {
 		return true // Assume operational if no status
 	}
-	return p.Status.Operational
-}
-
-// GetPayloadByProvider returns the payload for a specific provider
-func (r *UsageResult) GetPayloadByProvider(provider string) *ProviderPayload {
-	for i := range r.Payloads {
-		if r.Payloads[i].Provider == provider {
-			return &r.Payloads[i]
-		}
-	}
-	return nil
-}
-
-// HasErrors returns true if there were any errors during the fetch
-func (r *UsageResult) HasErrors() bool {
-	return len(r.Errors) > 0
+	return p.Status.Operational()
 }
 
 // AgentTypeToProvider maps NTM agent type to caut provider
@@ -166,55 +151,14 @@ func AgentTypeToProvider(agentType string) string {
 		return "gemini"
 	case agent.AgentTypeCursor:
 		return "cursor"
-	case agent.AgentTypeWindsurf:
-		return "windsurf"
-	case agent.AgentTypeAider:
-		return "aider"
 	default:
+		// caut has no windsurf or aider provider; asking for one is an
+		// invalid-provider error, not usage data.
 		return ""
 	}
 }
 
-// ProviderToAgentType maps caut provider to NTM agent type
-func ProviderToAgentType(provider string) string {
-	switch agent.AgentType(provider).Canonical() {
-	case agent.AgentTypeClaudeCode:
-		return "cc"
-	case agent.AgentTypeCodex:
-		return "cod"
-	case agent.AgentTypeGemini:
-		return "gmi"
-	case agent.AgentTypeAntigravity:
-		return "agy"
-	case agent.AgentTypeCursor:
-		return "cursor"
-	case agent.AgentTypeWindsurf:
-		return "windsurf"
-	case agent.AgentTypeAider:
-		return "aider"
-	}
-
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "anthropic", "claude":
-		return "cc"
-	case "openai", "codex":
-		return "cod"
-	case "google", "gemini":
-		return "gmi"
-	case "antigravity", "agy":
-		return "agy"
-	case "cursor":
-		return "cursor"
-	case "windsurf":
-		return "windsurf"
-	case "aider":
-		return "aider"
-	default:
-		return ""
-	}
-}
-
-// SupportedProviders returns the list of providers supported by NTM
+// SupportedProviders returns the caut providers NTM agents map to.
 func SupportedProviders() []string {
-	return []string{"claude", "codex", "gemini", "cursor", "windsurf", "aider"}
+	return []string{"claude", "codex", "gemini", "cursor"}
 }

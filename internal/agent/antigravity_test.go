@@ -27,9 +27,6 @@ func TestAntigravityAgentType(t *testing.T) {
 	if !AgentTypeAntigravity.IsValid() {
 		t.Error("AgentTypeAntigravity should be valid")
 	}
-	if !AgentTypeAntigravity.NeedsDoubleEnter() {
-		t.Error("agy should need double-enter (mirrors the Gemini CLI TUI)")
-	}
 
 	// agy and the legacy gemini provider must never collapse into each other,
 	// even though they share the ~/.gemini parent directory.

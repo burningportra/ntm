@@ -428,6 +428,9 @@ func TestProfileToAgentType(t *testing.T) {
 		// Aider variants
 		{"aider", "aider"},
 		{"AIDER", "aider"},
+		// Oh My Pi variants
+		{"omp", "omp"},
+		{"oh-my-pi", "omp"},
 		// Muse Code variants must not fall back to Claude
 		{"muse", "muse"},
 		{"muse-code", "muse"},

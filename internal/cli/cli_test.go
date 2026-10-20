@@ -46,7 +46,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
-	"github.com/Dicklesworthstone/ntm/internal/tracker"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
@@ -324,7 +323,7 @@ func resetFlags() {
 	robotSendType = ""
 	robotSendExclude = ""
 	robotSendDelay = 0
-	robotAssignStrategy = "balanced"
+	robotAssignStrategy = "simple"
 	robotBulkAssign = ""
 	robotBulkAssignFromBV = false
 	robotBulkAssignAlloc = ""
@@ -333,6 +332,7 @@ func resetFlags() {
 	robotBulkAssignTemplate = ""
 	robotBulkAssignParallel = false
 	robotBulkAssignStagger = 0
+	robotReserveFiles = true
 	robotRequireReservation = false
 	robotReservationPaths = ""
 	robotDiff = ""
@@ -355,11 +355,16 @@ func resetFlags() {
 	robotSpawnTimeout = "30s"
 	robotSpawnStrategy = "top-n"
 	robotSpawn = ""
-	robotSpawnCC = 0
-	robotSpawnCod = 0
-	robotSpawnGmi = 0
-	robotSpawnAgy = 0
-	robotSpawnGrok = 0
+	robotSpawnCC = ""
+	robotSpawnCod = ""
+	robotSpawnGmi = ""
+	robotSpawnPi = ""
+	robotSpawnKimi = ""
+	robotSpawnMuse = ""
+	robotSpawnAgy = ""
+	robotSpawnGrok = ""
+	robotSpawnOmp = ""
+	robotSpawnOc = ""
 	robotSpawnPreset = ""
 	robotSpawnNoUser = false
 	robotSpawnWait = false
@@ -368,6 +373,10 @@ func resetFlags() {
 	robotSpawnAssignWork = false
 	robotSpawnNames = ""
 	robotSpawnLabel = ""
+	robotSpawnPrompt = ""
+	robotSpawnPromptFile = ""
+	robotSpawnStaggerMode = ""
+	robotSpawnStaggerDelay = ""
 	robotInterruptMsg = ""
 	robotInterruptAll = false
 	robotInterruptForce = false
@@ -399,11 +408,11 @@ func TestRobotSpawnOptionsFromFlagsPreservesDurationAndCopiesInputs(t *testing.T
 
 	robotSpawn = "duration-spawn"
 	robotSpawnLabel = "goal"
-	robotSpawnCC = 1
-	robotSpawnCod = 2
-	robotSpawnGmi = 3
-	robotSpawnAgy = 4
-	robotSpawnGrok = 5
+	robotSpawnCC = "1"
+	robotSpawnCod = "2:gpt-5.3-codex:high"
+	robotSpawnGmi = "3"
+	robotSpawnAgy = "4"
+	robotSpawnGrok = "5"
 	robotSpawnPreset = "custom"
 	robotSpawnNoUser = true
 	robotSpawnDir = t.TempDir()
@@ -415,9 +424,15 @@ func TestRobotSpawnOptionsFromFlagsPreservesDurationAndCopiesInputs(t *testing.T
 	robotRequireReservation = true
 	paths := []string{"internal/robot/**", "internal/cli/**"}
 
-	opts := robotSpawnOptionsFromFlags(nil, 500*time.Millisecond, paths, true)
+	opts, err := robotSpawnOptionsFromFlags(nil, 500*time.Millisecond, paths, true)
+	if err != nil {
+		t.Fatalf("robotSpawnOptionsFromFlags: %v", err)
+	}
 	if opts.ReadyTimeout != 500*time.Millisecond {
 		t.Fatalf("ReadyTimeout=%s, want 500ms", opts.ReadyTimeout)
+	}
+	if opts.CodModel != "gpt-5.3-codex" || opts.CodReasoningEffort != "high" {
+		t.Fatalf("Cod model/effort=%q/%q, want gpt-5.3-codex/high", opts.CodModel, opts.CodReasoningEffort)
 	}
 	if opts.Session != robotSpawn || opts.Label != robotSpawnLabel || opts.CCCount != 1 || opts.CodCount != 2 || opts.GmiCount != 3 || opts.AgyCount != 4 || opts.GrokCount != 5 {
 		t.Fatalf("spawn identity/count options=%+v", opts)
@@ -1005,58 +1020,6 @@ func TestResolveMessageScopeUsesSavedSessionAgentWhenInferringSession(t *testing
 	}
 	if gotAgent != "BlueLake" {
 		t.Fatalf("agent name = %q, want %q", gotAgent, "BlueLake")
-	}
-}
-
-func TestResolveMessageScopeUsesCurrentPaneRegistryIdentity(t *testing.T) {
-	testutil.RequireTmuxThrottled(t)
-	isolateSessionAgentStorage(t)
-
-	projectsBase := t.TempDir()
-	projectDir := filepath.Join(projectsBase, "messagepaneidentity")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project: %v", err)
-	}
-
-	oldCfg := cfg
-	cfg = &config.Config{ProjectsBase: projectsBase}
-	t.Cleanup(func() { cfg = oldCfg })
-
-	oldWd, _ := os.Getwd()
-	otherDir := t.TempDir()
-	if err := os.Chdir(otherDir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
-	defer os.Chdir(oldWd)
-
-	session := "messagepaneidentity"
-	_ = tmux.KillSession(session)
-	if err := tmux.CreateSession(session, projectDir); err != nil {
-		t.Fatalf("CreateSession(%q): %v", session, err)
-	}
-	t.Cleanup(func() { _ = tmux.KillSession(session) })
-
-	panes, err := tmux.GetPanes(session)
-	if err != nil {
-		t.Fatalf("GetPanes(%q): %v", session, err)
-	}
-	if len(panes) == 0 {
-		t.Fatal("expected at least one pane")
-	}
-
-	saveSessionAgentForTest(t, session, projectDir, "BlueLake")
-	saveSessionAgentRegistryForTest(t, session, projectDir, "", panes[0].ID, "GreenCastle")
-	t.Setenv("TMUX_PANE", panes[0].ID)
-
-	gotDir, gotAgent, err := resolveMessageScope(t.Context(), session)
-	if err != nil {
-		t.Fatalf("resolveMessageScope() error = %v", err)
-	}
-	if gotDir != projectDir {
-		t.Fatalf("project dir = %q, want %q", gotDir, projectDir)
-	}
-	if gotAgent != "GreenCastle" {
-		t.Fatalf("agent name = %q, want %q", gotAgent, "GreenCastle")
 	}
 }
 
@@ -2128,19 +2091,6 @@ func TestRunEnsembleSynthesize_RejectsRunIDWithoutStream(t *testing.T) {
 	}
 }
 
-func TestResolveEnsembleStateCommandSession_ExplicitOfflineSession(t *testing.T) {
-	res, err := resolveEnsembleStateCommandSession("offline-explicit-session", io.Discard)
-	if err != nil {
-		t.Fatalf("resolveEnsembleStateCommandSession() error = %v", err)
-	}
-	if res.Session != "offline-explicit-session" {
-		t.Fatalf("Session = %q, want %q", res.Session, "offline-explicit-session")
-	}
-	if res.Inferred {
-		t.Fatal("expected explicit session resolution, got inferred")
-	}
-}
-
 func TestNewEnsembleSynthesizeCmd_AllowsExplicitOfflineSession(t *testing.T) {
 	isolateSessionAgentStorage(t)
 	ensemble.CloseDefaultStateStore()
@@ -2847,109 +2797,12 @@ func TestRollbackCmd_InvalidCheckpointReportsLoadFailure(t *testing.T) {
 	}
 }
 
-func TestRunChangesNormalizesExplicitPrefix(t *testing.T) {
-	origStore := tracker.GlobalFileChanges
-	store := tracker.NewFileChangeStore(100)
-	tracker.GlobalFileChanges = store
-	t.Cleanup(func() { tracker.GlobalFileChanges = origStore })
-
-	projectsBase := t.TempDir()
-	projectDir := filepath.Join(projectsBase, "changeproject")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project: %v", err)
-	}
-
-	oldCfg := cfg
-	oldJSON := jsonOutput
-	cfg = &config.Config{ProjectsBase: projectsBase}
-	jsonOutput = false
-	t.Cleanup(func() {
-		cfg = oldCfg
-		jsonOutput = oldJSON
-	})
-
-	store.Add(tracker.RecordedFileChange{
-		Timestamp: time.Now(),
-		Session:   "changeproject",
-		Agents:    []string{"agent-1"},
-		Change: tracker.FileChange{
-			Path: filepath.Join(projectDir, "file.go"),
-			Type: tracker.FileModified,
-		},
-	})
-
-	out, err := captureStdout(t, func() error { return runChanges(t.Context(), "changep") })
-	if err != nil {
-		t.Fatalf("runChanges() error = %v", err)
-	}
-	if strings.Contains(out, "No file changes recorded.") {
-		t.Fatalf("expected recorded change output, got %q", out)
-	}
-	if !strings.Contains(out, "agent-1") {
-		t.Fatalf("expected agent name in output, got %q", out)
-	}
-}
-
-func TestRunConflictsNormalizesExplicitPrefix(t *testing.T) {
-	origStore := tracker.GlobalFileChanges
-	store := tracker.NewFileChangeStore(100)
-	tracker.GlobalFileChanges = store
-	t.Cleanup(func() { tracker.GlobalFileChanges = origStore })
-
-	projectsBase := t.TempDir()
-	projectDir := filepath.Join(projectsBase, "conflictproject")
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatalf("mkdir project: %v", err)
-	}
-
-	oldCfg := cfg
-	oldJSON := jsonOutput
-	cfg = &config.Config{ProjectsBase: projectsBase}
-	jsonOutput = false
-	t.Cleanup(func() {
-		cfg = oldCfg
-		jsonOutput = oldJSON
-	})
-
-	path := filepath.Join(projectDir, "file.go")
-	store.Add(tracker.RecordedFileChange{
-		Timestamp: time.Now().Add(-2 * time.Minute),
-		Session:   "conflictproject",
-		Agents:    []string{"agent-1"},
-		Change: tracker.FileChange{
-			Path: path,
-			Type: tracker.FileModified,
-		},
-	})
-	store.Add(tracker.RecordedFileChange{
-		Timestamp: time.Now().Add(-1 * time.Minute),
-		Session:   "conflictproject",
-		Agents:    []string{"agent-2"},
-		Change: tracker.FileChange{
-			Path: path,
-			Type: tracker.FileModified,
-		},
-	})
-
-	out, err := captureStdout(t, func() error { return runConflicts(t.Context(), "conflictp", "24h", 10) })
-	if err != nil {
-		t.Fatalf("runConflicts() error = %v", err)
-	}
-	if strings.Contains(out, "No conflicts detected.") {
-		t.Fatalf("expected conflict output, got %q", out)
-	}
-	if !strings.Contains(out, "conflictproject") {
-		t.Fatalf("expected session name in output, got %q", out)
-	}
-	if !strings.Contains(out, "file.go") {
-		t.Fatalf("expected conflicted file in output, got %q", out)
-	}
-}
-
 func TestRunContextRotationPendingNormalizesExplicitPrefix(t *testing.T) {
-	storePath := filepath.Join(t.TempDir(), "pending.jsonl")
+	// NewPendingRotationStoreWithPath was removed as dead code; redirect the
+	// default store's location via HOME instead (NTMDir = $HOME/.ntm).
+	t.Setenv("HOME", t.TempDir())
 	origStore := ctxmon.DefaultPendingRotationStore
-	ctxmon.DefaultPendingRotationStore = ctxmon.NewPendingRotationStoreWithPath(storePath)
+	ctxmon.DefaultPendingRotationStore = ctxmon.NewPendingRotationStore()
 	t.Cleanup(func() { ctxmon.DefaultPendingRotationStore = origStore })
 
 	projectsBase := t.TempDir()
@@ -2973,7 +2826,6 @@ func TestRunContextRotationPendingNormalizesExplicitPrefix(t *testing.T) {
 		ContextPercent: 91.2,
 		CreatedAt:      time.Now(),
 		TimeoutAt:      time.Now().Add(5 * time.Minute),
-		DefaultAction:  ctxmon.ConfirmRotate,
 		WorkDir:        projectDir,
 	}); err != nil {
 		t.Fatalf("AddPendingRotation() error = %v", err)
@@ -3271,10 +3123,17 @@ func TestSmartRestartHardKillFlagsRegistered(t *testing.T) {
 }
 
 func TestAtomicRobotAssignmentReservationFlagsRegistered(t *testing.T) {
-	for _, name := range []string{"require-reservation", "reservation-paths"} {
+	for _, name := range []string{"require-reservation", "reservation-paths", "reserve-files"} {
 		if rootCmd.Flags().Lookup(name) == nil {
 			t.Fatalf("expected --%s flag to be registered", name)
 		}
+	}
+	// Bulk assignment reserves by default, mirroring `ntm assign --reserve-files`.
+	if reserve := rootCmd.Flags().Lookup("reserve-files"); reserve.DefValue != "true" {
+		t.Fatalf("--reserve-files default = %q, want true", reserve.DefValue)
+	}
+	if assignReserve := newAssignCmd().Flags().Lookup("reserve-files"); assignReserve == nil || assignReserve.DefValue != "true" {
+		t.Fatalf("ntm assign --reserve-files = %+v, want a flag defaulting to true", assignReserve)
 	}
 }
 
@@ -3437,8 +3296,12 @@ func TestConfigShowJSONIncludesSafetyProfile(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected safety.preflight to be object, got %T", safety["preflight"])
 	}
-	if enabled, ok := preflight["enabled"].(bool); !ok || !enabled {
-		t.Fatalf("expected safety.preflight.enabled=true, got %v", preflight["enabled"])
+	// preflight.enabled was deprecated in v1.28.0 (bd-6otuk); only strict remains.
+	if _, exists := preflight["enabled"]; exists {
+		t.Fatalf("safety.preflight must not echo the deprecated enabled key, got %v", preflight["enabled"])
+	}
+	if _, ok := preflight["strict"].(bool); !ok {
+		t.Fatalf("expected safety.preflight.strict to be a bool, got %v", preflight["strict"])
 	}
 
 	if _, exists := parsed["health"]; exists {
@@ -3532,6 +3395,10 @@ func TestConfigShowJSONListsEveryAgentCommand(t *testing.T) {
 
 // TestDepsCmdExecutes tests the deps command runs
 func TestDepsCmdExecutes(t *testing.T) {
+	// Hermetic config: since v1.27.0 (WS6-remove-finalize) a real user config
+	// containing removed keys is a hard load error, so the test must not read
+	// the developer's ~/.config/ntm/config.toml.
+	isolateSessionAgentStorage(t)
 	fakeToolsDir := filepath.Join(repoRoot(t), "testdata", "faketools")
 	toolDir := t.TempDir()
 	writeFakeVersionTool(t, toolDir, "tmux", "tmux 3.4")
@@ -3554,6 +3421,8 @@ func TestDepsCmdExecutes(t *testing.T) {
 }
 
 func TestDepsCmdSmoke(t *testing.T) {
+	// Hermetic config: see TestDepsCmdExecutes.
+	isolateSessionAgentStorage(t)
 	fakeToolsDir := filepath.Join(repoRoot(t), "testdata", "faketools")
 	toolDir := t.TempDir()
 
@@ -3924,8 +3793,23 @@ func TestSpawnValidation(t *testing.T) {
 func TestSessionsCreateKernelHandlerDecodesMapInputAndValidatesLabelShape(t *testing.T) {
 	resetFlags()
 
+	// Under the canonical LAST-"--" split (internal/config/label.go), the base
+	// of "project--bad--label" is "project--bad", which trips the reserved
+	// project-name validation.
 	_, err := kernel.Run(context.Background(), "sessions.create", map[string]interface{}{
 		"session": "project--bad--label",
+		"panes":   1,
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("expected reserved-separator project-name error, got %v", err)
+	}
+
+	// A malformed label (bad shape, no extra separator) still fails label validation.
+	_, err = kernel.Run(context.Background(), "sessions.create", map[string]interface{}{
+		"session": "project--bad!label",
 		"panes":   1,
 	})
 	if err == nil {
@@ -4019,14 +3903,6 @@ func TestIsJSONOutput(t *testing.T) {
 	jsonOutput = true
 	if !IsJSONOutput() {
 		t.Error("Expected IsJSONOutput() to return true")
-	}
-}
-
-// TestGetFormatter tests the formatter creation
-func TestGetFormatter(t *testing.T) {
-	formatter := GetFormatter()
-	if formatter == nil {
-		t.Fatal("Expected non-nil formatter")
 	}
 }
 
@@ -4921,23 +4797,6 @@ func TestUpgradeCmdHelp(t *testing.T) {
 	}
 }
 
-// TestGetAssetName tests the asset name generation for different platforms
-func TestGetAssetName(t *testing.T) {
-	// Note: This tests the actual runtime values, so results depend on where tests run
-	name := getAssetName()
-
-	// Must start with ntm_
-	if !strings.HasPrefix(name, "ntm_") {
-		t.Errorf("getAssetName() = %q, want prefix 'ntm_'", name)
-	}
-
-	// Must contain underscore separators (not dashes)
-	parts := strings.Split(name, "_")
-	if len(parts) != 3 {
-		t.Errorf("getAssetName() = %q, want 3 parts separated by underscore", name)
-	}
-}
-
 // TestGetArchiveAssetName tests archive asset name generation
 func TestGetArchiveAssetName(t *testing.T) {
 	tests := []struct {
@@ -5346,16 +5205,6 @@ func TestUpgradeAssetNamingConsistency(t *testing.T) {
 	// The real functions use runtime.GOOS/GOARCH, so we test that the
 	// current platform produces expected patterns
 
-	realBinary := getAssetName()
-	// Binary should always start with ntm_ and use underscore separators
-	if !strings.HasPrefix(realBinary, "ntm_") {
-		t.Errorf("getAssetName() = %q, should start with 'ntm_'", realBinary)
-	}
-	parts := strings.Split(realBinary, "_")
-	if len(parts) != 3 {
-		t.Errorf("getAssetName() = %q, should have 3 underscore-separated parts", realBinary)
-	}
-
 	realArchive := getArchiveAssetName("1.0.0")
 	// Archive should have format: ntm_VERSION_OS_ARCH.ext
 	if !strings.HasPrefix(realArchive, "ntm_1.0.0_") {
@@ -5366,7 +5215,7 @@ func TestUpgradeAssetNamingConsistency(t *testing.T) {
 	}
 
 	// Log for debugging
-	t.Logf("Current platform produces: binary=%q, archive=%q", realBinary, realArchive)
+	t.Logf("Current platform produces: archive=%q", realArchive)
 }
 
 func TestParseRobotSinceWindowAcceptsRFC3339(t *testing.T) {
@@ -5415,8 +5264,8 @@ func TestResolveRobotMailCheckUsesSharedCanonicalFlags(t *testing.T) {
 		t.Fatalf("set limit: %v", err)
 	}
 
-	if got := resolveRobotMailCheckSince(cmd); got != robotSince {
-		t.Fatalf("resolveRobotMailCheckSince() = %q, want %q", got, robotSince)
+	if got := resolveRobotCASSSince(cmd); got != robotSince {
+		t.Fatalf("resolveRobotCASSSince() = %q, want %q", got, robotSince)
 	}
 	if got := resolveRobotMailCheckLimit(cmd); got != 25 {
 		t.Fatalf("resolveRobotMailCheckLimit() = %d, want 25", got)
@@ -5450,8 +5299,8 @@ func TestResolveRobotMailCheckSincePrefersDeprecatedAliasWhenExplicitlySet(t *te
 		t.Fatalf("set cass-since: %v", err)
 	}
 
-	if got := resolveRobotMailCheckSince(cmd); got != cassSince {
-		t.Fatalf("resolveRobotMailCheckSince() = %q, want deprecated explicit value %q", got, cassSince)
+	if got := resolveRobotCASSSince(cmd); got != cassSince {
+		t.Fatalf("resolveRobotCASSSince() = %q, want deprecated explicit value %q", got, cassSince)
 	}
 }
 
@@ -6133,6 +5982,198 @@ func TestRobotProcessContractHelper(t *testing.T) {
 	os.Exit(0)
 }
 
+// startClaudePaneFixture creates a tmux session (on the package's isolated
+// server) holding one pane titled as an ntm Claude agent and running a long
+// sleep, and returns the session name and that pane, PID included.
+func startClaudePaneFixture(t *testing.T, prefix string) (string, tmux.Pane) {
+	t.Helper()
+	dir := t.TempDir()
+	session := fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
+	if err := tmux.CreateSession(session, dir); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+	paneID, err := tmux.DefaultClient.Run("new-window", "-d", "-t", session, "-c", dir, "-P", "-F", "#{pane_id}", "sleep 300")
+	if err != nil {
+		t.Fatalf("create agent window: %v", err)
+	}
+	paneID = strings.TrimSpace(paneID)
+	if err := tmux.SetPaneTitle(paneID, session+"__cc_1"); err != nil {
+		t.Fatalf("set pane title: %v", err)
+	}
+	panes, err := tmux.GetPanes(session)
+	if err != nil {
+		t.Fatalf("list panes: %v", err)
+	}
+	for _, pane := range panes {
+		if pane.ID == paneID {
+			if pane.PID <= 0 || pane.Type != tmux.AgentClaude {
+				t.Fatalf("agent pane fixture not attributable: %+v", pane)
+			}
+			return session, pane
+		}
+	}
+	t.Fatalf("agent pane %s absent from session topology: %+v", paneID, panes)
+	return "", tmux.Pane{}
+}
+
+// --robot-rano-stats end to end: the real CLI dispatch, config loading, tmux
+// topology, /proc PID attribution and rano adapter. Only the rano binary is a
+// fake, and it speaks upstream's real contract (rano 0.2.1,
+// github.com/Dicklesworthstone/rano@7f342a3d195dea97f083602274fd2758ff46c88e
+// src/main.rs): `--version` prints "rano 0.2.1", `status` exits 0, there is no
+// `stats` subcommand, and `export --format jsonl --sqlite DB --fields ...`
+// prints rows ordered by ts with alphabetical keys, NULL columns omitted and
+// whole-second UTC timestamps.
+func TestRobotRanoStatsReadsUpstreamExportThroughCLI(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	session, pane := startClaudePaneFixture(t, "ntmranostats")
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	project := filepath.Join(root, "project")
+	bin := filepath.Join(root, "bin")
+	for _, dir := range []string{home, project, bin, filepath.Join(root, "rano")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	database := filepath.Join(root, "rano", "observer.sqlite")
+	if err := os.WriteFile(database, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	ts := func(ago time.Duration) string { return now.Add(-ago).Format(time.RFC3339) }
+	fixture := strings.Join([]string{
+		// Outside the 5m window: ntm applies the exact window itself.
+		fmt.Sprintf(`{"comm":"claude","event":"connect","pid":%d,"provider":"anthropic","ts":%q}`, pane.PID, ts(10*time.Minute)),
+		fmt.Sprintf(`{"comm":"claude","event":"connect","pid":%d,"provider":"anthropic","ts":%q}`, pane.PID, ts(90*time.Second)),
+		fmt.Sprintf(`{"comm":"claude","event":"connect","pid":%d,"provider":"unknown","ts":%q}`, pane.PID, ts(30*time.Second)),
+		// A close is not a second connection; a threshold alert has no pid.
+		fmt.Sprintf(`{"comm":"claude","event":"close","pid":%d,"provider":"anthropic","ts":%q}`, pane.PID, ts(20*time.Second)),
+		fmt.Sprintf(`{"comm":"","event":"alert","provider":"anthropic","ts":%q}`, ts(15*time.Second)),
+		// A process outside every agent pane is not attributed.
+		fmt.Sprintf(`{"comm":"curl","event":"connect","pid":%d,"provider":"unknown","ts":%q}`, os.Getpid(), ts(10*time.Second)),
+	}, "\n") + "\n"
+	fixturePath := filepath.Join(root, "export.jsonl")
+	if err := os.WriteFile(fixturePath, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeRano := `#!/bin/sh
+case "$1" in
+--version) echo "rano 0.2.1" ;;
+status) echo "0 active | anthropic:0 openai:0" ;;
+export)
+	printf '%s\n' "$@" > "$FAKE_RANO_ARGS"
+	if [ "$4" != "--sqlite" ] || [ ! -f "$5" ]; then echo "SQLite file not found: observer.sqlite" >&2; exit 1; fi
+	cat "$FAKE_RANO_EXPORT" ;;
+*) echo "Unexpected argument: $1" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(bin, "rano"), []byte(fakeRano), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(t *testing.T, sqlitePath, argsLog string) (map[string]any, robot.RanoStatsOutput, int) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(configPath, []byte(fmt.Sprintf("[integrations.rano]\nsqlite_path = %q\n", sqlitePath)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rawArgs, err := json.Marshal([]string{"--config", configPath, "--robot-rano-stats", "--rano-window=5m"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestRobotProcessContractHelper$")
+		cmd.Dir = project
+		cmd.Env = envWithOverrides(os.Environ(),
+			"HOME="+home,
+			"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
+			"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"FAKE_RANO_ARGS="+argsLog,
+			"FAKE_RANO_EXPORT="+fixturePath,
+			"NTM_TEST_TMUX_ENV_OWNED=1",
+			"NTM_NO_COLOR=1",
+			"NTM_CONFIG=",
+			"NTM_ROBOT_FORMAT=",
+			"NTM_OUTPUT_FORMAT=",
+			"TOON_DEFAULT_FORMAT=",
+			"NTM_ROBOT_VERBOSITY=",
+			"NTM_ROBOT_CONTRACT_ARGS="+string(rawArgs),
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		exitCode := 0
+		if err := cmd.Run(); err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("run ntm --robot-rano-stats: %v", err)
+			}
+			exitCode = exitErr.ExitCode()
+		}
+		var raw map[string]any
+		var out robot.RanoStatsOutput
+		if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+			t.Fatalf("stdout is not one JSON document: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("decode rano stats: %v", err)
+		}
+		return raw, out, exitCode
+	}
+
+	t.Run("recorded connections reach the agent pane", func(t *testing.T) {
+		argsLog := filepath.Join(t.TempDir(), "args")
+		raw, out, exitCode := run(t, database, argsLog)
+		if exitCode != 0 || !out.Success {
+			t.Fatalf("exit=%d output=%v", exitCode, raw)
+		}
+		got, ok := out.Panes[pane.ID]
+		if !ok {
+			t.Fatalf("agent pane %s (pid %d) missing from %v", pane.ID, pane.PID, raw)
+		}
+		if got.Session != session || got.ConnectionCount != 2 || got.LastConnection != ts(30*time.Second) ||
+			!reflect.DeepEqual(got.PIDs, []int{pane.PID}) ||
+			got.Providers["anthropic"].Connections != 1 || got.Providers["unknown"].Connections != 1 || len(got.Providers) != 2 {
+			t.Fatalf("pane stats = %+v", got)
+		}
+		if out.Total.ConnectionCount != 2 || out.Database != database || out.Measurement != "connection_events" {
+			t.Fatalf("totals/source = %+v database=%q measurement=%q", out.Total, out.Database, out.Measurement)
+		}
+		encoded, _ := json.Marshal(raw)
+		for _, unmeasured := range []string{`"request_count":`, `"bytes_in":`, `"bytes_out":`, `"last_request":`, `"bytes_sent":`} {
+			if strings.Contains(string(encoded), unmeasured) {
+				t.Fatalf("surface reports an unmeasured metric %s: %s", unmeasured, encoded)
+			}
+		}
+		logged, err := os.ReadFile(argsLog)
+		if err != nil {
+			t.Fatalf("rano export was never invoked: %v", err)
+		}
+		args := strings.Split(strings.TrimSpace(string(logged)), "\n")
+		if len(args) != 11 || !reflect.DeepEqual(args[:7], []string{"export", "--format", "jsonl", "--sqlite", database, "--fields", "ts,event,pid,comm,provider"}) ||
+			args[7] != "--since" || args[9] != "--until" {
+			t.Fatalf("rano export argv = %q", args)
+		}
+	})
+
+	t.Run("missing observer database is a missing dependency", func(t *testing.T) {
+		argsLog := filepath.Join(t.TempDir(), "args")
+		missing := filepath.Join(root, "rano", "never-recorded.sqlite")
+		raw, out, exitCode := run(t, missing, argsLog)
+		if exitCode != 1 || out.Success || out.ErrorCode != robot.ErrCodeDependencyMissing {
+			t.Fatalf("exit=%d output=%v; want exit 1 DEPENDENCY_MISSING", exitCode, raw)
+		}
+		if !strings.Contains(out.Error, missing) || out.Database != missing || len(out.Panes) != 0 || out.Measurement != "" {
+			t.Fatalf("missing database not reported honestly: %v", raw)
+		}
+		if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+			t.Fatalf("rano export ran without a database (stat err %v)", err)
+		}
+	})
+}
+
 func TestRobotProcessErrorContract(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping process-level robot contract integration in short mode")
@@ -6157,14 +6198,20 @@ func TestRobotProcessErrorContract(t *testing.T) {
 		errorCode       string
 		expectedExit    int
 		expectedCommand string
+		expectedHint    string
 	}{
 		{name: "unknown robot flag", args: []string{"--robot-status", "--not-a-real-flag"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
+		{name: "robot status rejects session value with corrective hint", args: []string{"--robot-status=project"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1, expectedCommand: "robot-status", expectedHint: "reports all sessions and takes no value"},
 		{name: "invalid pagination", args: []string{"--robot-status", "--robot-limit=-1"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "invalid duration", args: []string{"--robot-attention", "--attention-timeout=not-a-duration"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "invalid panes", args: []string{"--robot-rano-stats", "--panes=not-a-pane"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "robot send empty singular pane", args: []string{"--robot-send=proj", "--msg=work", "--pane="}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "robot send singular and plural panes", args: []string{"--robot-send=proj", "--msg=work", "--pane=1", "--panes=2"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "robot send malformed verify render", args: []string{"--robot-send=proj", "--msg=work", "--verify-render=not-a-bool"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
+		{name: "robot send missing msg", args: []string{"--robot-send=proj"}, errorCode: robot.ErrCodeInvalidArgs, expectedExit: 1},
+		{name: "robot send empty msg", args: []string{"--robot-send=proj", "--msg="}, errorCode: robot.ErrCodeInvalidArgs, expectedExit: 1},
+		{name: "robot send rejects route strategy modifier", args: []string{"--robot-send=proj", "--msg=work", "--strategy=least-loaded"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1, expectedCommand: "robot-send", expectedHint: "--robot-route=SESSION"},
+		{name: "robot send rejects last-agent modifier", args: []string{"--robot-send=proj", "--msg=work", "--last-agent=%1"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1, expectedCommand: "robot-send", expectedHint: "--robot-route=SESSION"},
 		{name: "missing session", args: []string{"--robot-agent-names=ntm-robot-contract-missing-session"}, errorCode: robot.ErrCodeSessionNotFound, expectedExit: 1},
 		{name: "unknown docs topic", args: []string{"--robot-docs=not-a-topic"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "unknown docs topic forces json from toon", args: []string{"--robot-docs=not-a-topic", "--robot-format=toon"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
@@ -6241,6 +6288,12 @@ func TestRobotProcessErrorContract(t *testing.T) {
 			}
 			if got, _ := payload["error_code"].(string); got != tt.errorCode {
 				t.Fatalf("error_code = %q, want %q; payload=%v", got, tt.errorCode, payload)
+			}
+			if tt.expectedHint != "" {
+				got, _ := payload["hint"].(string)
+				if !strings.Contains(got, tt.expectedHint) {
+					t.Fatalf("hint = %q, want substring %q; payload=%v", got, tt.expectedHint, payload)
+				}
 			}
 			if meta, ok := payload["_meta"].(map[string]any); ok {
 				if got, ok := meta["exit_code"].(float64); ok && int(got) != exitCode {
@@ -7180,13 +7233,16 @@ printf '%s\n' "$dir"
 		checksumRequests []string
 		wantOutput       string
 	}{
-		{name: "GoReleaser aggregate", mode: "goreleaser", wantSuccess: true, checksumRequests: []string{"checksums.txt"}},
-		{name: "DSR aggregate", mode: "aggregate", wantSuccess: true, checksumRequests: []string{"checksums.txt", "SHA256SUMS"}},
-		{name: "DSR per-asset sidecar", mode: "sidecar", wantSuccess: true, checksumRequests: []string{"checksums.txt", "SHA256SUMS", assetName + ".sha256"}},
-		{name: "missing checksums", mode: "missing", checksumRequests: []string{"checksums.txt", "SHA256SUMS", assetName + ".sha256"}, wantOutput: "Could not download release checksums"},
-		{name: "mismatched preferred aggregate fails closed", mode: "mismatch", checksumRequests: []string{"checksums.txt"}, wantOutput: "Checksum mismatch"},
-		{name: "mismatched DSR aggregate fails closed", mode: "aggregate-mismatch", checksumRequests: []string{"checksums.txt", "SHA256SUMS"}, wantOutput: "Checksum mismatch"},
-		{name: "mismatched DSR sidecar fails closed", mode: "sidecar-mismatch", checksumRequests: []string{"checksums.txt", "SHA256SUMS", assetName + ".sha256"}, wantOutput: "Checksum mismatch"},
+		// Probe order is SHA256SUMS first (what current DSR releases actually
+		// publish), then the legacy checksums.txt, then the per-asset sidecar
+		// (#247). Probes for absent candidates fall through silently.
+		{name: "GoReleaser aggregate", mode: "goreleaser", wantSuccess: true, checksumRequests: []string{"SHA256SUMS", "checksums.txt"}},
+		{name: "DSR aggregate", mode: "aggregate", wantSuccess: true, checksumRequests: []string{"SHA256SUMS"}},
+		{name: "DSR per-asset sidecar", mode: "sidecar", wantSuccess: true, checksumRequests: []string{"SHA256SUMS", "checksums.txt", assetName + ".sha256"}},
+		{name: "missing checksums", mode: "missing", checksumRequests: []string{"SHA256SUMS", "checksums.txt", assetName + ".sha256"}, wantOutput: "Could not download release checksums"},
+		{name: "mismatched legacy aggregate fails closed", mode: "mismatch", checksumRequests: []string{"SHA256SUMS", "checksums.txt"}, wantOutput: "Checksum mismatch"},
+		{name: "mismatched DSR aggregate fails closed", mode: "aggregate-mismatch", checksumRequests: []string{"SHA256SUMS"}, wantOutput: "Checksum mismatch"},
+		{name: "mismatched DSR sidecar fails closed", mode: "sidecar-mismatch", checksumRequests: []string{"SHA256SUMS", "checksums.txt", assetName + ".sha256"}, wantOutput: "Checksum mismatch"},
 	}
 
 	for _, downloader := range []string{"curl", "wget"} {
@@ -7860,7 +7916,7 @@ func TestInitializeRobotPersistenceDefersProjectionRefreshToFirstRead(t *testing
 	prevFeed := robot.PeekAttentionFeed()
 	t.Cleanup(func() { robot.SetAttentionFeed(prevFeed) })
 
-	if err := initializeRobotPersistence(context.Background()); err != nil {
+	if err := initializeRobotPersistence(context.Background(), true); err != nil {
 		t.Fatalf("initializeRobotPersistence: %v", err)
 	}
 	t.Cleanup(closeRobotPersistence)
@@ -7905,7 +7961,7 @@ func TestInitializeRobotPersistenceWarnsWhenMissingExplicitConfigTurnsRefreshOff
 	prevFeed := robot.PeekAttentionFeed()
 	t.Cleanup(func() { robot.SetAttentionFeed(prevFeed) })
 
-	if err := initializeRobotPersistence(context.Background()); err != nil {
+	if err := initializeRobotPersistence(context.Background(), true); err != nil {
 		t.Fatalf("initializeRobotPersistence: %v", err)
 	}
 	t.Cleanup(closeRobotPersistence)
@@ -7919,5 +7975,272 @@ func TestInitializeRobotPersistenceWarnsWhenMissingExplicitConfigTurnsRefreshOff
 	warnings := robot.ProjectionRefreshWarnings()
 	if len(warnings) != 1 || !strings.Contains(warnings[0], missing) || !strings.Contains(warnings[0], "does not exist") {
 		t.Fatalf("projection warnings = %v, want one naming the missing config %s", warnings, missing)
+	}
+}
+
+// Field-evidence regressions: unknown flags get a did-you-mean suggestion,
+// and cobra usage errors classify as INVALID_FLAG rather than
+// INTERNAL_ERROR with misleading "retry" advice.
+func TestClassifyRobotExecuteErrorSuggestsNearestFlag(t *testing.T) {
+	code, hint := classifyRobotExecuteError(errors.New("unknown flag: --robot-state"))
+	if code != robot.ErrCodeInvalidFlag {
+		t.Fatalf("code = %q, want INVALID_FLAG", code)
+	}
+	if !strings.Contains(hint, "--robot-status") {
+		t.Errorf("hint = %q, want a --robot-status suggestion", hint)
+	}
+
+	// A wildly-off guess gets no suggestion, just the discovery hint.
+	_, hint = classifyRobotExecuteError(errors.New("unknown flag: --zzzzqqqq"))
+	if strings.Contains(hint, "Did you mean") {
+		t.Errorf("hint = %q, want no suggestion for a hopeless guess", hint)
+	}
+}
+
+func TestClassifyRobotExecuteErrorExplainsRobotStatusValueMisuse(t *testing.T) {
+	err := errors.New(`invalid argument "project" for "--robot-status" flag: strconv.ParseBool: parsing "project": invalid syntax`)
+	code, hint := classifyRobotExecuteError(err)
+	if code != robot.ErrCodeInvalidFlag {
+		t.Fatalf("code = %q, want INVALID_FLAG", code)
+	}
+	for _, want := range []string{"--robot-status", "reports all sessions", "takes no value"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("hint = %q, want %q", hint, want)
+		}
+	}
+}
+
+func TestClassifyRobotExecuteErrorUnknownCommandIsInvalidFlag(t *testing.T) {
+	code, hint := classifyRobotExecuteError(errors.New(`unknown command "myproject" for "ntm"`))
+	if code != robot.ErrCodeInvalidFlag {
+		t.Fatalf("code = %q, want INVALID_FLAG (deterministic usage error, not internal)", code)
+	}
+	if strings.Contains(strings.ToLower(hint), "retry") {
+		t.Errorf("hint = %q, must not advise retrying a deterministic usage error", hint)
+	}
+}
+
+func TestResolveMessageScopeUsesCurrentPaneRegistryIdentity(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	isolateSessionAgentStorage(t)
+
+	projectsBase := t.TempDir()
+	projectDir := filepath.Join(projectsBase, "messagepaneidentity")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+
+	oldCfg := cfg
+	cfg = &config.Config{ProjectsBase: projectsBase}
+	t.Cleanup(func() { cfg = oldCfg })
+
+	oldWd, _ := os.Getwd()
+	otherDir := t.TempDir()
+	if err := os.Chdir(otherDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer os.Chdir(oldWd)
+
+	session := "messagepaneidentity"
+	_ = tmux.KillSession(session)
+	if err := tmux.CreateSession(session, projectDir); err != nil {
+		t.Fatalf("CreateSession(%q): %v", session, err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+
+	panes, err := tmux.GetPanes(session)
+	if err != nil {
+		t.Fatalf("GetPanes(%q): %v", session, err)
+	}
+	if len(panes) == 0 {
+		t.Fatal("expected at least one pane")
+	}
+
+	saveSessionAgentForTest(t, session, projectDir, "BlueLake")
+	saveSessionAgentRegistryForTest(t, session, projectDir, "", panes[0].ID, "GreenCastle")
+	t.Setenv("TMUX_PANE", panes[0].ID)
+
+	gotDir, gotAgent, err := resolveMessageScope(t.Context(), session)
+	if err != nil {
+		t.Fatalf("resolveMessageScope() error = %v", err)
+	}
+	if gotDir != projectDir {
+		t.Fatalf("project dir = %q, want %q", gotDir, projectDir)
+	}
+	if gotAgent != "GreenCastle" {
+		t.Fatalf("agent name = %q, want %q", gotAgent, "GreenCastle")
+	}
+}
+
+func TestClassifyRobotExecuteErrorCuratedMisGuessHints(t *testing.T) {
+	// Top mis-guessed flags from the cass-mined INVALID_FLAG dataset get a
+	// curated hint naming the real spelling instead of a nearest-flag guess.
+	code, hint := classifyRobotExecuteError(errors.New("unknown flag: --project-dir"))
+	if code != robot.ErrCodeInvalidFlag {
+		t.Fatalf("classifyRobotExecuteError() code = %q, want %q", code, robot.ErrCodeInvalidFlag)
+	}
+	if !strings.Contains(hint, "--spawn-dir") || !strings.Contains(hint, "--project") {
+		t.Fatalf("classifyRobotExecuteError() hint = %q, want curated --spawn-dir/--project guidance", hint)
+	}
+}
+
+func TestUnknownFlagFromError(t *testing.T) {
+	tests := []struct {
+		errMsg string
+		want   string
+	}{
+		{"unknown flag: --project-dir", "project-dir"},
+		{"unknown flag: --session in command", "session"},
+		{"flag needs an argument: --msg", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := unknownFlagFromError(tt.errMsg); got != tt.want {
+			t.Errorf("unknownFlagFromError(%q) = %q, want %q", tt.errMsg, got, tt.want)
+		}
+	}
+}
+
+func TestSubcommandFlagErrorsGetCuratedOrNearestHints(t *testing.T) {
+	// The root FlagErrorFunc annotates subcommand flag errors: curated hints
+	// for the fleet's top mis-guesses, nearest-flag did-you-mean otherwise.
+	fn := rootCmd.FlagErrorFunc()
+	if fn == nil {
+		t.Fatal("rootCmd has no FlagErrorFunc")
+	}
+	sendCmd, _, err := rootCmd.Find([]string{"send"})
+	if err != nil || sendCmd == rootCmd {
+		t.Fatalf("finding 'send' subcommand: %v", err)
+	}
+	sendCmd.InitDefaultHelpFlag()
+
+	got := fn(sendCmd, errors.New("unknown flag: --session"))
+	if got == nil || !strings.Contains(got.Error(), "--robot-send=SESSION") {
+		t.Fatalf("curated --session hint missing: %v", got)
+	}
+	got = fn(sendCmd, errors.New("unknown flag: --pane-x"))
+	if got == nil || !strings.Contains(got.Error(), "did you mean --pane?") {
+		t.Fatalf("nearest-flag hint missing for --pane-x: %v", got)
+	}
+	// Root flag errors pass through untouched (the robot path classifies them).
+	rootErr := errors.New("unknown flag: --robot-beads")
+	if got := fn(rootCmd, rootErr); got != rootErr {
+		t.Fatalf("root error was modified: %v", got)
+	}
+}
+
+func TestRootVersionFlagRegistered(t *testing.T) {
+	// `ntm --version` / `-V` must work alongside the version subcommand
+	// (85 fleet failures probed --version first and read "unknown flag" as a
+	// broken install). Output shape is pinned by the version template.
+	f := rootCmd.Flags().Lookup("version")
+	if f == nil {
+		t.Fatal("root --version flag is not registered")
+	}
+	if f.Shorthand != "V" {
+		t.Fatalf("version flag shorthand = %q, want \"V\"", f.Shorthand)
+	}
+	if tmpl := rootCmd.VersionTemplate(); !strings.Contains(tmpl, "ntm version") {
+		t.Fatalf("version template %q does not match the 'ntm version' headline", tmpl)
+	}
+}
+
+// TestShouldInitializeRobotPersistenceForActivity pins that `ntm activity`
+// opens the runtime store: without it there is no watermark to make state_since
+// durable across one-shot invocations (ntm#301).
+func TestShouldInitializeRobotPersistenceForActivity(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"ntm", "activity", "agent-factory", "--json"}
+
+	cmd := &cobra.Command{Use: "activity"}
+	if !shouldInitializeRobotPersistence(cmd) {
+		t.Fatal("activity must initialize persistence for durable state_since")
+	}
+	if robotPersistenceRefreshesProjection(cmd) {
+		t.Fatal("activity must not pay for the bv/br projection refresh")
+	}
+	if !robotPersistenceRefreshesProjection(&cobra.Command{Use: "status"}) {
+		t.Fatal("other commands must keep the projection refresh")
+	}
+}
+
+// TestRobotSurfacesWithoutProjectionSkipRefresh: a tool-bridge surface skips
+// the projection refresh, also with a global modifier, while any other robot
+// surface in the invocation keeps it. Every exempt name must be a real root
+// flag, so a renamed flag cannot silently fall out of the list.
+func TestRobotSurfacesWithoutProjectionSkipRefresh(t *testing.T) {
+	for name := range robotSurfacesWithoutProjection {
+		if rootCmd.Flags().Lookup(name) == nil {
+			t.Errorf("robotSurfacesWithoutProjection names %q, which is not a root flag", name)
+		}
+	}
+
+	refreshes := func(args ...string) bool {
+		t.Helper()
+		cmd := &cobra.Command{Use: "ntm"}
+		cmd.Flags().Bool("robot-mail", false, "")
+		cmd.Flags().Bool("robot-status", false, "")
+		cmd.Flags().String("robot-format", "", "")
+		cmd.Flags().String("jfp-category", "", "")
+		if err := cmd.ParseFlags(args); err != nil {
+			t.Fatal(err)
+		}
+		return robotPersistenceRefreshesProjection(cmd)
+	}
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"--robot-mail"}, false},
+		{[]string{"--robot-mail", "--robot-format=toon", "--jfp-category=x"}, false},
+		{[]string{"--robot-status"}, true},
+		{[]string{"--robot-mail", "--robot-status"}, true},
+		{[]string{"--robot-format=toon"}, true},
+		{nil, true},
+	} {
+		if got := refreshes(tc.args...); got != tc.want {
+			t.Errorf("args %v: refreshes projection = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+// GH #333: --spawn-oc reaches the robot spawn engine with its count and model.
+func TestRobotSpawnOptionsFromFlagsCarriesOpencode(t *testing.T) {
+	resetFlags()
+	t.Cleanup(resetFlags)
+
+	robotSpawn = "oc-spawn"
+	robotSpawnOc = "2:opencode/space-bunny-free"
+	opts, err := robotSpawnOptionsFromFlags(nil, 30*time.Second, nil, true)
+	if err != nil {
+		t.Fatalf("robotSpawnOptionsFromFlags: %v", err)
+	}
+	if opts.OcCount != 2 || opts.OcModel != "opencode/space-bunny-free" {
+		t.Fatalf("oc options = count:%d model:%q, want 2 opencode/space-bunny-free", opts.OcCount, opts.OcModel)
+	}
+}
+
+// --spawn-pi, --spawn-kimi and --spawn-muse reach the robot spawn engine as
+// counts, and a model on them is refused instead of dropped.
+func TestRobotSpawnOptionsFromFlagsCarriesPiKimiMuseCounts(t *testing.T) {
+	resetFlags()
+	t.Cleanup(resetFlags)
+
+	robotSpawn = "muse-spawn"
+	robotSpawnPi = "1"
+	robotSpawnKimi = "2"
+	robotSpawnMuse = "3"
+	opts, err := robotSpawnOptionsFromFlags(nil, 30*time.Second, nil, true)
+	if err != nil {
+		t.Fatalf("robotSpawnOptionsFromFlags: %v", err)
+	}
+	if opts.PiCount != 1 || opts.KimiCount != 2 || opts.MuseCount != 3 {
+		t.Fatalf("counts = pi:%d kimi:%d muse:%d, want 1 2 3", opts.PiCount, opts.KimiCount, opts.MuseCount)
+	}
+
+	robotSpawnMuse = "1:spark"
+	if _, err := robotSpawnOptionsFromFlags(nil, 30*time.Second, nil, true); err == nil || !strings.Contains(err.Error(), "--spawn-muse") {
+		t.Fatalf("--spawn-muse=1:spark error = %v, want a count-only refusal naming the flag", err)
 	}
 }

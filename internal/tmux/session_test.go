@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
@@ -148,6 +149,7 @@ func TestValidatePaneLaunchBaseline(t *testing.T) {
 		{name: "empty observation", pane: Pane{ID: "%1"}},
 		{name: "shell", pane: Pane{ID: "%2", Command: "zsh"}},
 		{name: "shell path", pane: Pane{ID: "%3", Command: "/bin/bash"}},
+		{name: "starting (child has not exec'd the shell yet)", pane: Pane{ID: "%6", Command: "tmux"}},
 		{name: "occupied utility", pane: Pane{ID: "%4", Command: "sleep"}, wantErr: true},
 		{name: "occupied agent", pane: Pane{ID: "%5", Command: "/opt/bin/grok"}, wantErr: true},
 	}
@@ -164,13 +166,127 @@ func TestValidatePaneLaunchBaseline(t *testing.T) {
 			if err == nil {
 				t.Fatalf("ValidatePaneLaunchBaseline(%+v) error = nil, want occupied-pane rejection", test.pane)
 			}
-			for _, want := range []string{test.pane.ID, strings.TrimSpace(test.pane.Command), "pre-launch", "non-shell", "idle shell"} {
+			if !errors.Is(err, ErrPaneOccupied) {
+				t.Fatalf("ValidatePaneLaunchBaseline(%+v) error = %v, want wrapped ErrPaneOccupied", test.pane, err)
+			}
+			for _, want := range []string{test.pane.ID, strings.TrimSpace(test.pane.Command), "pre-launch", "non-shell", "free the pane"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("ValidatePaneLaunchBaseline(%+v) error = %q, want %q", test.pane, err, want)
 				}
 			}
 		})
 	}
+}
+
+func TestValidatePaneLaunchBaselineLiveContextRefusesInsteadOfRetargeting(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("exact target became occupied after the batch preflight", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%other", Command: "zsh"}, {ID: "%target", Command: "claude"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !errors.Is(err, ErrPaneOccupied) {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want occupied-pane rejection", err)
+		}
+		for _, want := range []string{"%target", `"claude"`} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %q, want %q", err, want)
+			}
+		}
+	})
+
+	t.Run("exact target is still an idle shell", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%other", Command: "vim"}, {ID: "%target", Command: "/bin/zsh"}}, nil
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list); err != nil {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v", err)
+		}
+	})
+
+	t.Run("freshly created pane still shows tmux, then its shell", func(t *testing.T) {
+		// tmux reports its own binary as the pane command until the child execs
+		// the shell (~300 ms on Linux); the live check must wait, not refuse.
+		calls := 0
+		list := func(context.Context, string) ([]Pane, error) {
+			calls++
+			command := "tmux"
+			if calls >= 3 {
+				command = "zsh"
+			}
+			return []Pane{{ID: "%target", Command: command}}, nil
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list); err != nil {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want the launch to proceed once the shell appears", err)
+		}
+		if calls < 3 {
+			t.Fatalf("listPanes called %d time(s), want the check to re-observe until the shell appears", calls)
+		}
+	})
+
+	t.Run("pane that never leaves tmux is refused as a nested client after the settle window", func(t *testing.T) {
+		savedTimeout, savedPoll := paneLaunchSettleTimeout, paneLaunchSettlePoll
+		paneLaunchSettleTimeout, paneLaunchSettlePoll = 60*time.Millisecond, 5*time.Millisecond
+		defer func() { paneLaunchSettleTimeout, paneLaunchSettlePoll = savedTimeout, savedPoll }()
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%target", Command: "tmux"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !errors.Is(err, ErrPaneOccupied) {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want occupied-pane refusal after the starting timeout", err)
+		}
+		if !strings.Contains(err.Error(), "did not become a shell") {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %q, want the starting-timeout wording", err)
+		}
+	})
+
+	t.Run("missing target is never replaced by another pane", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%other", Command: "zsh"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !strings.Contains(err.Error(), "pane %target disappeared") {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want missing-pane refusal", err)
+		}
+	})
+
+	t.Run("unreadable topology fails closed", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return nil, errors.New("tmux unavailable")
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !strings.Contains(err.Error(), "tmux unavailable") {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want lister failure surfaced", err)
+		}
+	})
+
+	t.Run("canceled context is not a launch", func(t *testing.T) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		listed := false
+		list := func(context.Context, string) ([]Pane, error) {
+			listed = true
+			return []Pane{{ID: "%target", Command: "zsh"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(canceled, "project", "%target", list)
+		if !errors.Is(err, context.Canceled) || listed {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext(canceled) error = %v listed=%v, want cancellation before any read", err, listed)
+		}
+	})
+
+	t.Run("blank identifiers are refused", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) { return nil, nil }
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "", "%target", list); err == nil {
+			t.Fatal("blank session accepted")
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", " ", list); err == nil {
+			t.Fatal("blank pane ID accepted")
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", nil); err == nil {
+			t.Fatal("nil lister accepted")
+		}
+	})
 }
 
 func TestWaitForPaneProcessStartRequiresStableNonShellObservation(t *testing.T) {
@@ -271,6 +387,8 @@ func TestClassifySessionExistsResultUsesExactExitStatus(t *testing.T) {
 	wrappedExitTwo := fmt.Errorf("tmux has-session -t broken: %w: can't find session: broken", exitTwo)
 	noServer := fmt.Errorf("tmux has-session -t first: %w: no server running on /tmp/tmux-1000/default", exitOne)
 	noSocket := fmt.Errorf("tmux has-session -t first: %w: error connecting to /tmp/tmux-1000/default (No such file or directory)", exitOne)
+	// tmux 3.6 with exit-empty off: a live server holding no sessions at all.
+	emptyServer := fmt.Errorf("tmux has-session -t =absent: %w: no current target", exitOne)
 	permissionSocket := fmt.Errorf("tmux has-session -t private: %w: error connecting to /tmp/tmux-1000/default (Permission denied)", exitOne)
 	staleSocket := fmt.Errorf("tmux has-session -t stale: %w: error connecting to /tmp/tmux-1000/default (Connection refused)", exitOne)
 	remoteFailure := fmt.Errorf("ssh -- host tmux has-session -t absent: %w: can't find session: absent", exit255)
@@ -289,6 +407,7 @@ func TestClassifySessionExistsResultUsesExactExitStatus(t *testing.T) {
 		{name: "wrapped has-session exit one", err: wrappedExitOne},
 		{name: "first session without server", err: noServer},
 		{name: "first session without socket", err: noSocket},
+		{name: "live server with no sessions", err: emptyServer},
 		{name: "socket permission denied", err: permissionSocket, wantErr: true},
 		{name: "stale socket connection refused", err: staleSocket, wantErr: true},
 		{name: "exit two", err: exitTwo, wantErr: true},
@@ -412,6 +531,50 @@ func skipIfNoTmux(t *testing.T) {
 	}
 }
 
+// ntm spawn --privacy records its settings on the session, where every other
+// ntm process reads them back for as long as the session exists.
+func TestRealSessionPrivacyRoundTrip(t *testing.T) {
+	session := createTestSession(t)
+	ctx := context.Background()
+
+	read := func() (bool, bool, bool) {
+		t.Helper()
+		privacyMode, allowPersist, recorded, err := SessionPrivacyContext(ctx, session)
+		if err != nil {
+			t.Fatalf("SessionPrivacyContext: %v", err)
+		}
+		return privacyMode, allowPersist, recorded
+	}
+	if _, _, recorded := read(); recorded {
+		t.Fatal("a fresh session reported recorded privacy settings")
+	}
+	if err := SetSessionPrivacyContext(ctx, session, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if p, a, recorded := read(); !recorded || !p || a {
+		t.Fatalf("after --privacy: privacy=%v allow=%v recorded=%v", p, a, recorded)
+	}
+	if err := SetSessionPrivacyContext(ctx, session, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if p, a, recorded := read(); !recorded || !p || !a {
+		t.Fatalf("after --privacy --allow-persist: privacy=%v allow=%v recorded=%v", p, a, recorded)
+	}
+	if err := SetSessionPrivacyContext(ctx, session, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, recorded := read(); recorded {
+		t.Fatal("clearing the settings left them recorded")
+	}
+
+	if err := KillSession(session); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, recorded, err := SessionPrivacyContext(ctx, session); recorded || err != nil {
+		t.Fatalf("a killed session = recorded %v, err %v; want nothing recorded and no error", recorded, err)
+	}
+}
+
 func TestValidateSessionName(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -437,6 +600,81 @@ func TestValidateSessionName(t *testing.T) {
 			err := ValidateSessionName(tt.name)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateSessionName(%q) error = %v, wantErr %v", tt.name, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCreateSessionUsesReadableDetachedDimensions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell for the tmux transport")
+	}
+	root := t.TempDir()
+	tmuxPath := filepath.Join(root, "tmux")
+	script := `#!/bin/sh
+printf '%s\000' "$@" >> "$NTM_SESSION_SIZE_LOG"
+printf '\n' >> "$NTM_SESSION_SIZE_LOG"
+if [ "${1:-}" = "${NTM_SESSION_SIZE_FAIL:-}" ]; then
+  printf 'requested session failure\n' >&2
+  exit 81
+fi
+case "${1:-}" in
+  new-session|set-option) exit 0 ;;
+  *) exit 64 ;;
+esac
+`
+	if err := os.WriteFile(tmuxPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write tmux transport: %v", err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", tmuxPath)
+
+	for _, tt := range []struct {
+		name         string
+		historyLimit int
+		useDefault   bool
+		failCommand  string
+		wantError    string
+	}{
+		{name: "default history", historyLimit: 50000, useDefault: true},
+		{name: "custom history", historyLimit: 1234},
+		{name: "tmux history default", historyLimit: 0},
+		{name: "creation failure", historyLimit: 50000, failCommand: "new-session", wantError: "requested session failure"},
+		{name: "history failure", historyLimit: 50000, failCommand: "set-option", wantError: `tmux session "detached-size" was created but setting history limit failed`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "commands")
+			t.Setenv("NTM_SESSION_SIZE_LOG", logPath)
+			t.Setenv("NTM_SESSION_SIZE_FAIL", tt.failCommand)
+			directory := filepath.Join(root, "project with spaces")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client := NewClient("")
+			var err error
+			if tt.useDefault {
+				err = client.CreateSessionContext(ctx, "detached-size", directory)
+			} else {
+				err = client.CreateSessionWithHistoryLimitContext(ctx, "detached-size", directory, tt.historyLimit)
+			}
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("create detached session: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("create detached session error = %v, want %q", err, tt.wantError)
+			}
+
+			// Record argument boundaries and every command: the size must be set
+			// at creation, without freezing later resizes via window-size manual.
+			want := strings.Join([]string{"new-session", "-d", "-s", "detached-size", "-c", directory, "-x", "320", "-y", "100", ""}, "\x00") + "\n"
+			if tt.historyLimit > 0 && tt.failCommand != "new-session" {
+				want += strings.Join([]string{"set-option", "-t", "=detached-size:", "history-limit", fmt.Sprint(tt.historyLimit), ""}, "\x00") + "\n"
+			}
+			got, readErr := os.ReadFile(logPath)
+			if readErr != nil {
+				t.Fatalf("read tmux command log: %v", readErr)
+			}
+			if string(got) != want {
+				t.Fatalf("tmux commands = %q, want %q", got, want)
 			}
 		})
 	}
@@ -1127,7 +1365,7 @@ func TestSendInterrupt(t *testing.T) {
 	}
 }
 
-func TestInterruptKey(t *testing.T) {
+func TestInterruptKeyForAgent(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -1137,6 +1375,7 @@ func TestInterruptKey(t *testing.T) {
 		{AgentMuse, "Escape"},
 		{AgentType("muse-code"), "Escape"},
 		{AgentType(" MUSE "), "Escape"},
+		{AgentOmp, "Escape"},
 		{AgentClaude, "C-c"},
 		{AgentCodex, "C-c"},
 		{AgentUser, "C-c"},
@@ -1144,8 +1383,8 @@ func TestInterruptKey(t *testing.T) {
 		{AgentType("unknown-tui"), "C-c"},
 	}
 	for _, tc := range cases {
-		if got := InterruptKey(tc.agent); got != tc.want {
-			t.Errorf("InterruptKey(%q) = %q, want %q", tc.agent, got, tc.want)
+		if got := InterruptKeyForAgent(tc.agent); got != tc.want {
+			t.Errorf("InterruptKeyForAgent(%q) = %q, want %q", tc.agent, got, tc.want)
 		}
 	}
 }
@@ -1324,22 +1563,6 @@ func TestGetFirstWindow(t *testing.T) {
 	}
 }
 
-func TestGetDefaultPaneIndex(t *testing.T) {
-	skipIfNoTmux(t)
-
-	session := createTestSession(t)
-
-	paneIdx, err := GetDefaultPaneIndex(session)
-	if err != nil {
-		t.Fatalf("GetDefaultPaneIndex failed: %v", err)
-	}
-
-	// Pane index should be 0 or 1 depending on tmux config
-	if paneIdx < 0 || paneIdx > 1 {
-		t.Errorf("unexpected default pane index: %d", paneIdx)
-	}
-}
-
 func TestGetCurrentSession(t *testing.T) {
 	acquireGlobalTmuxTestLock(t)
 
@@ -1465,54 +1688,6 @@ func TestGetPanesWithActivity(t *testing.T) {
 	}
 }
 
-func TestIsRecentlyActive(t *testing.T) {
-	skipIfNoTmux(t)
-
-	session := createTestSession(t)
-
-	panes, _ := GetPanes(session)
-	paneID := panes[0].ID
-
-	// Generate recent activity
-	SendKeys(paneID, "echo recent", true)
-	time.Sleep(300 * time.Millisecond)
-
-	// Should be recently active (within 1 minute)
-	recent, err := IsRecentlyActive(paneID, time.Minute)
-	if err != nil {
-		// Some tmux versions may not support this - skip test
-		t.Skipf("IsRecentlyActive not supported: %v", err)
-	}
-
-	if !recent {
-		t.Error("pane should be recently active after generating output")
-	}
-}
-
-func TestGetPaneLastActivityAge(t *testing.T) {
-	skipIfNoTmux(t)
-
-	session := createTestSession(t)
-
-	panes, _ := GetPanes(session)
-	paneID := panes[0].ID
-
-	// Generate activity
-	SendKeys(paneID, "echo age test", true)
-	time.Sleep(300 * time.Millisecond)
-
-	age, err := GetPaneLastActivityAge(paneID)
-	if err != nil {
-		// Some tmux versions may not support this - skip test
-		t.Skipf("GetPaneLastActivityAge not supported: %v", err)
-	}
-
-	// Age should be small (just generated activity)
-	if age > 5*time.Second {
-		t.Errorf("pane activity age should be < 5s, got %v", age)
-	}
-}
-
 func TestListSessionsNoServer(t *testing.T) {
 	// This just verifies the function handles edge cases
 	// When tmux is running, it should return sessions or empty list
@@ -1604,14 +1779,6 @@ func TestBinaryPathConsistency(t *testing.T) {
 	}
 }
 
-func TestResolveTmuxBinaryPathUsesExplicitOverride(t *testing.T) {
-	override := filepath.Join(t.TempDir(), "custom-tmux")
-	t.Setenv("NTM_TMUX_BINARY", "  "+override+"  ")
-	if got := resolveTmuxBinaryPath(); got != override {
-		t.Fatalf("resolveTmuxBinaryPath() = %q, want override %q", got, override)
-	}
-}
-
 func TestBinaryPathExplicitOverrideWinsAfterInstalledPathIsCached(t *testing.T) {
 	t.Setenv("NTM_TMUX_BINARY", "")
 	if baseline := BinaryPath(); baseline == "" {
@@ -1652,39 +1819,6 @@ func TestBinaryPathPreferredLocations(t *testing.T) {
 }
 
 // ============== Pure Function Tests ==============
-
-func TestTagsFromTitle(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		title string
-		want  []string
-	}{
-		{"simple tags", "session__cc_1[frontend]", []string{"frontend"}},
-		{"multiple tags", "session__cc_1[frontend,api]", []string{"frontend", "api"}},
-		{"no tags", "session__cc_1", nil},
-		{"empty tags", "session__cc_1[]", nil},
-		{"not NTM format", "just_a_title", nil},
-		{"with variant and tags", "session__cc_1_opus[backend]", []string{"backend"}},
-		{"tags with spaces", "session__cc_1[tag1, tag2]", []string{"tag1", "tag2"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tagsFromTitle(tt.title)
-			if len(got) != len(tt.want) {
-				t.Errorf("tagsFromTitle(%q) = %v, want %v", tt.title, got, tt.want)
-				return
-			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Errorf("tagsFromTitle(%q)[%d] = %q, want %q", tt.title, i, got[i], tt.want[i])
-				}
-			}
-		})
-	}
-}
 
 func TestParseAgentFromTitleEdgeCases(t *testing.T) {
 	t.Parallel()
@@ -2616,11 +2750,11 @@ func TestClearComposerContextMuseDraftHelper(t *testing.T) {
 	if os.Getenv("NTM_TEST_MUSE_CLEAR_HELPER") != "1" || root == "" {
 		return
 	}
-	cleared, verified, err := NewClient("").ClearComposerContext(context.Background(), "%1", AgentMuse)
+	cleared, err := NewClient("").ClearComposerContext(context.Background(), "%1", AgentMuse)
 	if err != nil {
 		t.Fatalf("ClearComposerContext() error = %v", err)
 	}
-	result := fmt.Sprintf("cleared=%v verified=%v", cleared, verified)
+	result := fmt.Sprintf("cleared=%v verified=%v", cleared.Cleared, cleared.Verified)
 	if err := os.WriteFile(filepath.Join(root, "result"), []byte(result), 0o600); err != nil {
 		t.Fatalf("write result: %v", err)
 	}
@@ -3189,8 +3323,12 @@ case "$1" in
     ;;
 esac
 `
-	clearKeys := []string{"send-keys -t %1 Escape", "send-keys -t %1 Escape", "send-keys -t %1 Escape", "send-keys -t %1 C-u"}
 	capture := "capture-pane -t %1 -p -S 0"
+	// ClearComposerContext's Codex rounds: capture, edit keys (Escape pairs
+	// open transcript browsing, GH#345), verify; the last round drains the
+	// residue with a measured backspace burst.
+	clearRound := []string{capture, "send-keys -t %1 C-e", "send-keys -t %1 C-u", capture}
+	drainRound := []string{capture, "send-keys -t %1 C-e", "send-keys -t %1 -N 16 BSpace", capture}
 	doubleCtrlC := []string{"send-keys -t %1 C-c", "send-keys -t %1 C-c"}
 	for _, tc := range []struct {
 		name           string
@@ -3203,20 +3341,21 @@ esac
 			name:           "one-line draft is cleared before /exit",
 			afterLineKill:  emptyComposer,
 			afterExitTyped: exitTyped,
-			wantCalls:      slices.Concat(clearKeys, []string{capture, "send-keys -t %1 -l /exit", capture, "send-keys -t %1 Enter"}),
+			wantCalls:      slices.Concat(clearRound, []string{"send-keys -t %1 -l /exit", capture, "send-keys -t %1 Enter"}),
 			wantMethod:     "clear_then_exit_command",
 		},
 		{
-			// C-u kills only the cursor's line of a multi-line draft.
+			// C-u kills only the cursor's line of a multi-line draft, and
+			// here no clear round empties it.
 			name:          "draft line left after the clear",
 			afterLineKill: screen("› line one"),
-			wantCalls:     slices.Concat(clearKeys, []string{capture}, doubleCtrlC),
+			wantCalls:     slices.Concat(clearRound, clearRound, clearRound, drainRound, doubleCtrlC),
 			wantMethod:    "double_ctrl_c",
 		},
 		{
 			name:          "no composer on screen",
 			afterLineKill: "  Allow command?\n    1. Yes\n    2. No",
-			wantCalls:     slices.Concat(clearKeys, []string{capture}, doubleCtrlC),
+			wantCalls:     slices.Concat(clearRound, doubleCtrlC),
 			wantMethod:    "double_ctrl_c",
 		},
 		{
@@ -3225,7 +3364,7 @@ esac
 			name:           "draft continues under the typed /exit",
 			afterLineKill:  screen("› \n  line two"),
 			afterExitTyped: "› /exit  exit Codex\n\n" + screen("› /exit\n  line two"),
-			wantCalls:      slices.Concat(clearKeys, []string{capture, "send-keys -t %1 -l /exit", capture}, doubleCtrlC),
+			wantCalls:      slices.Concat(clearRound, []string{"send-keys -t %1 -l /exit", capture}, doubleCtrlC),
 			wantMethod:     "double_ctrl_c",
 		},
 	} {
@@ -3272,14 +3411,14 @@ esac
 }
 
 // ntm-5p0b: the pre-send composer clear sequence is per-agent because the
-// same keys mean different things per TUI (double-Escape is history jump-back
-// in Claude Code; the triple-Escape ritual is codex doctrine from AP-16).
+// same keys mean different things per TUI. Escape pairs enter history in
+// Claude Code and current Codex, so Codex uses editing keys (GH#345).
 func TestComposerClearKeys_PerAgentSequences(t *testing.T) {
 	cases := []struct {
 		agent AgentType
 		want  []string
 	}{
-		{AgentCodex, []string{"Escape", "Escape", "Escape", "C-u"}},
+		{AgentCodex, []string{"C-e", "C-u"}},
 		{AgentClaude, []string{"Escape", "C-u"}},
 		// Escape and C-c interrupt a running Muse turn.
 		{AgentMuse, []string{"C-u"}},
@@ -3300,23 +3439,24 @@ func TestComposerClearKeys_PerAgentSequences(t *testing.T) {
 	}
 }
 
-func TestComposerMarkerForAgent(t *testing.T) {
+func TestComposerMarkersForAgent(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		agent AgentType
-		want  string
+		want  []string
 	}{
-		{AgentCodex, "›"},
-		{AgentClaude, "❯"},
-		{AgentMuse, "❯"},
-		{AgentType(" Muse-Code "), "❯"},
-		{AgentGemini, ""},
-		{AgentUser, ""},
+		{AgentCodex, []string{"›", "»"}},
+		{AgentClaude, []string{"❯"}},
+		{AgentMuse, []string{"❯"}},
+		{AgentType(" Muse-Code "), []string{"❯"}},
+		{AgentGrok, []string{"❯"}},
+		{AgentGemini, nil},
+		{AgentUser, nil},
 	}
 	for _, tc := range cases {
-		if got := composerMarkerForAgent(tc.agent); got != tc.want {
-			t.Errorf("composerMarkerForAgent(%q) = %q, want %q", tc.agent, got, tc.want)
+		if got := composerMarkersForAgent(tc.agent); !slices.Equal(got, tc.want) {
+			t.Errorf("composerMarkersForAgent(%q) = %q, want %q", tc.agent, got, tc.want)
 		}
 	}
 }
@@ -3339,9 +3479,9 @@ func TestComposerLineEmpty_BottomMostMarkerOnly(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			found, empty := composerLineEmpty(tc.capture, tc.marker, nil)
+			found, empty, _ := composerBlockEmpty(tc.capture, []string{tc.marker}, nil)
 			if found != tc.wantFound || empty != tc.wantEmpty {
-				t.Fatalf("composerLineEmpty = (found=%v, empty=%v), want (found=%v, empty=%v)", found, empty, tc.wantFound, tc.wantEmpty)
+				t.Fatalf("composerBlockEmpty = (found=%v, empty=%v), want (found=%v, empty=%v)", found, empty, tc.wantFound, tc.wantEmpty)
 			}
 		})
 	}
@@ -3353,16 +3493,16 @@ func TestComposerLineEmpty_BottomMostMarkerOnly(t *testing.T) {
 // verified clear on an idle pane would false-fail.
 func TestComposerLineEmpty_PlaceholderCountsAsEmpty(t *testing.T) {
 	capture := "chat\n❯ Try \"refactor <filepath>\"\n────\n"
-	found, empty := composerLineEmpty(capture, "❯", composerPlaceholder(AgentClaude))
+	found, empty, _ := composerBlockEmpty(capture, []string{"❯"}, composerPlaceholderPrefixes(AgentClaude))
 	if !found || !empty {
 		t.Fatalf("claude placeholder: got (found=%v, empty=%v), want (true, true)", found, empty)
 	}
-	found, empty = composerLineEmpty("› Ask Codex to do anything\n", "›", composerPlaceholder(AgentCodex))
+	found, empty, _ = composerBlockEmpty("› Ask Codex to do anything\n", []string{"›"}, composerPlaceholderPrefixes(AgentCodex))
 	if !found || !empty {
 		t.Fatalf("codex placeholder: got (found=%v, empty=%v), want (true, true)", found, empty)
 	}
 	// Real residue must still read as non-empty.
-	found, empty = composerLineEmpty("❯ Try harder next time, agent\n", "❯", composerPlaceholder(AgentClaude))
+	found, empty, _ = composerBlockEmpty("❯ Try harder next time, agent\n", []string{"❯"}, composerPlaceholderPrefixes(AgentClaude))
 	if !found {
 		t.Fatalf("residue: marker not found")
 	}
@@ -3385,7 +3525,8 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 			"──────────────────────────────────────────────────\n" +
 			"  echo · /private/tmp/claude-501/musews · YOLO"
 	}
-	prefixes := composerPlaceholder(AgentType("muse-code"))
+	prefixes := composerPlaceholderPrefixes(AgentType("muse-code"))
+	markers := composerMarkersForAgent(AgentType("muse-code"))
 
 	for _, tip := range []string{
 		"❯ Type @ to search and insert workspace file paths",
@@ -3399,7 +3540,7 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 		"❯ Type @",
 		"❯",
 	} {
-		found, empty := composerLineEmpty(screen(tip), "❯", prefixes)
+		found, empty, _ := composerBlockEmpty(screen(tip), markers, prefixes)
 		if !found || !empty {
 			t.Errorf("Muse composer %q: got (found=%v, empty=%v), want (true, true)", tip, found, empty)
 		}
@@ -3412,7 +3553,7 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 		"❯ Type",
 		"❯ Type @ me when done",
 	} {
-		found, empty := composerLineEmpty(screen(residue), "❯", prefixes)
+		found, empty, _ := composerBlockEmpty(screen(residue), markers, prefixes)
 		if !found || empty {
 			t.Errorf("Muse composer residue %q: got (found=%v, empty=%v), want (true, false)", residue, found, empty)
 		}
@@ -3431,9 +3572,9 @@ func TestComposerLineEmpty_MuseFeatureTipCountsAsEmpty(t *testing.T) {
 			composers = append(composers, "❯ "+strings.Join(words[:n], " "))
 		}
 		for _, composer := range composers {
-			found, empty := composerLineEmpty(screen(composer), "❯", prefixes)
+			found, empty, _ := composerBlockEmpty(screen(composer), markers, prefixes)
 			if !found || !empty {
-				t.Errorf("Muse tip %q: composerLineEmpty = (found=%v, empty=%v), want (true, true)", composer, found, empty)
+				t.Errorf("Muse tip %q: composerBlockEmpty = (found=%v, empty=%v), want (true, true)", composer, found, empty)
 			}
 			if !agent.MuseIdlePromptShowing(screen(composer)) {
 				t.Errorf("Muse tip %q: agent.MuseIdlePromptShowing = false, want true", composer)
@@ -3590,5 +3731,161 @@ func TestRespawnPaneShellContextLeavesRestoredAgentPaneAtShell(t *testing.T) {
 		if command != shellName || strings.Contains(start, "cat") {
 			t.Fatalf("restart %d left the pane running %q (start command %q), want the %s shell", attempt, command, start, shellName)
 		}
+	}
+}
+
+func TestNewSendBufferNameUniqueUnderConcurrency(t *testing.T) {
+	// Concurrent sends must never share a tmux buffer name: paste-buffer -d
+	// deletes the buffer after pasting, so a name collision means one send
+	// pastes/deletes the other's payload ("no buffer ntm-..." in the field).
+	const goroutines = 32
+	const perGoroutine = 64
+	names := make(chan string, goroutines*perGoroutine)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				names <- newSendBufferName()
+			}
+		}()
+	}
+	wg.Wait()
+	close(names)
+	seen := make(map[string]struct{}, goroutines*perGoroutine)
+	prefix := fmt.Sprintf("ntm-%d-", os.Getpid())
+	for name := range names {
+		if _, dup := seen[name]; dup {
+			t.Fatalf("duplicate buffer name generated: %s", name)
+		}
+		seen[name] = struct{}{}
+		if !strings.HasPrefix(name, prefix) {
+			t.Fatalf("buffer name %q missing PID prefix %q (cross-process uniqueness)", name, prefix)
+		}
+	}
+}
+
+// claudeComposerBox renders a bordered Claude Code composer around the given
+// rows, matching the frame shape a wrapped entry produces.
+func claudeComposerBox(rows ...string) string {
+	out := "⏺ Previous turn output\n\n╭──────────────────────────────────────────────╮\n"
+	for _, row := range rows {
+		out += "│ " + row + "  │\n"
+	}
+	out += "╰──────────────────────────────────────────────╯\n  ? for shortcuts\n"
+	return out
+}
+
+// TestComposerBlockEmptyCoversWrappedEntries is the ntm#300 regression: a
+// stranded Claude prompt long enough to wrap renders its tail on the rows BELOW
+// the marker, so a verifier that only reads the marker row calls a
+// half-cleared composer "empty" and lets the leftover text survive delivery.
+func TestComposerBlockEmptyCoversWrappedEntries(t *testing.T) {
+	markers := composerMarkersForAgent(AgentClaude)
+	placeholders := composerPlaceholderPrefixes(AgentClaude)
+
+	wrapped := claudeComposerBox(
+		"❯ this is a long stranded prompt that wrapped",
+		"  across several visual rows and is one entry",
+		"  that must be gone before delivery",
+	)
+	found, empty, text := composerBlockEmpty(wrapped, markers, placeholders)
+	if !found || empty {
+		t.Fatalf("wrapped entry: found=%v empty=%v, want found and not empty", found, empty)
+	}
+	if !strings.Contains(text, "across several visual rows") {
+		t.Fatalf("residual text lost the continuation rows: %q", text)
+	}
+
+	// The exact half-cleared shape the old single-row check accepted.
+	halfCleared := claudeComposerBox(
+		"❯ ",
+		"  across several visual rows and is one entry",
+	)
+	if _, empty, _ := composerBlockEmpty(halfCleared, markers, placeholders); empty {
+		t.Fatal("a composer whose marker row was cleared but whose continuation rows still hold text must NOT verify as empty")
+	}
+
+	// A genuinely empty composer stays empty.
+	if _, empty, _ := composerBlockEmpty(claudeComposerBox("❯ "), markers, placeholders); !empty {
+		t.Fatal("an empty bordered composer must verify as empty")
+	}
+	// Placeholder hint text counts as empty.
+	if _, empty, _ := composerBlockEmpty(claudeComposerBox(`❯ Try "fix the auth bug"`), markers, placeholders); !empty {
+		t.Fatal("TUI placeholder text must count as an empty composer")
+	}
+	// An unboxed marker line keeps the old single-row behavior.
+	if _, empty, _ := composerBlockEmpty("transcript\n❯ \n", markers, placeholders); !empty {
+		t.Fatal("an unboxed empty composer must verify as empty")
+	}
+	if _, empty, _ := composerBlockEmpty("transcript\n❯ stranded\n", markers, placeholders); empty {
+		t.Fatal("an unboxed composer holding text must not verify as empty")
+	}
+	// No marker at all is unverifiable, not empty.
+	if found, _, _ := composerBlockEmpty("no composer here\n", markers, placeholders); found {
+		t.Fatal("a capture with no marker must report found=false")
+	}
+}
+
+// TestInspectComposerReportsWrappedUnsubmittedInput pins that the
+// message-independent composer view sees a wrapped entry too, so
+// `unsubmitted_input` is true for exactly the panes --clear-input must handle.
+func TestInspectComposerReportsWrappedUnsubmittedInput(t *testing.T) {
+	state := InspectComposer(claudeComposerBox(
+		"❯ ",
+		"  a wrapped entry whose head row was cleared",
+	), AgentClaude)
+	if !state.MarkerVisible || !state.HoldsText {
+		t.Fatalf("InspectComposer(wrapped) = %+v, want MarkerVisible and HoldsText", state)
+	}
+	if state := InspectComposer(claudeComposerBox("❯ "), AgentClaude); !state.MarkerVisible || state.HoldsText {
+		t.Fatalf("InspectComposer(empty) = %+v, want MarkerVisible without HoldsText", state)
+	}
+}
+
+// TestComposerClearEscalationIsBoundedAndKeyOnly pins the escalation ladder
+// ntm#300 needs: the per-agent ritual, then end-of-entry + line-kill rounds,
+// then a measured backspace drain that depends on no editor binding at all.
+func TestComposerClearEscalationIsBoundedAndKeyOnly(t *testing.T) {
+	if composerClearMaxRounds < 2 {
+		t.Fatalf("composerClearMaxRounds = %d, want at least one escalation round", composerClearMaxRounds)
+	}
+	if got := composerClearEscalationKeys; len(got) != 2 || got[0] != "C-e" || got[1] != "C-u" {
+		t.Fatalf("composerClearEscalationKeys = %v, want [C-e C-u]", got)
+	}
+
+	if got := backspaceCount(""); got <= 0 {
+		t.Fatalf("backspaceCount(\"\") = %d, want a positive margin", got)
+	}
+	if got, want := backspaceCount("abcde"), len("abcde")+8; got != want {
+		t.Fatalf("backspaceCount = %d, want %d", got, want)
+	}
+	// Multi-byte runes count once each, not per byte.
+	if got, want := backspaceCount("héllo→"), 6+8; got != want {
+		t.Fatalf("backspaceCount(multibyte) = %d, want %d", got, want)
+	}
+	long := strings.Repeat("x", composerClearMaxBackspaces*2)
+	if got := backspaceCount(long); got != composerClearMaxBackspaces {
+		t.Fatalf("backspaceCount(long) = %d, want the cap %d", got, composerClearMaxBackspaces)
+	}
+}
+
+// TestComposerClearBlockerVocabularyIsDistinct pins that the typed reasons a
+// clear can report are distinct and non-empty except for "no blocker", so the
+// dispatch surface can render them without ambiguity (ntm#300).
+func TestComposerClearBlockerVocabularyIsDistinct(t *testing.T) {
+	if ComposerBlockerNone != "" {
+		t.Fatalf("ComposerBlockerNone = %q, want the empty string", ComposerBlockerNone)
+	}
+	seen := map[ComposerClearBlocker]bool{}
+	for _, blocker := range []ComposerClearBlocker{ComposerBlockerInput, ComposerBlockerQueued, ComposerBlockerModal} {
+		if blocker == ComposerBlockerNone {
+			t.Fatalf("blocker %q collides with ComposerBlockerNone", blocker)
+		}
+		if seen[blocker] {
+			t.Fatalf("duplicate blocker value %q", blocker)
+		}
+		seen[blocker] = true
 	}
 }

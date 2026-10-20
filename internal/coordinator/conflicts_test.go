@@ -9,83 +9,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 )
 
-func TestMatchesPattern(t *testing.T) {
-	tests := []struct {
-		path    string
-		pattern string
-		matches bool
-	}{
-		// Exact matches
-		{"internal/cli/coordinator.go", "internal/cli/coordinator.go", true},
-		{"internal/cli/coordinator.go", "internal/cli/other.go", false},
-
-		// Single * patterns
-		{"internal/cli/coordinator.go", "internal/cli/*.go", true},
-		{"internal/cli/coordinator.go", "internal/cli/*.ts", false},
-		{"internal/cli/coordinator.go", "*.go", true},
-
-		// Multiple * patterns (was broken before fix)
-		{"src/app/test/main.go", "src/*/test/*.go", true},
-		{"src/foo/bar/test.go", "src/*/test.go", false},
-		{"src/app/other/main.go", "src/*/test/*.go", false},
-		{"internal/cli/subdir/file.go", "internal/cli/*.go", false},
-
-		// Double ** patterns
-		{"internal/cli/coordinator.go", "internal/**", true},
-		{"internal/cli/subdir/file.go", "internal/**", true},
-		{"external/cli/file.go", "internal/**", false},
-
-		// Double ** patterns with suffix (was broken before fix)
-		{"src/foo/bar/test.go", "src/**/test.go", true},
-		{"src/test.go", "src/**/test.go", true},
-		{"src/deep/nested/path/test.go", "src/**/test.go", true},
-		{"src/foo/bar/main.go", "src/**/test.go", false},
-		{"other/test.go", "src/**/test.go", false},
-
-		// Double ** patterns with wildcard suffix (was broken before fix)
-		{"src/foo/bar/test.go", "src/**/*.go", true},
-		{"src/main.go", "src/**/*.go", true},
-		{"src/foo/bar/test.ts", "src/**/*.go", false},
-		{"other/main.go", "src/**/*.go", false},
-		{"foo/bar/main.go", "**/*.go", true},
-		{"main.go", "**/*.go", true},
-
-		// Multi-segment suffix patterns after **
-		{"src/a/b/foo/main.go", "src/**/foo/*.go", true},
-		{"src/a/b/bar/main.go", "src/**/foo/*.go", false},
-
-		// Prefix patterns (directory matching)
-		{"internal/cli/coordinator.go", "internal/cli", true},
-		{"internal/cli/subdir/file.go", "internal/cli", true},
-		{"internal/cli_other/file.go", "internal/cli", false},
-
-		// Edge cases
-		{"file.go", "file.go", true},
-		{"a/b/c.go", "a/b/*.go", true},
-		{"a/b/c.ts", "a/b/*.go", false},
-
-		// bd-eebvt: literal suffix after ** must occupy a whole
-		// basename, not a fragment. Pre-fix, a basename that ends
-		// with the literal mid-filename (e.g. "mytest.go" vs
-		// "**/test.go") was a false-positive match.
-		{"mytest.go", "**/test.go", false},                // basename ends with "test.go" but isn't "test.go"
-		{"xtest.go", "**/test.go", false},                 // same — single char prefix in basename
-		{"internal/xfoo.go", "internal/**/foo.go", false}, // prefixed form: basename "xfoo.go" not "foo.go"
-		{"test.go", "**/test.go", true},                   // exact basename — matches
-		{"foo/test.go", "**/test.go", true},               // basename in subdir — matches
-		{"deep/nested/test.go", "**/test.go", true},       // basename at any depth — matches
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.pattern+"_"+tt.path, func(t *testing.T) {
-			result := matchesPattern(tt.path, tt.pattern)
-			if result != tt.matches {
-				t.Errorf("matchesPattern(%q, %q) = %v, expected %v", tt.path, tt.pattern, result, tt.matches)
-			}
-		})
-	}
-}
-
 func TestSanitizeForID(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -291,7 +214,7 @@ func TestFormatNegotiationRequest_NoReason(t *testing.T) {
 
 	// Should NOT contain "Reason:" line when reason is empty
 	if strings.Contains(body, "**Reason:**") {
-		t.Error("expected no Reason line when holder reason is empty")
+		t.Error("expected no Reason line when reason is empty")
 	}
 }
 
@@ -365,19 +288,6 @@ func TestFormatConflictNotification_EmptyHolders(t *testing.T) {
 	}
 	if !strings.Contains(body, "## Recommendation") {
 		t.Error("expected recommendation section even with no holders")
-	}
-}
-
-// =============================================================================
-// matchesSuffixPattern edge case
-// =============================================================================
-
-func TestMatchesSuffixPattern_TooFewSegments(t *testing.T) {
-	t.Parallel()
-
-	// path has fewer segments than suffix pattern requires
-	if matchesSuffixPattern("main.go", "foo/bar/*.go") {
-		t.Error("expected false when path has fewer segments than suffix pattern")
 	}
 }
 
@@ -573,10 +483,10 @@ func TestDigestWorkSummaryStatesProvenance(t *testing.T) {
 
 // bd-elewe: a reservation whose expires_ts is absent or unparseable decodes to
 // the zero time (agentmail.FlexTime maps "" to time.Time{}). Comparing against
-// that made every such lease look EXPIRED, so DetectConflicts and
-// CheckPathConflict skipped it entirely and reported "no conflict" for a path
-// that is exclusively held — a fail-OPEN in the layer whose whole job is
-// stopping two agents from editing the same file.
+// that made every such lease look EXPIRED, so DetectConflicts skipped it
+// entirely and reported "no conflict" for a path that is exclusively held — a
+// fail-OPEN in the layer whose whole job is stopping two agents from editing
+// the same file.
 func TestReservationActiveAt_UnknownExpiryFailsClosed(t *testing.T) {
 	now := time.Now().UTC()
 
@@ -628,18 +538,4 @@ func TestReservationActiveAt_UnknownExpiryFailsClosed(t *testing.T) {
 			t.Fatal("a reservation with a future expiry must be active")
 		}
 	})
-}
-
-func TestActiveReservationPatterns_UnknownExpiryStaysVisible(t *testing.T) {
-	now := time.Date(2026, time.August, 6, 5, 0, 0, 0, time.UTC)
-	released := agentmail.FlexTime{Time: now.Add(-time.Minute)}
-	patterns := activeReservationPatterns([]agentmail.FileReservation{
-		{AgentName: "BlueLake", PathPattern: "internal/workflow/*.go"},
-		{AgentName: "BlueLake", PathPattern: "internal/pipeline/*.go", ExpiresTS: agentmail.FlexTime{Time: now.Add(-time.Minute)}},
-		{AgentName: "BlueLake", PathPattern: "internal/coordinator/*.go", ExpiresTS: agentmail.FlexTime{Time: now.Add(time.Hour)}, ReleasedTS: &released},
-	}, now)
-
-	if len(patterns) != 1 || patterns[0] != "internal/workflow/*.go" {
-		t.Fatalf("activeReservationPatterns() = %v, want only the unknown-expiry reservation", patterns)
-	}
 }

@@ -165,13 +165,14 @@ func TestUpdateActivity_FirstCall(t *testing.T) {
 
 	t.Logf("OUTPUT: lastTS=%v linesDelta=%d", lastTS, linesDelta)
 
-	// First call should return current time and total lines
-	if lastTS.IsZero() {
-		t.Error("updateActivity() first call should have non-zero timestamp")
+	// First call only records the baseline: there is no prior capture to
+	// diff against, so it must not claim output was just produced (#288).
+	if !lastTS.IsZero() {
+		t.Errorf("updateActivity() first call timestamp = %v, want zero (no baseline)", lastTS)
 	}
 
-	if linesDelta != 3 {
-		t.Errorf("updateActivity() first call linesDelta = %d, want 3", linesDelta)
+	if linesDelta != 0 {
+		t.Errorf("updateActivity() first call linesDelta = %d, want 0", linesDelta)
 	}
 }
 
@@ -446,41 +447,6 @@ func TestGetChildPID_NonExistentProcess(t *testing.T) {
 // ====================
 // GetLastOutput Tests
 // ====================
-
-func TestGetLastOutput_ExistingPane(t *testing.T) {
-	clearPaneStates()
-
-	paneID := "test-pane-lastoutput"
-	content := "Some output\n"
-
-	// Initialize state
-	updateActivity(paneID, content)
-
-	t.Logf("INPUT: paneID=%q (exists)", paneID)
-
-	ts := getLastOutput(paneID)
-
-	t.Logf("OUTPUT: ts=%v isZero=%v", ts, ts.IsZero())
-
-	if ts.IsZero() {
-		t.Error("getLastOutput() returned zero time for existing pane")
-	}
-}
-
-func TestGetLastOutput_NonExistentPane(t *testing.T) {
-	clearPaneStates()
-
-	paneID := "non-existent-pane"
-	t.Logf("INPUT: paneID=%q (does not exist)", paneID)
-
-	ts := getLastOutput(paneID)
-
-	t.Logf("OUTPUT: ts=%v isZero=%v", ts, ts.IsZero())
-
-	if !ts.IsZero() {
-		t.Errorf("getLastOutput() returned non-zero time for non-existent pane: %v", ts)
-	}
-}
 
 // ====================
 // Rate Limit Patterns Test

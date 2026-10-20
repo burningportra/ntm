@@ -116,6 +116,7 @@ type Assignment struct {
 	OccupancyKey             string               `json:"occupancy_key,omitempty"`
 	PromptSHA256             string               `json:"prompt_sha256,omitempty"`
 	IntentSHA256             string               `json:"intent_sha256,omitempty"`
+	BaseIntentSHA256         string               `json:"base_intent_sha256,omitempty"` // pre-enrichment prompt checksum (AtomicRequest.BaseIntentSHA256)
 	PendingPrompt            string               `json:"pending_prompt,omitempty"`
 	DispatchAttempts         int                  `json:"dispatch_attempts,omitempty"`
 	DispatchStartedAt        *time.Time           `json:"dispatch_started_at,omitempty"`
@@ -133,6 +134,20 @@ type Assignment struct {
 	CompletionDetectedAt     *time.Time           `json:"completion_detected_at,omitempty"`
 	CompletionConsumerToken  string               `json:"completion_consumer_token,omitempty"`
 	CompletionLeaseExpiresAt *time.Time           `json:"completion_lease_expires_at,omitempty"`
+
+	// Renewal diagnostics keep lost/uncertain protection visible without
+	// altering the original claim, dispatch, or reservation recovery barriers.
+	ReservationRenewalCheckedAt *time.Time `json:"reservation_renewal_checked_at,omitempty"`
+	ReservationRenewalError     string     `json:"reservation_renewal_error,omitempty"`
+
+	// Audit record for a dispatch_state="sending" barrier that was resolved
+	// from external evidence rather than from its own transport outcome
+	// (ntm#304). The reason names the concrete observation that justified the
+	// resolution; it is never cleared by a later generation transition, so an
+	// operator can always see why an outcome-unknown dispatch stopped being
+	// unknown.
+	StrandedDispatchReason     string     `json:"stranded_dispatch_reason,omitempty"`
+	StrandedDispatchResolvedAt *time.Time `json:"stranded_dispatch_resolved_at,omitempty"`
 }
 
 // AssignmentUpdate describes mutable assignment metadata that can be updated
@@ -183,12 +198,14 @@ func cloneAssignment(a *Assignment) *Assignment {
 	cloned.ClaimedAt = cloneTimePtr(a.ClaimedAt)
 	cloned.ClaimStartedAt = cloneTimePtr(a.ClaimStartedAt)
 	cloned.ReservationExpiresAt = cloneTimePtr(a.ReservationExpiresAt)
+	cloned.ReservationRenewalCheckedAt = cloneTimePtr(a.ReservationRenewalCheckedAt)
 	cloned.ReservationStartedAt = cloneTimePtr(a.ReservationStartedAt)
 	cloned.DispatchStartedAt = cloneTimePtr(a.DispatchStartedAt)
 	cloned.DispatchedAt = cloneTimePtr(a.DispatchedAt)
 	cloned.ClearStartedAt = cloneTimePtr(a.ClearStartedAt)
 	cloned.CompletionDetectedAt = cloneTimePtr(a.CompletionDetectedAt)
 	cloned.CompletionLeaseExpiresAt = cloneTimePtr(a.CompletionLeaseExpiresAt)
+	cloned.StrandedDispatchResolvedAt = cloneTimePtr(a.StrandedDispatchResolvedAt)
 	cloned.ReservationRequested = append([]string(nil), a.ReservationRequested...)
 	cloned.ReservationInputPaths = append([]string(nil), a.ReservationInputPaths...)
 	cloned.ReservedPaths = append([]string(nil), a.ReservedPaths...)
@@ -1174,7 +1191,17 @@ func (s *AssignmentStore) ListActive() []*Assignment {
 // release. The barrier retains exact reservation IDs and blocks new assignment
 // generations until CompleteClear removes the record.
 func (s *AssignmentStore) BeginClear(ctx context.Context, beadID string, startedAt time.Time) (*Assignment, error) {
-	return s.beginClear(ctx, beadID, startedAt, nil)
+	return s.beginClear(ctx, beadID, startedAt, false, nil)
+}
+
+// BeginClearForce establishes the clear barrier even when dispatch is stuck at
+// the outcome-unknown sending boundary. This is an explicit operator escape
+// hatch (ntm assign --clear --force): the original delivery may or may not
+// have happened, but the durable claim, leases, and pane occupancy can still
+// be released so the bead and pane do not stay occupied forever. The dispatch
+// state is returned to pending so a later retry is possible.
+func (s *AssignmentStore) BeginClearForce(ctx context.Context, beadID string, startedAt time.Time) (*Assignment, error) {
+	return s.beginClear(ctx, beadID, startedAt, true, nil)
 }
 
 // BeginClearIfStatus establishes the clear barrier only if the status still
@@ -1185,7 +1212,15 @@ func (s *AssignmentStore) BeginClearIfStatus(ctx context.Context, beadID string,
 	if len(expected) == 0 {
 		return nil, errors.New("at least one expected assignment status is required")
 	}
-	return s.beginClear(ctx, beadID, startedAt, expected)
+	return s.beginClear(ctx, beadID, startedAt, false, expected)
+}
+
+// BeginClearForceIfStatus is the status-guarded variant of BeginClearForce.
+func (s *AssignmentStore) BeginClearForceIfStatus(ctx context.Context, beadID string, startedAt time.Time, expected ...AssignmentStatus) (*Assignment, error) {
+	if len(expected) == 0 {
+		return nil, errors.New("at least one expected assignment status is required")
+	}
+	return s.beginClear(ctx, beadID, startedAt, true, expected)
 }
 
 // BeginTerminalReconciliationIfCurrent durably records the desired terminal
@@ -1311,7 +1346,7 @@ func (s *AssignmentStore) beginTerminalReconciliationIfCurrent(ctx context.Conte
 	return cloneAssignment(current), true, nil
 }
 
-func (s *AssignmentStore) beginClear(ctx context.Context, beadID string, startedAt time.Time, expected []AssignmentStatus) (*Assignment, error) {
+func (s *AssignmentStore) beginClear(ctx context.Context, beadID string, startedAt time.Time, forceOutcomeUnknown bool, expected []AssignmentStatus) (*Assignment, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1323,13 +1358,13 @@ func (s *AssignmentStore) beginClear(ctx context.Context, beadID string, started
 	if err := s.LoadStrict(); err != nil {
 		return nil, fmt.Errorf("refresh assignment clear %s: %w", beadID, err)
 	}
-	return s.beginClearWithOperationLock(beadID, startedAt, expected)
+	return s.beginClearWithOperationLock(beadID, startedAt, forceOutcomeUnknown, expected)
 }
 
 // beginClearWithOperationLock mutates clear state while the caller owns the
 // bead operation lock and has refreshed the store. Atomic replacement uses it
 // to avoid recursively acquiring the same cross-process lock.
-func (s *AssignmentStore) beginClearWithOperationLock(beadID string, startedAt time.Time, expected []AssignmentStatus) (*Assignment, error) {
+func (s *AssignmentStore) beginClearWithOperationLock(beadID string, startedAt time.Time, forceOutcomeUnknown bool, expected []AssignmentStatus) (*Assignment, error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	assignment := s.Assignments[beadID]
@@ -1339,7 +1374,7 @@ func (s *AssignmentStore) beginClearWithOperationLock(beadID string, startedAt t
 	if len(expected) > 0 && !assignmentStatusAllowed(assignment.Status, expected) {
 		return nil, fmt.Errorf("%w: %s is %s, expected %s", ErrAssignmentStatusMismatch, beadID, assignment.Status, formatAssignmentStatuses(expected))
 	}
-	if assignment.DispatchState == DispatchSending {
+	if assignment.DispatchState == DispatchSending && !forceOutcomeUnknown {
 		return nil, fmt.Errorf("%w: cannot clear %s while dispatch outcome is unknown", ErrDispatchOutcomeUnknown, beadID)
 	}
 	if strings.TrimSpace(assignment.PendingCompletionEventID) != "" {
@@ -1352,6 +1387,12 @@ func (s *AssignmentStore) beginClearWithOperationLock(beadID string, startedAt t
 		startedAt = time.Now().UTC()
 	}
 	previous := cloneAssignment(assignment)
+	if assignment.DispatchState == DispatchSending {
+		// Force-clear only: terminalize the outcome-unknown dispatch barrier
+		// so the release below can proceed and a later retry stays possible.
+		assignment.DispatchState = DispatchPending
+		assignment.LastDispatchError = "force-cleared after dispatch outcome became unknown"
+	}
 	assignment.ClearState = ClearStateReservationReleasing
 	assignment.ClearStartedAt = &startedAt
 	assignment.ClearError = ""
@@ -1525,6 +1566,8 @@ func (s *AssignmentStore) recordClearLeasesReleasedWithOperationLock(beadID stri
 	assignment.ReservationIDs = nil
 	assignment.ReservationExpiresAt = nil
 	assignment.ReservationError = ""
+	assignment.ReservationRenewalCheckedAt = nil
+	assignment.ReservationRenewalError = ""
 	if s.replace == nil {
 		s.replace = make(map[string]struct{})
 	}
@@ -1570,9 +1613,17 @@ func (s *AssignmentStore) CompleteClear(ctx context.Context, beadID string) erro
 	if s.ClearedGenerations == nil {
 		s.ClearedGenerations = make(map[string]uint64)
 	}
+	cleared := cloneAssignment(assignment)
 	s.ClearedGenerations[beadID]++
 	delete(s.Assignments, beadID)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	// The ledger forgets cleared work; keep a finished assignment's outcome
+	// for agent performance statistics (AggregateOutcomes). Appending only
+	// after the save means a record is never both live and archived.
+	appendOutcomeRecord(s.path, cleared)
+	return nil
 }
 
 // CompleteTerminalReconciliation retires tracker-terminal work only after the
@@ -1626,6 +1677,8 @@ func (s *AssignmentStore) CompleteTerminalReconciliation(ctx context.Context, be
 	assignment.ReservationIDs = nil
 	assignment.ReservationExpiresAt = nil
 	assignment.ReservationError = ""
+	assignment.ReservationRenewalCheckedAt = nil
+	assignment.ReservationRenewalError = ""
 	assignment.ClearState = ClearStateNone
 	assignment.ClearStartedAt = nil
 	assignment.ClearError = ""
@@ -2166,6 +2219,84 @@ func (s *AssignmentStore) transitionIfCurrent(ctx context.Context, observed *Ass
 		emitAgentIdle(s.SessionName, cloned, previousStatus, newStatus)
 	}
 	return true, nil
+}
+
+// RefreshReservationIfCurrent verifies or renews a delivered assignment's
+// leases while holding the same cross-process locks as assignment replacement
+// and external cleanup. The callback must return an independently verified
+// expiry; zero with no error means no renewal is appropriate (for example,
+// the tracker has closed the work). A failure records a diagnostic without
+// releasing the occupied pane or changing dispatch/recovery state.
+func (s *AssignmentStore) RefreshReservationIfCurrent(ctx context.Context, observed *Assignment, refresh func(context.Context, *Assignment) (time.Time, error)) (bool, error) {
+	if observed == nil || strings.TrimSpace(observed.BeadID) == "" || refresh == nil {
+		return false, errors.New("observed assignment and reservation refresh callback are required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanupUnlock, err := s.AcquireExternalCleanupLock(ctx, observed.BeadID)
+	if err != nil {
+		return false, fmt.Errorf("lock reservation refresh cleanup %s: %w", observed.BeadID, err)
+	}
+	defer cleanupUnlock()
+	operationUnlock, err := acquireAtomicBeadOperationLock(ctx, s.path, observed.BeadID)
+	if err != nil {
+		return false, fmt.Errorf("lock reservation refresh %s: %w", observed.BeadID, err)
+	}
+	defer operationUnlock()
+	if err := s.LoadStrict(); err != nil {
+		return false, fmt.Errorf("refresh reservation assignment %s: %w", observed.BeadID, err)
+	}
+	current := s.Get(observed.BeadID)
+	eligible := func(a *Assignment) bool {
+		return SameAssignmentGeneration(observed, a) && a.ClearState == ClearStateNone &&
+			(a.Status == StatusAssigned || a.Status == StatusWorking) && a.DispatchState == DispatchSent &&
+			a.ReservationState == ReservationReserved && a.ReservationCompleted
+	}
+	if !eligible(current) {
+		return false, nil
+	}
+	expiresAt, refreshErr := refresh(ctx, cloneAssignment(current))
+	if refreshErr == nil && expiresAt.IsZero() {
+		return false, nil
+	}
+	checkedAt := time.Now().UTC()
+	if refreshErr == nil && !expiresAt.After(checkedAt) {
+		refreshErr = errors.New("reservation refresh returned an expired lease")
+	}
+	if err := s.LoadStrict(); err != nil {
+		return false, errors.Join(refreshErr, fmt.Errorf("reload reservation refresh result: %w", err))
+	}
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	latest := s.Assignments[observed.BeadID]
+	if !eligible(latest) || latest.ClaimActor != current.ClaimActor || latest.AgentName != current.AgentName || latest.OccupancyKey != current.OccupancyKey ||
+		latest.ReservationAgent != current.ReservationAgent || latest.ReservationTarget != current.ReservationTarget ||
+		!reflect.DeepEqual(latest.ReservationIDs, current.ReservationIDs) || !reflect.DeepEqual(latest.ReservedPaths, current.ReservedPaths) {
+		return false, refreshErr
+	}
+	previous := cloneAssignment(latest)
+	latest.ReservationRenewalCheckedAt = &checkedAt
+	latest.ReservationRenewalError = ""
+	if refreshErr != nil {
+		latest.ReservationRenewalError = refreshErr.Error()
+	} else {
+		expiresAt = expiresAt.UTC()
+		latest.ReservationExpiresAt = &expiresAt
+	}
+	if s.replace == nil {
+		s.replace = make(map[string]struct{})
+	}
+	s.replace[observed.BeadID] = struct{}{}
+	if err := s.saveLocked(); err != nil {
+		var concurrentMutation *ConcurrentMutationError
+		if !errors.As(err, &concurrentMutation) {
+			s.Assignments[observed.BeadID] = previous
+			delete(s.replace, observed.BeadID)
+		}
+		return false, errors.Join(refreshErr, err)
+	}
+	return true, refreshErr
 }
 
 // SameAssignmentGeneration reports whether two snapshots identify the same

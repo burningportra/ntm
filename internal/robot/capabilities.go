@@ -13,12 +13,69 @@ import (
 // CapabilitiesOutput represents the output for --robot-capabilities
 type CapabilitiesOutput struct {
 	RobotResponse
-	Version    string                   `json:"version"`
-	Commands   []RobotCommandInfo       `json:"commands"`
-	Surfaces   []RobotSurfaceDescriptor `json:"surfaces,omitempty"`
-	Categories []string                 `json:"categories"`
-	Attention  *AttentionCapabilities   `json:"attention,omitempty"`
-	Filter     *CapabilitiesFilter      `json:"filter,omitempty"`
+	Version    string                      `json:"version"`
+	Commands   []RobotCommandInfo          `json:"commands"`
+	Surfaces   []CapabilitySurfaceMetadata `json:"surfaces,omitempty"`
+	Categories []string                    `json:"categories"`
+	Attention  *AttentionCapabilities      `json:"attention,omitempty"`
+	Filter     *CapabilitiesFilter         `json:"filter,omitempty"`
+	// PaginationContractViolations self-reports drift between the registry
+	// and the WS0-G6 single-declaration pagination flags (schema_pagination.go).
+	// Always empty on a healthy build; conformance tests enforce emptiness.
+	PaginationContractViolations []string `json:"pagination_contract_violations,omitempty"`
+}
+
+// CapabilitySurfaceMetadata is the registry metadata --robot-capabilities
+// publishes per surface in addition to its commands[] entry, joined by name.
+//
+// It deliberately omits every field the command entry already carries (flag,
+// category, summary, description, formats, schema binding, sections,
+// parameters, examples, transports). Surfaces used to be emitted as full
+// registry descriptors, which repeated each command in its entirety: about
+// 190 KB of the 431 KB full discovery payload was that second copy.
+type CapabilitySurfaceMetadata struct {
+	Name             string              `json:"name"`
+	Paginated        *bool               `json:"paginated,omitempty"`
+	PaginatedReason  string              `json:"paginated_reason,omitempty"`
+	ConsumerGuidance *ConsumerGuidance   `json:"consumer_guidance,omitempty"`
+	Boundedness      *BoundednessInfo    `json:"boundedness,omitempty"`
+	FollowUp         *FollowUpInfo       `json:"follow_up,omitempty"`
+	ActionHandoff    *ActionHandoffInfo  `json:"action_handoff,omitempty"`
+	RequestSemantics *RequestSemantics   `json:"request_semantics,omitempty"`
+	AttentionOps     *AttentionOpsInfo   `json:"attention_ops,omitempty"`
+	Explainability   *ExplainabilityInfo `json:"explainability,omitempty"`
+	Lifecycle        *LifecycleInfo      `json:"lifecycle,omitempty"`
+}
+
+// capabilitySurfaceMetadata projects registry descriptors onto the
+// surface-only metadata published next to the command catalog, in the
+// catalog's order.
+func capabilitySurfaceMetadata(surfaces []RobotSurfaceDescriptor, commands []RobotCommandInfo) []CapabilitySurfaceMetadata {
+	byName := make(map[string]RobotSurfaceDescriptor, len(surfaces))
+	for _, surface := range surfaces {
+		byName[surface.Name] = surface
+	}
+	metadata := make([]CapabilitySurfaceMetadata, 0, len(commands))
+	for _, command := range commands {
+		surface, ok := byName[command.Name]
+		if !ok {
+			continue
+		}
+		metadata = append(metadata, CapabilitySurfaceMetadata{
+			Name:             surface.Name,
+			Paginated:        surface.Paginated,
+			PaginatedReason:  surface.PaginatedReason,
+			ConsumerGuidance: surface.ConsumerGuidance,
+			Boundedness:      surface.Boundedness,
+			FollowUp:         surface.FollowUp,
+			ActionHandoff:    surface.ActionHandoff,
+			RequestSemantics: surface.RequestSemantics,
+			AttentionOps:     surface.AttentionOps,
+			Explainability:   surface.Explainability,
+			Lifecycle:        surface.Lifecycle,
+		})
+	}
+	return metadata
 }
 
 // CapabilitiesOptions limits the discovery payload to the catalog slice an
@@ -115,29 +172,25 @@ func GetCapabilitiesWithOptions(opts CapabilitiesOptions) (*CapabilitiesOutput, 
 	commands := buildCapabilitiesCommandCatalog(surfaces)
 	categories := capabilityCategories(registry.Categories, commands)
 	attention := DefaultAttentionCapabilities()
+	surfaceMetadata := capabilitySurfaceMetadata(surfaces, commands)
 	if normalized.Compact {
 		commands = compactCapabilitiesCommandCatalog(commands)
-		surfaces = nil
+		surfaceMetadata = nil
 		attention = nil
 	} else if hasCapabilitiesFilter(normalized) && !commandCatalogHasCategory(commands, "attention") {
 		attention = nil
 	}
 
 	return &CapabilitiesOutput{
-		RobotResponse: NewRobotResponse(true),
-		Version:       Version,
-		Commands:      commands,
-		Surfaces:      surfaces,
-		Categories:    categories,
-		Attention:     attention,
-		Filter:        capabilitiesFilter(normalized),
+		RobotResponse:                NewRobotResponse(true),
+		Version:                      Version,
+		Commands:                     commands,
+		Surfaces:                     surfaceMetadata,
+		Categories:                   categories,
+		Attention:                    attention,
+		Filter:                       capabilitiesFilter(normalized),
+		PaginationContractViolations: SchemaPaginationViolations(),
 	}, nil
-}
-
-// PrintCapabilities outputs robot mode capabilities as JSON.
-// This is a thin wrapper around GetCapabilities() for CLI output.
-func PrintCapabilities() error {
-	return PrintCapabilitiesWithOptions(CapabilitiesOptions{})
 }
 
 // PrintCapabilitiesWithOptions writes a filtered catalog and propagates a
@@ -152,9 +205,12 @@ func PrintCapabilitiesWithOptions(opts CapabilitiesOptions) error {
 	}
 	if opts.Compact && GetOutputFormat() != FormatTOON {
 		// Compact discovery is a context-budget contract, so indentation must
-		// not re-inflate the projection at the final stdout boundary.
+		// not re-inflate the projection at the final stdout boundary. The
+		// direct encoder still honors the arrays-never-null contract and the
+		// verbosity projection, exactly like the standard encode path.
 		output.OutputFormat = string(FormatJSON)
-		if err := json.NewEncoder(os.Stdout).Encode(applyVerbosity(output, GetOutputVerbosity())); err != nil {
+		payload := applyVerbosity(NormalizeArraysNeverNull(output), GetOutputVerbosity())
+		if err := json.NewEncoder(os.Stdout).Encode(payload); err != nil {
 			return fmt.Errorf("encode compact robot capabilities: %w", err)
 		}
 	} else {
@@ -572,7 +628,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-watch-bead", Type: "string", Required: true, Description: "Session name"},
 				{Name: "bead", Flag: "--bead", Type: "string", Required: true, Description: "Bead ID to track"},
-				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated pane indices to filter"},
+				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated N, W.P, or %N pane selectors"},
 				{Name: "lines", Flag: "--lines", Type: "int", Required: false, Default: "200", Description: "Lines captured per pane"},
 				{Name: "interval", Flag: "--interval", Type: "string", Required: false, Default: "30s", Description: "Status polling interval"},
 			},
@@ -681,12 +737,13 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "metrics",
 			Flag:        "--robot-metrics",
 			Category:    "state",
-			Description: "Session metrics export for analysis.",
+			Description: "Per-agent session metrics: prompts received, crashes and restarts in the period; current context tokens, context percent and uptime. Fields no source measured for the call are listed in unmeasured.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-metrics", Type: "string", Required: false, Description: "Optional session filter"},
-				{Name: "metrics-period", Flag: "--metrics-period", Type: "string", Required: false, Default: "24h", Description: "Period: 1h, 24h, 7d, all"},
+				{Name: "metrics-period", Flag: "--metrics-period", Type: "string", Required: false, Default: "24h", Description: "Period bounding prompt, crash and restart counts: 1h, 24h, 7d, all (any duration such as 30m)"},
+				{Name: "disk-attribution", Flag: "--disk-attribution", Type: "bool", Required: false, Default: "false", Description: "Include per-pane build-dir disk sizes (bounded du of target/, node_modules/, .venv/, dist/ under each agent pane's cwd)"},
 			},
-			Examples: []string{"ntm --robot-metrics=myproject --metrics-period=7d"},
+			Examples: []string{"ntm --robot-metrics=myproject --metrics-period=7d", "ntm --robot-metrics --disk-attribution"},
 		},
 		{
 			Name:        "activity",
@@ -696,7 +753,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-activity", Type: "string", Required: true, Description: "Session name"},
 				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated N, W.P, or %N pane selectors"},
-				{Name: "activity-type", Flag: "--activity-type", Type: "string", Required: false, Description: "Comma-separated agent types to filter: claude, codex, antigravity, grok, gemini, pi, kimi, muse"},
+				{Name: "activity-type", Flag: "--activity-type", Type: "string", Required: false, Description: "Comma-separated agent types to filter: claude, codex, antigravity, grok, omp, gemini, pi, kimi, muse"},
 			},
 			Examples: []string{
 				"ntm --robot-activity=myproject --activity-type=claude",
@@ -802,7 +859,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Description: "Active pane responsiveness probe using keystroke or interrupt methods.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-probe", Type: "string", Required: true, Description: "Session name"},
-				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated pane selectors to probe. On a multi-window session a bare index selects a WINDOW (the shared convention used by send/interrupt/restart-pane/is-working) and every pane in it is probed; on a single-window session it is the window-local pane index. Each result carries pane_ref with the exact window.pane address probed."},
+				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated N, W.P, or %N pane selectors to probe. W.P and %N name exactly one pane. On a multi-window session a bare index selects a WINDOW (the shared convention used by send/interrupt/restart-pane/is-working) and every pane in it is probed; on a single-window session it is the window-local pane index. Each result carries pane_ref with the exact window.pane address probed."},
 				{Name: "probe-method", Flag: "--probe-method", Type: "string", Required: false, Default: "keystroke_echo", Description: "Probe method: keystroke_echo, interrupt_test, wake_ping (responsiveness + still_rate_limited + tail_sample in one call; agent panes only)"},
 				{Name: "probe-timeout", Flag: "--probe-timeout", Type: "int", Required: false, Default: "5000", Description: "Probe timeout in milliseconds"},
 				{Name: "probe-aggressive", Flag: "--probe-aggressive", Type: "bool", Required: false, Description: "Fallback to interrupt_test if keystroke_echo fails"},
@@ -913,17 +970,19 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "msg", Flag: "--msg", Type: "string", Required: true, Description: "Message content to send (or use --msg-file)"},
 				{Name: "msg-file", Flag: "--msg-file", Type: "string", Required: false, Description: "Read message content from file"},
 				{Name: "enter", Flag: "--enter", Type: "bool", Required: false, Description: "Send Enter after paste (default true). Alias: --submit"},
-				{Name: "type", Flag: "--type", Type: "string", Required: false, Description: "Filter by agent type: claude|cc, codex|cod, antigravity|agy, grok, gemini|gmi, pi, kimi, muse, cursor, windsurf, aider, opencode|oc, ollama"},
+				{Name: "type", Flag: "--type", Type: "string", Required: false, Description: "Filter by agent type: claude|cc, codex|cod, antigravity|agy, grok, gemini|gmi, pi, kimi, muse, omp, cursor, windsurf, aider, opencode|oc, ollama"},
 				{Name: "all", Flag: "--all", Type: "bool", Required: false, Description: "Include user pane (default: agents only)"},
 				{Name: "pane", Flag: "--pane", Type: "string", Required: false, Description: "Resolve exactly one N, W.P, or %N pane selector (mutually exclusive with --panes)"},
 				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Filter to a set of N, W.P, or %N pane selectors"},
 				{Name: "exclude", Flag: "--exclude", Type: "string", Required: false, Description: "Exclude N, W.P, or %N pane selectors"},
 				{Name: "delay-ms", Flag: "--delay-ms", Type: "int", Required: false, Description: "Delay between sends (ms)"},
-				{Name: "clear-input", Flag: "--clear-input", Type: "bool", Required: false, Description: "Clear residual composer text (per-agent Escape ritual + C-u, verified) before typing; recommended after interrupts on codex panes"},
+				{Name: "clear-input", Flag: "--clear-input", Type: "bool", Required: false, Description: "Clear residual composer text (agent-specific keys, verified) before typing; recommended after interrupts on codex panes"},
 				{Name: "verify-render", Flag: "--verify-render", Type: "bool", Required: false, Description: "Capture bounded before/after output and require rendered delivery evidence"},
+				{Name: "with-memory", Flag: "--with-memory", Type: "bool", Required: false, Description: "Inject relevant CM (cass-memory) rules above the message before sending; degrades gracefully when cm is unavailable. Injection metadata is reported as memory_injection"},
 				{Name: "track", Flag: "--track", Type: "bool", Required: false, Description: "Combined send+ack: wait for response"},
 				{Name: "timeout", Flag: "--timeout", Type: "string", Required: false, Default: "30s", Description: "Max wait time when --track is enabled"},
 				{Name: "poll", Flag: "--poll", Type: "string", Required: false, Default: "500ms", Description: "Poll interval when --track is enabled"},
+				{Name: "op-id", Flag: "--op-id", Type: "string", Required: false, Description: "Durable idempotent operation ID, scoped per session: identical retries replay the recorded outcome without re-sending; conflicting reuse is rejected (IDEMPOTENCY_CONFLICT); per-target admission receipts are returned and queryable via --robot-send-receipt. Not supported with --track"},
 				{Name: "dry-run", Flag: "--dry-run", Type: "bool", Required: false, Description: "Preview without executing"},
 			},
 			Examples: []string{
@@ -932,6 +991,20 @@ func buildCommandRegistry() []RobotCommandInfo {
 				"ntm --robot-send=proj --msg-file=/tmp/prompt.txt --type=codex",
 				"ntm --robot-send=proj --msg='draft' --enter=false",
 				"ntm --robot-send=proj --msg='hello' --track --timeout=30s",
+				"ntm --robot-send=proj --msg='deploy' --op-id=deploy-42",
+				"ntm --robot-send=proj --msg='Fix auth' --with-memory",
+			},
+		},
+		{
+			Name:        "send-receipt",
+			Flag:        "--robot-send-receipt",
+			Category:    "control",
+			Description: "Query the durable receipt of an idempotent --robot-send or --robot-interrupt by operation ID: operation kind, payload digest, byte count, per-target admission states, and the recorded outcome (outcome for sends, interrupt_outcome for interrupts). Receipts survive caller timeouts and crashes.",
+			Parameters: []RobotParameter{
+				{Name: "operation-id", Flag: "--robot-send-receipt", Type: "string", Required: true, Description: "Operation ID supplied via --op-id to --robot-send or --robot-interrupt (or a REST Idempotency-Key)"},
+			},
+			Examples: []string{
+				"ntm --robot-send-receipt=deploy-42",
 			},
 		},
 		{
@@ -952,7 +1025,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "interrupt",
 			Flag:        "--robot-interrupt",
 			Category:    "control",
-			Description: "Send Ctrl+C (Escape to Muse Code panes) to stop agents, optionally send a new task.",
+			Description: "Send Ctrl+C (Escape to omp and Muse Code panes) to stop agents, optionally send a new task.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-interrupt", Type: "string", Required: true, Description: "Session name"},
 				{Name: "msg", Flag: "--msg", Type: "string", Required: false, Description: "New task to send after Ctrl+C"},
@@ -962,11 +1035,13 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Filter by N, W.P, or %N pane selectors"},
 				{Name: "no-wait", Flag: "--no-wait", Type: "bool", Required: false, Description: "Return immediately after Ctrl+C without closed-loop verification"},
 				{Name: "timeout", Flag: "--timeout", Type: "string", Required: false, Default: "10s", Description: "Max wait for ready state after interrupt"},
+				{Name: "op-id", Flag: "--op-id", Type: "string", Required: false, Description: "Durable idempotent operation ID, scoped per session and shared with --robot-send: claimed before any Ctrl+C, so an identical retry (same panes/all/force/message) replays the recorded outcome without interrupting or re-sending the task; conflicting reuse is rejected (IDEMPOTENCY_CONFLICT); the receipt is queryable via --robot-send-receipt"},
 				{Name: "dry-run", Flag: "--dry-run", Type: "bool", Required: false, Description: "Preview without executing"},
 			},
 			Examples: []string{
 				"ntm --robot-interrupt=proj --msg='Stop and fix bug'",
 				"ntm --robot-interrupt=proj --panes=1.0,%7 --force --timeout=15s",
+				"ntm --robot-interrupt=proj --msg='Stop and fix bug' --op-id=retask-42",
 			},
 		},
 		{
@@ -1147,14 +1222,16 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Description: "Get routing recommendation for work distribution.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-route", Type: "string", Required: true, Description: "Session name"},
-				{Name: "strategy", Flag: "--strategy", Type: "string", Required: false, Default: "least-loaded", Description: "Strategy: least-loaded, first-available, round-robin, round-robin-available, random, sticky, explicit"},
+				{Name: "strategy", Flag: "--strategy", Type: "string", Required: false, Default: "least-loaded", Description: "Strategy: least-loaded, first-available, round-robin, round-robin-available, random, sticky, explicit, affinity (prefers the holder of Agent Mail reservations on files the message names; falls back to least-loaded)"},
 				{Name: "type", Flag: "--type", Type: "string", Required: false, Description: "Filter by agent type"},
 				{Name: "exclude", Flag: "--exclude", Type: "string", Required: false, Description: "Exclude pane indices"},
 				{Name: "last-agent", Flag: "--last-agent", Type: "string", Required: false, Description: "Pane ID (%N) of the previously routed agent; anchors sticky and round-robin rotation across stateless invocations"},
+				{Name: "msg", Flag: "--msg", Type: "string", Required: false, Description: "Message being routed (or --msg-file); its file paths drive reservation affinity. Required with --strategy=affinity"},
 			},
 			Examples: []string{
 				"ntm --robot-route=proj --strategy=least-loaded --type=claude --exclude=0",
 				"ntm --robot-route=proj --strategy=round-robin --last-agent=%7",
+				"ntm --robot-route=proj --strategy=affinity --msg='Fix internal/auth/session.go'",
 			},
 		},
 		{
@@ -1165,7 +1242,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-assign", Type: "string", Required: true, Description: "Session name"},
 				{Name: "beads", Flag: "--beads", Type: "string", Required: false, Description: "Specific bead IDs to assign (comma-separated)"},
-				{Name: "strategy", Flag: "--strategy", Type: "string", Required: false, Default: "balanced", Description: "Strategy: balanced, speed, quality, dependency"},
+				{Name: "strategy", Flag: "--strategy", Type: "string", Required: false, Default: "simple", Description: "Strategy: simple (sequential pairing), balanced, speed, quality, dependency"},
 			},
 			Examples: []string{"ntm --robot-assign=proj --strategy=speed --beads=bd-abc,bd-xyz"},
 		},
@@ -1183,11 +1260,17 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "template", Flag: "--template", Type: "string", Required: false, Description: "Custom prompt template file"},
 				{Name: "bulk-parallel", Flag: "--bulk-parallel", Type: "bool", Required: false, Description: "Execute independent assignment attempts concurrently and join all workers before returning"},
 				{Name: "bulk-stagger", Flag: "--bulk-stagger", Type: "duration", Required: false, Default: "0s", Description: "Delay between sequential assignment attempts"},
+				{Name: "reserve-files", Flag: "--reserve-files", Type: "bool", Required: false, Default: "true", Description: "Reserve each bead's file scope in Agent Mail after its claim and before dispatch, as ntm assign does: --reservation-paths when given, otherwise the paths named in the bead's title and description. A bead naming no files, or an unavailable Agent Mail, refuses that assignment unclaimed (RESERVATION_REQUIRED); assignments[].reservation reports the scope. --reserve-files=false opts out"},
+				{Name: "reservation-paths", Flag: "--reservation-paths", Type: "string", Required: false, Description: "Comma-separated project-relative globs reserved instead of the paths discovered from each bead"},
+				{Name: "with-cass", Flag: "--with-cass", Type: "bool", Required: false, Description: "Inject relevant CASS session history above each fresh assignment prompt, queried by the bead's title, labels, and description (default from [cass.context] enabled); degrades gracefully when cass is unavailable. Reported per assignment as cass_injection"},
+				{Name: "no-cass", Flag: "--no-cass", Type: "bool", Required: false, Description: "Disable CASS history injection, overriding [cass.context] enabled=true"},
+				{Name: "with-memory", Flag: "--with-memory", Type: "bool", Required: false, Description: "Inject relevant CM (cass-memory) rules above each fresh assignment prompt (default from [memory] send_injection); degrades gracefully when cm is unavailable. Reported per assignment as memory_injection"},
 				{Name: "dry-run", Flag: "--dry-run", Type: "bool", Required: false, Description: "Preview assignments without sending prompts"},
 			},
 			Examples: []string{
 				"ntm --robot-bulk-assign=proj --from-bv --bulk-parallel",
 				"ntm --robot-bulk-assign=proj --allocation='{\"0.1\":\"bd-abc\"}' --skip=%7 --dry-run",
+				"ntm --robot-bulk-assign=proj --from-bv --with-cass --with-memory",
 			},
 		},
 
@@ -1199,30 +1282,40 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Description: "Create session with agents and optionally wait for readiness or assign initial work.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-spawn", Type: "string", Required: true, Description: "Session name to create"},
-				{Name: "spawn-cc", Flag: "--spawn-cc", Type: "int", Required: false, Description: "Number of Claude agents"},
-				{Name: "spawn-cod", Flag: "--spawn-cod", Type: "int", Required: false, Description: "Number of Codex agents"},
-				{Name: "spawn-gmi", Flag: "--spawn-gmi", Type: "int", Required: false, Description: "Number of Gemini agents (legacy)"},
-				{Name: "spawn-pi", Flag: "--spawn-pi", Type: "int", Required: false, Description: "Number of Pi agents"},
-				{Name: "spawn-kimi", Flag: "--spawn-kimi", Type: "int", Required: false, Description: "Number of Kimi agents"},
-				{Name: "spawn-muse", Flag: "--spawn-muse", Type: "int", Required: false, Description: "Number of Muse Code agents"},
-				{Name: "spawn-agy", Flag: "--spawn-agy", Type: "int", Required: false, Description: "Number of Antigravity (agy) agents"},
-				{Name: "spawn-grok", Flag: "--spawn-grok", Type: "int", Required: false, Description: "Number of Grok Build agents (phase one: launch only; no wait or assignment)"},
+				{Name: "spawn-cc", Flag: "--spawn-cc", Type: "string", Required: false, Description: "Claude agents: count[:model[:effort]] (effort also as model@effort), e.g. 2 or 2:opus:high"},
+				{Name: "spawn-cod", Flag: "--spawn-cod", Type: "string", Required: false, Description: "Codex agents: count[:model[:effort]] (effort also as model@effort), e.g. 1 or 8:gpt-5.3-codex:high"},
+				{Name: "spawn-gmi", Flag: "--spawn-gmi", Type: "string", Required: false, Description: "Gemini agents (legacy): count[:model]"},
+				{Name: "spawn-pi", Flag: "--spawn-pi", Type: "string", Required: false, Description: "Pi agents: count (no model override)"},
+				{Name: "spawn-kimi", Flag: "--spawn-kimi", Type: "string", Required: false, Description: "Kimi agents: count (no model override)"},
+				{Name: "spawn-muse", Flag: "--spawn-muse", Type: "string", Required: false, Description: "Muse Code agents: count (no model override)"},
+				{Name: "spawn-agy", Flag: "--spawn-agy", Type: "string", Required: false, Description: "Antigravity (agy) agents: count (model is pinned by config)"},
+				{Name: "spawn-grok", Flag: "--spawn-grok", Type: "string", Required: false, Description: "Grok Build agents: count[:model[:effort]]"},
+				{Name: "spawn-omp", Flag: "--spawn-omp", Type: "string", Required: false, Description: "Oh My Pi (omp) agents: count[:model[:effort]] (effort maps to omp --thinking; no model = omp's own configured default)"},
+				{Name: "spawn-oc", Flag: "--spawn-oc", Type: "string", Required: false, Description: "OpenCode (oc) agents: count[:model], model as provider/model (no model = OpenCode's own default; no effort knob)"},
 				{Name: "spawn-preset", Flag: "--spawn-preset", Type: "string", Required: false, Description: "Use recipe preset instead of counts"},
 				{Name: "spawn-no-user", Flag: "--spawn-no-user", Type: "bool", Required: false, Description: "Skip user pane creation"},
 				{Name: "spawn-wait", Flag: "--spawn-wait", Type: "bool", Required: false, Description: "Wait for agents to show ready state before returning"},
 				{Name: "timeout", Flag: "--timeout", Type: "string", Required: false, Default: "30s", Description: "Max wait for ready state when --spawn-wait is enabled"},
 				{Name: "spawn-dir", Flag: "--spawn-dir", Type: "string", Required: false, Description: "Working directory for session"},
 				{Name: "spawn-label", Flag: "--spawn-label", Type: "string", Required: false, Description: "Goal label for multi-session support (creates SESSION--LABEL)"},
-				{Name: "spawn-assign-work", Flag: "--spawn-assign-work", Type: "bool", Required: false, Description: "Claim and assign ready work during spawn"},
+				{Name: "spawn-assign-work", Flag: "--spawn-assign-work", Type: "bool", Required: false, Description: "Claim and assign ready work during spawn. Each fresh work prompt is enriched like --robot-bulk-assign (--with-cass/--no-cass/--with-memory over [cass.context]/[memory]) and reported per assignment as cass_injection/memory_injection"},
 				{Name: "strategy", Flag: "--strategy", Type: "string", Required: false, Default: "top-n", Description: "Assignment strategy when --spawn-assign-work is enabled: top-n, diverse, dependency-aware, skill-matched"},
+				{Name: "spawn-prompt", Flag: "--spawn-prompt", Type: "string", Required: false, Description: "Initial prompt delivered to every agent after the readiness wait (implies --spawn-wait) through robot send's dispatch path; prefixes each work prompt with --spawn-assign-work. Outcomes in prompt_deliveries[]"},
+				{Name: "spawn-prompt-file", Flag: "--spawn-prompt-file", Type: "string", Required: false, Description: "Read the --spawn-prompt text from a file, or stdin with '-'"},
+				{Name: "spawn-stagger-mode", Flag: "--spawn-stagger-mode", Type: "string", Required: false, Description: "Pace prompt delivery between agents: none, fixed, or smart (learned rate-limit delay); default [spawn] stagger_mode, else none. Plan in stagger.schedule[]"},
+				{Name: "spawn-stagger-delay", Flag: "--spawn-stagger-delay", Type: "duration", Required: false, Description: "Interval between consecutive agents for --spawn-stagger-mode=fixed (0-5m); default [spawn] stagger_delay, else 30s"},
 				{Name: "dry-run", Flag: "--dry-run", Type: "bool", Required: false, Description: "Preview without executing"},
 			},
 			Examples: []string{
 				"ntm --robot-spawn=myproject --spawn-cc=2 --spawn-cod=1 --spawn-wait --timeout=30s",
+				"ntm --robot-spawn=myproject --spawn-cod=8:gpt-5.3-codex:high",
 				"ntm --robot-spawn=myproject --spawn-grok=1",
+				"ntm --robot-spawn=myproject --spawn-omp=8 --spawn-no-user --spawn-wait",
+				"ntm --robot-spawn=myproject --spawn-oc=2:opencode/big-pickle --spawn-wait",
 				"ntm --robot-spawn=myproject --spawn-preset=standard",
 				"ntm --robot-spawn=myproject --spawn-label=frontend --spawn-cc=3",
 				"ntm --robot-spawn=myproject --spawn-assign-work --strategy=dependency-aware",
+				"ntm --robot-spawn=myproject --spawn-cc=3 --spawn-prompt='Read AGENTS.md, then pick ready work' --spawn-stagger-mode=fixed --spawn-stagger-delay=90s",
 			},
 		},
 		{
@@ -1274,7 +1367,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Flag:              "--robot-ensemble-spawn",
 			Category:          "ensemble",
 			Description:       "Spawn a reasoning ensemble session with mode assignments.",
-			Note:              "Requires build tag: ensemble_experimental. Default build returns NOT_IMPLEMENTED.",
+			Note:              "Gated by build tag: ensemble_experimental. Enabled in official release builds; untagged source builds return NOT_IMPLEMENTED.",
 			Unavailable:       !ensembleSpawnAvailable,
 			UnavailableReason: ensembleSpawnUnavailableReason,
 			Parameters: []RobotParameter{
@@ -1526,9 +1619,11 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "cass-insights",
 			Flag:        "--robot-cass-insights",
 			Category:    "cass",
-			Description: "Get aggregated CASS insights about topics, patterns, and agent activity.",
-			Parameters:  []RobotParameter{},
-			Examples:    []string{"ntm --robot-cass-insights"},
+			Description: "Get CASS session counts per agent and workspace over a recent window.",
+			Parameters: []RobotParameter{
+				{Name: "since", Flag: "--since", Type: "string", Required: false, Default: "7d", Description: "Window to aggregate, e.g. 7d, 30d"},
+			},
+			Examples: []string{"ntm --robot-cass-insights", "ntm --robot-cass-insights --since=30d"},
 		},
 
 		// === PIPELINE ===
@@ -1754,14 +1849,6 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Examples: []string{"ntm --robot-jfp-suggest='build a REST API'"},
 		},
 		{
-			Name:        "jfp-installed",
-			Flag:        "--robot-jfp-installed",
-			Category:    "utility",
-			Description: "List installed Claude Code skills from JFP.",
-			Parameters:  []RobotParameter{},
-			Examples:    []string{"ntm --robot-jfp-installed"},
-		},
-		{
 			Name:        "jfp-categories",
 			Flag:        "--robot-jfp-categories",
 			Category:    "utility",
@@ -1784,18 +1871,6 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Description: "List JFP bundles.",
 			Parameters:  []RobotParameter{},
 			Examples:    []string{"ntm --robot-jfp-bundles"},
-		},
-		{
-			Name:        "jfp-install",
-			Flag:        "--robot-jfp-install",
-			Category:    "utility",
-			Description: "Install JFP prompt(s) by ID.",
-			Parameters: []RobotParameter{
-				{Name: "ids", Flag: "--robot-jfp-install", Type: "string", Required: true, Description: "Prompt ID(s), comma-separated"},
-				{Name: "project", Flag: "--project", Type: "string", Required: false, Description: "Project directory override (alias: --jfp-project)"},
-				{Name: "jfp-project", Flag: "--jfp-project", Type: "string", Required: false, Description: "Optional project directory for installs"},
-			},
-			Examples: []string{"ntm --robot-jfp-install=prompt-123", "ntm --robot-jfp-install=prompt-1,prompt-2 --jfp-project=/path/to/project"},
 		},
 		{
 			Name:        "jfp-export",
@@ -1880,7 +1955,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "slb-approve",
 			Flag:        "--robot-slb-approve",
 			Category:    "utility",
-			Description: "Approve an SLB request by ID.",
+			Description: "Approve an SLB request by ID, signed by the reviewer session in SLB_SESSION_ID/SLB_SESSION_KEY.",
 			Parameters: []RobotParameter{
 				{Name: "id", Flag: "--robot-slb-approve", Type: "string", Required: true, Description: "Request ID"},
 			},
@@ -1890,10 +1965,10 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "slb-deny",
 			Flag:        "--robot-slb-deny",
 			Category:    "utility",
-			Description: "Deny an SLB request by ID.",
+			Description: "Reject an SLB request by ID, signed by the reviewer session in SLB_SESSION_ID/SLB_SESSION_KEY.",
 			Parameters: []RobotParameter{
 				{Name: "id", Flag: "--robot-slb-deny", Type: "string", Required: true, Description: "Request ID"},
-				{Name: "reason", Flag: "--reason", Type: "string", Required: false, Description: "Optional denial reason"},
+				{Name: "reason", Flag: "--reason", Type: "string", Required: true, Description: "Rejection reason (slb requires one)"},
 			},
 			Examples: []string{"ntm --robot-slb-deny=req-123 --reason='Too risky'"},
 		},
@@ -2090,8 +2165,8 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Parameters: []RobotParameter{
 				{Name: "query", Flag: "--robot-xf-search", Type: "string", Required: true, Description: "Search query"},
 				{Name: "xf-limit", Flag: "--xf-limit", Type: "int", Required: false, Default: "20", Description: "Max results to return"},
-				{Name: "xf-mode", Flag: "--xf-mode", Type: "string", Required: false, Description: "Search mode: semantic, keyword, fuzzy"},
-				{Name: "xf-sort", Flag: "--xf-sort", Type: "string", Required: false, Description: "Sort order: relevance or date"},
+				{Name: "xf-mode", Flag: "--xf-mode", Type: "string", Required: false, Description: "Search mode: lexical, semantic, hybrid (xf default), two-tier"},
+				{Name: "xf-sort", Flag: "--xf-sort", Type: "string", Required: false, Description: "Sort order: relevance (xf default), date, date-desc, engagement"},
 			},
 			Examples: []string{
 				"ntm --robot-xf-search='error handling patterns'",
@@ -2255,17 +2330,4 @@ func annotateDeprecatedRobotParameters(commands []RobotCommandInfo) []RobotComma
 	}
 
 	return commands
-}
-
-func isSupportedSurfaceOutputFormat(format string) bool {
-	if RobotFormat(format).IsValid() {
-		return true
-	}
-
-	switch format {
-	case "markdown", "text":
-		return true
-	default:
-		return false
-	}
 }

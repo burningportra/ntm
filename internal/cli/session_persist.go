@@ -14,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -127,6 +128,9 @@ func (r *SessionsSaveResult) Text(w io.Writer) error {
 		}
 		if r.State.Agents.Muse > 0 {
 			fmt.Fprintf(w, "  Muse: %d\n", r.State.Agents.Muse)
+		}
+		if r.State.Agents.Omp > 0 {
+			fmt.Fprintf(w, "  Oh My Pi: %d\n", r.State.Agents.Omp)
 		}
 		if r.State.GitBranch != "" {
 			fmt.Fprintf(w, "  Git: %s\n", r.State.GitBranch)
@@ -360,6 +364,9 @@ func (r *SessionsShowResult) Text(w io.Writer) error {
 	if s.Agents.Muse > 0 {
 		fmt.Fprintf(w, "  Muse:   %d\n", s.Agents.Muse)
 	}
+	if s.Agents.Omp > 0 {
+		fmt.Fprintf(w, "  Omp:    %d\n", s.Agents.Omp)
+	}
 	if s.Agents.User > 0 {
 		fmt.Fprintf(w, "  User:   %d\n", s.Agents.User)
 	}
@@ -550,6 +557,9 @@ func (r *SessionsRestoreResult) Text(w io.Writer) error {
 		if r.State.Agents.Muse > 0 {
 			fmt.Fprintf(w, "  Muse: %d\n", r.State.Agents.Muse)
 		}
+		if r.State.Agents.Omp > 0 {
+			fmt.Fprintf(w, "  Oh My Pi: %d\n", r.State.Agents.Omp)
+		}
 	}
 	if r.PromptSent > 0 || r.PromptFailed > 0 {
 		fmt.Fprintf(w, "  Prompt injected into %d pane(s)", r.PromptSent)
@@ -612,9 +622,27 @@ func runSessionsRestore(ctx context.Context, savedName string, opts session.Rest
 			Error:     err.Error(),
 		})
 	}
+	var cmds session.AgentCommands
+	if launchAgents {
+		// Render and validate the whole batch before --force can replace the
+		// running session. A malformed later pane must not destroy the original.
+		applyModelCommands(state)
+		cmds = buildAgentCommands(state)
+	}
 
-	// Restore session
-	if err := session.Restore(state, opts); err != nil {
+	// Launching restore performs shared replay preflight before replacing the
+	// topology, then uses those pinned plans and physical pane targets.
+	var launchErr error
+	var launchResult *session.ResumeResult
+	if launchAgents {
+		launchResult, err = session.RestoreWithAgents(ctx, state, cmds, cfg, opts)
+		if launchResult != nil {
+			launchErr, err = err, nil
+		}
+	} else {
+		err = session.RestoreContext(ctx, state, opts)
+	}
+	if err != nil {
 		return emitRestoreFailure(&SessionsRestoreResult{
 			Success:   false,
 			SavedName: savedName,
@@ -638,27 +666,17 @@ func runSessionsRestore(ctx context.Context, savedName string, opts session.Rest
 	}
 
 	// Optionally launch agents
-	var launchErr error
 	var promptErr error
 	agentCount := 0
 	promptSent, promptFailed := 0, 0
 	if launchAgents {
-		if cfg != nil {
-			// Render each pane's captured model into its launch command so the
-			// relaunch honors the saved model (ntm-boi0).
-			applyModelCommands(state)
-			// Render the agent command templates before launching: the raw
-			// cfg.Agents.* values are Go templates and must not be sent into a
-			// pane verbatim (a literal `{{memLimitPrefix}} claude ...` would fail
-			// to exec and the agent would never launch).
-			cmds := buildAgentCommands(state)
-			launchErr = session.RestoreAgents(restoredName, state, cmds, cfg)
-			// Optionally inject an initial prompt into the launched panes.
-			if launchErr == nil && strings.TrimSpace(prompt) != "" {
-				promptSent, promptFailed, promptErr = sendResumePrompt(ctx, restoredName, prompt)
-			}
+		// Optionally inject an initial prompt into the launched panes.
+		if launchErr == nil && strings.TrimSpace(prompt) != "" {
+			promptSent, promptFailed, promptErr = sendResumePrompt(ctx, restoredName, prompt)
 		}
-		agentCount = state.Agents.Total()
+		if launchResult != nil {
+			agentCount = launchResult.Launched
+		}
 	}
 	operationErr := sessionsRestoreOperationError(launchErr, promptErr)
 
@@ -727,12 +745,14 @@ func newSessionsResumeCmd() *cobra.Command {
 		Short: "Resume a saved session (rebuild topology + resume agents)",
 		Long: `Resume a saved session.
 
-Reconstructs the tmux topology (windows, panes, splits, cwd, layout) and
-relaunches each pane's agent. Panes that captured a provider session id at
-save time are resumed via casr (Cross Agent Session Resumer) when available,
-or the agent's native --resume <id>. Panes without a captured id are launched
-fresh. ntm owns the topology restore; per-pane agent-session resume is
-delegated to casr, not reimplemented here.
+Reconstructs the tmux topology (windows, panes, splits, worktrees, layout) and
+relaunches each pane's agent with its recorded launch settings. Fresh provider
+session bindings use native resume while preserving the saved model, arguments,
+persona and account. Older saves without a recorded command may use casr
+(Cross Agent Session Resumer) when available, or the agent's native resume.
+Panes without a fresh binding receive their saved launch command. Required
+settings and native resume commands are validated before --force replaces a
+running session; ambiguous commands fail with an explanation.
 
 Examples:
   ntm sessions resume myproject            # Resume topology + agents
@@ -765,6 +785,7 @@ type SessionsResumeResult struct {
 	Resumed      int                  `json:"resumed"`
 	Launched     int                  `json:"launched"`
 	Skipped      int                  `json:"skipped"`
+	Failed       int                  `json:"failed"`
 	Panes        []session.ResumePane `json:"panes,omitempty"`
 	PromptSent   int                  `json:"prompt_sent,omitempty"`
 	PromptFailed int                  `json:"prompt_failed,omitempty"`
@@ -776,13 +797,17 @@ func (r *SessionsResumeResult) Text(w io.Writer) error {
 	if !r.Success {
 		fmt.Fprintf(w, "%s✗%s Failed to resume session: %s\n",
 			colorize(t.Red), colorize(t.Text), r.Error)
-		return nil
+		if r.ResumedAs == "" {
+			return nil
+		}
+		fmt.Fprintf(w, "  Session '%s' remains available for inspection\n", r.ResumedAs)
+	} else {
+		fmt.Fprintf(w, "%s✓%s Resumed session '%s'\n",
+			colorize(t.Success), colorize(t.Text), r.ResumedAs)
 	}
 
-	fmt.Fprintf(w, "%s✓%s Resumed session '%s'\n",
-		colorize(t.Success), colorize(t.Text), r.ResumedAs)
-	fmt.Fprintf(w, "  %d agent(s) resumed, %d launched fresh, %d skipped\n",
-		r.Resumed, r.Launched, r.Skipped)
+	fmt.Fprintf(w, "  %d agent(s) resumed, %d launched fresh, %d skipped, %d failed\n",
+		r.Resumed, r.Launched, r.Skipped, r.Failed)
 	for _, p := range r.Panes {
 		marker := "·"
 		switch p.Action {
@@ -790,12 +815,17 @@ func (r *SessionsResumeResult) Text(w io.Writer) error {
 			marker = "↻"
 		case "launched":
 			marker = "+"
+		case "failed":
+			marker = "✗"
 		}
 		idInfo := ""
 		if p.SessionID != "" {
 			idInfo = fmt.Sprintf(" [%s:%s]", p.Provider, p.SessionID)
 		}
 		fmt.Fprintf(w, "  %s [%d] %s (%s)%s\n", marker, p.Index, p.Title, p.Action, idInfo)
+		if p.Error != "" {
+			fmt.Fprintf(w, "    %s\n", p.Error)
+		}
 	}
 	if r.PromptSent > 0 || r.PromptFailed > 0 {
 		fmt.Fprintf(w, "  Prompt injected into %d pane(s)", r.PromptSent)
@@ -834,18 +864,23 @@ func buildAgentCommands(state *session.SessionState) session.AgentCommands {
 		PaneIndex:   1,
 	}
 
+	claudeSettings := policy.ClaudeAgentLaunchSettings(cfg).Settings
 	render := func(tmpl, agentType string) string {
 		if tmpl == "" {
 			return ""
 		}
 		v := vars
 		v.AgentType = agentType
+		if agentType == "cc" {
+			v.ClaudeSettings = claudeSettings
+		}
 		rendered, err := config.GenerateAgentCommand(tmpl, v)
 		if err != nil {
 			// Leave empty so the launch path skips this agent rather than
 			// sending an unrendered template into the pane.
 			return ""
 		}
+		policy.LogClaudeHooksNotApplied("restore", rendered, v.ClaudeSettings)
 		return rendered
 	}
 
@@ -861,6 +896,7 @@ func buildAgentCommands(state *session.SessionState) session.AgentCommands {
 		Windsurf:    render(cfg.Agents.Windsurf, "windsurf"),
 		Aider:       render(cfg.Agents.Aider, "aider"),
 		Opencode:    render(opencodeCommandOrDefault(cfg.Agents.Opencode), "opencode"),
+		Omp:         render(config.OmpCommandOrDefault(cfg.Agents.Omp), "omp"),
 		Ollama:      render(cfg.Agents.Ollama, "ollama"),
 	}
 }
@@ -868,6 +904,7 @@ func buildAgentCommands(state *session.SessionState) session.AgentCommands {
 // applyModelCommands renders each agent pane's launch command with that pane's
 // captured model alias and stores it in PaneState.Command, so resume/restore
 // relaunch the agent on the same model instead of the account default (ntm-boi0).
+// Recorded launch specifications and commands are authoritative and unchanged.
 // The session-layer launch path prefers PaneState.Command over the type-default.
 // Panes without a captured model are left untouched (Command stays empty) and
 // fall back to the no-model type command. Render failures are non-fatal: the
@@ -884,6 +921,9 @@ func applyModelCommands(state *session.SessionState) {
 	}
 	for i := range state.Panes {
 		ps := &state.Panes[i]
+		if ps.LaunchSpec != nil || ps.Command != "" {
+			continue
+		}
 		modelAlias, reasoningEffort := tmux.ParsePaneVariant(ps.Model)
 		if modelAlias == "" {
 			continue
@@ -902,7 +942,11 @@ func applyModelCommands(state *session.SessionState) {
 			ModelRequested:  true,
 			ReasoningEffort: reasoningEffort,
 		}
+		if cliType == AgentTypeClaude {
+			v.ClaudeSettings = policy.ClaudeAgentLaunchSettings(cfg).Settings
+		}
 		if rendered, err := config.GenerateAgentCommand(tmpl, v); err == nil && rendered != "" {
+			policy.LogClaudeHooksNotApplied("restore", rendered, v.ClaudeSettings)
 			ps.Command = rendered
 		}
 	}
@@ -939,6 +983,8 @@ func agentTemplateAndType(agentType string) (string, AgentType, bool) {
 		return cfg.Agents.Aider, AgentTypeAider, true
 	case tmux.AgentOpencode:
 		return opencodeCommandOrDefault(cfg.Agents.Opencode), AgentTypeOpencode, true
+	case tmux.AgentOmp:
+		return config.OmpCommandOrDefault(cfg.Agents.Omp), AgentTypeOmp, true
 	case tmux.AgentOllama:
 		return cfg.Agents.Ollama, AgentTypeOllama, true
 	default:
@@ -1038,23 +1084,29 @@ func runSessionsResume(ctx context.Context, savedName, name string, force, attac
 	// values are Go templates and must not be sent into a pane verbatim.
 	cmds := buildAgentCommands(state)
 
-	res, err := session.Resume(state, cmds, session.ResumeOptions{
+	res, err := session.ResumeContext(ctx, state, cmds, session.ResumeOptions{
 		Name:       name,
 		Force:      force,
 		PreferCASR: preferCASR,
+		Config:     cfg,
 	})
-	if err != nil {
+	if err != nil && res == nil {
 		return emitFailure(&SessionsResumeResult{Success: false, SavedName: savedName, Error: err.Error()})
 	}
 
 	result := &SessionsResumeResult{
-		Success:   true,
+		Success:   err == nil,
 		SavedName: savedName,
 		ResumedAs: res.Session,
 		Resumed:   res.Resumed,
 		Launched:  res.Launched,
 		Skipped:   res.Skipped,
+		Failed:    res.Failed,
 		Panes:     res.Panes,
+	}
+	if err != nil {
+		result.Error = err.Error()
+		return emitFailure(result)
 	}
 
 	// Optionally inject an initial prompt into the relaunched agent panes.

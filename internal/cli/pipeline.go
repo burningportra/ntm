@@ -251,6 +251,11 @@ func newPipelineRunCmd() *cobra.Command {
 The workflow file defines steps with prompts, dependencies, conditionals,
 and agent routing. Variables can be passed via --var or --var-file.
 
+Background runs use a detached worker that survives this command's exit.
+State and private worker logs are stored under .ntm/pipelines/ in the project.
+Run status/cancel from that project directory. Dry runs never spawn a worker.
+Templates must exist at launch or use absolute paths when generated later.
+
 Examples:
   # Basic execution
   ntm pipeline run workflow.yaml --session myproject
@@ -390,14 +395,15 @@ Examples:
 			} else if fromState != "" {
 				return fmt.Errorf("--from-state requires --start-from")
 			}
-			executor := pipeline.NewExecutor(execCfg)
-
 			// Create progress channel
 			progress := make(chan pipeline.ProgressEvent, 100)
-			ctx := context.Background()
+			ctx := cmd.Context()
 
-			if background {
+			if background && !dryRun {
 				exec := pipeline.StartBackgroundPipeline(workflow, vars, execCfg)
+				if exec.Error != "" || exec.Status == "failed" {
+					return fmt.Errorf("background pipeline %s failed to start: %s", exec.RunID, exec.Error)
+				}
 
 				fmt.Printf("✓ Pipeline started in background\n")
 				fmt.Printf("   Run ID: %s\n", exec.RunID)
@@ -407,16 +413,21 @@ Examples:
 			}
 
 			// Foreground mode - show progress
-			done := make(chan *pipeline.ExecutionState)
+			type executionResult struct {
+				state *pipeline.ExecutionState
+				err   error
+			}
+			done := make(chan executionResult, 1)
 			go func() {
+				var result executionResult
 				defer func() {
 					if r := recover(); r != nil {
-						close(done)
+						result.err = fmt.Errorf("pipeline execution panicked: %v", r)
 					}
+					done <- result
 				}()
 				defer close(progress)
-				state, _ := executor.Run(ctx, workflow, vars, progress)
-				done <- state
+				result.state, result.err = pipeline.RunControlledPipeline(ctx, workflow, vars, execCfg, progress)
 			}()
 
 			// Display progress
@@ -428,7 +439,7 @@ Examples:
 						continue
 					}
 					printProgressEvent(event)
-				case state := <-done:
+				case result := <-done:
 					// Drain remaining events
 					if progress != nil {
 						for event := range progress {
@@ -437,6 +448,10 @@ Examples:
 					}
 
 					fmt.Println()
+					if result.err != nil {
+						return result.err
+					}
+					state := result.state
 					if state == nil {
 						fmt.Fprintf(os.Stderr, "❌ Pipeline crashed unexpectedly\n")
 						os.Exit(1)
@@ -588,9 +603,10 @@ func newPipelineCancelCmd() *cobra.Command {
 			// Human-friendly cancel
 			fmt.Printf("Cancelling pipeline: %s\n", runID)
 			exitCode := pipeline.PrintPipelineCancel(runID)
-			if exitCode == 0 {
-				output.SuccessCheck("Pipeline cancelled")
+			if exitCode != 0 {
+				return fmt.Errorf("pipeline cancellation was not confirmed")
 			}
+			output.SuccessCheck("Cancellation acknowledged; inspect status for cleanup completion")
 			return nil
 		},
 	}
@@ -600,6 +616,7 @@ func newPipelineCancelCmd() *cobra.Command {
 func newPipelineResumeCmd() *cobra.Command {
 	var (
 		session        string
+		background     bool
 		mode           string
 		keepState      bool
 		maxResumeAge   string
@@ -614,11 +631,25 @@ func newPipelineResumeCmd() *cobra.Command {
 		Long: `Resume a previously interrupted pipeline from its last checkpoint.
 
 Pipeline state is persisted to .ntm/pipelines/<run-id>.json after each step.
-This allows resuming from the last completed step if a pipeline is interrupted.
+Confirmed prompt/template deliveries resume observation of the original physical
+pane and process, without sending again. Saved completed responses are reused.
+Unknown delivery outcomes, replaced panes, and lost output boundaries require
+operator inspection. Commands with durable settled outcomes retain ordinary
+retry behavior. A command interrupted by a worker crash is never automatically
+repeated: its process group may still be running or have performed side effects.
+
+After inspection and stopping any surviving command processes,
+--mode=restart-failed deliberately repeats failed or interrupted steps;
+--keep-state=false repeats the entire workflow.
+--mode=force-iter deliberately repeats the selected iteration and later ones.
+These explicit restart choices may repeat side effects.
 
 Examples:
   # Resume a specific pipeline
   ntm pipeline resume run-20241230-123456-abcd --session myproject
+
+  # Continue recovery after this terminal exits
+  ntm pipeline resume run-20241230-123456-abcd --background --mode=restart-failed
 
   # Resume will pick up from the last incomplete step`,
 		Args: cobra.ExactArgs(1),
@@ -663,6 +694,50 @@ Examples:
 			if err != nil {
 				return err
 			}
+
+			if background {
+				execution, err := pipeline.StartBackgroundResume(cmd.Context(), projectDir, runID, resolvedSession, resumeOpts)
+				if err != nil {
+					if jsonOutput {
+						code := "RESUME_START_FAILED"
+						if errors.Is(err, pipeline.ErrRunAlreadyOwned) {
+							code = "PIPELINE_RUNNING"
+						}
+						return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
+							"success": false, "run_id": runID, "error": err.Error(), "error_code": code,
+						}, err)
+					}
+					return fmt.Errorf("start background pipeline resume: %w", err)
+				}
+				if jsonOutput {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]interface{}{
+						"success": true, "run_id": execution.RunID, "status": execution.Status,
+						"workflow": execution.WorkflowID, "session": execution.Session,
+						"mode": string(resumeOpts.Mode), "background": true,
+					})
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Pipeline %s resume started in background (%s).\n", execution.RunID, execution.Session)
+				fmt.Fprintf(cmd.OutOrStdout(), "Inspect with 'ntm pipeline status %s'; cancel with 'ntm pipeline cancel %s'.\n", execution.RunID, execution.RunID)
+				return nil
+			}
+
+			// Join the same ownership protocol as API and detached executions.
+			// Load the checkpoint only AFTER acquiring it: no stale snapshot
+			// may queue behind an owner and replay work the owner completed.
+			control, err := pipeline.AcquireRunControl(cmd.Context(), projectDir, runID)
+			if err != nil {
+				if jsonOutput {
+					code := "CONTROL_UNAVAILABLE"
+					if errors.Is(err, pipeline.ErrRunAlreadyOwned) {
+						code = "PIPELINE_RUNNING"
+					}
+					return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
+						"success": false, "run_id": runID, "error": err.Error(), "error_code": code,
+					}, err)
+				}
+				return fmt.Errorf("acquire pipeline resume ownership: %w", err)
+			}
+			defer control.Close()
 
 			state, err := pipeline.LoadState(projectDir, runID)
 			if err != nil {
@@ -717,7 +792,7 @@ Examples:
 				workflowFile = filepath.Join(projectDir, workflowFile)
 			}
 
-			workflow, result, err := pipeline.LoadAndValidate(workflowFile)
+			workflow, result, err := pipeline.LoadResumeWorkflow(workflowFile)
 			if err != nil {
 				return fmt.Errorf("failed to load workflow: %w", err)
 			}
@@ -756,7 +831,7 @@ Examples:
 
 			state.WorkflowFile = workflowFile
 
-			ctx := context.Background()
+			ctx := control.Context()
 
 			if jsonOutput {
 				finalState, err := executor.Resume(ctx, workflow, state, nil)
@@ -849,6 +924,7 @@ Examples:
 	}
 
 	cmd.Flags().StringVarP(&session, "session", "s", "", "Tmux session name (uses saved session if not specified)")
+	cmd.Flags().BoolVar(&background, "background", false, "Resume in a detached worker that survives this command's exit")
 	cmd.Flags().StringVar(&mode, "mode", string(pipeline.ResumeModeContinue), "Resume mode: continue, restart-failed, force-iter")
 	cmd.Flags().BoolVar(&keepState, "keep-state", true, "Preserve completed step outputs while resuming")
 	cmd.Flags().StringVar(&maxResumeAge, "max-resume-age", "", "Refuse to resume state older than this duration (for example 7d, 24h)")

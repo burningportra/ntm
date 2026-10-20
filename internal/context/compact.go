@@ -112,6 +112,16 @@ func GetAgentCapabilities(agentType string) AgentCapabilities {
 			BuiltinCompactCommand:  "",
 			HistoryClearCommand:    "/clear",
 		}
+	case agent.AgentTypeOmp:
+		// omp ships both as slash commands (omp v18.2.3): "/compact"
+		// ("Compact: context N% used") and "/clear" ("drop context, keep
+		// session").
+		return AgentCapabilities{
+			SupportsBuiltinCompact: true,
+			SupportsHistoryClear:   true,
+			BuiltinCompactCommand:  "/compact",
+			HistoryClearCommand:    "/clear",
+		}
 	case agent.AgentTypeCursor, agent.AgentTypeWindsurf, agent.AgentTypeAider, agent.AgentTypeOpencode, agent.AgentTypeOllama:
 		// These IDE-based agents typically manage their own context or don't support explicit compaction commands yet
 		return AgentCapabilities{
@@ -137,11 +147,6 @@ Your context window is reaching capacity. To continue working effectively, pleas
 After you provide this summary, we will use it to help you continue with fresh context.
 
 Please provide this summary now. Be concise but comprehensive.`
-
-// GenerateCompactionPrompt returns the prompt for requesting summarization.
-func (c *Compactor) GenerateCompactionPrompt() string {
-	return CompactionPromptTemplate
-}
 
 // CompactionCommand represents a command to send to an agent for compaction.
 type CompactionCommand struct {
@@ -178,27 +183,9 @@ func (c *Compactor) GetCompactionCommands(agentType string) []CompactionCommand 
 		})
 	}
 
-	// If the agent supports clearing non-essential history, try that before asking
-	// for a manual summary. This gives agents with native history pruning a cheaper
-	// fallback than a full summarization round-trip.
-	if caps.SupportsHistoryClear && caps.HistoryClearCommand != "" {
-		commands = append(commands, CompactionCommand{
-			Command:     caps.HistoryClearCommand,
-			Method:      CompactionClearHistory,
-			IsPrompt:    false,
-			WaitTime:    c.builtinTimeout,
-			Description: "history clear command",
-		})
-	}
-
-	// Fallback to summarization request.
-	commands = append(commands, CompactionCommand{
-		Command:     c.GenerateCompactionPrompt(),
-		Method:      CompactionSummarize,
-		IsPrompt:    true,
-		WaitTime:    c.summarizeTimeout,
-		Description: "summarization request",
-	})
+	// Clearing history destroys the context we are trying to preserve. Asking
+	// for a summary adds another turn but does not compact a provider's context.
+	// Unsupported providers must use the handoff/replacement rotation instead.
 
 	return commands
 }

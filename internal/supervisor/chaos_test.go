@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -58,7 +59,7 @@ func TestDaemonRestartOnCrash(t *testing.T) {
 	}
 
 	// After max restarts, should be in failed state
-	if restarts >= int(s.maxRestarts) && state != StateFailed {
+	if restarts > s.maxRestarts && state != StateFailed {
 		t.Errorf("daemon should be in StateFailed after %d restarts (max: %d), but state = %v",
 			restarts, s.maxRestarts, state)
 	}
@@ -147,8 +148,8 @@ func TestMaxRestartBackoff(t *testing.T) {
 	}
 
 	// Poll until daemon exhausts all restarts (with timeout)
-	// The supervisor sets StateFailed before each backoff wait, then restarts.
-	// We need to wait until restarts exceed maxRestarts (meaning no more restarts will happen).
+	// StateRestarting includes backoff waits and failed launch attempts.
+	// StateFailed and a count above maxRestarts mark exhausted recovery.
 	deadline := time.Now().Add(15 * time.Second)
 	var restarts int
 	var state DaemonState
@@ -211,7 +212,7 @@ func TestCleanShutdown(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Verify daemons are running
-	status := s.Status()
+	status := supervisorStatusForTest(s)
 	running := 0
 	for _, d := range status {
 		if d.State == StateRunning || d.State == StateStarting {
@@ -230,7 +231,7 @@ func TestCleanShutdown(t *testing.T) {
 
 	// Verify all stopped (or failed if killed during shutdown)
 	time.Sleep(200 * time.Millisecond)
-	status = s.Status()
+	status = supervisorStatusForTest(s)
 	for name, d := range status {
 		// After Shutdown(), daemons should be either Stopped or Failed
 		// (Failed can happen if the process was killed with SIGTERM/SIGKILL)
@@ -246,7 +247,22 @@ func TestCleanShutdown(t *testing.T) {
 		t.Fatalf("failed to read pids dir: %v", err)
 	}
 	for _, entry := range entries {
-		t.Errorf("PID file not cleaned up: %s", entry.Name())
+		name := entry.Name()
+		// The cross-process ownership fence (.daemon-<hash>.lock) and its
+		// launch record (.daemon-<hash>.json) are retained by design
+		// (docs/supervisor-ownership.md); a clean stop leaves the record
+		// quiescent: phase "stopped" with no PID.
+		if strings.HasPrefix(name, ".daemon-") && strings.HasSuffix(name, ".lock") {
+			continue
+		}
+		if strings.HasPrefix(name, ".daemon-") && strings.HasSuffix(name, ".json") {
+			record, err := readDaemonOwnership(filepath.Join(pidsDir, name))
+			if err != nil || record == nil || record.Phase != "stopped" || record.PID != 0 {
+				t.Errorf("ownership record %s not quiescent after shutdown: %+v %v", name, record, err)
+			}
+			continue
+		}
+		t.Errorf("PID file not cleaned up: %s", name)
 	}
 }
 
@@ -347,7 +363,7 @@ func TestConcurrentDaemonOperations(t *testing.T) {
 	}
 
 	// Verify all daemons started
-	status := s.Status()
+	status := supervisorStatusForTest(s)
 	if len(status) != 5 {
 		t.Errorf("Expected 5 daemons, got %d", len(status))
 	}
@@ -358,7 +374,7 @@ func TestConcurrentDaemonOperations(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			s.Stop(fmt.Sprintf("concurrent-%d", idx))
+			supervisorStopForTest(s, fmt.Sprintf("concurrent-%d", idx))
 		}(i)
 	}
 

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/term"
@@ -62,20 +61,7 @@ func NewStepsWriter(w io.Writer) *Steps {
 	}
 }
 
-// SetTotal sets the expected total steps (for "1/N" display).
-func (s *Steps) SetTotal(n int) *Steps {
-	s.total = n
-	return s
-}
-
-// SetIndent sets the indentation prefix (default: "  ").
-func (s *Steps) SetIndent(indent string) *Steps {
-	s.indent = indent
-	return s
-}
-
-// Start begins a new step with the given name.
-// Prints "name..." and waits for Done/Fail/Skip.
+// Start begins a new named step, auto-completing any running step.
 func (s *Steps) Start(name string) *Steps {
 	// Auto-complete previous step if still running
 	if s.current != nil && s.current.status == StepRunning {
@@ -118,17 +104,6 @@ func (s *Steps) Fail() *Steps {
 	return s
 }
 
-// Skip marks the current step as skipped.
-// Prints "⊘" (or "[SKIP]" without color).
-func (s *Steps) Skip() *Steps {
-	if s.current == nil {
-		return s
-	}
-	s.current.status = StepSkipped
-	s.printStatus("⊘", "SKIP", s.dimStyle())
-	return s
-}
-
 // Warn marks the current step as completed with warnings.
 // Prints "⚠" (or "[WARN]" without color).
 func (s *Steps) Warn() *Steps {
@@ -148,14 +123,6 @@ func (s *Steps) printStatus(icon, text string, style lipgloss.Style) {
 	}
 }
 
-// Status returns the current step's status.
-func (s *Steps) Status() StepStatus {
-	if s.current == nil {
-		return StepPending
-	}
-	return s.current.status
-}
-
 // Style helpers
 func (s *Steps) successStyle() lipgloss.Style {
 	t := theme.Current()
@@ -170,11 +137,6 @@ func (s *Steps) errorStyle() lipgloss.Style {
 func (s *Steps) warnStyle() lipgloss.Style {
 	t := theme.Current()
 	return lipgloss.NewStyle().Foreground(t.Warning)
-}
-
-func (s *Steps) dimStyle() lipgloss.Style {
-	t := theme.Current()
-	return lipgloss.NewStyle().Foreground(t.Overlay)
 }
 
 // ===========================================================================
@@ -203,12 +165,6 @@ func ProgressWriter(w io.Writer) *ProgressMsg {
 	return &ProgressMsg{w: w, useColor: useColor, indent: ""}
 }
 
-// SetIndent sets the indentation prefix.
-func (p *ProgressMsg) SetIndent(indent string) *ProgressMsg {
-	p.indent = indent
-	return p
-}
-
 // Success prints "✓ message".
 func (p *ProgressMsg) Success(msg string) {
 	p.printWithIcon("✓", msg, p.successStyle())
@@ -229,16 +185,6 @@ func (p *ProgressMsg) Warningf(format string, args ...any) {
 	p.Warning(fmt.Sprintf(format, args...))
 }
 
-// Error prints "✗ message".
-func (p *ProgressMsg) Error(msg string) {
-	p.printWithIcon("✗", msg, p.errorStyle())
-}
-
-// Errorf prints "✗ formatted message".
-func (p *ProgressMsg) Errorf(format string, args ...any) {
-	p.Error(fmt.Sprintf(format, args...))
-}
-
 // Info prints "ℹ message".
 func (p *ProgressMsg) Info(msg string) {
 	p.printWithIcon("ℹ", msg, p.infoStyle())
@@ -247,16 +193,6 @@ func (p *ProgressMsg) Info(msg string) {
 // Infof prints "ℹ formatted message".
 func (p *ProgressMsg) Infof(format string, args ...any) {
 	p.Info(fmt.Sprintf(format, args...))
-}
-
-// Print prints a plain message (no icon).
-func (p *ProgressMsg) Print(msg string) {
-	fmt.Fprintf(p.w, "%s%s\n", p.indent, msg)
-}
-
-// Printf prints a formatted plain message (no icon).
-func (p *ProgressMsg) Printf(format string, args ...any) {
-	p.Print(fmt.Sprintf(format, args...))
 }
 
 func (p *ProgressMsg) printWithIcon(icon, msg string, style lipgloss.Style) {
@@ -270,11 +206,6 @@ func (p *ProgressMsg) printWithIcon(icon, msg string, style lipgloss.Style) {
 func (p *ProgressMsg) successStyle() lipgloss.Style {
 	t := theme.Current()
 	return lipgloss.NewStyle().Foreground(t.Success)
-}
-
-func (p *ProgressMsg) errorStyle() lipgloss.Style {
-	t := theme.Current()
-	return lipgloss.NewStyle().Foreground(t.Error)
 }
 
 func (p *ProgressMsg) warnStyle() lipgloss.Style {
@@ -324,76 +255,3 @@ func PrintInfof(format string, args ...any) {
 // ===========================================================================
 // Multi-step operation helpers
 // ===========================================================================
-
-// Operation represents a multi-step CLI operation.
-// Provides consistent progress output for long operations.
-type Operation struct {
-	name     string
-	steps    *Steps
-	errors   []string
-	warnings []string
-}
-
-// NewOperation creates a named operation for tracking multi-step progress.
-func NewOperation(name string) *Operation {
-	return &Operation{
-		name:  name,
-		steps: NewSteps(),
-	}
-}
-
-// Start begins a step within this operation.
-func (o *Operation) Start(stepName string) *Steps {
-	return o.steps.Start(stepName)
-}
-
-// AddError records an error (for summary at end).
-func (o *Operation) AddError(msg string) {
-	o.errors = append(o.errors, msg)
-}
-
-// AddWarning records a warning (for summary at end).
-func (o *Operation) AddWarning(msg string) {
-	o.warnings = append(o.warnings, msg)
-}
-
-// HasErrors returns true if any errors were recorded.
-func (o *Operation) HasErrors() bool {
-	return len(o.errors) > 0
-}
-
-// HasWarnings returns true if any warnings were recorded.
-func (o *Operation) HasWarnings() bool {
-	return len(o.warnings) > 0
-}
-
-// Summary prints a summary of the operation outcome.
-func (o *Operation) Summary() {
-	p := Progress()
-
-	if len(o.errors) > 0 {
-		p.Error(fmt.Sprintf("%s completed with %d error(s)", o.name, len(o.errors)))
-		for _, e := range o.errors {
-			fmt.Printf("  - %s\n", e)
-		}
-	} else if len(o.warnings) > 0 {
-		p.Warning(fmt.Sprintf("%s completed with %d warning(s)", o.name, len(o.warnings)))
-		for _, w := range o.warnings {
-			fmt.Printf("  - %s\n", w)
-		}
-	} else {
-		p.Success(fmt.Sprintf("%s completed successfully", o.name))
-	}
-}
-
-// FormatStepList formats a list of step names for display.
-func FormatStepList(steps []string) string {
-	if len(steps) == 0 {
-		return ""
-	}
-	var lines []string
-	for i, step := range steps {
-		lines = append(lines, fmt.Sprintf("%d. %s", i+1, step))
-	}
-	return strings.Join(lines, "\n")
-}

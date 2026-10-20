@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -24,83 +23,69 @@ func pidmapLogger() *slog.Logger {
 
 // PaneIdentity represents a pane's identity for attribution.
 type PaneIdentity struct {
-	Session   string         // Session name
-	PaneIndex int            // Pane index within session
-	PaneTitle string         // Full pane title (e.g., "myproject__cc_1")
-	AgentType tmux.AgentType // Parsed agent type
-	NTMIndex  int            // NTM-specific index (e.g., 1 for cc_1)
+	PaneID      string         // Durable tmux identity; titles are not unique
+	PanePID     int            // Root process; also retained on child attribution
+	WindowIndex int            // Physical window containing PaneIndex
+	Session     string         // Session name
+	PaneIndex   int            // Pane index within session
+	PaneTitle   string         // Full pane title (e.g., "myproject__cc_1")
+	AgentType   tmux.AgentType // Parsed agent type
+	NTMIndex    int            // NTM-specific index (e.g., 1 for cc_1)
 }
 
-// String returns a readable representation of the pane identity.
+// String prefers the durable tmux ID. Titles are a readable fallback for
+// synthetic identities that have no tmux ID, never the production join key.
 func (p PaneIdentity) String() string {
+	if p.PaneID != "" {
+		return p.PaneID
+	}
 	if p.PaneTitle != "" {
 		return p.PaneTitle
 	}
 	return fmt.Sprintf("%s:%d", p.Session, p.PaneIndex)
 }
 
-// PIDMap maintains bidirectional mappings between PIDs and pane identities.
-// It tracks both shell PIDs and their child processes to enable attribution
-// of any process to its originating pane.
+// PIDMap attributes any process (a pane's shell or one of its children) to
+// the pane it runs in.
 type PIDMap struct {
 	mu sync.RWMutex
-
-	// paneToShellPID maps pane identity to its shell PID
-	paneToShellPID map[string]int // paneTitle -> shell PID
 
 	// pidToPane maps any PID (shell or child) to its pane identity
 	pidToPane map[int]*PaneIdentity
 
-	// shellToChildren maps shell PIDs to their child PIDs
-	shellToChildren map[int][]int
-
 	// session to watch (empty means all sessions)
 	session string
-
-	// lastRefresh records when the map was last updated
-	lastRefresh time.Time
 }
 
 // NewPIDMap creates a new PID map for the specified session.
 // If session is empty, it tracks all NTM sessions.
 func NewPIDMap(session string) *PIDMap {
 	return &PIDMap{
-		paneToShellPID:  make(map[string]int),
-		pidToPane:       make(map[int]*PaneIdentity),
-		shellToChildren: make(map[int][]int),
-		session:         session,
+		pidToPane: make(map[int]*PaneIdentity),
+		session:   session,
 	}
 }
 
-// Refresh updates all PID mappings by querying tmux and /proc.
-// This should be called periodically or before queries to ensure accuracy.
-func (m *PIDMap) Refresh() error {
-	return m.RefreshContext(context.Background())
-}
-
-// RefreshContext updates all PID mappings with cancellation support.
+// RefreshContext rebuilds the PID mappings from tmux and /proc, with
+// cancellation support. Call it before queries to keep attribution current.
 func (m *PIDMap) RefreshContext(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Clear existing mappings
-	m.paneToShellPID = make(map[string]int)
 	m.pidToPane = make(map[int]*PaneIdentity)
-	m.shellToChildren = make(map[int][]int)
+	paneCount := 0
 
 	var sessions []tmux.Session
 	var err error
 
 	if m.session != "" {
-		// Get specific session
-		sess, err := tmux.GetSession(m.session)
-		if err != nil {
-			return fmt.Errorf("failed to get session %s: %w", m.session, err)
-		}
-		sessions = []tmux.Session{*sess}
+		// GetPanesContext below validates the named session. Avoid GetSession:
+		// its context-free subprocess can outlive a one-shot reader's budget.
+		sessions = []tmux.Session{{Name: m.session}}
 	} else {
 		// Get all sessions
-		sessions, err = tmux.ListSessions()
+		sessions, err = tmux.ListSessionsContext(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to list sessions: %w", err)
 		}
@@ -115,31 +100,28 @@ func (m *PIDMap) RefreshContext(ctx context.Context) error {
 
 		panes, err := tmux.GetPanesContext(ctx, sess.Name)
 		if err != nil {
-			pidmapLogger().Warn("failed to get panes for session",
-				"session", sess.Name,
-				"error", err,
-			)
-			continue
+			return fmt.Errorf("failed to get panes for session %s: %w", sess.Name, err)
 		}
 
 		for _, pane := range panes {
-			if pane.PID <= 0 {
+			if pane.PID <= 0 || pane.Dead || pane.IsServicePane() {
 				continue
 			}
 
 			identity := &PaneIdentity{
-				Session:   sess.Name,
-				PaneIndex: pane.Index,
-				PaneTitle: pane.Title,
-				AgentType: pane.Type,
-				NTMIndex:  pane.NTMIndex,
+				PaneID:      pane.ID,
+				PanePID:     pane.PID,
+				WindowIndex: pane.WindowIndex,
+				Session:     sess.Name,
+				PaneIndex:   pane.Index,
+				PaneTitle:   pane.Title,
+				AgentType:   pane.Type,
+				NTMIndex:    pane.NTMIndex,
 			}
-
-			// Map pane to shell PID
-			m.paneToShellPID[pane.Title] = pane.PID
 
 			// Map shell PID to pane
 			m.pidToPane[pane.PID] = identity
+			paneCount++
 
 			// Discover and map child processes
 			children, err := getChildPIDs(pane.PID)
@@ -152,7 +134,6 @@ func (m *PIDMap) RefreshContext(ctx context.Context) error {
 				continue
 			}
 
-			m.shellToChildren[pane.PID] = children
 			for _, childPID := range children {
 				m.pidToPane[childPID] = identity
 			}
@@ -165,9 +146,9 @@ func (m *PIDMap) RefreshContext(ctx context.Context) error {
 		}
 	}
 
-	m.lastRefresh = time.Now()
-	pidmapLogger().Info("refreshed PID map",
-		"pane_count", len(m.paneToShellPID),
+	// Routine per-poll success; the dashboard refreshes this every second.
+	pidmapLogger().Debug("refreshed PID map",
+		"pane_count", paneCount,
 		"total_pids", len(m.pidToPane),
 	)
 
@@ -182,31 +163,8 @@ func (m *PIDMap) GetPaneForPID(pid int) *PaneIdentity {
 	return m.pidToPane[pid]
 }
 
-// GetShellPID returns the shell PID for a pane title.
-// Returns 0 if the pane is not known.
-func (m *PIDMap) GetShellPID(paneTitle string) int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.paneToShellPID[paneTitle]
-}
-
-// GetAllPIDsForPane returns all PIDs (shell + children) for a pane.
-func (m *PIDMap) GetAllPIDsForPane(paneTitle string) []int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	shellPID, ok := m.paneToShellPID[paneTitle]
-	if !ok {
-		return nil
-	}
-
-	result := []int{shellPID}
-	result = append(result, m.shellToChildren[shellPID]...)
-	return result
-}
-
 // GetPIDLabels returns a map of PID to label string for use with rano.
-// The label format is: "session:paneTitle" or just "paneTitle" if unambiguous.
+// Live mappings use durable pane IDs so retitled or same-titled panes stay distinct.
 func (m *PIDMap) GetPIDLabels() map[int]string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -216,53 +174,6 @@ func (m *PIDMap) GetPIDLabels() map[int]string {
 		labels[pid] = identity.String()
 	}
 	return labels
-}
-
-// LastRefresh returns when the map was last refreshed.
-func (m *PIDMap) LastRefresh() time.Time {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.lastRefresh
-}
-
-// Stats returns statistics about the current PID map.
-type Stats struct {
-	PaneCount     int            `json:"pane_count"`
-	TotalPIDCount int            `json:"total_pid_count"`
-	ShellPIDCount int            `json:"shell_pid_count"`
-	ChildPIDCount int            `json:"child_pid_count"`
-	LastRefresh   time.Time      `json:"last_refresh"`
-	Session       string         `json:"session,omitempty"`
-	ByAgentType   map[string]int `json:"by_agent_type,omitempty"`
-}
-
-// GetStats returns statistics about the current PID map.
-func (m *PIDMap) GetStats() Stats {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	byAgentType := make(map[string]int)
-	for _, identity := range m.pidToPane {
-		if identity.AgentType != "" {
-			byAgentType[string(identity.AgentType)]++
-		}
-	}
-
-	shellCount := len(m.paneToShellPID)
-	childCount := 0
-	for _, children := range m.shellToChildren {
-		childCount += len(children)
-	}
-
-	return Stats{
-		PaneCount:     len(m.paneToShellPID),
-		TotalPIDCount: len(m.pidToPane),
-		ShellPIDCount: shellCount,
-		ChildPIDCount: childCount,
-		LastRefresh:   m.lastRefresh,
-		Session:       m.session,
-		ByAgentType:   byAgentType,
-	}
 }
 
 // getChildPIDs returns all child PIDs for a given parent PID.
@@ -360,25 +271,3 @@ var (
 	globalPIDMapOnce sync.Once
 	globalPIDMapMu   sync.RWMutex
 )
-
-// GetGlobalPIDMap returns the global PID map singleton.
-// It tracks all sessions by default.
-func GetGlobalPIDMap() *PIDMap {
-	globalPIDMapOnce.Do(func() {
-		globalPIDMap = NewPIDMap("")
-	})
-	return globalPIDMap
-}
-
-// GetGlobalPIDMapForSession returns or creates a global PID map for a specific session.
-func GetGlobalPIDMapForSession(session string) *PIDMap {
-	globalPIDMapMu.Lock()
-	defer globalPIDMapMu.Unlock()
-
-	if globalPIDMap != nil && globalPIDMap.session == session {
-		return globalPIDMap
-	}
-
-	globalPIDMap = NewPIDMap(session)
-	return globalPIDMap
-}

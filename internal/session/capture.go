@@ -2,8 +2,11 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +70,15 @@ func Capture(sessionName string) (state *SessionState, err error) {
 	// Map topology immediately, then sample resumable provider bindings in the
 	// background while the remaining session metadata is collected.
 	paneStates := mapPaneStates(panes, cwd)
+	if err := capturePaneLaunchState(context.Background(), paneStates); err != nil {
+		return nil, err
+	}
+	// Discovery can outlive its deadline while a provider finishes a filesystem
+	// read. Keep its inputs separate from the states enriched after that deadline.
+	paneWorkDirs := make(map[string]string, len(paneStates))
+	for _, pane := range paneStates {
+		paneWorkDirs[pane.PaneID] = pane.WorkDir
+	}
 	bindingObservedAt := time.Now().UTC()
 	bindingCtx, cancelBindings := context.WithTimeout(context.Background(), paneSessionBindingTimeout)
 	defer cancelBindings()
@@ -79,7 +91,12 @@ func Capture(sessionName string) (state *SessionState, err error) {
 				cwd,
 				bindingObservedAt,
 				agentsession.NewDiscoverer(),
-				paneCurrentPathContext,
+				func(_ context.Context, paneID string) string {
+					if directory := paneWorkDirs[paneID]; directory != "" {
+						return directory
+					}
+					return cwd
+				},
 			)
 		}()
 	} else {
@@ -94,6 +111,9 @@ func Capture(sessionName string) (state *SessionState, err error) {
 	windows := captureWindows(sessionName)
 	bindings := awaitPaneSessionBindings(bindingCtx, bindingResults, panes, bindingObservedAt)
 	applyPaneSessionBindings(paneStates, bindings)
+	if err := verifyCapturedPanes(context.Background(), sessionName, panes, paneStates); err != nil {
+		return nil, err
+	}
 
 	// Parse session creation time (tmux format varies, try common formats)
 	var createdAt time.Time
@@ -142,7 +162,7 @@ func captureWindows(sessionName string) []WindowState {
 	sep := tmux.FieldSeparator
 	format := "#{window_index}" + sep + "#{window_name}" + sep +
 		"#{window_active}" + sep + "#{window_zoomed_flag}" + sep + "#{window_layout}"
-	output, err := tmux.DefaultClient.Run("list-windows", "-t", sessionName, "-F", format)
+	output, err := tmux.DefaultClient.Run("list-windows", "-t", tmux.TargetSession(sessionName), "-F", format)
 	if err != nil {
 		return nil
 	}
@@ -207,6 +227,8 @@ func countAgents(panes []tmux.Pane) AgentConfig {
 			config.Aider++
 		case tmux.AgentOpencode:
 			config.Opencode++
+		case tmux.AgentOmp:
+			config.Omp++
 		case tmux.AgentOllama:
 			config.Ollama++
 		case tmux.AgentUser:
@@ -234,6 +256,74 @@ func mapPaneStates(panes []tmux.Pane, _ string) []PaneState {
 		}
 	}
 	return states
+}
+
+// A missing option identifies a legacy pane. A present but unreadable launch
+// record must fail capture rather than turn exact recovery into a default launch.
+// Read each pane's cwd once, and use that same directory for transcript discovery.
+func capturePaneLaunchState(ctx context.Context, states []PaneState) error {
+	for i := range states {
+		pane := &states[i]
+		cwd, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", pane.PaneID, "#{pane_current_path}")
+		if err != nil {
+			return fmt.Errorf("capturing pane %d.%d working directory: %w", pane.WindowIndex, pane.Index, err)
+		}
+		pane.WorkDir = strings.TrimSpace(cwd)
+		if !filepath.IsAbs(pane.WorkDir) {
+			return fmt.Errorf("capturing pane %d.%d: working directory is not absolute", pane.WindowIndex, pane.Index)
+		}
+		agentType := tmux.ParsePaneAgentTypeOption(pane.AgentType)
+		pane.LaunchSpec = nil
+		if agentType == tmux.AgentUser || agentType == tmux.AgentUnknown {
+			continue
+		}
+		spec, err := tmux.ReadPaneLaunchSpecContext(ctx, pane.PaneID)
+		if err != nil {
+			return fmt.Errorf("capturing pane %d.%d launch settings: %w", pane.WindowIndex, pane.Index, err)
+		}
+		if spec == nil {
+			continue
+		}
+		if err := spec.Validate(agentType); err != nil {
+			return fmt.Errorf("capturing pane %d.%d launch settings: %w", pane.WindowIndex, pane.Index, err)
+		}
+		pane.LaunchSpec = spec
+		pane.Command = spec.Command
+		pane.Model = spec.Model
+	}
+	return nil
+}
+
+// A save must describe one observed pane generation. A concurrent restart can
+// otherwise combine an old transcript binding with a new command or account.
+func verifyCapturedPanes(ctx context.Context, sessionName string, original []tmux.Pane, states []PaneState) error {
+	current, err := tmux.GetPanesContext(ctx, sessionName)
+	if err != nil {
+		return fmt.Errorf("verifying saved pane generation: %w", err)
+	}
+	if len(current) != len(original) {
+		return fmt.Errorf("session panes changed during capture; retry saving")
+	}
+	byID := make(map[string]tmux.Pane, len(current))
+	for _, pane := range current {
+		byID[pane.ID] = pane
+	}
+	for _, pane := range original {
+		live, ok := byID[pane.ID]
+		if !ok || live.PID != pane.PID || live.Type != pane.Type || live.Index != pane.Index || live.WindowIndex != pane.WindowIndex {
+			return fmt.Errorf("pane %s changed during capture; retry saving", pane.ID)
+		}
+	}
+	rechecked := append([]PaneState(nil), states...)
+	if err := capturePaneLaunchState(ctx, rechecked); err != nil {
+		return err
+	}
+	for i, pane := range states {
+		if pane.WorkDir != rechecked[i].WorkDir || !reflect.DeepEqual(pane.LaunchSpec, rechecked[i].LaunchSpec) {
+			return fmt.Errorf("pane %s launch settings or directory changed during capture; retry saving", pane.PaneID)
+		}
+	}
+	return nil
 }
 
 func hasResumablePane(panes []tmux.Pane) bool {
@@ -335,26 +425,12 @@ func applyPaneSessionBindings(states []PaneState, bindings []agentsession.Bindin
 	}
 }
 
-// paneCurrentPath reads a single pane's current working directory via tmux.
-// Returns "" on any failure.
-func paneCurrentPath(paneID string) string {
-	return paneCurrentPathContext(context.Background(), paneID)
-}
-
-func paneCurrentPathContext(ctx context.Context, paneID string) string {
-	output, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-t", paneID, "-p", "#{pane_current_path}")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(output)
-}
-
 // detectWorkDir attempts to detect the working directory for the session.
 func detectWorkDir(sessionName string, panes []tmux.Pane) string {
 	// Try to get the active pane's current path via tmux
 	for _, p := range panes {
 		if p.Active {
-			output, err := tmux.DefaultClient.Run("display-message", "-t", p.ID, "-p", "#{pane_current_path}")
+			output, err := tmux.DefaultClient.Run("display-message", "-t", tmux.ExactTarget(p.ID), "-p", "#{pane_current_path}")
 			if err == nil && len(output) > 0 {
 				path := strings.TrimSpace(output)
 				if path != "" {
@@ -367,7 +443,7 @@ func detectWorkDir(sessionName string, panes []tmux.Pane) string {
 
 	// Fallback: try the first pane if no active pane or it failed
 	if len(panes) > 0 {
-		output, err := tmux.DefaultClient.Run("display-message", "-t", panes[0].ID, "-p", "#{pane_current_path}")
+		output, err := tmux.DefaultClient.Run("display-message", "-t", tmux.ExactTarget(panes[0].ID), "-p", "#{pane_current_path}")
 		if err == nil && len(output) > 0 {
 			path := strings.TrimSpace(output)
 			if path != "" {
@@ -419,11 +495,14 @@ func runGitInfoCommand(dir string, timeout time.Duration, args ...string) string
 
 // getLayout gets the current tmux layout for the session.
 func getLayout(sessionName string) string {
-	output, err := tmux.DefaultClient.Run("display-message", "-t", sessionName, "-p", "#{window_layout}")
-	if err != nil {
+	// Pane-qualified exact target: the bare `=name` form yields empty output
+	// from `display-message -p` on tmux 3.4/3.6a (ntm#310).
+	output, err := tmux.DefaultClient.Run("display-message", "-t", tmux.SessionPaneTarget(sessionName), "-p", "#{window_layout}")
+	layout := strings.TrimSpace(output)
+	if err != nil || layout == "" {
 		return "tiled" // Default fallback
 	}
 	// Return the layout string as-is. tmux select-layout accepts both
 	// named layouts (tiled, even-horizontal) and serialized geometry strings.
-	return strings.TrimSpace(output)
+	return layout
 }

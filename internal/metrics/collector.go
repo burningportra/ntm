@@ -7,27 +7,39 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	"github.com/Dicklesworthstone/ntm/internal/tracker"
 )
 
-// Collector tracks success metrics for NTM orchestration.
-// It subscribes to the event bus and persists metrics to the state store.
+// FileConflictWindow is how far back a report counts file conflicts. It matches
+// the default window of `ntm conflicts` so the two agree.
+const FileConflictWindow = 24 * time.Hour
+
+// countFileConflicts is the conflict source, injectable for tests.
+var countFileConflicts = func(session string) int64 {
+	return int64(len(tracker.ConflictsSince(time.Now().Add(-FileConflictWindow), session)))
+}
+
+// Collector tracks success metrics for NTM orchestration and persists them to
+// the state store.
 type Collector struct {
-	store       *state.Store
-	sessionID   string
-	mu          sync.RWMutex
-	unsubscribe events.UnsubscribeFunc
+	store     *state.Store
+	sessionID string
+	mu        sync.RWMutex
 
 	// In-memory counters for fast access
 	apiCalls        map[string]int64 // tool:operation -> count
 	latencies       map[string][]float64
 	blockedCommands int64
-	fileConflicts   int64
+	// No fileConflicts counter: nothing ever incremented the one that used to
+	// live here, so the metric and its Tier-0 target reported a clean 0 for
+	// every session. GenerateReport counts from the tracker instead, which
+	// keeps one source of truth rather than a copy that must be maintained.
 }
 
 // NewCollector creates a new metrics collector for the given session.
@@ -38,61 +50,14 @@ func NewCollector(store *state.Store, sessionID string) *Collector {
 		apiCalls:  make(map[string]int64),
 		latencies: make(map[string][]float64),
 	}
-	c.subscribeToEvents()
 	return c
 }
 
-// subscribeToEvents registers handlers for relevant events.
-func (c *Collector) subscribeToEvents() {
-	c.unsubscribe = events.SubscribeAll(func(e events.BusEvent) {
-		switch evt := e.(type) {
-		case events.AgentErrorEvent:
-			if evt.ErrorType == "blocked_command" {
-				c.RecordBlockedCommand(evt.AgentID, evt.Message, "policy")
-			}
-		}
-	})
-}
-
-// Close releases resources and unsubscribes from events.
-func (c *Collector) Close() {
-	if c.unsubscribe != nil {
-		c.unsubscribe()
-	}
-}
-
-// RecordAPICall records an API call for a tool and operation.
-func (c *Collector) RecordAPICall(tool, operation string) {
-	c.mu.Lock()
-	key := fmt.Sprintf("%s:%s", tool, operation)
-	c.apiCalls[key]++
-	c.mu.Unlock()
-
-	// Persist to database
-	if c.store != nil {
-		c.upsertCounter("api_call", tool, operation)
-	}
-}
-
-// RecordLatency records a latency measurement for an operation.
-func (c *Collector) RecordLatency(operation string, duration time.Duration) {
-	ms := float64(duration.Nanoseconds()) / 1e6
-
-	c.mu.Lock()
-	c.latencies[operation] = append(c.latencies[operation], ms)
-	// Keep only last 1000 samples per operation
-	if len(c.latencies[operation]) > 1000 {
-		c.latencies[operation] = c.latencies[operation][1:]
-	}
-	c.mu.Unlock()
-
-	// Persist to database
-	if c.store != nil {
-		c.insertLatency(operation, ms)
-	}
-}
-
-// RecordBlockedCommand records a blocked command event.
+// RecordBlockedCommand records a blocked command event. Its producers are the
+// dcg check on the send path (cli recordBlockedCommandMetric) and refusals by
+// the installed safety hooks (cli recordHookRefusal); the event-bus
+// subscription that used to feed it listened for an event nothing published,
+// so destructive_cmd_incidents stayed at zero for every session.
 func (c *Collector) RecordBlockedCommand(agentID, command, reason string) {
 	c.mu.Lock()
 	c.blockedCommands++
@@ -101,18 +66,6 @@ func (c *Collector) RecordBlockedCommand(agentID, command, reason string) {
 	// Persist to database
 	if c.store != nil {
 		c.insertBlockedCommand(agentID, command, reason)
-	}
-}
-
-// RecordFileConflict records a file reservation conflict.
-func (c *Collector) RecordFileConflict(requestingAgent, holdingAgent, pathPattern string) {
-	c.mu.Lock()
-	c.fileConflicts++
-	c.mu.Unlock()
-
-	// Persist to database
-	if c.store != nil {
-		c.insertFileConflict(requestingAgent, holdingAgent, pathPattern)
 	}
 }
 
@@ -190,35 +143,52 @@ func (c *Collector) GenerateReport() (*MetricsReport, error) {
 		report.LatencyStats[op] = calculateLatencyStats(samples)
 	}
 
+	// Prefer the persisted count. `ntm metrics` builds a Collector and reports
+	// immediately, so the in-memory counter is whatever this process happened to
+	// observe — zero, for a one-shot command — which made
+	// destructive_cmd_incidents report a green "met" for every session while
+	// the blocked_commands rows sat in the database unread. The counter remains
+	// the fallback for a collector with no store.
 	report.BlockedCommands = c.blockedCommands
-	report.FileConflicts = c.fileConflicts
+	if persisted, ok := c.persistedBlockedCommands(); ok {
+		report.BlockedCommands = persisted
+	}
 
-	// Generate target comparisons
-	report.TargetComparison = c.generateTargetComparisons()
+	// Counted from the tracker rather than from a counter of our own. Nothing
+	// ever incremented c.fileConflicts, so this metric — and the Tier-0
+	// file_conflicts target built on it — reported 0 and a green "met" for every
+	// session regardless of what the agents did. A safety target that cannot
+	// fail is worse than an absent one.
+	report.FileConflicts = countFileConflicts(c.sessionID)
+
+	// Generate target comparisons from the resolved report values, not from the
+	// in-memory counters: the counters are what made both Tier-0 targets report
+	// a green "met" for every session.
+	report.TargetComparison = c.generateTargetComparisons(report.BlockedCommands, report.FileConflicts)
 
 	return report, nil
 }
 
 // generateTargetComparisons compares current metrics against targets.
-func (c *Collector) generateTargetComparisons() []TargetComparison {
+func (c *Collector) generateTargetComparisons(blockedCommands, fileConflicts int64) []TargetComparison {
 	comparisons := make([]TargetComparison, 0)
 
 	// Blocked commands
 	comparisons = append(comparisons, TargetComparison{
 		Metric:   "destructive_cmd_incidents",
-		Current:  float64(c.blockedCommands),
+		Current:  float64(blockedCommands),
 		Target:   Tier0Targets["destructive_cmd_incidents"],
 		Baseline: Tier0Baselines["destructive_cmd_incidents"],
-		Status:   getTargetStatus(float64(c.blockedCommands), Tier0Targets["destructive_cmd_incidents"], true),
+		Status:   getTargetStatus(float64(blockedCommands), Tier0Targets["destructive_cmd_incidents"], true),
 	})
 
 	// File conflicts
 	comparisons = append(comparisons, TargetComparison{
 		Metric:   "file_conflicts",
-		Current:  float64(c.fileConflicts),
+		Current:  float64(fileConflicts),
 		Target:   Tier0Targets["file_conflicts"],
 		Baseline: Tier0Baselines["file_conflicts"],
-		Status:   getTargetStatus(float64(c.fileConflicts), Tier0Targets["file_conflicts"], true),
+		Status:   getTargetStatus(float64(fileConflicts), Tier0Targets["file_conflicts"], true),
 	})
 
 	// CM query latency
@@ -341,6 +311,55 @@ func (c *Collector) LoadSnapshot(name string) (*MetricsReport, error) {
 	return &report, nil
 }
 
+// SnapshotInfo describes one saved metrics snapshot row (metadata only,
+// without the JSON metrics blob).
+type SnapshotInfo struct {
+	ID        int64     `json:"id"`
+	SessionID string    `json:"session_id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ListSnapshots returns the saved snapshots for this collector's session,
+// ordered oldest-first (created_at, then id for same-timestamp ties).
+// Returns an empty (non-nil) slice when no snapshots exist.
+func (c *Collector) ListSnapshots() ([]SnapshotInfo, error) {
+	if c.store == nil {
+		return nil, fmt.Errorf("no store configured")
+	}
+
+	snapshots := make([]SnapshotInfo, 0)
+
+	db := c.getDB()
+	if db == nil {
+		return nil, fmt.Errorf("no database connection")
+	}
+
+	rows, err := db.Query(`
+		SELECT id, COALESCE(session_id, ''), snapshot_name, created_at
+		FROM metric_snapshots
+		WHERE session_id = ?
+		ORDER BY created_at ASC, id ASC`,
+		c.sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("query snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var info SnapshotInfo
+		if err := rows.Scan(&info.ID, &info.SessionID, &info.Name, &info.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan snapshot row: %w", err)
+		}
+		snapshots = append(snapshots, info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshot rows: %w", err)
+	}
+
+	return snapshots, nil
+}
+
 // CompareSnapshots compares two snapshots and returns the differences.
 func (c *Collector) CompareSnapshots(baseline, current *MetricsReport) *ComparisonResult {
 	if baseline == nil || current == nil {
@@ -406,55 +425,40 @@ type ComparisonResult struct {
 
 // Database helper methods
 
-func (c *Collector) upsertCounter(metricName, tool, operation string) {
-	// Use raw SQL since state.Store doesn't have metrics methods yet
-	db := c.getDB()
-	if db == nil {
-		return
-	}
-
-	_, _ = db.Exec(`
-		INSERT INTO metric_counters (session_id, metric_name, tool, operation, count, updated_at)
-		VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
-		ON CONFLICT(session_id, metric_name, COALESCE(tool, ''), COALESCE(operation, ''))
-		DO UPDATE SET count = count + 1, updated_at = CURRENT_TIMESTAMP`,
-		c.sessionID, metricName, tool, operation)
-}
-
-func (c *Collector) insertLatency(operation string, durationMs float64) {
-	db := c.getDB()
-	if db == nil {
-		return
-	}
-
-	_, _ = db.Exec(`
-		INSERT INTO metric_latencies (session_id, operation, duration_ms)
-		VALUES (?, ?, ?)`,
-		c.sessionID, operation, durationMs)
-}
-
 func (c *Collector) insertBlockedCommand(agentID, command, reason string) {
 	db := c.getDB()
 	if db == nil {
 		return
 	}
 
-	_, _ = db.Exec(`
+	if _, err := db.Exec(`
 		INSERT INTO blocked_commands (session_id, agent_id, command, reason)
 		VALUES (?, ?, ?, ?)`,
-		c.sessionID, agentID, command, reason)
+		c.sessionID, agentID, command, reason); err != nil {
+		// A blocked command is a safety event. Losing one silently is how a
+		// metric ends up under-reporting the incidents it exists to count.
+		log.Printf("metrics: recording blocked command for session %s: %v", c.sessionID, err)
+	}
 }
 
-func (c *Collector) insertFileConflict(requestingAgent, holdingAgent, pathPattern string) {
+// persistedBlockedCommands returns the blocked-command count recorded for this
+// session, and whether the database could answer.
+//
+// A false return means "unknown" — the caller keeps its in-memory count rather
+// than reporting a zero it did not measure.
+func (c *Collector) persistedBlockedCommands() (int64, bool) {
 	db := c.getDB()
 	if db == nil {
-		return
+		return 0, false
 	}
-
-	_, _ = db.Exec(`
-		INSERT INTO file_conflicts (session_id, requesting_agent_id, holding_agent_id, path_pattern)
-		VALUES (?, ?, ?, ?)`,
-		c.sessionID, requestingAgent, holdingAgent, pathPattern)
+	var count int64
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM blocked_commands WHERE session_id = ?`,
+		c.sessionID).Scan(&count); err != nil {
+		log.Printf("metrics: counting blocked commands for session %s: %v", c.sessionID, err)
+		return 0, false
+	}
+	return count, true
 }
 
 func (c *Collector) insertSnapshot(name, data string) error {
@@ -490,16 +494,20 @@ func (c *Collector) querySnapshot(name string) (string, error) {
 
 // getDB returns the underlying database connection.
 // This is a workaround until state.Store exposes metrics methods.
+// getDB returns the metrics connection, or nil when storage is unavailable.
+//
+// The nil check is on the concrete pointer, not an interface assertion. A nil
+// *state.Store wrapped in an interface is not a nil interface: the assertion
+// this used to do succeeded, called DB() on the nil receiver and dereferenced
+// nil. getMetricsCollector constructs exactly that — NewCollector(nil, id) when
+// the state store cannot be opened — so a blocked-command event on a machine
+// with an unreadable state.db crashed the process instead of quietly skipping
+// persistence.
 func (c *Collector) getDB() *sql.DB {
-	// Use reflection or interface assertion if needed
-	// For now, we'll use type assertion assuming Store exposes DB()
-	type dbGetter interface {
-		DB() *sql.DB
+	if c.store == nil {
+		return nil
 	}
-	if getter, ok := interface{}(c.store).(dbGetter); ok {
-		return getter.DB()
-	}
-	return nil
+	return c.store.DB()
 }
 
 // Export formats for CLI commands

@@ -1,0 +1,10 @@
+# ci/allowlists/placebo.txt — G5 placebo lint allowlist (bd-ws0-guards-klz98.6)
+# Format: <entry>\t<bead-id>\t<reason>  (see ci/allowlists/README.md)
+# Entry = repo-relative file path carrying one or more inline `placebo-waiver: <bead-id>`
+# lines for that bead. Consumed by scripts/guards/placebo_lint.sh (ratchet both directions:
+# an inline waiver pair absent here fails; a line here with no surviving inline waiver is stale).
+#
+# Register-known seeds (each burned by its own fix bead):
+# (D5 executeJob simulator line burned by bd-ws3-contract-breadth-psvyu.5.2 — simulator deleted, real dispatcher in jobs_dispatch.go)
+#
+# Remaining pre-existing hits, each re-tagged to a specific fix bead by the bd-d7z7i triage:

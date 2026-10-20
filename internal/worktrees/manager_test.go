@@ -733,7 +733,7 @@ func TestCleanup_DoesNotRemoveOtherSessionWorktrees(t *testing.T) {
 		t.Fatalf("beta ListWorktrees after alpha cleanup: %v", err)
 	}
 	if len(betaWorktrees) != 1 {
-		t.Fatalf("expected beta worktree to survive alpha cleanup, got %d entries", len(betaWorktrees))
+		t.Fatalf("expected beta worktree to survive alpha cleanup, got %d", len(betaWorktrees))
 	}
 }
 
@@ -945,27 +945,22 @@ func TestRemoveWorktree_NonExistent(t *testing.T) {
 }
 
 func TestRemoveWorktreeReportsFailedBranchDeletion(t *testing.T) {
-	fakeBin := t.TempDir()
-	script := `#!/bin/sh
-case "$1 $2" in
-  "worktree remove") exit 0 ;;
-  "branch -D") echo "branch deletion refused" >&2; exit 1 ;;
-  "show-ref --verify") exit 0 ;;
-  *) echo "unexpected git invocation: $*" >&2; exit 99 ;;
-esac
-`
-	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake git: %v", err)
-	}
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	err := NewManager(t.TempDir(), "test-sess").RemoveWorktree(t.Context(), "agent-1")
+	manager, info := removalFixture(t)
+	removalWrapper(t, `if [ "$1 $2" = "branch -D" ]; then
+  echo "branch deletion refused" >&2
+  exit 1
+fi`)
+	err := manager.RemoveWorktree(context.Background(), info.AgentName)
 	if err == nil {
 		t.Fatal("RemoveWorktree() succeeded after branch deletion failed")
 	}
-	if !strings.Contains(err.Error(), "delete worktree branch ntm/test-sess/agent-1") {
+	if !strings.Contains(err.Error(), "delete worktree branch "+info.BranchName) {
 		t.Fatalf("RemoveWorktree() error = %v, want branch deletion failure", err)
 	}
+	if _, err := os.Lstat(info.Path); !os.IsNotExist(err) {
+		t.Fatalf("test did not reach branch cleanup after real checkout removal: %v", err)
+	}
+	removalGit(t, manager.projectPath, "show-ref", "--verify", "refs/heads/"+info.BranchName)
 }
 
 func TestRemoveWorktree_RejectsUnsafeAgentNameWithoutDeletingSiblingPath(t *testing.T) {
@@ -990,7 +985,7 @@ func TestRemoveWorktree_RejectsUnsafeAgentNameWithoutDeletingSiblingPath(t *test
 func TestRemoveWorktreeRefusesFallbackForUnregisteredDirectory(t *testing.T) {
 	t.Parallel()
 
-	projectDir := t.TempDir() // Intentionally not a Git repository.
+	projectDir := setupWorktreeGitRepo(t) // Directory below is not a registered worktree.
 	manager := NewManager(projectDir, "test-session")
 	worktreePath := manager.worktreePath("agent-1")
 	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
@@ -1001,7 +996,7 @@ func TestRemoveWorktreeRefusesFallbackForUnregisteredDirectory(t *testing.T) {
 		t.Fatalf("write marker: %v", err)
 	}
 
-	err := manager.RemoveWorktree(t.Context(), "agent-1")
+	err := manager.RemoveWorktree(context.Background(), "agent-1")
 	if err == nil || !strings.Contains(err.Error(), "refusing filesystem cleanup for unregistered worktree") {
 		t.Fatalf("RemoveWorktree() error = %v, want unregistered-worktree rejection", err)
 	}
@@ -1084,5 +1079,88 @@ func TestGetWorktreeForAgent_DoesNotTreatPrefixMatchedWorktreeAsValid(t *testing
 	}
 	if info.Error == "" {
 		t.Fatalf("expected prefix-matched fake worktree to be reported invalid, got %+v", info)
+	}
+}
+
+func TestSessionHasWorktrees(t *testing.T) {
+	t.Parallel()
+	projectDir := t.TempDir()
+
+	if SessionHasWorktrees(projectDir, "sess") {
+		t.Fatal("no worktree root yet: want false")
+	}
+	if SessionHasWorktrees("", "sess") || SessionHasWorktrees(projectDir, "") {
+		t.Fatal("empty inputs must report false")
+	}
+
+	root := filepath.Join(projectDir, ".ntm", "worktrees", "sess")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !SessionHasWorktrees(projectDir, "sess") {
+		t.Fatal("session worktree root exists: want true")
+	}
+	t.Logf("decision: the surviving worktree root is the previous-isolation-mode record used for transition detection (persists across ntm kill)")
+}
+
+// runWorktreeE2EGit runs a git command in dir for the merge round-trip test.
+func runWorktreeE2EGit(t *testing.T, dir string, args ...string) []byte {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
+	return out
+}
+
+// TestMergeBack_MasterDefaultRepo proves the worktree merge round-trip works
+// in a repo whose default branch is 'master' (bd-ws1-truth-safety-l5ddi.5):
+// before DefaultBranch(), MergeBack hardcoded `git checkout main` and was
+// unusable on master-default repos.
+func TestMergeBack_MasterDefaultRepo(t *testing.T) {
+	// Keep host-level init.defaultBranch out of the resolution chain.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+
+	tmp := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "master"},
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test"},
+		{"commit", "--allow-empty", "-m", "init"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmp
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Skipf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+
+	manager := NewManager(tmp, "merge-sess")
+	info, err := manager.CreateForAgent(t.Context(), "cc-1")
+	if err != nil {
+		t.Fatalf("CreateForAgent: %v", err)
+	}
+
+	// Commit agent work in the isolated worktree.
+	if err := os.WriteFile(filepath.Join(info.Path, "agent.txt"), []byte("agent work\n"), 0o644); err != nil {
+		t.Fatalf("write agent file: %v", err)
+	}
+	runWorktreeE2EGit(t, info.Path, "add", "agent.txt")
+	runWorktreeE2EGit(t, info.Path, "commit", "-m", "agent work")
+
+	if err := manager.MergeBack(t.Context(), "cc-1"); err != nil {
+		t.Fatalf("MergeBack: %v", err)
+	}
+
+	// The primary checkout must be on master with the agent's work merged.
+	branch := strings.TrimSpace(string(runWorktreeE2EGit(t, tmp, "rev-parse", "--abbrev-ref", "HEAD")))
+	if branch != "master" {
+		t.Fatalf("primary checkout on %q after merge, want master", branch)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "agent.txt")); err != nil {
+		t.Fatalf("agent work not merged into master: %v", err)
 	}
 }

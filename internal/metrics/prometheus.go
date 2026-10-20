@@ -57,9 +57,24 @@ func (r *MetricsReport) ExportPrometheus() string {
 	b.WriteString(fmt.Sprintf("ntm_blocked_commands_total{session=%q} %d\n", session, r.BlockedCommands))
 	b.WriteByte('\n')
 
-	// File conflicts gauge
-	b.WriteString("# HELP ntm_file_conflicts_total Total file reservation conflicts.\n")
-	b.WriteString("# TYPE ntm_file_conflicts_total counter\n")
+	// File conflicts. Declared a gauge, not a counter: this is the number of
+	// conflicts detected within the tracker's rolling window, so it falls as old
+	// conflicts age out. Exporting a decreasing series as a counter makes
+	// rate() read every decline as a counter reset and invent traffic that
+	// never happened.
+	//
+	// The _total suffix is kept deliberately, against Prometheus naming
+	// convention, so that existing dashboards and alerts keep resolving. The
+	// wrong type was the part that produced wrong numbers; the suffix only
+	// misleads a human reading the endpoint. Renaming it is a breaking change
+	// for scrapers and was declined.
+	//
+	// The HELP text also said "reservation conflicts". These are file *edit*
+	// conflicts from the tracker — two agents touching one path — which is a
+	// different thing from the reservation/lease conflicts in the
+	// file_conflicts table.
+	b.WriteString("# HELP ntm_file_conflicts_total Files edited by more than one agent within the tracker window (gauge; falls as conflicts age out).\n")
+	b.WriteString("# TYPE ntm_file_conflicts_total gauge\n")
 	b.WriteString(fmt.Sprintf("ntm_file_conflicts_total{session=%q} %d\n", session, r.FileConflicts))
 	b.WriteByte('\n')
 

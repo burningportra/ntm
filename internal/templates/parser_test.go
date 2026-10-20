@@ -4,6 +4,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -228,29 +230,100 @@ Focus on: {{focus}}
 	})
 }
 
-func TestExtractVariables(t *testing.T) {
-	body := `Hello {{name}}!
-{{#greet}}Greetings, {{person}}!{{/greet}}
-The {{adjective}} {{noun}}.`
-
-	vars := ExtractVariables(body)
-
-	expected := []string{"name", "person", "adjective", "noun", "greet"}
-	if len(vars) != len(expected) {
-		t.Errorf("len(vars) = %d, want %d", len(vars), len(expected))
+func TestTemplate_ExecuteRefusesUnresolvedPlaceholders(t *testing.T) {
+	tmpl := &Template{
+		Name: "roll_call",
+		Body: "Agent #{{agent_num}} ({{AGENT_TYPE}}) on {{BEAD_ID}}: {{TITLE}} via {{channel}}{{#extra}} {{extra}}{{/extra}}",
 	}
 
-	for _, e := range expected {
-		found := false
-		for _, v := range vars {
-			if v == e {
-				found = true
-				break
-			}
+	t.Run("lists every unresolved name canonically", func(t *testing.T) {
+		_, err := tmpl.Execute(ExecutionContext{})
+		var unresolved *UnresolvedVariablesError
+		if !errors.As(err, &unresolved) {
+			t.Fatalf("Execute error = %v, want *UnresolvedVariablesError", err)
 		}
-		if !found {
-			t.Errorf("Variable %q not found", e)
+		want := []string{"agent_num", "agent_type", "bead_id", "bead_title", "channel"}
+		if !reflect.DeepEqual(unresolved.Names, want) {
+			t.Fatalf("unresolved names = %v, want %v (aliases folded, sorted, conditional body skipped)", unresolved.Names, want)
 		}
+		if unresolved.Template != "roll_call" || !strings.Contains(err.Error(), `template "roll_call" has unresolved variable(s): agent_num, agent_type, bead_id, bead_title, channel`) {
+			t.Fatalf("error message = %q", err.Error())
+		}
+	})
+
+	t.Run("full context renders with aliases", func(t *testing.T) {
+		ctx := ExecutionContext{Variables: map[string]string{"channel": "mail"}}.
+			WithBead("bd-7", "Fix it", "", "", "", "").
+			WithAgent(3, "codex", "", "%12")
+		got, err := tmpl.Execute(ctx)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if want := "Agent #3 (codex) on bd-7: Fix it via mail"; got != want {
+			t.Fatalf("Execute = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("user-supplied canonical variable fills its alias", func(t *testing.T) {
+		ctx := ExecutionContext{Variables: map[string]string{
+			"channel": "mail", "bead_id": "bd-9", "bead_title": "Typed by hand",
+			"agent_num": "1", "agent_type": "claude",
+		}}
+		got, err := tmpl.Execute(ctx)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if want := "Agent #1 (claude) on bd-9: Typed by hand via mail"; got != want {
+			t.Fatalf("Execute = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("substituted values are neither checked nor re-expanded", func(t *testing.T) {
+		fileTmpl := &Template{Name: "review", Body: "Review:\n{{file}}"}
+		got, err := fileTmpl.Execute(ExecutionContext{FileContent: "<p>{{user_name}}</p>"})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if want := "Review:\n<p>{{user_name}}</p>"; got != want {
+			t.Fatalf("Execute = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestTemplate_ExecuteSharedDefersOnlyPaneContext(t *testing.T) {
+	tmpl := &Template{
+		Name: "assignment",
+		Body: "{{send_num}}/{{send_total}} Agent #{{AGENT_NUM}} ({{agent_type}}{{#agent_variant}}:{{agent_variant}}{{/agent_variant}}) pane {{agent_pane}} index {{send_index}}: {{bead_id}}",
+	}
+
+	shared, err := tmpl.ExecuteShared(ExecutionContext{}.WithBead("bd-3", "T", "", "", "", ""))
+	if err != nil {
+		t.Fatalf("ExecuteShared with bead context: %v", err)
+	}
+	if want := "{{send_num}}/{{send_total}} Agent #{{AGENT_NUM}} ({{agent_type}}) pane {{agent_pane}} index {{send_index}}: bd-3"; shared != want {
+		t.Fatalf("ExecuteShared = %q, want pane placeholders kept and bead filled: %q", shared, want)
+	}
+
+	_, err = tmpl.ExecuteShared(ExecutionContext{})
+	var unresolved *UnresolvedVariablesError
+	if !errors.As(err, &unresolved) || !reflect.DeepEqual(unresolved.Names, []string{"bead_id"}) {
+		t.Fatalf("ExecuteShared without bead error = %v, want only bead_id unresolved", err)
+	}
+
+	_, err = tmpl.Execute(ExecutionContext{}.WithBead("bd-3", "T", "", "", "", ""))
+	if !errors.As(err, &unresolved) || !reflect.DeepEqual(unresolved.Names, []string{"agent_num", "agent_pane", "agent_type", "send_index", "send_num", "send_total"}) {
+		t.Fatalf("Execute without pane context error = %v, want every pane variable unresolved", err)
+	}
+
+	perPane, err := tmpl.Execute(ExecutionContext{}.
+		WithBead("bd-3", "T", "", "", "", "").
+		WithAgent(2, "claude", "opus", "%5").
+		WithSendBatch(1, 4))
+	if err != nil {
+		t.Fatalf("Execute with pane context: %v", err)
+	}
+	if want := "2/4 Agent #2 (claude:opus) pane %5 index 1: bd-3"; perPane != want {
+		t.Fatalf("Execute = %q, want %q", perPane, want)
 	}
 }
 
@@ -271,7 +344,7 @@ func TestLoader_Load_ReturnsParseError(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	loader := NewLoaderWithProject(projectDir)
+	loader := newLoaderWithProjectForTest(projectDir)
 	_, err := loader.Load(name)
 	if err == nil {
 		t.Fatalf("Load(%q) expected error, got nil", name)
@@ -294,127 +367,6 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
-}
-
-func TestExpandMacros(t *testing.T) {
-	tests := []struct {
-		name        string
-		input       string
-		contains    []string
-		notContains []string
-	}{
-		{
-			name:        "underscore syntax",
-			input:       "Please follow @marching_orders",
-			contains:    []string{"Marching Orders", "{{BEAD_ID}}"},
-			notContains: []string{"@marching_orders"},
-		},
-		{
-			name:        "hyphen syntax",
-			input:       "Use @marching-orders for this task",
-			contains:    []string{"Marching Orders", "{{BEAD_ID}}"},
-			notContains: []string{"@marching-orders"},
-		},
-		{
-			name:        "self review macro",
-			input:       "Before completing: @self_review",
-			contains:    []string{"Self-Review", "Checklist"},
-			notContains: []string{"@self_review"},
-		},
-		{
-			name:     "multiple macros",
-			input:    "Start with @marching_orders then do @self_review",
-			contains: []string{"Marching Orders", "Self-Review"},
-		},
-		{
-			name:        "code_review macro",
-			input:       "Apply @code_review to this file",
-			contains:    []string{"Review the following code"},
-			notContains: []string{"@code_review"},
-		},
-		{
-			name:     "unknown macro unchanged",
-			input:    "Check @nonexistent_macro here",
-			contains: []string{"@nonexistent_macro"},
-		},
-		{
-			name:     "email address not expanded",
-			input:    "Contact user@example.com for help",
-			contains: []string{"user@example.com"},
-		},
-		{
-			name:     "no macros",
-			input:    "Plain text without macros",
-			contains: []string{"Plain text without macros"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ExpandMacros(tt.input)
-
-			for _, want := range tt.contains {
-				if !contains(result, want) {
-					t.Errorf("Result should contain %q, got:\n%s", want, result)
-				}
-			}
-
-			for _, notWant := range tt.notContains {
-				if contains(result, notWant) {
-					t.Errorf("Result should NOT contain %q, got:\n%s", notWant, result)
-				}
-			}
-		})
-	}
-}
-
-func TestExpandMacrosWithContext(t *testing.T) {
-	input := "Execute @marching_orders for this bead"
-
-	ctx := ExecutionContext{
-		Variables: make(map[string]string),
-	}
-	ctx = ctx.WithBead("bd-test1", "Test Task", "P1", "Task description", "open", "task")
-	ctx = ctx.WithAgent(2, "claude", "opus", "%123")
-
-	result, err := ExpandMacrosWithContext(input, ctx)
-	if err != nil {
-		t.Fatalf("ExpandMacrosWithContext failed: %v", err)
-	}
-
-	// Check that variables are substituted
-	if !contains(result, "bd-test1") {
-		t.Error("Result should contain bead_id")
-	}
-	if !contains(result, "Test Task") {
-		t.Error("Result should contain bead title")
-	}
-	if !contains(result, "Agent #2") {
-		t.Error("Result should contain agent number")
-	}
-}
-
-func TestListMacros(t *testing.T) {
-	macros := ListMacros()
-
-	if len(macros) == 0 {
-		t.Error("ListMacros should return at least one macro")
-	}
-
-	// Check for expected macros
-	expectedMacros := []string{"marching_orders", "self_review", "cross_review", "code_review"}
-	for _, expected := range expectedMacros {
-		found := false
-		for _, m := range macros {
-			if m == expected {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("Expected macro %q not found in ListMacros", expected)
-		}
-	}
 }
 
 // =============================================================================
@@ -511,7 +463,7 @@ Hello
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	loader := NewLoaderWithProject(projectDir)
+	loader := newLoaderWithProjectForTest(projectDir)
 	_, err := loader.Load(name)
 	if err == nil {
 		t.Fatalf("Load(%q) expected error, got nil", name)
@@ -523,5 +475,14 @@ Hello
 	}
 	if !contains(err.Error(), "field legacy not found") {
 		t.Fatalf("expected unknown-field error, got %v", err)
+	}
+}
+
+// newLoaderWithProjectForTest builds a Loader rooted at a test project dir.
+func newLoaderWithProjectForTest(projectPath string) *Loader {
+	projectDir := resolveProjectTemplateDir(projectPath, projectPath)
+	return &Loader{
+		projectDir: projectDir,
+		userDir:    getDefaultUserTemplateDir(),
 	}
 }

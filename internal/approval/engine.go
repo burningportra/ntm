@@ -8,8 +8,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +25,26 @@ import (
 
 // DefaultExpiry is the default time before an approval request expires.
 const DefaultExpiry = 24 * time.Hour
+
+// Sentinel errors for approval workflow failures. Callers that surface engine
+// results over another protocol (the serve REST/WS layer maps these onto HTTP
+// status codes) classify with errors.Is instead of matching message text.
+var (
+	// ErrNotFound reports that no approval record exists for the given ID.
+	ErrNotFound = errors.New("approval not found")
+	// ErrNotPending reports a decision attempted on a record already in a
+	// terminal state (approved/denied/expired/consumed).
+	ErrNotPending = errors.New("approval is not pending")
+	// ErrExpired reports a decision attempted after the record's deadline;
+	// the record has been durably transitioned to expired.
+	ErrExpired = errors.New("approval has expired")
+	// ErrSLBSelfApproval reports a two-person-rule violation: the approver is
+	// the identity that requested the approval.
+	ErrSLBSelfApproval = errors.New("SLB violation: approver cannot be the same as requester")
+	// ErrConcurrentDecision reports that the guarded SQL transition lost to a
+	// decision landed by a concurrent process.
+	ErrConcurrentDecision = errors.New("concurrently decided or expired")
+)
 
 // Config holds configuration for the approval engine.
 type Config struct {
@@ -89,12 +112,33 @@ type RequestParams struct {
 	CorrelationID string        // Optional correlation ID for tracing
 	RequiresSLB   bool          // Whether two-person rule applies
 	ExpiresIn     time.Duration // Override default expiry (0 = use default)
+	ProjectDir    string        // SLB project directory (empty = current working directory)
 }
 
 // Request creates a new approval request.
 func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Approval, error) {
+	record, _, err := e.requestWithID(ctx, params, generateApprovalID(), false)
+	return record, err
+}
+
+// requestWithID lets an operation use a deterministic primary key. SQLite's
+// unique insert deduplicates admission requests across independent processes;
+// a retry receives the stored request and never resets its decision.
+func (e *Engine) requestWithID(ctx context.Context, params RequestParams, id string, reuse bool) (*state.Approval, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if reuse {
+		existing, err := e.store.GetApproval(id)
+		if err != nil {
+			return nil, false, err
+		}
+		if existing != nil {
+			return existing, false, nil
+		}
 	}
 
 	// Set expiry
@@ -105,7 +149,7 @@ func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Appr
 
 	now := time.Now().UTC()
 	approval := &state.Approval{
-		ID:            generateApprovalID(),
+		ID:            id,
 		Action:        params.Action,
 		Resource:      params.Resource,
 		Reason:        params.Reason,
@@ -117,23 +161,33 @@ func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Appr
 		Status:        state.ApprovalPending,
 	}
 
-	// If SLB is required and available, enqueue an SLB request first.
-	if params.RequiresSLB && e.config.EnableSLB {
-		slbID, err := e.enqueueSLBRequest(ctx, params)
-		if err != nil {
-			return nil, err
-		}
-		if slbID != "" && approval.CorrelationID == "" {
-			approval.CorrelationID = "slb:" + slbID
-		}
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Store the approval
+	// Persist admission before contacting SLB. Only the winner of this
+	// unique insert may enqueue; another process replaying the same request
+	// must not create a second external authorization. An interrupted mirror
+	// remains a native approval, never an invitation to resubmit blindly.
 	if err := e.store.CreateApproval(approval); err != nil {
-		return nil, fmt.Errorf("create approval: %w", err)
+		if reuse {
+			existing, readErr := e.store.GetApproval(id)
+			if readErr == nil && existing != nil {
+				return existing, false, nil
+			}
+		}
+		return nil, false, fmt.Errorf("create approval: %w", err)
+	}
+	if params.RequiresSLB && e.config.EnableSLB {
+		link, err := e.enqueueSLBRequest(ctx, params)
+		if err != nil {
+			return approval, true, err
+		}
+		if link != nil {
+			link.ApprovalID = approval.ID
+			if err := e.store.CreateApprovalSLBLink(ctx, *link); err != nil {
+				return approval, true, fmt.Errorf("approval %s was saved but its SLB request %s could not be linked; inspect before retrying: %w", approval.ID, link.RequestID, err)
+			}
+			if approval.CorrelationID == "" {
+				approval.CorrelationID = "slb:" + link.RequestID
+			}
+		}
 	}
 
 	// Emit event
@@ -149,24 +203,54 @@ func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Appr
 		e.notifyApprovalRequest(approval)
 	}
 
-	return approval, nil
+	return approval, true, nil
 }
 
-func (e *Engine) enqueueSLBRequest(ctx context.Context, params RequestParams) (string, error) {
+func (e *Engine) enqueueSLBRequest(ctx context.Context, params RequestParams) (*state.ApprovalSLBLink, error) {
 	adapter := tools.NewSLBAdapter()
 	if _, installed := adapter.Detect(); !installed {
-		return "", nil
+		return nil, nil
 	}
+
+	// slb files requests under an agent session; without one in the
+	// environment there is nothing to mirror into.
+	session := tools.SLBSessionFromEnv()
+	if session.ID == "" {
+		return nil, nil
+	}
+	projectDir := params.ProjectDir
+	if projectDir == "" {
+		var err error
+		projectDir, err = os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("resolve SLB working directory: %w", err)
+		}
+	}
+	projectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve SLB project: %w", err)
+	}
+	projectDir, err = filepath.EvalSymlinks(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve SLB project identity: %w", err)
+	}
+	adapter.ProjectDir = projectDir
 
 	command := buildSLBCommand(params.Action, params.Resource)
-	raw, err := adapter.Request(ctx, command, params.Reason)
+	raw, err := adapter.Request(ctx, session, command, params.Reason)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		// Graceful fallback to internal approvals if SLB is unavailable or errors.
 		slog.Warn("SLB adapter request failed, falling back to internal approval", "error", err, "command", command)
-		return "", nil
+		return nil, nil
 	}
-
-	return parseSLBRequestID(raw), nil
+	requestID := parseSLBRequestID(raw)
+	if strings.TrimSpace(requestID) == "" || strings.TrimSpace(requestID) != requestID {
+		return nil, errors.New("SLB returned no exact request ID; native approval retained without automatic resubmission")
+	}
+	return &state.ApprovalSLBLink{RequestID: requestID, ProjectDir: projectDir}, nil
 }
 
 func buildSLBCommand(action, resource string) string {
@@ -185,14 +269,13 @@ func parseSLBRequestID(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
-	var payload map[string]interface{}
+	var payload struct {
+		RequestID string `json:"request_id"`
+	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return ""
 	}
-	if id, ok := payload["id"].(string); ok {
-		return id
-	}
-	return ""
+	return payload.RequestID
 }
 
 // Check returns the current status of an approval request.
@@ -202,7 +285,7 @@ func (e *Engine) Check(ctx context.Context, id string) (*state.Approval, error) 
 		return nil, fmt.Errorf("get approval: %w", err)
 	}
 	if approval == nil {
-		return nil, fmt.Errorf("approval not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 
 	// Check if expired
@@ -212,7 +295,118 @@ func (e *Engine) Check(ctx context.Context, id string) (*state.Approval, error) 
 		}
 	}
 
+	// An approval mirrored into slb takes slb's decision once a reviewer has
+	// made one there.
+	if approval.Status == state.ApprovalPending && e.syncSLBDecision(ctx, approval) {
+		synced, err := e.store.GetApproval(id)
+		if err != nil {
+			return nil, fmt.Errorf("get approval: %w", err)
+		}
+		if synced != nil {
+			approval = synced
+		}
+	}
+
 	return approval, nil
+}
+
+// syncSLBDecision follows the persisted external link, not the operation's
+// correlation key or the checking process's cwd. Native Approve/Deny retain
+// authority over the allowed reviewer and the guarded final transition.
+func (e *Engine) syncSLBDecision(ctx context.Context, approval *state.Approval) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || approval == nil || !approval.RequiresSLB || approval.Status != state.ApprovalPending {
+		return false
+	}
+	if !e.config.EnableSLB {
+		return false
+	}
+	link, err := e.store.GetApprovalSLBLink(ctx, approval.ID)
+	if err != nil || link == nil {
+		if err != nil {
+			slog.Warn("SLB linkage unavailable; approval stays pending", "approval", approval.ID, "error", err)
+		}
+		return false
+	}
+	requestID := link.RequestID
+	resolved, err := filepath.EvalSymlinks(link.ProjectDir)
+	if err != nil || resolved != link.ProjectDir {
+		slog.Warn("SLB project identity changed; approval stays pending", "approval", approval.ID, "slb_request", requestID)
+		return false
+	}
+	adapter := tools.NewSLBAdapter()
+	adapter.ProjectDir = link.ProjectDir
+	if _, installed := adapter.Detect(); !installed {
+		return false
+	}
+	status, err := adapter.RequestStatus(ctx, requestID)
+	if err != nil {
+		slog.Debug("slb status unavailable; approval stays pending", "approval", approval.ID, "slb_request", requestID, "error", err)
+		return false
+	}
+
+	if ctx.Err() != nil {
+		return false
+	}
+	if status != nil && status.Status != "approved" && status.Status != "rejected" {
+		return false
+	}
+	deciding, valid := slbDecisionReview(requestID, approval.RequestedBy, status)
+	if !valid {
+		slog.Warn("slb decision lacks bound reviewer evidence; approval stays pending", "approval", approval.ID, "slb_request", requestID)
+		return false
+	}
+	if status.Status == "approved" {
+		err = e.Approve(ctx, approval.ID, "slb:"+deciding.Reviewer)
+	} else {
+		err = e.Deny(ctx, approval.ID, "slb:"+deciding.Reviewer, deciding.Comments)
+	}
+	if err != nil {
+		slog.Warn("could not apply slb decision to approval", "approval", approval.ID, "slb_request", requestID, "slb_status", status.Status, "error", err)
+		return false
+	}
+	return true
+}
+
+// slbDecisionReview requires evidence for this exact external request. A
+// terminal status alone is not an approval, and an unknown review decision is
+// not a rejection. Preserve the adapter's review order, but never synthesize
+// an anonymous reviewer when the matching review is absent or malformed.
+func slbDecisionReview(requestID, requester string, status *tools.SLBRequestStatus) (tools.SLBReview, bool) {
+	if status == nil || requestID == "" || status.RequestID != requestID {
+		return tools.SLBReview{}, false
+	}
+	var decision string
+	switch status.Status {
+	case "approved":
+		decision = "approve"
+	case "rejected":
+		decision = "reject"
+	default:
+		return tools.SLBReview{}, false
+	}
+	var review tools.SLBReview
+	found := false
+	for _, candidate := range status.Reviews {
+		if candidate.Decision == decision {
+			review, found = candidate, true
+		}
+	}
+	if !found || strings.TrimSpace(review.Reviewer) == "" || strings.TrimSpace(review.Reviewer) != review.Reviewer {
+		return tools.SLBReview{}, false
+	}
+	// "slb:" is an audit-source prefix, not another human. A requester
+	// named alice cannot approve her own request by coming back as slb:alice.
+	if decision == "approve" {
+		requester = strings.TrimSpace(requester)
+		if requester == "" || review.Reviewer == requester || "slb:"+review.Reviewer == requester ||
+			strings.TrimPrefix(review.Reviewer, "slb:") == strings.TrimPrefix(requester, "slb:") {
+			return tools.SLBReview{}, false
+		}
+	}
+	return review, true
 }
 
 // Approve grants an approval request.
@@ -225,7 +419,7 @@ func (e *Engine) Approve(ctx context.Context, id string, approverID string) erro
 		return fmt.Errorf("get approval: %w", err)
 	}
 	if approval == nil {
-		return fmt.Errorf("approval not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 
 	now := time.Now().UTC()
@@ -237,22 +431,30 @@ func (e *Engine) Approve(ctx context.Context, id string, approverID string) erro
 		return err
 	}
 	if expired {
-		return fmt.Errorf("approval has expired")
+		return ErrExpired
 	}
 	if len(e.config.ApproverList) > 0 && !contains(e.config.ApproverList, approverID) {
 		return fmt.Errorf("%s is not an authorized approver", approverID)
 	}
 	if approval.RequiresSLB && approverID == approval.RequestedBy {
-		return fmt.Errorf("SLB violation: approver cannot be the same as requester")
+		return ErrSLBSelfApproval
 	}
 
-	// Update approval
+	// Update approval. The pending->approved transition is guarded in SQL
+	// (like Consume's approved->consumed): a concurrent `ntm approve deny`
+	// runs in a separate process, so both may read status=pending; the
+	// conditional UPDATE ensures the first decision is terminal instead of
+	// letting this write silently flip a landed denial to approved.
 	approval.Status = state.ApprovalApproved
 	approval.ApprovedBy = approverID
 	approval.ApprovedAt = &now
 
-	if err := e.store.UpdateApproval(approval); err != nil {
+	ok, err := e.store.UpdateApprovalFrom(approval, state.ApprovalPending)
+	if err != nil {
 		return fmt.Errorf("update approval: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("approval %s was %w; re-check its status before approving", id, ErrConcurrentDecision)
 	}
 
 	// Emit event
@@ -284,7 +486,7 @@ func (e *Engine) Deny(ctx context.Context, id string, approverID string, reason 
 		return fmt.Errorf("get approval: %w", err)
 	}
 	if approval == nil {
-		return fmt.Errorf("approval not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 
 	now := time.Now().UTC()
@@ -296,17 +498,22 @@ func (e *Engine) Deny(ctx context.Context, id string, approverID string, reason 
 		return err
 	}
 	if expired {
-		return fmt.Errorf("approval has expired")
+		return ErrExpired
 	}
 
-	// Update approval
+	// Update approval. Guarded like Approve: the first decision to land is
+	// terminal; a racing process's approve must not be overwritten blindly.
 	approval.Status = state.ApprovalDenied
 	approval.ApprovedBy = approverID // Record who denied
 	approval.ApprovedAt = &now
 	approval.DeniedReason = reason
 
-	if err := e.store.UpdateApproval(approval); err != nil {
+	ok, err := e.store.UpdateApprovalFrom(approval, state.ApprovalPending)
+	if err != nil {
 		return fmt.Errorf("update approval: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("approval %s was %w; re-check its status before denying", id, ErrConcurrentDecision)
 	}
 
 	// Emit event
@@ -328,69 +535,51 @@ func (e *Engine) Deny(ctx context.Context, id string, approverID string, reason 
 	return nil
 }
 
-// WaitForApproval blocks until the approval is approved, denied, or times out.
-func (e *Engine) WaitForApproval(ctx context.Context, id string, timeout time.Duration) (*state.Approval, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	baseCtx := ctx
+// Consume marks an approved record as spent (status=consumed). One approval
+// authorizes exactly one gated execution (bd-2y2on): callers that find an
+// approved record for their operation must Consume it before proceeding so a
+// later run of the same operation requires a fresh approval. Only approved
+// records can be consumed.
+func (e *Engine) Consume(ctx context.Context, id string, consumerID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	// bd-e2qk2: register the wait channel BEFORE checking status, then
-	// re-check. If a pre-fix WaitForApproval did Check-first then
-	// register, an Approve() racing between Check and register would
-	// notify the waiter list while this waiter's channel wasn't yet
-	// in it — the decision was lost and the caller blocked for the
-	// full timeout despite a decision having been made. With register-
-	// then-check, either (a) the second Check sees the decision, or
-	// (b) any future decision arrives via the now-registered channel.
-	waitCh := make(chan struct{}, 1)
-	e.waitersMu.Lock()
-	e.waiters[id] = append(e.waiters[id], waitCh)
-	e.waitersMu.Unlock()
-
-	defer e.removeWaiter(id, waitCh)
-
-	// Check current status AFTER registering — closes the race window.
-	approval, err := e.Check(baseCtx, id)
+	approval, err := e.store.GetApproval(id)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("get approval: %w", err)
 	}
-	if approval.Status != state.ApprovalPending {
-		return approval, nil
+	if approval == nil {
+		return fmt.Errorf("%w: %s", ErrNotFound, id)
+	}
+	if approval.Status != state.ApprovalApproved {
+		return fmt.Errorf("approval is not approved (status: %s)", approval.Status)
+	}
+	if time.Now().After(approval.ExpiresAt) {
+		// An approval authorizes only within its record's validity window
+		// (mirroring how denials go inert after expires_at). Refuse to spend
+		// a stale grant; the gate files a fresh request instead.
+		return fmt.Errorf("approval %s expired at %s and can no longer be consumed", id, approval.ExpiresAt.Format(time.RFC3339))
 	}
 
-	waitCtx, cancel := context.WithTimeout(baseCtx, timeout)
-	defer cancel()
-
-	select {
-	case <-waitCh:
-		// Approval was decided
-		return e.Check(baseCtx, id)
-	case <-waitCtx.Done():
-		if baseCtx.Err() != nil {
-			return nil, baseCtx.Err()
-		}
-		// Timeout - check final status
-		return e.Check(baseCtx, id)
+	// The approved->consumed transition MUST be guarded in SQL, not by the
+	// read above: e.mu only serializes consumers inside this process, while
+	// gated commands run as independent processes sharing state.db. The
+	// conditional UPDATE lets exactly one of two racing consumers win.
+	consumed, err := e.store.ConsumeApproval(id)
+	if err != nil {
+		return fmt.Errorf("consume approval: %w", err)
 	}
-}
-
-func (e *Engine) removeWaiter(id string, waitCh chan struct{}) {
-	e.waitersMu.Lock()
-	defer e.waitersMu.Unlock()
-
-	waiters := e.waiters[id]
-	for i, ch := range waiters {
-		if ch == waitCh {
-			waiters = append(waiters[:i], waiters[i+1:]...)
-			break
-		}
+	if !consumed {
+		return fmt.Errorf("approval %s was already spent by a concurrent consumer", id)
 	}
-	if len(waiters) == 0 {
-		delete(e.waiters, id)
-		return
+
+	if e.eventBus != nil {
+		e.eventBus.Publish(events.BaseEvent{
+			Type:      "approval.consumed",
+			Timestamp: time.Now().UTC(),
+		})
 	}
-	e.waiters[id] = waiters
+	return nil
 }
 
 // ListPending returns all pending approval requests.
@@ -415,22 +604,25 @@ func (e *Engine) ListPending(ctx context.Context) ([]state.Approval, error) {
 	return pending, nil
 }
 
-// ExpireStale marks all expired pending approvals as expired.
-func (e *Engine) ExpireStale(ctx context.Context) (int, error) {
-	// Use ListExpiredPendingApprovals which returns pending approvals where expires_at <= now
-	approvals, err := e.store.ListExpiredPendingApprovals()
+// History returns every approval record — pending, approved, denied,
+// consumed, and expired — newest first. Pending rows past their deadline are
+// transitioned to expired on the way out (same best-effort policy as
+// ListPending) so history reflects reality, not a stale pending status.
+func (e *Engine) History(ctx context.Context) ([]state.Approval, error) {
+	approvals, err := e.store.ListApprovalHistory()
 	if err != nil {
-		return 0, fmt.Errorf("list expired pending approvals: %w", err)
+		return nil, fmt.Errorf("list approval history: %w", err)
 	}
 
-	count := 0
-	for _, a := range approvals {
-		if err := e.expireApproval(&a, time.Now().UTC()); err == nil {
-			count++
+	now := time.Now()
+	for i := range approvals {
+		if approvals[i].Status == state.ApprovalPending && now.After(approvals[i].ExpiresAt) {
+			// Best-effort: expireApproval updates the row's status in place
+			// (or reloads the record if a concurrent decision won the race).
+			_ = e.expireApproval(&approvals[i], now.UTC())
 		}
 	}
-
-	return count, nil
+	return approvals, nil
 }
 
 // notifyWaiters wakes up all goroutines waiting on this approval.
@@ -501,7 +693,7 @@ func (e *Engine) notifyApprovalDecision(appr *state.Approval, decision string) {
 
 func (e *Engine) ensurePendingApproval(approval *state.Approval) error {
 	if approval.Status != state.ApprovalPending {
-		return fmt.Errorf("approval is not pending (status: %s)", approval.Status)
+		return fmt.Errorf("%w (status: %s)", ErrNotPending, approval.Status)
 	}
 	return nil
 }
@@ -516,10 +708,27 @@ func (e *Engine) expireIfNeeded(approval *state.Approval, now time.Time) (bool, 
 	return true, nil
 }
 
+// expireApproval lazily transitions a pending record to expired. The write is
+// guarded on the record still being pending in the database: a concurrent
+// process may have decided (or already expired) it since our read, and that
+// durable transition must win — a blind write here would erase a landed
+// decision's status/approver/reason. On a lost race the fresh record is
+// reloaded into approval and nil is returned.
 func (e *Engine) expireApproval(approval *state.Approval, now time.Time) error {
 	approval.Status = state.ApprovalExpired
-	if err := e.store.UpdateApproval(approval); err != nil {
+	ok, err := e.store.UpdateApprovalFrom(approval, state.ApprovalPending)
+	if err != nil {
 		return fmt.Errorf("update expired approval: %w", err)
+	}
+	if !ok {
+		fresh, gerr := e.store.GetApproval(approval.ID)
+		if gerr != nil {
+			return fmt.Errorf("reload concurrently updated approval: %w", gerr)
+		}
+		if fresh != nil {
+			*approval = *fresh
+		}
+		return nil
 	}
 	if e.eventBus != nil {
 		e.eventBus.Publish(events.BaseEvent{

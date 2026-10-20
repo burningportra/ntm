@@ -347,6 +347,36 @@
         },
         "type": "object"
       },
+      "DiskSection": {
+        "properties": {
+          "available_bytes": {
+            "description": "Available bytes",
+            "type": "integer"
+          },
+          "delta_bytes_per_min": {
+            "description": "Delta bytes per min",
+            "type": "number"
+          },
+          "mount_path": {
+            "description": "Mount path",
+            "type": "string"
+          },
+          "mount_used_pct": {
+            "description": "Mount used pct",
+            "type": "number"
+          },
+          "projected_full_at": {
+            "description": "Projected full at",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_path",
+          "mount_used_pct",
+          "available_bytes"
+        ],
+        "type": "object"
+      },
       "ErrorDetails": {
         "properties": {
           "actual_output": {
@@ -394,6 +424,33 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "Exclusion": {
+        "properties": {
+          "blocked_by": {
+            "description": "Blocked by",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "description": "I d",
+            "type": "string"
+          },
+          "reasons": {
+            "description": "Reasons",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "reasons"
+        ],
         "type": "object"
       },
       "HandoffSummary": {
@@ -473,6 +530,27 @@
         "required": [
           "session"
         ],
+        "type": "object"
+      },
+      "Identity": {
+        "properties": {
+          "head_sha": {
+            "description": "Head s h a",
+            "type": "string"
+          },
+          "jsonl_path": {
+            "description": "J s o n l path",
+            "type": "string"
+          },
+          "jsonl_sha256": {
+            "description": "J s o n l s h a256",
+            "type": "string"
+          },
+          "project_dir": {
+            "description": "Project dir",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "NextAction": {
@@ -1118,6 +1196,32 @@
         ],
         "type": "object"
       },
+      "SnapshotService": {
+        "properties": {
+          "command": {
+            "description": "Command",
+            "type": "string"
+          },
+          "manager": {
+            "description": "Manager",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name",
+            "type": "string"
+          },
+          "pane": {
+            "description": "Pane",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pane",
+          "name",
+          "manager"
+        ],
+        "type": "object"
+      },
       "SnapshotSession": {
         "properties": {
           "agents": {
@@ -1134,6 +1238,13 @@
           "name": {
             "description": "Name",
             "type": "string"
+          },
+          "services": {
+            "description": "Services",
+            "items": {
+              "$ref": "#/definitions/SnapshotService"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -1225,6 +1336,26 @@
         ],
         "type": "object"
       },
+      "StaleError": {
+        "properties": {
+          "expected": {
+            "$ref": "#/definitions/Identity",
+            "description": "Expected"
+          },
+          "observed": {
+            "$ref": "#/definitions/Identity",
+            "description": "Observed"
+          },
+          "reason": {
+            "description": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
       "StatusSummary": {
         "properties": {
           "agents_by_state": {
@@ -1241,12 +1372,40 @@
             "description": "Agents by type",
             "type": "object"
           },
+          "aider_count": {
+            "description": "Aider count",
+            "type": "integer"
+          },
           "alerts_active": {
             "description": "Alerts active",
             "type": "integer"
           },
+          "antigravity_count": {
+            "description": "Antigravity count",
+            "type": "integer"
+          },
           "attached_count": {
             "description": "Attached count",
+            "type": "integer"
+          },
+          "claude_count": {
+            "description": "Claude count",
+            "type": "integer"
+          },
+          "codex_count": {
+            "description": "Codex count",
+            "type": "integer"
+          },
+          "cursor_count": {
+            "description": "Cursor count",
+            "type": "integer"
+          },
+          "gemini_count": {
+            "description": "Gemini count",
+            "type": "integer"
+          },
+          "grok_count": {
+            "description": "Grok count",
             "type": "integer"
           },
           "health_score": {
@@ -1261,12 +1420,36 @@
             "description": "In progress",
             "type": "integer"
           },
+          "kimi_count": {
+            "description": "Kimi count",
+            "type": "integer"
+          },
           "mail_unread": {
             "description": "Mail unread",
             "type": "integer"
           },
           "mail_urgent": {
             "description": "Mail urgent",
+            "type": "integer"
+          },
+          "muse_count": {
+            "description": "Muse count",
+            "type": "integer"
+          },
+          "ollama_count": {
+            "description": "Ollama count",
+            "type": "integer"
+          },
+          "omp_count": {
+            "description": "Omp count",
+            "type": "integer"
+          },
+          "opencode_count": {
+            "description": "Opencode count",
+            "type": "integer"
+          },
+          "pi_count": {
+            "description": "Pi count",
             "type": "integer"
           },
           "ready_work": {
@@ -1281,15 +1464,29 @@
             "description": "Total sessions",
             "type": "integer"
           },
-          "work_stale": {
-            "description": "Work stale",
-            "type": "boolean"
+          "windsurf_count": {
+            "description": "Windsurf count",
+            "type": "integer"
           }
         },
         "required": [
           "total_sessions",
           "total_agents",
           "attached_count",
+          "claude_count",
+          "codex_count",
+          "gemini_count",
+          "pi_count",
+          "kimi_count",
+          "muse_count",
+          "antigravity_count",
+          "grok_count",
+          "cursor_count",
+          "windsurf_count",
+          "aider_count",
+          "opencode_count",
+          "omp_count",
+          "ollama_count",
           "agents_by_state",
           "agents_by_type",
           "ready_work",
@@ -1563,6 +1760,10 @@
             },
             "type": "array"
           },
+          "disabled": {
+            "description": "Disabled",
+            "type": "boolean"
+          },
           "health": {
             "$ref": "#/definitions/ToolHealthOutput",
             "description": "Health"
@@ -1729,6 +1930,45 @@
         ],
         "type": "object"
       },
+      "WorkReservationVerification": {
+        "properties": {
+          "active": {
+            "description": "Active",
+            "type": "integer"
+          },
+          "mapped_beads": {
+            "description": "Mapped beads",
+            "type": "integer"
+          },
+          "observed_at": {
+            "description": "Observed at",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project i d",
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Reason",
+            "type": "string"
+          },
+          "state": {
+            "description": "State",
+            "type": "string"
+          },
+          "unmapped": {
+            "description": "Unmapped",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state",
+          "active",
+          "mapped_beads",
+          "unmapped"
+        ],
+        "type": "object"
+      },
       "WorkSection": {
         "properties": {
           "available": {
@@ -1764,10 +2004,6 @@
             "description": "Reason",
             "type": "string"
           },
-          "stale": {
-            "description": "Stale",
-            "type": "boolean"
-          },
           "summary": {
             "$ref": "#/definitions/WorkSummary",
             "description": "Summary"
@@ -1775,6 +2011,10 @@
           "triage": {
             "$ref": "#/definitions/WorkTriage",
             "description": "Triage"
+          },
+          "verification": {
+            "$ref": "#/definitions/WorkVerification",
+            "description": "Verification"
           }
         },
         "required": [
@@ -1847,6 +2087,87 @@
           "blockers_count"
         ],
         "type": "object"
+      },
+      "WorkVerification": {
+        "properties": {
+          "cache_collected_at": {
+            "description": "Cache collected at",
+            "type": "string"
+          },
+          "cache_expires_at": {
+            "description": "Cache expires at",
+            "type": "string"
+          },
+          "candidates_observed": {
+            "description": "Candidates observed",
+            "type": "integer"
+          },
+          "count_scope": {
+            "description": "Count scope",
+            "type": "string"
+          },
+          "dirty": {
+            "description": "Dirty",
+            "type": "boolean"
+          },
+          "excluded": {
+            "description": "Excluded",
+            "items": {
+              "$ref": "#/definitions/Exclusion"
+            },
+            "type": "array"
+          },
+          "from_cache": {
+            "description": "From cache",
+            "type": "boolean"
+          },
+          "mismatch": {
+            "$ref": "#/definitions/StaleError",
+            "description": "Mismatch"
+          },
+          "preview_limit": {
+            "description": "Preview limit",
+            "type": "integer"
+          },
+          "preview_truncated": {
+            "description": "Preview truncated",
+            "type": "boolean"
+          },
+          "project_dir": {
+            "description": "Project dir",
+            "type": "string"
+          },
+          "reason_code": {
+            "description": "Reason code",
+            "type": "string"
+          },
+          "remediation": {
+            "description": "Remediation",
+            "type": "string"
+          },
+          "reported_ready": {
+            "description": "Reported ready",
+            "type": "integer"
+          },
+          "reservations": {
+            "$ref": "#/definitions/WorkReservationVerification",
+            "description": "Reservations"
+          },
+          "source": {
+            "$ref": "#/definitions/Identity",
+            "description": "Source"
+          },
+          "verified_ready": {
+            "description": "Verified ready",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "excluded",
+          "reported_ready",
+          "count_scope"
+        ],
+        "type": "object"
       }
     },
     "description": "Unified state query: sessions + beads + alerts + mail. Use --since for delta snapshots.",
@@ -1910,6 +2231,10 @@
           "type": "string"
         },
         "type": "array"
+      },
+      "disk": {
+        "$ref": "#/definitions/DiskSection",
+        "description": "Disk"
       },
       "error": {
         "description": "Error",

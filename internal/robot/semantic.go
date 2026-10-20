@@ -32,7 +32,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -67,9 +66,10 @@ type SemanticProgress struct {
 	// look-back window (attributed BY TOKEN, never by repo/cwd).
 	CommitsInWindow int `json:"commits_in_window"`
 	// ClaimsInWindow counts beads carrying this pane's label whose status
-	// changed within the window. See the limitation note on gatherClaimActivity:
-	// beads_rust exposes no per-transition ledger, so this is a conservative
-	// proxy (status-updated-within-window), not an exact claim/close count.
+	// changed within the window. See the limitation note on
+	// gatherClaimActivityWithContext: beads_rust exposes no per-transition
+	// ledger, so this is a conservative proxy (status-updated-within-window),
+	// not an exact claim/close count.
 	ClaimsInWindow int `json:"claims_in_window"`
 	// LastCommitAt is the RFC3339 committer time of the most recent
 	// token-attributed commit (any age), or null when none exists. A value
@@ -78,6 +78,9 @@ type SemanticProgress struct {
 	// WindowSeconds echoes the window used so a consumer can interpret the
 	// counts without guessing the default.
 	WindowSeconds int `json:"window_seconds"`
+	// EvidenceComplete distinguishes observed inactivity from unavailable or
+	// truncated reads. Positive counts remain useful even when it is false.
+	EvidenceComplete bool `json:"evidence_complete"`
 	// SuspectedWedge is an ADVISORY indicator string set only when there is
 	// sustained terminal velocity AND the pane was stamped AND no
 	// token-attributed forward motion landed within the window. It is purely
@@ -163,17 +166,32 @@ func PaneSemanticProgress(addr PaneAddr, repoDir string, window time.Duration, v
 // deliberately keeps its long-standing best-effort behavior, while callers
 // that make a stop decision can fail closed on unavailable attribution.
 func paneSemanticProgressWithAvailability(addr PaneAddr, repoDir string, window time.Duration, velocityPositive bool, now time.Time) (*SemanticProgress, bool) {
+	return paneSemanticProgressWithContext(context.Background(), addr, repoDir, window, velocityPositive, now)
+}
+
+// paneSemanticProgressWithContext shares one deadline across the independent
+// git and bead reads, and inherits the enclosing productivity poll's budget.
+func paneSemanticProgressWithContext(ctx context.Context, addr PaneAddr, repoDir string, window time.Duration, velocityPositive bool, now time.Time) (*SemanticProgress, bool) {
 	if window <= 0 {
 		window = defaultSemanticWindow
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, semanticReadTimeout)
+	defer cancel()
 	token := PaneWorkToken(addr.Session, addr.Window, addr.Pane)
 	label := PaneBeadLabel(addr.Session, addr.Window, addr.Pane)
 
-	git := gatherGitTokenActivity(repoDir, token, window, now)
-	claims := gatherClaimActivity(repoDir, label, window, now)
+	gitResult := make(chan gitTokenActivity, 1)
+	go func() {
+		gitResult <- gatherGitTokenActivityWithContext(ctx, repoDir, token, window, now)
+	}()
+	claims := gatherClaimActivityWithContext(ctx, repoDir, label, window, now)
+	git := <-gitResult
 
 	sp := buildSemanticProgress(token, window, velocityPositive, git, claims, now)
-	return &sp, git.available && claims.available
+	return &sp, sp.EvidenceComplete
 }
 
 // buildSemanticProgress is the PURE core (no I/O). Keeping it pure makes the
@@ -194,12 +212,13 @@ func buildSemanticProgress(token string, window time.Duration, velocityPositive 
 	}
 
 	sp := SemanticProgress{
-		Source:          source,
-		Token:           token,
-		CommitsInWindow: git.commitsInWindow,
-		ClaimsInWindow:  claims.claimsInWindow,
-		LastCommitAt:    lastCommitStr,
-		WindowSeconds:   int(window / time.Second),
+		Source:           source,
+		Token:            token,
+		CommitsInWindow:  git.commitsInWindow,
+		ClaimsInWindow:   claims.claimsInWindow,
+		LastCommitAt:     lastCommitStr,
+		WindowSeconds:    int(window / time.Second),
+		EvidenceComplete: git.available && claims.available,
 	}
 
 	// Advisory wedge tell — ADVISORY ONLY. Fires only when the pane is BOTH
@@ -208,7 +227,9 @@ func buildSemanticProgress(token string, window time.Duration, velocityPositive 
 	// window (no commits, no claims, and the last token commit is stale or
 	// absent). It sets an informational string and nothing else; is_working is
 	// untouched, and there is deliberately no kill/reassign recommendation.
-	if velocityPositive && source == "token" {
+	// Missing evidence is not evidence of missing work. In particular, a
+	// stale git commit plus a failed br read must never diagnose a wedge.
+	if velocityPositive && source == "token" && sp.EvidenceComplete {
 		stale := git.lastCommitAt == nil || now.Sub(*git.lastCommitAt) > window
 		if stale && git.commitsInWindow == 0 && claims.claimsInWindow == 0 {
 			sp.SuspectedWedge = "sustained terminal velocity but no token-attributed commit or bead claim within the window; verify forward progress before any restart"
@@ -218,11 +239,11 @@ func buildSemanticProgress(token string, window time.Duration, velocityPositive 
 	return sp
 }
 
-// gatherGitTokenActivity runs a single bounded `git log --grep` keyed by the
-// pane token across all refs and attributes commits BY EXACT TOKEN LINE, so a
-// sibling pane's commits in the same shared repo are never counted. Any error
-// (not a git repo, git missing, timeout) degrades to "no activity" — never a
-// wedge.
+// gatherGitTokenActivityWithContext runs a single bounded `git log --grep`
+// keyed by the pane token across all refs and attributes commits BY EXACT
+// TOKEN LINE, so a sibling pane's commits in the same shared repo are never
+// counted. Any error (not a git repo, git missing, timeout) degrades to "no
+// activity" — never a wedge.
 //
 // IMPORTANT: `git --grep` is a substring (contains) match, and one pane's token
 // is a prefix of a denser sibling's ("NTM-Pane: s/0.1" ⊂ "NTM-Pane: s/0.10").
@@ -232,59 +253,19 @@ func buildSemanticProgress(token string, window time.Duration, velocityPositive 
 // and 10..19) would miscredit siblings — and worse, an unstamped but
 // genuinely-working pane could read as source="token" + stale and trip a false
 // wedge tell, the exact failure the design forbids.
-func gatherGitTokenActivity(repoDir, token string, window time.Duration, now time.Time) gitTokenActivity {
-	var out gitTokenActivity
-	if strings.TrimSpace(repoDir) == "" {
-		return out
+func gatherGitTokenActivityWithContext(ctx context.Context, repoDir, token string, window time.Duration, now time.Time) gitTokenActivity {
+	if strings.TrimSpace(repoDir) == "" || strings.TrimSpace(token) == "" {
+		return gitTokenActivity{}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), semanticReadTimeout)
-	defer cancel()
-
-	// -F: treat the token as a literal (it contains '.', '/'), not a regex.
-	// --all: attribute the pane's commits regardless of which branch they land
-	// on. -n caps the scan. -z NUL-terminates each commit so multi-line bodies
-	// parse unambiguously; %cI is the strict-ISO committer date and %B the raw
-	// body, joined by a unit separator (%x1f) that cannot occur in the date.
-	cmd := exec.CommandContext(ctx, "git", "-C", repoDir,
+	// Literal prefilter plus exact-token confirmation, across all branches.
+	// NUL-separated records retain multiline commit bodies unambiguously.
+	raw, err := semanticCommandOutput(ctx, "", "git", "-C", repoDir,
 		"log", "--all", "-F", "--grep="+token,
 		fmt.Sprintf("-n%d", semanticGitLogCap), "-z", "--format=%cI%x1f%B")
-	raw, err := cmd.Output()
 	if err != nil {
-		return out
+		return gitTokenActivity{}
 	}
-	out.available = true
-
-	cutoff := now.Add(-window)
-	// Records are NUL-separated (git -z) and newest-first.
-	for _, record := range strings.Split(string(raw), "\x00") {
-		if strings.TrimSpace(record) == "" {
-			continue
-		}
-		date, body, ok := strings.Cut(record, "\x1f")
-		if !ok {
-			continue
-		}
-		// Exact-line confirmation: reject prefilter substring hits where the
-		// token is only a prefix of a sibling pane's token line.
-		if !commitBodyHasTokenLine(body, token) {
-			continue
-		}
-		ts, perr := time.Parse(time.RFC3339, strings.TrimSpace(date))
-		if perr != nil {
-			continue
-		}
-		out.anyTokenCommit = true
-		// First confirmed record is the most recent → last commit.
-		if out.lastCommitAt == nil {
-			t := ts
-			out.lastCommitAt = &t
-		}
-		if !ts.Before(cutoff) {
-			out.commitsInWindow++
-		}
-	}
-	return out
+	return parseGitTokenActivity(raw, token, window, now)
 }
 
 // commitBodyHasTokenLine reports whether any trimmed line of the commit body
@@ -302,8 +283,8 @@ func commitBodyHasTokenLine(body, token string) bool {
 	return false
 }
 
-// gatherClaimActivity is a bounded, best-effort bead read keyed by the pane
-// label. It is the SECONDARY ("and/or") signal per the design.
+// gatherClaimActivityWithContext is a bounded, best-effort bead read keyed by
+// the pane label. It is the SECONDARY ("and/or") signal per the design.
 //
 // LIMITATION (documented deliberately): beads_rust exposes no per-pane→bead
 // binding and no per-window status-transition ledger. The only cleanly
@@ -315,66 +296,78 @@ func commitBodyHasTokenLine(body, token string) bool {
 // updated_at). It is never used to flip is_working; at worst it raises
 // confidence or suppresses the advisory wedge tell. Any error (br missing, no
 // .beads workspace, timeout) degrades to zero — never a wedge.
-func gatherClaimActivity(dir, label string, window time.Duration, now time.Time) claimActivity {
-	var out claimActivity
+func gatherClaimActivityWithContext(ctx context.Context, dir, label string, window time.Duration, now time.Time) claimActivity {
 	if strings.TrimSpace(dir) == "" || strings.TrimSpace(label) == "" {
-		return out
+		return claimActivity{}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), semanticReadTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "br", "list", "--label", label, "--include-closed", "--json")
-	cmd.Dir = dir
-	raw, err := cmd.Output()
+	// br includes closed issues with --all; it rejects --include-closed.
+	raw, err := semanticCommandOutput(ctx, dir, "br", "list", "--label", label, "--all", "--json")
 	if err != nil {
-		return out
+		return claimActivity{}
 	}
-	out = countClaimsInWindow(raw, window, now)
-	out.available = true
-	return out
+	return countClaimsInWindow(raw, window, now)
 }
 
-// brListResponse is the subset of `br list --json` we parse.
-type brListResponse struct {
-	Issues []struct {
-		Status    string `json:"status"`
-		UpdatedAt string `json:"updated_at"`
-		ClosedAt  string `json:"closed_at"`
-	} `json:"issues"`
+// brListIssue is the subset of a bead used as semantic work evidence.
+type brListIssue struct {
+	Status    string `json:"status"`
+	UpdatedAt string `json:"updated_at"`
+	ClosedAt  string `json:"closed_at"`
+}
+
+// decodeClaimIssues accepts the native br array and the compatibility envelope.
+// Missing/null lists and non-issue rows are unavailable evidence, not an empty
+// successful read: stop decisions must distinguish a broken schema from [].
+func decodeClaimIssues(raw []byte) ([]brListIssue, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return nil, false
+	}
+	if text[0] == '{' {
+		var envelope struct {
+			Issues json.RawMessage `json:"issues"`
+		}
+		if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+			return nil, false
+		}
+		text = strings.TrimSpace(string(envelope.Issues))
+	}
+	if text == "" || text[0] != '[' {
+		return nil, false
+	}
+	var rows []*brListIssue
+	if err := json.Unmarshal([]byte(text), &rows); err != nil {
+		return nil, false
+	}
+	issues := make([]brListIssue, 0, len(rows))
+	for _, row := range rows {
+		if row == nil || strings.TrimSpace(row.Status) == "" {
+			return nil, false
+		}
+		issues = append(issues, *row)
+	}
+	return issues, true
 }
 
 // countClaimsInWindow is the PURE parser over `br list --json` output, separated
 // for direct fixture testing. It counts labeled beads whose status changed
-// (updated_at or closed_at) within the window.
+// (updated_at or closed_at) within the window. Availability is set only after a
+// recognized response has been decoded; command success alone is insufficient.
 func countClaimsInWindow(raw []byte, window time.Duration, now time.Time) claimActivity {
 	var out claimActivity
-	var resp brListResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
+	issues, ok := decodeClaimIssues(raw)
+	if !ok {
 		return out
 	}
-	out.anyLabeledBead = len(resp.Issues) > 0
+	out.available = true
+	out.anyLabeledBead = len(issues) > 0
 	cutoff := now.Add(-window)
-	for _, issue := range resp.Issues {
-		if withinWindow(issue.ClosedAt, cutoff) || withinWindow(issue.UpdatedAt, cutoff) {
+	for _, issue := range issues {
+		recent, available := claimTimestampEvidence(issue, cutoff, now)
+		if recent {
 			out.claimsInWindow++
 		}
+		out.available = out.available && available
 	}
 	return out
-}
-
-func withinWindow(ts string, cutoff time.Time) bool {
-	ts = strings.TrimSpace(ts)
-	if ts == "" {
-		return false
-	}
-	parsed, err := time.Parse(time.RFC3339, ts)
-	if err != nil {
-		// br emits RFC3339 with sub-second precision; RFC3339Nano covers it.
-		parsed, err = time.Parse(time.RFC3339Nano, ts)
-		if err != nil {
-			return false
-		}
-	}
-	return !parsed.Before(cutoff)
 }

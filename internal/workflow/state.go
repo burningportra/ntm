@@ -1,13 +1,14 @@
 package workflow
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/util"
@@ -26,6 +27,59 @@ type WorkflowState struct {
 	Variables      map[string]string `json:"variables"`
 	StageHistory   []StageRecord     `json:"history"`
 	Errors         []WorkflowError   `json:"errors"`
+	// ResumeVersion distinguishes execution checkpoints with a write-ahead
+	// delivery journal from older observational snapshots. Missing evidence
+	// must never be interpreted as permission to resend a stage.
+	ResumeVersion int             `json:"resume_version,omitempty"`
+	TemplateHash  string          `json:"template_hash,omitempty"`
+	ProjectRoot   string          `json:"project_root,omitempty"`
+	PanePIDs      map[string]int  `json:"pane_pids,omitempty"`
+	NextByRole    map[string]int  `json:"next_by_role,omitempty"`
+	Turn          int             `json:"turn"`
+	Dispatches    []StageDispatch `json:"dispatches"`
+	Completed     bool            `json:"completed"`
+	// Evidence belongs to this particular visit to a stage. Its capture
+	// boundary is saved before prompts, and observed verdicts are saved before
+	// advancing. Resuming never substitutes old pane history for that boundary.
+	Evidence *StageEvidence `json:"evidence,omitempty"`
+}
+
+// StageEvidence binds incremental pane observations to one stage dispatch.
+// Matches uses the transition's index in the immutable workflow definition;
+// different verdict patterns never share approvals.
+type StageEvidence struct {
+	Version   int                          `json:"version"`
+	Stage     string                       `json:"stage"`
+	StartedAt time.Time                    `json:"started_at"`
+	Round     int                          `json:"round"`
+	Panes     map[string]StagePaneEvidence `json:"panes"`
+	Matches   map[int][]string             `json:"matches,omitempty"`
+}
+
+// StagePaneEvidence retains a bounded overlap boundary and exact response text.
+// Matched verdicts live in StageEvidence.Matches, so a long-running agent cannot
+// erase an already-observed approval by scrolling it out of the capture window.
+// Fresh is discarded only after all applicable verdicts have been recorded;
+// trimming it would change the meaning of anchored regular expressions.
+type StagePaneEvidence struct {
+	PID          int       `json:"pid"`
+	Capture      string    `json:"capture"`
+	Fresh        string    `json:"fresh,omitempty"`
+	LastActivity time.Time `json:"last_activity"`
+}
+
+// StageDispatch records one pane's prompt delivery in the current stage.
+// pending proves no attempt has started; sending has an unknown outcome after
+// a crash; delivered proves the dispatch port returned success. The sending
+// record is persisted BEFORE calling that port, and delivered afterward.
+type StageDispatch struct {
+	Pane            string     `json:"pane"`
+	Role            string     `json:"role"`
+	Turn            int        `json:"turn"`
+	Status          string     `json:"status"`
+	Resolution      string     `json:"resolution,omitempty"`
+	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+	ResolutionToken string     `json:"resolution_token,omitempty"`
 }
 type StageRecord struct {
 	Stage       string    `json:"stage"`
@@ -68,7 +122,7 @@ type PaneSequenceStore struct {
 	Now        func() time.Time
 }
 
-var paneSequenceMu sync.Mutex
+const paneSequenceLockTimeout = 10 * time.Second
 
 func NewPaneSequenceStore(projectDir string) (*PaneSequenceStore, error) {
 	if strings.TrimSpace(projectDir) == "" {
@@ -91,6 +145,22 @@ func (s *PaneSequenceStore) path(name string) (string, error) {
 		return "", fmt.Errorf("invalid sequence name %q", name)
 	}
 	return filepath.Join(s.sequenceDir(), name+".json"), nil
+}
+
+// Lock a stable sidecar, not the JSON file: AtomicWriteFile replaces the JSON
+// inode. Never unlink the sidecar, since that would let writers lock different
+// inodes for the same sequence. The OS releases the lock if a writer crashes.
+func (s *PaneSequenceStore) lockSequence(path string) (func(), error) {
+	if err := os.MkdirAll(s.sequenceDir(), 0o755); err != nil {
+		return nil, fmt.Errorf("create sequence directory: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), paneSequenceLockTimeout)
+	defer cancel()
+	unlock, err := lockPaneSequenceFile(ctx, path+".lock")
+	if err != nil {
+		return nil, fmt.Errorf("lock sequence: %w", err)
+	}
+	return unlock, nil
 }
 
 func (s *PaneSequenceStore) now() time.Time {
@@ -147,15 +217,18 @@ func (s *PaneSequenceStore) Create(name string, steps []string) (*PaneSequence, 
 		return nil, err
 	}
 
-	paneSequenceMu.Lock()
-	defer paneSequenceMu.Unlock()
-	if _, err := os.Stat(path); err == nil {
+	unlock, err := s.lockSequence(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if _, err := os.Lstat(path); err == nil {
 		return nil, fmt.Errorf("sequence %q already exists", name)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect sequence %q: %w", name, err)
 	}
 	sequence := &PaneSequence{
-		Name:      name,
+		Name:      strings.TrimSpace(name),
 		Steps:     normalized,
 		Positions: make(map[string]int),
 		CreatedAt: s.now(),
@@ -175,8 +248,8 @@ func (s *PaneSequenceStore) Load(name string) (*PaneSequence, error) {
 	if err != nil {
 		return nil, err
 	}
-	paneSequenceMu.Lock()
-	defer paneSequenceMu.Unlock()
+	// Atomic replacement gives readers a complete old or new snapshot without
+	// waiting for a writer (including a paused or stalled writer).
 	return s.loadLocked(path)
 }
 
@@ -195,9 +268,17 @@ func (s *PaneSequenceStore) Next(name, pane string) (PaneSequencePosition, error
 // Advance records that a pane consumed its current prompt and returns the new
 // next prompt. Advancing a completed pane is idempotent and reports Advanced
 // false, which lets recovery code retry safely after observing completion.
-func (s *PaneSequenceStore) Advance(name, pane string) (PaneSequencePosition, error) {
+//
+// Supply the zero-based position returned by Next to make every advance safe
+// to retry, not just completion. An already-consumed position returns the
+// current snapshot with Advanced false; a future position is rejected. The
+// comparison and write happen under the same cross-process sequence lock.
+func (s *PaneSequenceStore) Advance(name, pane string, expectedPosition ...int) (PaneSequencePosition, error) {
 	if s == nil {
 		return PaneSequencePosition{}, errors.New("sequence store is required")
+	}
+	if len(expectedPosition) > 1 || (len(expectedPosition) == 1 && expectedPosition[0] < 0) {
+		return PaneSequencePosition{}, errors.New("expected position must be a single non-negative integer")
 	}
 	if strings.TrimSpace(pane) == "" {
 		return PaneSequencePosition{}, errors.New("sequence pane is required")
@@ -207,13 +288,25 @@ func (s *PaneSequenceStore) Advance(name, pane string) (PaneSequencePosition, er
 		return PaneSequencePosition{}, err
 	}
 
-	paneSequenceMu.Lock()
-	defer paneSequenceMu.Unlock()
+	unlock, err := s.lockSequence(path)
+	if err != nil {
+		return PaneSequencePosition{}, err
+	}
+	defer unlock()
 	sequence, err := s.loadLocked(path)
 	if err != nil {
 		return PaneSequencePosition{}, err
 	}
 	position := sequence.Positions[pane]
+	if len(expectedPosition) == 1 {
+		expected := expectedPosition[0]
+		if expected > position {
+			return PaneSequencePosition{}, fmt.Errorf("sequence pane %q is at position %d, before expected position %d; refresh its next prompt", pane, position, expected)
+		}
+		if expected < position {
+			return sequencePosition(sequence, pane, false), nil
+		}
+	}
 	if position >= len(sequence.Steps) {
 		return sequencePosition(sequence, pane, false), nil
 	}
@@ -242,6 +335,10 @@ func (s *PaneSequenceStore) loadLocked(path string) (*PaneSequence, error) {
 	}
 	if err := validatePaneSequence(sequence); err != nil {
 		return nil, fmt.Errorf("invalid persisted sequence: %w", err)
+	}
+	sequence.Name = strings.TrimSpace(sequence.Name)
+	if sequence.Name != strings.TrimSuffix(filepath.Base(path), ".json") {
+		return nil, fmt.Errorf("persisted sequence name %q does not match requested sequence", sequence.Name)
 	}
 	return &sequence, nil
 }
@@ -300,11 +397,126 @@ func DefaultStateStore() (*StateStore, error) {
 	return &StateStore{Dir: filepath.Join(base, "ntm", "workflows")}, nil
 }
 func (s *StateStore) path(session string) (string, error) {
-	if strings.TrimSpace(session) == "" || filepath.Base(session) != session {
+	if s == nil || strings.TrimSpace(s.Dir) == "" {
+		return "", errors.New("workflow state directory is required")
+	}
+	if strings.TrimSpace(session) == "" || session == "." || session == ".." || filepath.Base(session) != session || strings.ContainsAny(session, "/\\\x00") {
 		return "", errors.New("workflow session name must be a single path component")
 	}
 	return filepath.Join(s.Dir, session+".json"), nil
 }
+
+// Acquire serializes a session's entire workflow run across processes. The
+// caller holds the returned lease from checkpoint load through its last
+// checkpoint write, not merely around individual saves. Atomic writes alone
+// cannot prevent two runners from dispatching the same stage concurrently.
+func (s *StateStore) Acquire(ctx context.Context, session string) (func(), error) {
+	if ctx == nil {
+		return nil, errors.New("workflow lock context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path, err := s.path(session)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create workflow state directory: %w", err)
+	}
+	unlock, err := lockPaneSequenceFile(ctx, path+".lock")
+	if err != nil {
+		return nil, fmt.Errorf("acquire workflow run for session %q (another runner may be active): %w", session, err)
+	}
+	return unlock, nil
+}
+
+// CheckpointToken fingerprints the complete checkpoint, including task
+// variables and pane lifetimes, without exposing those values in status.
+func (s *WorkflowState) CheckpointToken() (string, error) {
+	if s == nil {
+		return "", errors.New("workflow checkpoint is required")
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return "", fmt.Errorf("fingerprint workflow checkpoint: %w", err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
+}
+
+// ReconcileDelivery records an operator's verified outcome for an interrupted
+// send. It never types a prompt. The token from workflow status guards the
+// entire checkpoint, not just a stage/turn that a fresh run could reuse.
+// Only sending may change. Repeating the same resolution is a no-op.
+func (s *StateStore) ReconcileDelivery(ctx context.Context, session, pane, token, outcome string) (*WorkflowState, error) {
+	if strings.TrimSpace(pane) == "" || token == "" {
+		return nil, errors.New("delivery recovery requires a pane and checkpoint token from workflow status")
+	}
+	status := ""
+	switch outcome {
+	case "delivered":
+		status = "delivered"
+	case "not-sent":
+		status = "pending"
+	default:
+		return nil, errors.New("delivery outcome must be delivered or not-sent, based on independent verification")
+	}
+	unlock, err := s.Acquire(ctx, session)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	state, err := s.Load(session)
+	if err != nil {
+		return nil, err
+	}
+	if state == nil || state.ResumeVersion != 1 || state.Completed {
+		return nil, errors.New("no unfinished execution checkpoint supports delivery recovery")
+	}
+	index := -1
+	for i, delivery := range state.Dispatches {
+		if delivery.Pane != pane {
+			continue
+		}
+		if index >= 0 {
+			return nil, errors.New("checkpoint contains duplicate pane deliveries")
+		}
+		index = i
+	}
+	if index < 0 {
+		return nil, fmt.Errorf("pane %s has no delivery in the current stage", pane)
+	}
+	delivery := &state.Dispatches[index]
+	if delivery.Turn <= 0 || delivery.Turn > state.Turn || delivery.Role == "" || state.Agents[pane] != delivery.Role {
+		return nil, errors.New("workflow delivery identity changed; refresh workflow status before recovery")
+	}
+	if delivery.Status == status && delivery.Resolution == outcome && delivery.ResolutionToken == token {
+		return state, nil // Preserve the original timestamp and file bytes.
+	}
+	currentToken, err := state.CheckpointToken()
+	if err != nil {
+		return nil, err
+	}
+	if currentToken != token {
+		return nil, errors.New("workflow checkpoint changed; refresh workflow status before recovery")
+	}
+	if delivery.Status != "sending" {
+		return nil, fmt.Errorf("pane %s turn %d is %s, not an uncertain send; refusing to change confirmed work", pane, delivery.Turn, delivery.Status)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	delivery.Status = status
+	delivery.Resolution = outcome
+	delivery.ResolvedAt = &now
+	delivery.ResolutionToken = token
+	if err := s.Save(state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
 func (s *StateStore) Save(state *WorkflowState) error {
 	if state == nil {
 		return errors.New("workflow state is required")
@@ -340,6 +552,9 @@ func (s *StateStore) Load(session string) (*WorkflowState, error) {
 	var state WorkflowState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("decode workflow state: %w", err)
+	}
+	if state.SessionName != session {
+		return nil, fmt.Errorf("workflow checkpoint session %q does not match requested session %q", state.SessionName, session)
 	}
 	return &state, nil
 }

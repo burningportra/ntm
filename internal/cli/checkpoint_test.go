@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 func TestNewCheckpointCmd(t *testing.T) {
@@ -198,7 +200,7 @@ func TestListCheckpointSessions(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	storage := checkpoint.NewStorageWithDir(tmpDir)
+	storage := &checkpoint.Storage{BaseDir: tmpDir}
 
 	// Empty directory should return nil
 	sessions, err := listCheckpointSessions(storage)
@@ -247,7 +249,7 @@ func TestListCheckpointSessions(t *testing.T) {
 
 func TestListCheckpointSessions_SkipsSymlinkSessionDir(t *testing.T) {
 	tmpDir := t.TempDir()
-	storage := checkpoint.NewStorageWithDir(tmpDir)
+	storage := &checkpoint.Storage{BaseDir: tmpDir}
 
 	outsideDir := t.TempDir()
 	if err := os.Symlink(outsideDir, filepath.Join(tmpDir, "symlink-session")); err != nil {
@@ -265,7 +267,7 @@ func TestListCheckpointSessions_SkipsSymlinkSessionDir(t *testing.T) {
 
 func TestListCheckpointSessions_IncludesSessionWithOnlyInvalidCheckpoints(t *testing.T) {
 	tmpDir := t.TempDir()
-	storage := checkpoint.NewStorageWithDir(tmpDir)
+	storage := &checkpoint.Storage{BaseDir: tmpDir}
 
 	sessionName := "broken-session"
 	cpDir := filepath.Join(tmpDir, sessionName, "20251210-120000-broken")
@@ -287,7 +289,7 @@ func TestListCheckpointSessions_IncludesSessionWithOnlyInvalidCheckpoints(t *tes
 
 func TestListSessionCheckpoints_JSONMarksInvalidOnlySession(t *testing.T) {
 	tmpDir := t.TempDir()
-	storage := checkpoint.NewStorageWithDir(tmpDir)
+	storage := &checkpoint.Storage{BaseDir: tmpDir}
 
 	sessionName := "broken-session"
 	cpDir := filepath.Join(tmpDir, sessionName, "20251210-120000-broken")
@@ -310,7 +312,7 @@ func TestListSessionCheckpoints_JSONMarksInvalidOnlySession(t *testing.T) {
 	os.Stdout = w
 	t.Cleanup(func() { os.Stdout = oldStdout })
 
-	callErr := listSessionCheckpoints(storage, sessionName)
+	callErr := listSessionCheckpoints(storage, sessionName, 0, 0)
 	if err := w.Close(); err != nil {
 		t.Fatalf("stdout close: %v", err)
 	}
@@ -344,7 +346,7 @@ func TestListSessionCheckpoints_JSONMarksInvalidOnlySession(t *testing.T) {
 
 func TestListSessionCheckpoints_JSONIncludesInvalidIDsAlongsideValidCheckpoints(t *testing.T) {
 	tmpDir := t.TempDir()
-	storage := checkpoint.NewStorageWithDir(tmpDir)
+	storage := &checkpoint.Storage{BaseDir: tmpDir}
 
 	sessionName := "mixed-session"
 	valid := &checkpoint.Checkpoint{
@@ -382,7 +384,7 @@ func TestListSessionCheckpoints_JSONIncludesInvalidIDsAlongsideValidCheckpoints(
 	os.Stdout = w
 	t.Cleanup(func() { os.Stdout = oldStdout })
 
-	callErr := listSessionCheckpoints(storage, sessionName)
+	callErr := listSessionCheckpoints(storage, sessionName, 0, 0)
 	if err := w.Close(); err != nil {
 		t.Fatalf("stdout close: %v", err)
 	}
@@ -455,7 +457,7 @@ func TestCheckpointDeleteCmd_DeletesInvalidCheckpointEntry(t *testing.T) {
 
 func TestVerifySingleCheckpoint_JSONReturnsErrorForInvalidCheckpoint(t *testing.T) {
 	tmpDir := t.TempDir()
-	storage := checkpoint.NewStorageWithDir(tmpDir)
+	storage := &checkpoint.Storage{BaseDir: tmpDir}
 
 	sessionName := "verify-invalid-session"
 	checkpointID := "20251210-120000-broken"
@@ -515,7 +517,7 @@ func TestVerifySingleCheckpoint_JSONReturnsErrorForInvalidCheckpoint(t *testing.
 
 func TestVerifyAllCheckpoints_JSONReturnsErrorForInvalidCheckpoint(t *testing.T) {
 	tmpDir := t.TempDir()
-	storage := checkpoint.NewStorageWithDir(tmpDir)
+	storage := &checkpoint.Storage{BaseDir: tmpDir}
 
 	sessionName := "verify-all-invalid-session"
 	valid := &checkpoint.Checkpoint{
@@ -762,5 +764,138 @@ func TestCheckpointRestoreCmd_InvalidCheckpointReportsLoadFailure(t *testing.T) 
 	}
 	if strings.Contains(err.Error(), "finding checkpoint: no checkpoint found matching") {
 		t.Fatalf("error = %q, want exact invalid checkpoint load failure", err)
+	}
+}
+
+func checkpointRestoreCommandFixture(t *testing.T, paneCount int) (*checkpoint.Checkpoint, string, string) {
+	t.Helper()
+	resetFlags()
+	t.Cleanup(resetFlags)
+	jsonOutput = true
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	logPath, readyPath := filepath.Join(dir, "calls"), filepath.Join(dir, "ready")
+	t.Setenv("NTM_CLI_RESTORE_LOG", logPath)
+	t.Setenv("NTM_CLI_RESTORE_READY", readyPath)
+	t.Setenv("NTM_CLI_RESTORE_BLOCK", "")
+	bin := filepath.Join(dir, "tmux")
+	const script = `#!/bin/sh
+printf '%s\n' "$*" >> "$NTM_CLI_RESTORE_LOG"
+if [ "$1" = "$NTM_CLI_RESTORE_BLOCK" ]; then
+  echo ready > "$NTM_CLI_RESTORE_READY"
+  exec sleep 30
+fi
+case "$1" in
+  has-session) echo "can't find session" >&2; exit 1 ;;
+  list-windows) echo 0 ;;
+  list-panes) echo '%0_NTM_SEP_0_NTM_SEP__NTM_SEP_bash_NTM_SEP_80_NTM_SEP_24_NTM_SEP_1_NTM_SEP_0_NTM_SEP_0_NTM_SEP_user_NTM_SEP__NTM_SEP__NTM_SEP_0' ;;
+esac
+`
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", bin)
+	old := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = old })
+	cp := &checkpoint.Checkpoint{
+		Version: 1, ID: "cp-restore-cli", Name: "recovery", SessionName: "restore-source",
+		WorkingDir: t.TempDir(), CreatedAt: time.Now(), PaneCount: paneCount,
+	}
+	for i := 0; i < paneCount; i++ {
+		cp.Session.Panes = append(cp.Session.Panes, checkpoint.PaneState{Index: i, AgentType: "user"})
+	}
+	if err := checkpoint.NewStorage().Save(cp); err != nil {
+		t.Fatal(err)
+	}
+	return cp, logPath, readyPath
+}
+
+func TestCheckpointRestoreCmd_TargetSessionPreservesSource(t *testing.T) {
+	cp, logPath, _ := checkpointRestoreCommandFixture(t, 1)
+	cmd := newCheckpointRestoreCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{cp.SessionName, cp.ID, "--as", "restore-copy", "--skip-git-check"})
+	out, err := captureStdout(t, cmd.Execute)
+	if err != nil {
+		t.Fatalf("restore failed: %v; output=%s", err, out)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["success"] != true || result["session"] != "restore-copy" || result["source_session"] != cp.SessionName || result["panes_restored"] != float64(1) {
+		t.Fatalf("incorrect restore result: %#v", result)
+	}
+	stored, err := checkpoint.NewStorage().Load(cp.SessionName, cp.ID)
+	if err != nil || stored.SessionName != cp.SessionName {
+		t.Fatalf("source checkpoint changed: %#v, %v", stored, err)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "new-session -d -s restore-copy") || strings.Contains(string(calls), "kill-session") {
+		t.Fatalf("restore targeted wrong session: %s", calls)
+	}
+}
+
+func TestCheckpointRestoreCmd_CancellationRetainsPartialProgress(t *testing.T) {
+	cp, logPath, readyPath := checkpointRestoreCommandFixture(t, 2)
+	t.Setenv("NTM_CLI_RESTORE_BLOCK", "split-window")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := newCheckpointRestoreCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{cp.SessionName, cp.ID, "--as", "restore-copy", "--skip-git-check"})
+	type outcome struct {
+		output string
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		out, err := captureStdout(t, func() error { return cmd.ExecuteContext(ctx) })
+		done <- outcome{out, err}
+	}()
+	defer func() { cancel() }()
+	deadline := time.After(5 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		select {
+		case got := <-done:
+			t.Fatalf("restore returned before blocking: %v; %s", got.err, got.output)
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("restore did not reach split-window")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("cancellation error lost: %v; %s", got.err, got.output)
+		}
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(got.output), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result["success"] != false || result["session"] != "restore-copy" || result["stage"] != "restoring_layout" || result["panes_restored"] != float64(1) || result["interrupted"] != true {
+			t.Fatalf("partial recovery evidence lost: %#v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not stop the in-flight restore")
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "kill-session") || strings.Contains(string(calls), "respawn-pane") {
+		t.Fatalf("cancellation caused further mutations: %s", calls)
 	}
 }

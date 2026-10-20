@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/invariants"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tools"
 	processutil "github.com/shirou/gopsutil/v4/process"
@@ -36,7 +39,7 @@ func newDoctorCmd() *cobra.Command {
 and configured. Checks:
 
   - Tool detection (bv, bd, am, cm, cass, s2p)
-  - Version compatibility (including optional Grok Build discovery)
+  - Version compatibility (including optional Grok Build and Oh My Pi discovery)
   - Daemon health and port availability
   - Configuration files
 
@@ -268,8 +271,17 @@ type SafetyDefaults struct {
 	RedactionAllowlistCount   int    `json:"redaction_allowlist_count"`
 	PrivacyDefaultEnabled     bool   `json:"privacy_default_enabled"`
 	EncryptionAtRestEnabled   bool   `json:"encryption_at_rest_enabled"`
-	PreflightDefaultEnabled   bool   `json:"preflight_default_enabled"`
 	PreflightDefaultStrict    bool   `json:"preflight_default_strict"`
+	// ClaudeAgentHooks names the PreToolUse hooks ntm-launched Claude agents
+	// carry through --settings (ntm-policy, dcg, rch); empty when none.
+	ClaudeAgentHooks []string `json:"claude_agent_hooks"`
+	// ClaudePolicyHookRegistered reports that `ntm safety install` registered
+	// the policy hook in ~/.claude/settings.json, which covers every Claude
+	// session (launches then skip their own copy).
+	ClaudePolicyHookRegistered bool `json:"claude_policy_hook_registered"`
+	// ClaudeAgentHooksWarning explains why Claude agents would run without
+	// the safety policy hook; empty when they are covered.
+	ClaudeAgentHooksWarning string `json:"claude_agent_hooks_warning,omitempty"`
 }
 
 // InvariantCheck represents a design invariant check result
@@ -321,14 +333,45 @@ type ConfigCheck struct {
 	Message string `json:"message,omitempty"`
 }
 
+// doctorExitFailure reports whether an overall verdict must produce a non-zero
+// process exit.
+//
+// Both output paths consult this one predicate so they cannot disagree about
+// what counts as failure. They previously did: renderDoctorTUITo mapped
+// "unhealthy" onto an error, while runDoctor's JSON branch returned
+// outputDoctorJSON's encode error and nothing else — so `ntm doctor --json`
+// exited 0 on an unhealthy ecosystem. JSON mode is precisely the mode a
+// preflight script gates on, so the surface that mattered was the silent one.
+//
+// Warnings deliberately do not fail: an optional tool being absent is the
+// normal state on most machines, and failing on it would make the command
+// useless as a gate. Callers who want to gate on warnings read `.warnings`.
+func doctorExitFailure(overall string) bool {
+	return overall == "unhealthy"
+}
+
+// doctorCheck is the seam tests use to drive runDoctor with a chosen verdict;
+// production always runs the real probe. Mirrors healthKernelRun in health.go.
+var doctorCheck = performDoctorCheck
+
 func runDoctor(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	report := performDoctorCheck(ctx)
+	report := doctorCheck(ctx)
 
 	if IsJSONOutput() {
-		return outputDoctorJSON(report)
+		if err := outputDoctorJSON(report); err != nil {
+			return err
+		}
+		if doctorExitFailure(report.Overall) {
+			// The report itself is the machine-readable failure surface: its
+			// `overall` field already says "unhealthy". errJSONFailure makes
+			// Execute exit non-zero without encoding a second JSON envelope
+			// after the report, which would break a single-document `jq`.
+			return errJSONFailure
+		}
+		return nil
 	}
 
 	return renderDoctorTUI(report)
@@ -354,8 +397,10 @@ func performDoctorCheck(ctx context.Context) *DoctorReport {
 	// Check configuration
 	report.Configuration = checkConfiguration()
 
-	// Check design invariants
-	report.Invariants = checkInvariants(ctx)
+	// Check design invariants. The tool results computed above are handed over
+	// as evidence so Graceful Degradation is measured rather than asserted,
+	// without probing every adapter a second time.
+	report.Invariants = checkInvariants(ctx, report.Tools)
 
 	// Calculate overall status
 	for _, t := range report.Tools {
@@ -571,7 +616,42 @@ func checkDependencies(ctx context.Context) []DepCheck {
 	}
 	checks = append(checks, grokCheck)
 
+	// Oh My Pi is optional too: absence is healthy, presence reports the
+	// sanitized `omp --version` ("omp/18.2.3").
+	ompStatus, ompVersion, _ := checkDepWithPath(depCheck{
+		Name:        "Oh My Pi (omp)",
+		Command:     "omp",
+		VersionArgs: []string{"--version"},
+	})
+	ompCheck := DepCheck{
+		Name:      "omp",
+		Installed: ompStatus == "found",
+		Version:   ompVersion,
+		Status:    "ok",
+	}
+	if !ompCheck.Installed {
+		ompCheck.Message = "optional agent not found"
+	}
+	checks = append(checks, ompCheck)
+
 	return checks
+}
+
+// daemonVerdict renders the status and message for one daemon probe.
+//
+// Both arms of this decision used to report "ok", so a daemon that was not
+// running drew a green tick reading "port 8765 available" — including one the
+// operator had switched on in config. A down daemon is now a warning when it is
+// expected, and an unjudged "?" when it is not.
+func daemonVerdict(running, expected bool, port int) (status, message string) {
+	switch {
+	case running:
+		return "ok", fmt.Sprintf("listening on port %d", port)
+	case expected:
+		return "warning", fmt.Sprintf("enabled in config but not listening on port %d", port)
+	default:
+		return "unknown", fmt.Sprintf("not running (port %d free)", port)
+	}
 }
 
 func checkDaemons(ctx context.Context) []DaemonCheck {
@@ -579,12 +659,15 @@ func checkDaemons(ctx context.Context) []DaemonCheck {
 
 	// Check common daemon ports in deterministic order
 	type daemonPort struct {
-		name string
-		port int
+		name     string
+		port     int
+		expected bool
 	}
+	// expected records whether this daemon is supposed to be up, so a daemon
+	// that is down can be reported as a problem rather than as a tick.
 	daemons := []daemonPort{
-		{"agent-mail", 8765},
-		{"cm-server", 8766},
+		{"agent-mail", 8765, cfg != nil && cfg.AgentMail.Enabled},
+		{"cm-server", 8766, false},
 	}
 
 	dialer := &net.Dialer{Timeout: time.Second}
@@ -600,13 +683,8 @@ func checkDaemons(ctx context.Context) []DaemonCheck {
 		if err == nil {
 			conn.Close()
 			check.Running = true
-			check.Status = "ok"
-			check.Message = fmt.Sprintf("listening on port %d", dp.port)
-		} else {
-			check.Running = false
-			check.Status = "ok"
-			check.Message = fmt.Sprintf("port %d available", dp.port)
 		}
+		check.Status, check.Message = daemonVerdict(check.Running, dp.expected, dp.port)
 
 		checks = append(checks, check)
 	}
@@ -674,7 +752,109 @@ func checkConfiguration() []ConfigCheck {
 		})
 	}
 
+	// Pre-commit guard degraded runs (bd-ws1-truth-safety-l5ddi.1): fail-open
+	// hook runs are recorded in the state DB precisely because a WARN in
+	// commit scrollback is unobserved; doctor is where they become visible.
+	checks = append(checks, guardDegradationCheck())
+
+	// The one fail-open guard path that can never record a ledger row
+	// (bd-2c0yh.4): hook installed but `ntm` missing from PATH.
+	checks = append(checks, guardHookPathCheck())
+
+	// Removed config knobs (WS6-remove-finalize, bd-ws6-config-truth-ienmd.3):
+	// keys removed in v1.26.0 are hard strict-loader errors since v1.27.0.
+	// Doctor scans the config file leniently (ScanRemovedKnobs), so it can
+	// still name each removed key + disposition even though the strict loader
+	// refuses to load such a config.
+	checks = append(checks, removedKnobChecks()...)
+
+	// Deprecated config knobs (bd-6otuk, v1.28.0 batch): hard strict-loader
+	// errors since v1.29.0. Doctor scans the config file leniently
+	// (ScanDeprecatedKnobs), so it can still name each key + disposition even
+	// though the strict loader refuses to load such a config.
+	checks = append(checks, deprecatedKnobChecks()...)
+
 	return checks
+}
+
+// deprecatedKnobChecks reports every deprecated-in-v1.28.0 config key present
+// in the active config file, one error per key, with the exact disposition
+// text the strict loader uses in its load error.
+func deprecatedKnobChecks() []ConfigCheck {
+	knobs, err := config.ScanDeprecatedKnobs(selectedConfigPath())
+	if err != nil {
+		return []ConfigCheck{{
+			Name:    "deprecated config keys",
+			Valid:   false,
+			Status:  "warning",
+			Message: fmt.Sprintf("could not scan config for deprecated keys: %v", err),
+		}}
+	}
+	if len(knobs) == 0 {
+		return []ConfigCheck{{
+			Name:    "deprecated config keys",
+			Valid:   true,
+			Status:  "ok",
+			Message: "no deprecated config keys present",
+		}}
+	}
+	checks := make([]ConfigCheck, 0, len(knobs))
+	for _, knob := range knobs {
+		checks = append(checks, ConfigCheck{
+			Name:    "deprecated config key: " + knob.Key,
+			Valid:   false,
+			Status:  "error",
+			Message: deadKnobDoctorMessage(knob),
+		})
+	}
+	return checks
+}
+
+// removedKnobChecks reports every removed config key present in the active
+// config file, one error per key, with the exact disposition text the strict
+// loader uses in its load error and that key's own removal-batch provenance.
+func removedKnobChecks() []ConfigCheck {
+	knobs, err := config.ScanRemovedKnobs(selectedConfigPath())
+	if err != nil {
+		return []ConfigCheck{{
+			Name:    "removed config keys",
+			Valid:   false,
+			Status:  "warning",
+			Message: fmt.Sprintf("could not scan config for removed keys: %v", err),
+		}}
+	}
+	if len(knobs) == 0 {
+		return []ConfigCheck{{
+			Name:    "removed config keys",
+			Valid:   true,
+			Status:  "ok",
+			Message: "no removed config keys present",
+		}}
+	}
+	checks := make([]ConfigCheck, 0, len(knobs))
+	for _, knob := range knobs {
+		checks = append(checks, ConfigCheck{
+			Name:    "removed config key: " + knob.Key,
+			Valid:   false,
+			Status:  "error",
+			Message: deadKnobDoctorMessage(knob),
+		})
+	}
+	return checks
+}
+
+// deadKnobDoctorMessage renders doctor's per-key remediation line.
+//
+// The release text comes from the key's OWN removal batch. This function used
+// to be two copies that hard-coded "since v1.27.0" and "since v1.29.0", which
+// was fine while each scan returned exactly one batch — and became wrong the
+// moment ScanRemovedKnobs started carrying a later batch too, telling users a
+// key had failed loading since a release in which it still worked (ntm#323).
+func deadKnobDoctorMessage(knob config.RemovedKnob) string {
+	if provenance := config.DeadKeyTierProvenance(knob.Tier); provenance != "" {
+		return fmt.Sprintf("%s (%s) — delete it from your config file", knob.Disposition, provenance)
+	}
+	return fmt.Sprintf("%s — delete it from your config file", knob.Disposition)
 }
 
 func buildSafetyDefaults(cfg *config.Config) SafetyDefaults {
@@ -689,18 +869,109 @@ func buildSafetyDefaults(cfg *config.Config) SafetyDefaults {
 
 	allowlistCount := len(cfg.Redaction.Allowlist)
 
-	return SafetyDefaults{
+	defaults := SafetyDefaults{
 		RedactionMode:             redactionMode,
 		RedactionAllowlistEnabled: allowlistCount > 0,
 		RedactionAllowlistCount:   allowlistCount,
 		PrivacyDefaultEnabled:     cfg.Privacy.Enabled,
 		EncryptionAtRestEnabled:   cfg.Encryption.Enabled,
-		PreflightDefaultEnabled:   cfg.Preflight.Enabled,
 		PreflightDefaultStrict:    cfg.Preflight.Strict,
+		ClaudeAgentHooks:          []string{},
 	}
+	defaults.ClaudePolicyHookRegistered, defaults.ClaudeAgentHooksWarning = claudeAgentHookCoverage(cfg, &defaults.ClaudeAgentHooks)
+	return defaults
 }
 
-func checkInvariants(ctx context.Context) []InvariantCheck {
+// claudeAgentHookCoverage reports whether the Claude agents ntm launches are
+// covered by the safety policy hook: through --settings on the launch command,
+// or through the hook `ntm safety install` registered for every Claude session.
+func claudeAgentHookCoverage(cfg *config.Config, hooks *[]string) (registered bool, warning string) {
+	if home, err := os.UserHomeDir(); err == nil {
+		script := policy.ClaudeHookScriptPath(home)
+		ok, regErr := policy.ClaudeHookRegistered(policy.ClaudeUserSettingsPath(home), script)
+		registered = regErr == nil && ok && fileExists(script)
+	}
+	launch := policy.ClaudeAgentLaunchSettings(cfg)
+	*hooks = append(*hooks, launch.Sources...)
+
+	template := cfg.Agents.Claude
+	if strings.TrimSpace(template) == "" {
+		template = config.DefaultAgentTemplates().Claude
+	}
+	rendered, err := config.GenerateAgentCommand(template, config.AgentTemplateVars{AgentType: "cc", ClaudeSettings: launch.Settings})
+	switch {
+	case err != nil:
+		return registered, fmt.Sprintf("the [agents] claude command does not render: %v", err)
+	case config.ClaudeHooksNotAppliedWarning(rendered, launch.Settings) != "":
+		*hooks = (*hooks)[:0]
+		if registered {
+			return registered, ""
+		}
+		return registered, "the [agents] claude command cannot carry --settings; add --settings {{shellQuote .ClaudeSettings}} to it"
+	case !registered && !slices.Contains(launch.Sources, "ntm-policy"):
+		return registered, "[safety] claude_policy_hook = false and no hook registered by `ntm safety install`"
+	}
+	return registered, ""
+}
+
+// toolAvailabilityFromChecks converts doctor's tool results into the evidence
+// the Graceful Degradation invariant is measured from.
+//
+// "Reported" means the unavailable tool was actually surfaced to the operator —
+// a non-ok status with a message. A tool that is missing while doctor shows it
+// as fine is the silent degradation the invariant exists to catch.
+func toolAvailabilityFromChecks(tools []ToolCheck) []invariants.ToolAvailability {
+	out := make([]invariants.ToolAvailability, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, invariants.ToolAvailability{
+			Name:      t.Name,
+			Available: t.Installed,
+			Reported:  t.Installed || (t.Status != "ok" && t.Message != ""),
+		})
+	}
+	return out
+}
+
+// liveSchemaConstraints returns the table definitions from the state database,
+// so the Idempotent Orchestration invariant can verify that retry safety is
+// enforced by the schema rather than merely intended.
+func liveSchemaConstraints() ([]string, error) {
+	store, err := state.Open("")
+	if err != nil {
+		return nil, fmt.Errorf("open state store: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Deliberately does not migrate. doctor is a diagnostic, and migrating here
+	// would have it silently rewrite the operator's schema as a side effect of
+	// being asked a question — on a database still at the previous release that
+	// means running 023's table rebuild. An unmigrated database reports as
+	// unverified instead, which is the truth.
+	db := store.DB()
+	if db == nil {
+		return nil, fmt.Errorf("state store exposes no database handle")
+	}
+	rows, err := db.Query(`SELECT sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("read schema: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var stmts []string
+	for rows.Next() {
+		var stmt string
+		if err := rows.Scan(&stmt); err != nil {
+			return nil, fmt.Errorf("scan schema row: %w", err)
+		}
+		stmts = append(stmts, stmt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate schema: %w", err)
+	}
+	return stmts, nil
+}
+
+func checkInvariants(ctx context.Context, tools []ToolCheck) []InvariantCheck {
 	var checks []InvariantCheck
 
 	// Get current working directory for the checker
@@ -709,7 +980,11 @@ func checkInvariants(ctx context.Context) []InvariantCheck {
 		cwd = "."
 	}
 
-	checker := invariants.NewChecker(cwd)
+	checker := invariants.NewChecker(cwd).
+		WithToolReport(func() []invariants.ToolAvailability {
+			return toolAvailabilityFromChecks(tools)
+		}).
+		WithSchemaConstraints(liveSchemaConstraints)
 	report := checker.CheckAll(ctx)
 
 	// Convert invariant results to InvariantCheck format
@@ -865,15 +1140,25 @@ func renderDoctorTUITo(w io.Writer, report *DoctorReport) error {
 	fmt.Fprintf(w, "  %s Encryption at rest: %s\n", encryptionStatus, mutedStyle.Render(encryptionLabel))
 
 	preflightStatus := statusIcon("ok")
-	preflightLabel := "disabled"
-	if report.SafetyDefaults.PreflightDefaultEnabled {
-		preflightLabel = "enabled"
-	}
 	strictLabel := "strict=off"
 	if report.SafetyDefaults.PreflightDefaultStrict {
 		strictLabel = "strict=on"
 	}
-	fmt.Fprintf(w, "  %s Prompt preflight: %s (%s)\n", preflightStatus, mutedStyle.Render(preflightLabel), mutedStyle.Render(strictLabel))
+	fmt.Fprintf(w, "  %s Prompt preflight: %s\n", preflightStatus, mutedStyle.Render(strictLabel))
+
+	hooksStatus, hooksLabel := statusIcon("ok"), ""
+	switch {
+	case report.SafetyDefaults.ClaudeAgentHooksWarning != "":
+		hooksStatus, hooksLabel = statusIcon("warning"), "unprotected: "+report.SafetyDefaults.ClaudeAgentHooksWarning
+	case len(report.SafetyDefaults.ClaudeAgentHooks) > 0:
+		hooksLabel = strings.Join(report.SafetyDefaults.ClaudeAgentHooks, ", ") + " via --settings"
+		if report.SafetyDefaults.ClaudePolicyHookRegistered {
+			hooksLabel += "; policy hook registered in ~/.claude/settings.json"
+		}
+	default:
+		hooksLabel = "policy hook registered in ~/.claude/settings.json"
+	}
+	fmt.Fprintf(w, "  %s Claude agent hooks: %s\n", hooksStatus, mutedStyle.Render(hooksLabel))
 
 	// Invariants section
 	fmt.Fprintln(w, sectionStyle.Render("Design Invariants:"))
@@ -904,14 +1189,11 @@ func renderDoctorTUITo(w io.Writer, report *DoctorReport) error {
 	fmt.Fprintln(w, boxStyle.Render(statusStyle.Render(statusMsg)))
 	fmt.Fprintln(w)
 
-	// Return error to indicate non-healthy status (Cobra will set appropriate exit code)
-	switch report.Overall {
-	case "unhealthy":
+	// Return error to indicate non-healthy status (Cobra will set appropriate
+	// exit code). Shares doctorExitFailure with the JSON path so both surfaces
+	// agree on the exit contract.
+	if doctorExitFailure(report.Overall) {
 		return errors.New("ecosystem is unhealthy")
-	case "warning":
-		// Warnings are informational, don't fail
-		return nil
 	}
-
 	return nil
 }

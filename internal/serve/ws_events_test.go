@@ -2,69 +2,37 @@ package serve
 
 import (
 	"database/sql"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
+// setupTestDB opens a temp state store and applies the REAL managed
+// migrations (the ws_events schema lands via 006_ws_events.sql), so these
+// tests exercise the exact schema production runs against.
 func setupTestDB(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
+	dbPath := filepath.Join(t.TempDir(), "test.db")
 
-	db, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(
-		dbPath,
-		"journal_mode(WAL)",
-		"synchronous(NORMAL)",
-		"busy_timeout(5000)",
-		"foreign_keys(1)",
-	))
+	store, err := state.Open(dbPath)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open state store: %v", err)
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	// Create schema
-	schema := `
-		CREATE TABLE ws_events (
-			seq INTEGER PRIMARY KEY AUTOINCREMENT,
-			topic TEXT NOT NULL,
-			event_type TEXT NOT NULL,
-			data TEXT NOT NULL,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE INDEX idx_ws_events_seq ON ws_events(seq);
-		CREATE INDEX idx_ws_events_topic_seq ON ws_events(topic, seq);
-		CREATE INDEX idx_ws_events_created_at ON ws_events(created_at);
-
-		CREATE TABLE ws_dropped_events (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			topic TEXT NOT NULL,
-			client_id TEXT NOT NULL,
-			dropped_count INTEGER NOT NULL DEFAULT 1,
-			first_dropped_seq INTEGER,
-			last_dropped_seq INTEGER,
-			reason TEXT,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE INDEX idx_ws_dropped_client ON ws_dropped_events(client_id, created_at);
-	`
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		t.Fatalf("create schema: %v", err)
+	if err := store.Migrate(); err != nil {
+		store.Close()
+		t.Fatalf("apply migrations: %v", err)
 	}
 
 	cleanup := func() {
-		db.Close()
-		os.RemoveAll(dir)
+		if err := store.Close(); err != nil {
+			t.Errorf("close state store: %v", err)
+		}
 	}
 
-	return db, cleanup
+	return store.DB(), cleanup
 }
 
 func TestWSEventStore_StoreAndRetrieve(t *testing.T) {
@@ -218,10 +186,7 @@ func TestWSEventStore_DroppedEvents(t *testing.T) {
 	}
 
 	// Get stats
-	stats, err := store.GetDroppedStats("client-1", time.Now().Add(-time.Hour))
-	if err != nil {
-		t.Fatalf("get dropped stats: %v", err)
-	}
+	stats := droppedStatsForTest(t, store, "client-1", time.Now().Add(-time.Hour))
 
 	if len(stats) != 1 { // Grouped by topic+reason
 		t.Errorf("expected 1 grouped stat, got %d", len(stats))
@@ -460,10 +425,7 @@ func TestWSEventStore_BackpressureRecording(t *testing.T) {
 	}
 
 	// Verify dropped event was recorded
-	stats, err := store.GetDroppedStats(clientID, time.Now().Add(-time.Hour))
-	if err != nil {
-		t.Fatalf("get dropped stats: %v", err)
-	}
+	stats := droppedStatsForTest(t, store, clientID, time.Now().Add(-time.Hour))
 
 	if len(stats) == 0 {
 		t.Fatal("expected dropped stats to be recorded")
@@ -634,4 +596,46 @@ func TestWSEventStore_Stop_Idempotent(t *testing.T) {
 
 	store.Stop()
 	store.Stop()
+}
+
+// droppedStatsForTest aggregates recorded drops directly from the database;
+// the exported GetDroppedStats method was removed as dead code, and this
+// keeps the live RecordDropped path verifiable.
+func droppedStatsForTest(t *testing.T, s *WSEventStore, clientID string, since time.Time) []WSDroppedInfo {
+	t.Helper()
+	if s.db == nil {
+		return nil
+	}
+	rows, err := s.db.Query(`
+		SELECT topic, client_id, SUM(dropped_count), MIN(first_dropped_seq), MAX(last_dropped_seq), reason
+		FROM ws_dropped_events
+		WHERE client_id = ? AND created_at > ?
+		GROUP BY topic, reason
+		ORDER BY MAX(created_at) DESC`,
+		clientID, since,
+	)
+	if err != nil {
+		t.Fatalf("query dropped stats: %v", err)
+	}
+	defer rows.Close()
+
+	var stats []WSDroppedInfo
+	for rows.Next() {
+		var info WSDroppedInfo
+		var firstSeq, lastSeq sql.NullInt64
+		if err := rows.Scan(&info.Topic, &info.ClientID, &info.DroppedCount, &firstSeq, &lastSeq, &info.Reason); err != nil {
+			t.Fatalf("scan dropped info: %v", err)
+		}
+		if firstSeq.Valid {
+			info.FirstDroppedSeq = firstSeq.Int64
+		}
+		if lastSeq.Valid {
+			info.LastDroppedSeq = lastSeq.Int64
+		}
+		stats = append(stats, info)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows err: %v", err)
+	}
+	return stats
 }

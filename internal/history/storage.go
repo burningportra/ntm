@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -19,8 +20,9 @@ import (
 )
 
 const (
-	historyFileName   = "history.jsonl"
-	defaultMaxEntries = 10000
+	historyFileName     = "history.jsonl"
+	defaultMaxEntries   = 10000
+	maxHistoryLineBytes = 5 * 1024 * 1024
 )
 
 var (
@@ -88,92 +90,13 @@ func Append(entry *HistoryEntry) error {
 	// Apply redaction if configured
 	entryToWrite := RedactEntry(entry)
 
-	data, err := json.Marshal(entryToWrite)
-	if err != nil {
-		return err
-	}
-
-	// Encrypt if configured (after redaction, before write)
-	data, err = encryptJSONLine(data)
+	data, err := encodeHistoryLine(entryToWrite)
 	if err != nil {
 		return err
 	}
 
 	// Write line with newline atomically
 	_, err = f.Write(append(data, '\n'))
-	return err
-}
-
-// BatchAppend adds multiple entries to the history file atomically.
-// If redaction is configured via SetRedactionConfig, prompts are redacted before storage.
-func BatchAppend(entries []*HistoryEntry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-
-	// Apply privacy gating before taking any locks or touching the filesystem.
-	toWrite := make([]*HistoryEntry, 0, len(entries))
-	for _, entry := range entries {
-		if entry == nil {
-			continue
-		}
-		if entry.Session != "" {
-			if err := privacy.GetDefaultManager().CanPersist(entry.Session, privacy.OpPromptHistory); err != nil {
-				if privacy.IsPrivacyError(err) {
-					continue
-				}
-				return err
-			}
-		}
-		toWrite = append(toWrite, entry)
-	}
-	if len(toWrite) == 0 {
-		return nil
-	}
-
-	// Prepare all data in memory before locking to ensure atomicity
-	var buf bytes.Buffer
-	for _, entry := range toWrite {
-		// Apply redaction if configured
-		entryToWrite := RedactEntry(entry)
-
-		data, err := json.Marshal(entryToWrite)
-		if err != nil {
-			return err
-		}
-		// Encrypt if configured
-		data, err = encryptJSONLine(data)
-		if err != nil {
-			return err
-		}
-		buf.Write(data)
-		buf.WriteByte('\n')
-	}
-
-	if buf.Len() == 0 {
-		return nil
-	}
-
-	unlock, err := acquireLock()
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	path := StoragePath()
-
-	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = f.Write(buf.Bytes())
 	return err
 }
 
@@ -186,11 +109,13 @@ func ReadAll() ([]HistoryEntry, error) {
 	}
 	defer unlock()
 
-	return readAllLocked()
+	return readAllLocked(false)
 }
 
-// readAllLocked reads all entries (caller must hold lock)
-func readAllLocked() ([]HistoryEntry, error) {
+// readAllLocked reads all entries (caller must hold lock). Destructive
+// rewrites require strict reads: a partial view must never replace the source
+// when a key or record is unreadable.
+func readAllLocked(strict bool) ([]HistoryEntry, error) {
 	path := StoragePath()
 
 	f, err := os.Open(path)
@@ -205,18 +130,33 @@ func readAllLocked() ([]HistoryEntry, error) {
 	var entries []HistoryEntry
 	scanner := bufio.NewScanner(f)
 	// Set max line size for large prompts (5MB), start with 64KB
-	scanner.Buffer(make([]byte, 64*1024), 5*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryLineBytes)
 
+	lineNumber := 0
 	for scanner.Scan() {
-		line := scanner.Bytes()
+		lineNumber++
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
 		// Decrypt if encrypted
 		plain, err := decryptJSONLine(line)
 		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("read history line %d: %w", lineNumber, err)
+			}
 			slog.Warn("history: skipping unreadable line", "error", err)
 			continue
 		}
+		plain = bytes.TrimSpace(plain)
+		if strict && (len(plain) == 0 || plain[0] != '{') {
+			return nil, fmt.Errorf("read history line %d: expected a JSON object", lineNumber)
+		}
 		var entry HistoryEntry
 		if err := json.Unmarshal(plain, &entry); err != nil {
+			if strict {
+				return nil, fmt.Errorf("read history line %d: %w", lineNumber, err)
+			}
 			slog.Warn("history: skipping malformed line", "error", err)
 			continue
 		}
@@ -311,10 +251,13 @@ ReadEntries:
 	var entries []HistoryEntry
 	scanner := bufio.NewScanner(f)
 	// Set max line size for large prompts (5MB), start with 64KB
-	scanner.Buffer(make([]byte, 64*1024), 5*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryLineBytes)
 
 	for scanner.Scan() {
-		line := scanner.Bytes()
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
 		plain, err := decryptJSONLine(line)
 		if err != nil {
 			slog.Warn("history: skipping unreadable line", "error", err)
@@ -380,6 +323,8 @@ func Count() (int, error) {
 
 	count := 0
 	scanner := bufio.NewScanner(f)
+	// Count must accept the same large (including encrypted) rows as readers.
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryLineBytes)
 	for scanner.Scan() {
 		count++
 	}
@@ -405,13 +350,17 @@ func Clear() error {
 
 // Prune keeps only the last n entries, removing older ones.
 func Prune(keep int) (int, error) {
+	if keep < 0 {
+		return 0, fmt.Errorf("history retention count must be non-negative")
+	}
+
 	unlock, err := acquireLock()
 	if err != nil {
 		return 0, err
 	}
 	defer unlock()
 
-	entries, err := readAllLocked()
+	entries, err := readAllLocked(true)
 	if err != nil {
 		return 0, err
 	}
@@ -424,31 +373,7 @@ func Prune(keep int) (int, error) {
 	toKeep := entries[len(entries)-keep:]
 	removed := len(entries) - keep
 
-	// Rewrite file atomically (re-encrypt if enabled)
-	var buf bytes.Buffer
-	skipped := 0
-	for _, entry := range toKeep {
-		data, err := json.Marshal(entry)
-		if err != nil {
-			slog.Warn("history: prune: skipping entry that failed to marshal", "error", err)
-			skipped++
-			continue
-		}
-		data, err = encryptJSONLine(data)
-		if err != nil {
-			slog.Warn("history: prune: skipping entry that failed to encrypt", "error", err)
-			skipped++
-			continue
-		}
-		buf.Write(data)
-		buf.WriteByte('\n')
-	}
-	if skipped > 0 {
-		slog.Warn("history: prune: entries lost during rewrite", "skipped", skipped)
-	}
-
-	path := StoragePath()
-	if err := util.AtomicWriteFile(path, buf.Bytes(), 0600); err != nil {
+	if err := rewriteHistoryLocked(toKeep); err != nil {
 		return 0, err
 	}
 
@@ -463,14 +388,14 @@ func PruneByTime(cutoff time.Time) (int, error) {
 	}
 	defer unlock()
 
-	entries, err := readAllLocked()
+	entries, err := readAllLocked(true)
 	if err != nil {
 		return 0, err
 	}
 
 	var toKeep []HistoryEntry
 	for _, e := range entries {
-		if e.Timestamp.After(cutoff) {
+		if !e.Timestamp.Before(cutoff) {
 			toKeep = append(toKeep, e)
 		}
 	}
@@ -480,35 +405,45 @@ func PruneByTime(cutoff time.Time) (int, error) {
 		return 0, nil
 	}
 
-	// Rewrite file atomically (re-encrypt if enabled)
-	var buf bytes.Buffer
-	skipped := 0
-	for _, entry := range toKeep {
-		data, err := json.Marshal(entry)
-		if err != nil {
-			slog.Warn("history: prune-by-time: skipping entry that failed to marshal", "error", err)
-			skipped++
-			continue
-		}
-		data, err = encryptJSONLine(data)
-		if err != nil {
-			slog.Warn("history: prune-by-time: skipping entry that failed to encrypt", "error", err)
-			skipped++
-			continue
-		}
-		buf.Write(data)
-		buf.WriteByte('\n')
-	}
-	if skipped > 0 {
-		slog.Warn("history: prune-by-time: entries lost during rewrite", "skipped", skipped)
-	}
-
-	path := StoragePath()
-	if err := util.AtomicWriteFile(path, buf.Bytes(), 0600); err != nil {
+	if err := rewriteHistoryLocked(toKeep); err != nil {
 		return 0, err
 	}
 
 	return removed, nil
+}
+
+// rewriteHistoryLocked prepares every retained entry before replacing the
+// source. Encryption or encoding failure must leave the old file intact.
+// The caller must hold the history lock and supply a complete, strict read.
+func rewriteHistoryLocked(entries []HistoryEntry) error {
+	var buf bytes.Buffer
+	for i, entry := range entries {
+		data, err := encodeHistoryLine(&entry)
+		if err != nil {
+			return fmt.Errorf("encode history entry %d: %w", i+1, err)
+		}
+		buf.Write(data)
+		buf.WriteByte('\n')
+	}
+	return util.AtomicWriteFile(StoragePath(), buf.Bytes(), 0600)
+}
+
+// encodeHistoryLine enforces the reader's limit after encryption/base64
+// expansion. Neither append nor pruning may publish a row we cannot read.
+func encodeHistoryLine(entry *HistoryEntry) ([]byte, error) {
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return nil, err
+	}
+	data, err = encryptJSONLine(data)
+	if err != nil {
+		return nil, err
+	}
+	// Reserve one byte for the newline consumed by bufio.Scanner.
+	if len(data) >= maxHistoryLineBytes {
+		return nil, fmt.Errorf("encoded history entry must be smaller than %d bytes", maxHistoryLineBytes)
+	}
+	return data, nil
 }
 
 // Search finds entries matching a query string in the prompt.
@@ -560,7 +495,8 @@ func Exists() bool {
 	return info.Size() > 0
 }
 
-// ExportTo writes history to a specific file.
+// ExportTo writes a complete plaintext snapshot to a private file atomically.
+// The destination must not alias the active history file.
 func ExportTo(path string) error {
 	unlock, err := acquireLock()
 	if err != nil {
@@ -568,83 +504,51 @@ func ExportTo(path string) error {
 	}
 	defer unlock()
 
-	entries, err := readAllLocked()
+	// Compare normalized paths even when history does not exist yet. File
+	// identity additionally catches aliases through symlinks and hard links.
+	source, err := filepath.Abs(StoragePath())
+	if err != nil {
+		return err
+	}
+	destination, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if source == destination {
+		return errors.New("history export destination must not be the active history file")
+	}
+	sourceInfo, err := os.Stat(source)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat history source: %w", err)
+	}
+	destinationInfo, err := os.Stat(destination)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat history export destination: %w", err)
+	}
+	if sourceInfo != nil && destinationInfo != nil && os.SameFile(sourceInfo, destinationInfo) {
+		return errors.New("history export destination must not alias the active history file")
+	}
+
+	// A partial read is useful for browsing, but cannot be advertised as a
+	// complete export or replace a previous backup.
+	entries, err := readAllLocked(true)
 	if err != nil {
 		return err
 	}
 
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	writer := bufio.NewWriter(f)
-	skipped := 0
-	for _, entry := range entries {
+	var buf bytes.Buffer
+	for i, entry := range entries {
 		data, err := json.Marshal(entry)
 		if err != nil {
-			slog.Warn("history: export: skipping entry that failed to marshal", "error", err)
-			skipped++
-			continue
+			return fmt.Errorf("encode history export entry %d: %w", i+1, err)
 		}
-		if _, err := writer.Write(data); err != nil {
-			return err
-		}
-		if err := writer.WriteByte('\n'); err != nil {
-			return err
-		}
+		buf.Write(data)
+		buf.WriteByte('\n')
 	}
-	if skipped > 0 {
-		slog.Warn("history: export: entries skipped during export", "skipped", skipped)
-	}
-
-	return writer.Flush()
-}
-
-// ImportFrom reads history from a specific file and appends to current history.
-func ImportFrom(path string) (int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	var entries []*HistoryEntry
-	scanner := bufio.NewScanner(f)
-	// Set max line size for large prompts (5MB), start with 64KB
-	scanner.Buffer(make([]byte, 64*1024), 5*1024*1024)
-
-	skipped := 0
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		plain, err := decryptJSONLine(line)
-		if err != nil {
-			slog.Warn("history: import: skipping unreadable line", "error", err)
-			skipped++
-			continue
-		}
-		var entry HistoryEntry
-		if err := json.Unmarshal(plain, &entry); err != nil {
-			slog.Warn("history: import: skipping malformed line", "error", err)
-			skipped++
-			continue
-		}
-		entries = append(entries, &entry)
-	}
-	if skipped > 0 {
-		slog.Warn("history: import: lines skipped during import", "skipped", skipped, "path", path)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return len(entries), err
-	}
-
-	if err := BatchAppend(entries); err != nil {
-		return 0, err
-	}
-
-	return len(entries), nil
+	// Exports deliberately contain plaintext even when history is encrypted.
+	// Replace, rather than truncate, to enforce private permissions for both
+	// new and existing files and leave old contents intact on write failure.
+	return util.AtomicWriteFile(destination, buf.Bytes(), 0600)
 }
 
 // Stats returns summary statistics about history.

@@ -14,10 +14,13 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/reservationpath"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 const (
+	defaultWorkItemLimit             = 10
 	defaultThreadStaleAfter          = 24 * time.Hour
 	defaultReservationExpiringWithin = time.Hour
 	defaultConflictWindow            = 30 * time.Minute
@@ -40,9 +43,8 @@ type WorkSection struct {
 	Graph      *WorkGraph   `json:"graph,omitempty"`
 	Available  bool         `json:"available"`
 	Reason     string       `json:"reason,omitempty"`
-	// Stale says the section holds the last good work collection, because no
-	// refresh has read the work source since.
-	Stale bool `json:"stale,omitempty"`
+
+	Verification *WorkVerification `json:"verification,omitempty"`
 }
 
 // WorkItem is a normalized bead record suitable for robot surfaces.
@@ -221,68 +223,54 @@ type CoordinationInputs struct {
 	Reason                    string
 }
 
-// WorkCoordinationAdapterConfig controls live work and coordination
-// collection. WorkAdapter and CoordinationAdapter share it.
+// WorkCoordinationAdapterConfig controls live work/coordination collection.
 type WorkCoordinationAdapterConfig struct {
-	ProjectDir  string
-	SessionName string
-	// WorkItemLimit caps the ready, blocked and in-progress lists. Zero, the
-	// default, reads them all: the runtime projection counts these rows, so
-	// a cap held --robot-status ready_work at the cap however many beads br
-	// ready listed (bd-9k16u).
+	ProjectDir                string
+	SessionName               string
 	WorkItemLimit             int
 	ThreadStaleAfter          time.Duration
 	ReservationExpiringWithin time.Duration
 	ConflictWindow            time.Duration
 	MailBacklogThreshold      int
-	// AgentMailClient is the only Agent Mail client the adapter uses; nil
-	// leaves coordination unenriched. Callers build it from the [agent_mail]
-	// config so url, token and enabled apply here as everywhere else.
+	// AgentMailClient is the Agent Mail client coordination uses; nil leaves
+	// coordination unenriched. Callers build it from the [agent_mail] config
+	// so url, token and enabled apply here as everywhere else. Only work
+	// verification's reservation read falls back to an environment-configured
+	// client when it is nil.
 	AgentMailClient *agentmail.Client
+
+	VerificationPolicy WorkVerificationPolicy
 }
 
 // DefaultWorkCoordinationAdapterConfig returns conservative defaults.
 func DefaultWorkCoordinationAdapterConfig(projectDir string) WorkCoordinationAdapterConfig {
+	// Snapshots verify work under the same [assign.work_source] policy that
+	// dispatch applies, so they never advertise work dispatch would refuse.
+	policy := bv.WorkSourcePolicyForProject(projectDir)
 	return WorkCoordinationAdapterConfig{
 		ProjectDir:                projectDir,
+		WorkItemLimit:             defaultWorkItemLimit,
 		ThreadStaleAfter:          defaultThreadStaleAfter,
 		ReservationExpiringWithin: defaultReservationExpiringWithin,
 		ConflictWindow:            defaultConflictWindow,
 		MailBacklogThreshold:      defaultMailBacklogThreshold,
+		VerificationPolicy: WorkVerificationPolicy{
+			Source:        worksource.Policy{RequiredRef: policy.RequiredRef, RequireClean: policy.RequireClean},
+			ProgramLabels: policy.ProgramLabels,
+		},
 	}
 }
 
-// WorkAdapter collects the work section from br and bv triage.
-//
-// Work and coordination are separate sources so that one slow source degrades
-// only its own section: the aggregator drops the whole batch of an adapter
-// whose Collect fails, so a single adapter for both lost the coordination
-// half whenever bv overran its budget (bd-jv2dq).
-type WorkAdapter struct {
+// WorkCoordinationAdapter collects work and coordination state from live sources.
+type WorkCoordinationAdapter struct {
 	config  WorkCoordinationAdapterConfig
 	lastErr error
 }
 
-// CoordinationAdapter collects the coordination section from Agent Mail,
-// file conflicts and handoffs.
-type CoordinationAdapter struct {
-	config  WorkCoordinationAdapterConfig
-	lastErr error
-}
-
-// NewWorkAdapter constructs a live work adapter.
-func NewWorkAdapter(config WorkCoordinationAdapterConfig) *WorkAdapter {
-	return &WorkAdapter{config: withWorkCoordinationDefaults(config)}
-}
-
-// NewCoordinationAdapter constructs a live coordination adapter.
-func NewCoordinationAdapter(config WorkCoordinationAdapterConfig) *CoordinationAdapter {
-	return &CoordinationAdapter{config: withWorkCoordinationDefaults(config)}
-}
-
-func withWorkCoordinationDefaults(config WorkCoordinationAdapterConfig) WorkCoordinationAdapterConfig {
-	if config.WorkItemLimit < 0 {
-		config.WorkItemLimit = 0
+// NewWorkCoordinationAdapter constructs a live work/coordination adapter.
+func NewWorkCoordinationAdapter(config WorkCoordinationAdapterConfig) *WorkCoordinationAdapter {
+	if config.WorkItemLimit <= 0 {
+		config.WorkItemLimit = defaultWorkItemLimit
 	}
 	if config.ThreadStaleAfter <= 0 {
 		config.ThreadStaleAfter = defaultThreadStaleAfter
@@ -296,66 +284,119 @@ func withWorkCoordinationDefaults(config WorkCoordinationAdapterConfig) WorkCoor
 	if config.MailBacklogThreshold <= 0 {
 		config.MailBacklogThreshold = defaultMailBacklogThreshold
 	}
-	return config
+	return &WorkCoordinationAdapter{config: config}
 }
 
 // Name returns the adapter identifier.
-func (a *WorkAdapter) Name() string {
-	return "work"
+func (a *WorkCoordinationAdapter) Name() string {
+	return "work_coordination"
 }
 
-// Available returns true when the project has beads to read.
-func (a *WorkAdapter) Available(ctx context.Context) bool {
+// Available returns true when at least one work/coordination source should be readable.
+func (a *WorkCoordinationAdapter) Available(ctx context.Context) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if ctx.Err() != nil || a.config.ProjectDir == "" {
+	if ctx.Err() != nil {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(a.config.ProjectDir, ".beads"))
-	return err == nil
+	if a.config.ProjectDir == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(a.config.ProjectDir, ".beads")); err == nil {
+		return true
+	}
+	if client := a.config.AgentMailClient; client != nil && client.IsAvailableContext(ctx) {
+		return true
+	}
+	if handoff, _, err := handoffReaderForProject(a.config.ProjectDir).FindLatestAny(); err == nil && handoff != nil {
+		return true
+	}
+	return false
 }
 
-// Collect gathers the live work section.
-func (a *WorkAdapter) Collect(ctx context.Context) (*SignalBatch, error) {
+// Collect gathers the live work and coordination sections. They are
+// collected side by side, each with the whole of ctx's budget, so a slow
+// work source cannot starve coordination of time or the reverse (bd-jv2dq).
+func (a *WorkCoordinationAdapter) Collect(ctx context.Context) (*SignalBatch, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	now := time.Now()
-	work, err := a.collectWork(ctx)
+	var coordination *CoordinationSection
+	coordinationDone := make(chan struct{})
+	go func() {
+		defer close(coordinationDone)
+		coordination = a.collectCoordination(ctx, now)
+	}()
+	work, workErr := a.collectVerifiedWork(ctx)
+	<-coordinationDone
+
 	batch := &SignalBatch{
-		Source:      a.Name(),
-		CollectedAt: now,
-		Work:        work,
+		Source:       a.Name(),
+		CollectedAt:  now,
+		Work:         work,
+		Coordination: coordination,
 	}
-	if err == nil && (work == nil || !work.Available) {
-		reason := "work data unavailable"
-		if work != nil && work.Reason != "" {
-			reason = work.Reason
-		}
-		err = fmt.Errorf("work source unavailable: %s", reason)
+	// Work and coordination degrade independently (#285). A deadline that
+	// expires during Agent Mail enrichment must not discard a Beads work
+	// section that already completed — that turned slow mail history into a
+	// false "queue dry" status. collectWork surfaces its own context errors;
+	// collectCoordination degrades in-section (Available=false + Reason).
+	if workErr != nil {
+		a.lastErr = workErr
+		return batch, workErr
 	}
-	a.lastErr = err
-	return batch, err
+
+	if (work == nil || !work.Available) && (coordination == nil || !coordination.Available) {
+		a.lastErr = sourcesUnavailableError(work, coordination)
+		return batch, a.lastErr
+	}
+
+	a.lastErr = nil
+	return batch, nil
+}
+
+// sourcesUnavailableError names why neither section could be collected. The
+// per-section reasons ("br stats failed: …", "agent mail unavailable") are
+// what an operator needs to act on; a bare "sources unavailable" reached the
+// persisted source-health row and the snapshot as the only diagnostic while
+// the tracker itself was readable (#283, 2026-09-04 report).
+func sourcesUnavailableError(work *WorkSection, coordination *CoordinationSection) error {
+	workReason := "work section missing"
+	if work != nil {
+		workReason = firstNonEmpty(strings.TrimSpace(work.Reason), "work data unavailable")
+	}
+	coordinationReason := "coordination section missing"
+	if coordination != nil {
+		coordinationReason = firstNonEmpty(strings.TrimSpace(coordination.Reason), "coordination data unavailable")
+	}
+	return fmt.Errorf("work/coordination sources unavailable (work: %s; coordination: %s)", workReason, coordinationReason)
 }
 
 // LastError returns the most recent collection failure.
-func (a *WorkAdapter) LastError() error {
+func (a *WorkCoordinationAdapter) LastError() error {
 	return a.lastErr
+}
+
+// triageResult is one bv triage run's outcome.
+type triageResult struct {
+	triage *bv.TriageResponse
+	err    error
 }
 
 // collectWork reads the bead counts and lists from br, enriched by bv triage
 // when triage is ready in time. Triage runs alongside the br reads and may use
-// the rest of ctx's budget; without it the section still carries br's data.
-// A triage run that overruns keeps going and fills bv's shared result cache
-// for the next collection.
-func (a *WorkAdapter) collectWork(ctx context.Context) (*WorkSection, error) {
+// the rest of ctx's budget; without it the section still carries br's data
+// (bd-jv2dq). A triage that reports a source mismatch still rejects the
+// section, since optional enrichment must not swallow it.
+func (a *WorkCoordinationAdapter) collectWork(ctx context.Context) (*WorkSection, error) {
 	triageCtx, cancelTriage := context.WithCancel(ctx)
 	defer cancelTriage()
-	triageDone := make(chan *bv.TriageResponse, 1)
+	triageDone := make(chan triageResult, 1)
 	go func() {
-		triage, _ := bv.GetTriageContext(triageCtx, a.config.ProjectDir)
-		triageDone <- triage
+		triage, err := bv.GetTriageContext(triageCtx, a.config.ProjectDir)
+		triageDone <- triageResult{triage: triage, err: err}
 	}()
 
 	summary, err := bv.GetBeadsSummaryContext(ctx, a.config.ProjectDir, a.config.WorkItemLimit)
@@ -370,6 +411,9 @@ func (a *WorkAdapter) collectWork(ctx context.Context) (*WorkSection, error) {
 		blocked = nil
 	}
 	triage := awaitTriage(ctx, triageDone)
+	if isStaleWorkSourceError(triage.err) {
+		return rejectWorkSource(nil, triage.err), triage.err
+	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
@@ -378,13 +422,14 @@ func (a *WorkAdapter) collectWork(ctx context.Context) (*WorkSection, error) {
 		Ready:      readyItems(summary),
 		Blocked:    blocked,
 		InProgress: inProgressItems(summary),
-		Triage:     triage,
+		Triage:     triage.triage,
 	}), nil
 }
 
 // awaitTriage waits for triage until ctx's deadline less
-// triageEnrichmentReserve, or until ctx ends when it has no deadline.
-func awaitTriage(ctx context.Context, triageDone <-chan *bv.TriageResponse) *bv.TriageResponse {
+// triageEnrichmentReserve, or until ctx ends when it has no deadline. A
+// triage still running then yields an empty result.
+func awaitTriage(ctx context.Context, triageDone <-chan triageResult) triageResult {
 	var expired <-chan time.Time
 	if deadline, ok := ctx.Deadline(); ok {
 		timer := time.NewTimer(time.Until(deadline) - triageEnrichmentReserve)
@@ -392,72 +437,23 @@ func awaitTriage(ctx context.Context, triageDone <-chan *bv.TriageResponse) *bv.
 		expired = timer.C
 	}
 	select {
-	case triage := <-triageDone:
-		return triage
+	case result := <-triageDone:
+		return result
 	case <-expired:
-		return nil
+		return triageResult{}
 	case <-ctx.Done():
-		return nil
+		return triageResult{}
 	}
 }
 
-// Name returns the adapter identifier.
-func (a *CoordinationAdapter) Name() string {
-	return "coordination"
-}
-
-// Available returns true when Agent Mail answers or the project has a handoff.
-func (a *CoordinationAdapter) Available(ctx context.Context) bool {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if ctx.Err() != nil || a.config.ProjectDir == "" {
-		return false
-	}
-	if client := a.config.AgentMailClient; client != nil && client.IsAvailableContext(ctx) {
-		return true
-	}
-	if handoff, _, err := handoffReaderForProject(a.config.ProjectDir).FindLatestAny(); err == nil && handoff != nil {
-		return true
-	}
-	return false
-}
-
-// Collect gathers the live coordination section.
-func (a *CoordinationAdapter) Collect(ctx context.Context) (*SignalBatch, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	now := time.Now()
-	coordination := a.collectCoordination(ctx, now)
-	batch := &SignalBatch{
-		Source:       a.Name(),
-		CollectedAt:  now,
-		Coordination: coordination,
-	}
-	err := ctx.Err()
-	if err == nil && (coordination == nil || !coordination.Available) {
-		reason := "coordination data unavailable"
-		if coordination != nil && coordination.Reason != "" {
-			reason = coordination.Reason
-		}
-		err = fmt.Errorf("coordination source unavailable: %s", reason)
-	}
-	a.lastErr = err
-	return batch, err
-}
-
-// LastError returns the most recent collection failure.
-func (a *CoordinationAdapter) LastError() error {
-	return a.lastErr
-}
-
-func (a *CoordinationAdapter) collectCoordination(ctx context.Context, now time.Time) *CoordinationSection {
+func (a *WorkCoordinationAdapter) collectCoordination(ctx context.Context, now time.Time) *CoordinationSection {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	inputs := CoordinationInputs{
-		FileConflicts:             tracker.DetectConflictsRecent(a.config.ConflictWindow),
+		// Scoped to the configured project, not the process working directory:
+		// this adapter runs wherever the caller happens to be.
+		FileConflicts:             tracker.ConflictsForProject(a.config.ProjectDir, a.config.ConflictWindow),
 		Handoff:                   latestHandoff(a.config.ProjectDir, a.config.SessionName),
 		ThreadStaleAfter:          a.config.ThreadStaleAfter,
 		ReservationExpiringWithin: a.config.ReservationExpiringWithin,
@@ -471,20 +467,36 @@ func (a *CoordinationAdapter) collectCoordination(ctx context.Context, now time.
 		return NormalizeCoordination(inputs)
 	}
 
-	// The reservation listing and the inbox reads are independent calls.
+	// The reservation read and the inbox reads are independent calls. The
+	// reservation read is resource-only: coordination inspection must not
+	// issue tool calls, including legacy list tools, when the reservation
+	// resource is down.
 	var reservations []agentmail.FileReservation
 	var reservationsErr error
 	reservationsDone := make(chan struct{})
 	go func() {
 		defer close(reservationsDone)
-		reservations, reservationsErr = client.ListReservations(ctx, a.config.ProjectDir, "", true)
+		reservations, reservationsErr = client.ReadActiveReservations(ctx, a.config.ProjectDir)
 	}()
 
 	agents, err := client.ListProjectAgents(ctx, a.config.ProjectDir)
 	if err != nil {
 		inputs.Reason = fmt.Sprintf("list_agents failed: %v", err)
 	} else {
-		inputs.InboxByAgent = fetchInboxes(ctx, client, a.config.ProjectDir, agents)
+		names := make([]string, 0, len(agents))
+		for _, agent := range agents {
+			if agent.Name == agentmail.HumanOverseerAgentName {
+				continue
+			}
+			names = append(names, agent.Name)
+		}
+		inboxes, timedOut := peekInboxes(ctx, client, a.config.ProjectDir, names)
+		inputs.InboxByAgent = inboxes
+		if timedOut {
+			// Partial results stay usable, but the section must say so: mail
+			// counts derived from a cut-short sweep are a floor, not a total.
+			inputs.Reason = fmt.Sprintf("agent mail inbox enrichment timed out after %d of %d inboxes", len(inboxes), len(names))
+		}
 	}
 
 	<-reservationsDone
@@ -496,29 +508,45 @@ func (a *CoordinationAdapter) collectCoordination(ctx context.Context, now time.
 	return NormalizeCoordination(inputs)
 }
 
-// fetchInboxes peeks at every agent's inbox but the human overseer's through
-// client.PeekInboxes. An inbox that fails to load is left out.
-func fetchInboxes(ctx context.Context, client *agentmail.Client, projectKey string, agents []agentmail.Agent) map[string][]agentmail.InboxMessage {
-	names := make([]string, 0, len(agents))
-	for _, agent := range agents {
-		if agent.Name == agentmail.HumanOverseerAgentName {
-			continue
-		}
-		names = append(names, agent.Name)
+// peekInboxes reads the named agents' inboxes through client.PeekInboxes,
+// which peeks (a status read must not mark mail read, bd-ntu8w), bounds the
+// reads per client and shares a recent read among the client's callers
+// (bd-o4u96, bd-gm0d7). It returns the inboxes it read plus whether ctx cut
+// the sweep short; an inbox that fails for any other reason is left out.
+func peekInboxes(ctx context.Context, client *agentmail.Client, projectKey string, names []string) (map[string][]agentmail.InboxMessage, bool) {
+	inboxes := make(map[string][]agentmail.InboxMessage, len(names))
+	if len(names) == 0 {
+		return inboxes, false
 	}
-
 	peeks := client.PeekInboxes(ctx, agentmail.FetchInboxOptions{
 		ProjectKey:    projectKey,
 		Limit:         25,
 		IncludeBodies: true,
 	}, names)
-	byAgent := make(map[string][]agentmail.InboxMessage, len(peeks))
+	timedOut := false
 	for name, peek := range peeks {
 		if peek.Err == nil {
-			byAgent[name] = peek.Messages
+			inboxes[name] = peek.Messages
+			continue
+		}
+		if ctx.Err() != nil {
+			timedOut = true
 		}
 	}
-	return byAgent
+	return inboxes, timedOut
+}
+
+// mailClient is the client work verification reads reservations through:
+// the configured AgentMailClient, else an environment-configured client for
+// the project.
+func (a *WorkCoordinationAdapter) mailClient() *agentmail.Client {
+	if a.config.AgentMailClient != nil {
+		return a.config.AgentMailClient
+	}
+	if strings.TrimSpace(a.config.ProjectDir) == "" {
+		return nil
+	}
+	return agentmail.NewClient(agentmail.WithProjectKey(a.config.ProjectDir))
 }
 
 // NewWorkSection returns an initialized work section.
@@ -1114,7 +1142,11 @@ func reservationPatternsConflict(a, b string) bool {
 	if a == b {
 		return true
 	}
-	return matchesPattern(a, b) || matchesPattern(b, a)
+	// Matching one glob against the other's literal spelling misses
+	// intersections such as src/*/main.go and src/service/*.go, and a plain
+	// string glob lets * cross directories. Compare their path languages, as
+	// the coordinator does.
+	return reservationpath.MayOverlap(a, b)
 }
 
 func normalizeConflictPattern(a, b string) string {

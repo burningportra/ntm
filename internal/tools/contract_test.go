@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,8 +36,11 @@ func fakeToolsPath(t *testing.T) string {
 	return ""
 }
 
-// withFakeTools sets up PATH to include fake tools and returns a cleanup function
-func withFakeTools(t *testing.T) func() {
+// withFakeTools prepends the fake tools to PATH for the rest of the test.
+// t.Setenv keeps the restore ordered with any later t.Setenv("PATH", ...) in
+// the same test; a deferred os.Setenv restore ran first and let the later
+// t.Setenv cleanup put the fakes back on PATH for every following test.
+func withFakeTools(t *testing.T) {
 	t.Helper()
 
 	fakePath := fakeToolsPath(t)
@@ -44,13 +48,7 @@ func withFakeTools(t *testing.T) func() {
 		t.Skip("testdata/faketools not found")
 	}
 
-	// Prepend fake tools to PATH
-	oldPath := os.Getenv("PATH")
-	os.Setenv("PATH", fakePath+":"+oldPath)
-
-	return func() {
-		os.Setenv("PATH", oldPath)
-	}
+	t.Setenv("PATH", fakePath+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 // TestJFPAdapterVersionParsing tests JFP version string parsing
@@ -131,45 +129,6 @@ func TestSLBAdapterVersionParsing(t *testing.T) {
 	}
 }
 
-// TestACFSAdapterVersionParsing tests ACFS version string parsing
-func TestACFSAdapterVersionParsing(t *testing.T) {
-	tests := []struct {
-		input   string
-		want    Version
-		wantErr bool
-	}{
-		{
-			input: "0.1.0",
-			want:  Version{Major: 0, Minor: 1, Patch: 0, Raw: "0.1.0"},
-		},
-		{
-			input: "1.2.3",
-			want:  Version{Major: 1, Minor: 2, Patch: 3, Raw: "1.2.3"},
-		},
-		{
-			input: "2.0.0-beta",
-			want:  Version{Major: 2, Minor: 0, Patch: 0, Raw: "2.0.0-beta"},
-		},
-		{
-			input: "no version",
-			want:  Version{Raw: "no version"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseACFSVersion(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseACFSVersion() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got.Major != tt.want.Major || got.Minor != tt.want.Minor || got.Patch != tt.want.Patch {
-				t.Errorf("parseACFSVersion() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
 // TestMSAdapterVersionParsing tests MS version string parsing
 func TestMSAdapterVersionParsing(t *testing.T) {
 	tests := []struct {
@@ -209,169 +168,8 @@ func TestMSAdapterVersionParsing(t *testing.T) {
 	}
 }
 
-// TestGIILAdapterVersionParsing tests GIIL version string parsing
-// GIIL uses the generic parseVersion function which extracts X.Y.Z via regex
-func TestGIILAdapterVersionParsing(t *testing.T) {
-	tests := []struct {
-		input   string
-		want    Version
-		wantErr bool
-	}{
-		{
-			input: "giil version 3.1.0 (Hybrid Edition)",
-			want:  Version{Major: 3, Minor: 1, Patch: 0, Raw: "giil version 3.1.0 (Hybrid Edition)"},
-		},
-		{
-			input: "giil version 1.0.0",
-			want:  Version{Major: 1, Minor: 0, Patch: 0, Raw: "giil version 1.0.0"},
-		},
-		{
-			input: "3.2.1",
-			want:  Version{Major: 3, Minor: 2, Patch: 1, Raw: "3.2.1"},
-		},
-		{
-			input: "no version",
-			want:  Version{Raw: "no version"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseVersion(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseVersion() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got.Major != tt.want.Major || got.Minor != tt.want.Minor || got.Patch != tt.want.Patch {
-				t.Errorf("parseVersion() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestRUAdapterVersionParsing tests RU version string parsing
-// RU uses the generic parseVersion function which extracts X.Y.Z via regex
-func TestRUAdapterVersionParsing(t *testing.T) {
-	tests := []struct {
-		input   string
-		want    Version
-		wantErr bool
-	}{
-		{
-			input: "ru 0.3.2",
-			want:  Version{Major: 0, Minor: 3, Patch: 2, Raw: "ru 0.3.2"},
-		},
-		{
-			input: "ru version 1.0.0",
-			want:  Version{Major: 1, Minor: 0, Patch: 0, Raw: "ru version 1.0.0"},
-		},
-		{
-			input: "0.5.1",
-			want:  Version{Major: 0, Minor: 5, Patch: 1, Raw: "0.5.1"},
-		},
-		{
-			input: "no version",
-			want:  Version{Raw: "no version"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseVersion(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseVersion() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got.Major != tt.want.Major || got.Minor != tt.want.Minor || got.Patch != tt.want.Patch {
-				t.Errorf("parseVersion() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestXFAdapterVersionParsing tests XF version string parsing
-// XF uses the generic parseVersion function which extracts X.Y.Z via regex
-func TestXFAdapterVersionParsing(t *testing.T) {
-	tests := []struct {
-		input   string
-		want    Version
-		wantErr bool
-	}{
-		{
-			input: "xf 0.2.1",
-			want:  Version{Major: 0, Minor: 2, Patch: 1, Raw: "xf 0.2.1"},
-		},
-		{
-			input: "xf version 1.0.0-beta",
-			want:  Version{Major: 1, Minor: 0, Patch: 0, Raw: "xf version 1.0.0-beta"},
-		},
-		{
-			input: "0.1.5",
-			want:  Version{Major: 0, Minor: 1, Patch: 5, Raw: "0.1.5"},
-		},
-		{
-			input: "no version",
-			want:  Version{Raw: "no version"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseVersion(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseVersion() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got.Major != tt.want.Major || got.Minor != tt.want.Minor || got.Patch != tt.want.Patch {
-				t.Errorf("parseVersion() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestDCGAdapterVersionParsing tests DCG version string parsing
-// DCG uses the generic parseVersion function which extracts X.Y.Z via regex
-func TestDCGAdapterVersionParsing(t *testing.T) {
-	tests := []struct {
-		input   string
-		want    Version
-		wantErr bool
-	}{
-		{
-			input: "dcg 0.1.0",
-			want:  Version{Major: 0, Minor: 1, Patch: 0, Raw: "dcg 0.1.0"},
-		},
-		{
-			input: "dcg version 1.2.3",
-			want:  Version{Major: 1, Minor: 2, Patch: 3, Raw: "dcg version 1.2.3"},
-		},
-		{
-			input: "0.0.5",
-			want:  Version{Major: 0, Minor: 0, Patch: 5, Raw: "0.0.5"},
-		},
-		{
-			input: "no version",
-			want:  Version{Raw: "no version"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseVersion(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseVersion() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got.Major != tt.want.Major || got.Minor != tt.want.Minor || got.Patch != tt.want.Patch {
-				t.Errorf("parseVersion() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestDCGAvailabilityWithFakeTool(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewDCGAdapter()
 	adapter.InvalidateAvailabilityCache()
@@ -392,6 +190,26 @@ func TestDCGAvailabilityWithFakeTool(t *testing.T) {
 	}
 	if !adapter.IsAvailable(ctx) {
 		t.Fatalf("expected IsAvailable() to return true")
+	}
+}
+
+// A probe run under an already-ended context fails, but that failure must not
+// be cached: the send guard treats unavailable dcg as "no check", so a cached
+// miss let destructive commands through for the whole TTL.
+func TestDCGAvailabilityDoesNotCacheCanceledProbe(t *testing.T) {
+	withFakeTools(t)
+
+	adapter := NewDCGAdapter()
+	adapter.InvalidateAvailabilityCache()
+	t.Cleanup(adapter.InvalidateAvailabilityCache)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if adapter.IsAvailable(canceled) {
+		t.Fatal("IsAvailable under a canceled context = true, want the failed probe")
+	}
+	if !adapter.IsAvailable(context.Background()) {
+		t.Fatal("IsAvailable after a canceled probe = false, want a fresh probe to find dcg")
 	}
 }
 
@@ -450,50 +268,9 @@ func TestDCGAvailabilityIncompatibleVersion(t *testing.T) {
 	}
 }
 
-// TestUBSAdapterVersionParsing tests UBS version string parsing
-// UBS uses the generic parseVersion function which extracts X.Y.Z via regex
-func TestUBSAdapterVersionParsing(t *testing.T) {
-	tests := []struct {
-		input   string
-		want    Version
-		wantErr bool
-	}{
-		{
-			input: "ubs 0.4.2",
-			want:  Version{Major: 0, Minor: 4, Patch: 2, Raw: "ubs 0.4.2"},
-		},
-		{
-			input: "ubs version 1.0.0",
-			want:  Version{Major: 1, Minor: 0, Patch: 0, Raw: "ubs version 1.0.0"},
-		},
-		{
-			input: "0.3.1",
-			want:  Version{Major: 0, Minor: 3, Patch: 1, Raw: "0.3.1"},
-		},
-		{
-			input: "no version",
-			want:  Version{Raw: "no version"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseVersion(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseVersion() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got.Major != tt.want.Major || got.Minor != tt.want.Minor || got.Patch != tt.want.Patch {
-				t.Errorf("parseVersion() = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
 // TestJFPAdapterWithFakeTools tests the JFP adapter with fake tools
 func TestJFPAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewJFPAdapter()
 	ctx := context.Background()
@@ -546,8 +323,7 @@ func TestJFPAdapterWithFakeTools(t *testing.T) {
 
 // TestJFPAdapterMethods tests JFP-specific adapter methods
 func TestJFPAdapterMethods(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewJFPAdapter()
 	ctx := context.Background()
@@ -597,17 +373,13 @@ func TestJFPAdapterMethods(t *testing.T) {
 		t.Error("Suggest() returned invalid JSON")
 	}
 
-	// Test Install
-	result, err = adapter.Install(ctx, []string{"test-prompt"}, "")
-	if err != nil {
-		t.Fatalf("Install() error: %v", err)
-	}
-	if !json.Valid(result) {
-		t.Error("Install() returned invalid JSON")
+	// Skill management moved from jfp to jsm; jfp answers with deprecated_command.
+	if _, err = adapter.Export(ctx, []string{"test-prompt"}, "skill"); !errors.Is(err, ErrJFPCommandMoved) {
+		t.Fatalf("Export(skill) error = %v, want ErrJFPCommandMoved", err)
 	}
 
 	// Test Export
-	result, err = adapter.Export(ctx, []string{"test-prompt"}, "skill")
+	result, err = adapter.Export(ctx, []string{"test-prompt"}, "md")
 	if err != nil {
 		t.Fatalf("Export() error: %v", err)
 	}
@@ -615,52 +387,13 @@ func TestJFPAdapterMethods(t *testing.T) {
 		t.Error("Export() returned invalid JSON")
 	}
 
-	// Test Update
-	result, err = adapter.Update(ctx)
+	// Test Refresh
+	result, err = adapter.Refresh(ctx)
 	if err != nil {
-		t.Fatalf("Update() error: %v", err)
+		t.Fatalf("Refresh() error: %v", err)
 	}
 	if !json.Valid(result) {
-		t.Error("Update() returned invalid JSON")
-	}
-}
-
-// TestBVAdapterVersionParsing tests version string parsing
-func TestBVAdapterVersionParsing(t *testing.T) {
-	tests := []struct {
-		input   string
-		want    Version
-		wantErr bool
-	}{
-		{
-			input: "bv 0.31.0",
-			want:  Version{Major: 0, Minor: 31, Patch: 0, Raw: "bv 0.31.0"},
-		},
-		{
-			input: "0.31.0",
-			want:  Version{Major: 0, Minor: 31, Patch: 0, Raw: "0.31.0"},
-		},
-		{
-			input: "bv version 1.2.3-beta",
-			want:  Version{Major: 1, Minor: 2, Patch: 3, Raw: "bv version 1.2.3-beta"},
-		},
-		{
-			input: "no version here",
-			want:  Version{Raw: "no version here"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseVersion(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseVersion() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got.Major != tt.want.Major || got.Minor != tt.want.Minor || got.Patch != tt.want.Patch {
-				t.Errorf("parseVersion() = %+v, want %+v", got, tt.want)
-			}
-		})
+		t.Error("Refresh() returned invalid JSON")
 	}
 }
 
@@ -710,8 +443,7 @@ func TestVersionAtLeast(t *testing.T) {
 
 // TestBVAdapterWithFakeTools tests the BV adapter with fake tools
 func TestBVAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewBVAdapter()
 	ctx := context.Background()
@@ -764,8 +496,7 @@ func TestBVAdapterWithFakeTools(t *testing.T) {
 
 // TestBVAdapterRobotTriage tests robot-triage command
 func TestBVAdapterRobotTriage(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewBVAdapter()
 	ctx := context.Background()
@@ -804,8 +535,7 @@ func TestBVAdapterRobotTriage(t *testing.T) {
 }
 
 func TestBVAdapterRobotModes(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewBVAdapter()
 	ctx := context.Background()
@@ -850,12 +580,12 @@ func TestBVAdapterRobotModes(t *testing.T) {
 			name: "history",
 			key:  "stats",
 			call: func() (json.RawMessage, error) {
-				return adapter.GetHistory(ctx, projectRoot)
+				return adapter.GetHistory(ctx, projectRoot, "")
 			},
 		},
 		{
 			name: "burndown",
-			key:  "progress",
+			key:  "total_issues",
 			call: func() (json.RawMessage, error) {
 				return adapter.GetBurndown(ctx, projectRoot, "s1")
 			},
@@ -885,7 +615,7 @@ func TestBVAdapterRobotModes(t *testing.T) {
 			name: "search",
 			key:  "results",
 			call: func() (json.RawMessage, error) {
-				return adapter.GetSearch(ctx, projectRoot, "test query")
+				return adapter.GetSearchWithOptions(ctx, projectRoot, BVSearchOptions{Query: "test query"})
 			},
 		},
 		{
@@ -959,8 +689,7 @@ func TestAdapterTimeout(t *testing.T) {
 		t.Skip("Skipping timeout test in short mode")
 	}
 
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	// Set timeout mode
 	os.Setenv("FAKE_TOOL_MODE", "timeout")
@@ -992,8 +721,7 @@ func TestAdapterTimeout(t *testing.T) {
 
 // TestAdapterErrorMode tests error handling
 func TestAdapterErrorMode(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	// Set error mode
 	os.Setenv("FAKE_TOOL_MODE", "error")
@@ -1010,8 +738,7 @@ func TestAdapterErrorMode(t *testing.T) {
 
 // TestBDAdapterWithFakeTools tests the BD adapter
 func TestBDAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	fakePath := fakeToolsPath(t)
 	if fakePath == "" {
@@ -1131,8 +858,7 @@ func TestBDAdapterFallsBackToBdWhenBrVersionFails(t *testing.T) {
 
 // TestCASSAdapterWithFakeTools tests the CASS adapter
 func TestCASSAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewCASSAdapter()
 	ctx := context.Background()
@@ -1167,8 +893,7 @@ func TestCASSAdapterWithFakeTools(t *testing.T) {
 
 // TestAllAdaptersHaveConsistentInterface verifies all adapters implement Adapter correctly
 func TestAllAdaptersHaveConsistentInterface(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapters := []struct {
 		name    string
@@ -1233,9 +958,6 @@ func TestAllAdaptersHaveConsistentInterface(t *testing.T) {
 			if health == nil {
 				t.Error("Health() returned nil")
 			}
-
-			// All adapters must implement HasCapability
-			_ = tc.adapter.HasCapability(ctx, CapRobotMode)
 
 			// All adapters must implement Info
 			info, err := tc.adapter.Info(ctx)

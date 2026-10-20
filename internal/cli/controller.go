@@ -15,6 +15,7 @@ import (
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/swarm"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -175,7 +176,7 @@ Custom prompt files support template variables:
 		},
 	}
 
-	cmd.Flags().StringVar(&agentType, "agent-type", "cc", "Agent type: cc, cod, gmi, pi, kimi, muse, agy, cursor, windsurf|ws, aider, oc, or ollama")
+	cmd.Flags().StringVar(&agentType, "agent-type", "cc", "Agent type: cc, cod, gmi, pi, kimi, muse, agy, cursor, windsurf|ws, aider, oc, omp, or ollama")
 	cmd.Flags().StringVar(&promptFile, "prompt", "", "Custom prompt file (supports template variables)")
 	cmd.Flags().BoolVar(&noPrompt, "no-prompt", false, "Skip sending initial prompt")
 	cmd.ValidArgsFunction = completeSessionArgs
@@ -288,6 +289,9 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		// Mirror the spawn/add dispatch fallback so model injection works on
 		// restart too. See ntm#193.
 		agentCmdTemplate = opencodeCommandOrDefault(cfg.Agents.Opencode)
+	case "omp":
+		agentTypeFull = "omp"
+		agentCmdTemplate = config.OmpCommandOrDefault(cfg.Agents.Omp)
 	case "ollama":
 		agentTypeFull = "ollama"
 		agentCmdTemplate = cfg.Agents.Ollama
@@ -301,14 +305,23 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 	}
 
 	// Render the agent command template (fixes raw {{}} being sent to shell)
-	agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, config.AgentTemplateVars{
+	vars := config.AgentTemplateVars{
 		AgentType:   agentType,
 		SessionName: session,
 		PaneIndex:   1,
 		ProjectDir:  dir,
-	})
+	}
+	if agentTypeFull == "claude" {
+		vars.ClaudeSettings = policy.ClaudeAgentLaunchSettings(cfg).Settings
+	}
+	agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, vars)
 	if err != nil {
 		return nil, fmt.Errorf("rendering agent command template: %w", err)
+	}
+	policy.LogClaudeHooksNotApplied("controller", agentCmd, vars.ClaudeSettings)
+	launchSpec, err := captureAgentLaunchSpec(AgentType(tmux.AgentType(agentTypeFull).Canonical()), agentCmd, "", "", "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("capture controller launch settings: %w", err)
 	}
 
 	// Per-pane Claude credential isolation (GH#237, bd-4tz2d). Every path that
@@ -324,18 +337,19 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		agentCmd = claudeEnv.ApplyToCommand(agentCmd)
 	}
 
-	// Find or create pane 1
+	// Find or create the controller pane. Pane 1 is only a candidate slot:
+	// pane indices repeat per window (a session GetPanes sweep can surface an
+	// index-1 pane from ANY window), and in a spawned session pane 1 is
+	// usually a RUNNING agent — retitling it and typing the launch command
+	// into it would hijack that agent's identity and inject the command as a
+	// prompt. Reuse pane 1 only when it is verifiably a plain shell pane in
+	// the session's first window; otherwise create a fresh pane.
 	var targetPaneID string
 	var targetPaneIndex int
-	pane1Found := false
-
-	for _, p := range panes {
-		if p.Index == 1 {
-			pane1Found = true
-			targetPaneID = p.ID
-			targetPaneIndex = p.Index
-			break
-		}
+	reusable, pane1Found := controllerReusablePane(panes)
+	if pane1Found {
+		targetPaneID = reusable.ID
+		targetPaneIndex = reusable.Index
 	}
 
 	if !pane1Found {
@@ -359,10 +373,13 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		}
 	}
 
-	// Set pane title
+	// Persist the controller provider separately from its mutable display title.
 	title := tmux.FormatPaneName(session, "controller_"+agentTypeFull, 1, "")
-	if err := tmux.SetPaneTitle(targetPaneID, title); err != nil {
-		return nil, fmt.Errorf("setting pane title: %w", err)
+	if err := tmux.SetPaneAgentIdentity(targetPaneID, title, tmux.AgentType(agentTypeFull)); err != nil {
+		return nil, fmt.Errorf("setting controller pane identity: %w", err)
+	}
+	if err := tmux.SetPaneLaunchSpecContext(ctx, targetPaneID, launchSpec); err != nil {
+		return nil, fmt.Errorf("record controller launch settings: %w", err)
 	}
 
 	// Launch the agent
@@ -399,13 +416,39 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 	}, nil
 }
 
+// controllerReusablePane picks the pane the controller may take over: pane 1
+// of the session's first window, and only when it is verifiably a plain shell
+// pane. It refuses agent-typed panes and panes running anything but a bare
+// shell — retitling a running agent's pane and typing the controller launch
+// command into it would hijack that agent's identity and inject the command
+// as a prompt.
+func controllerReusablePane(panes []tmux.Pane) (tmux.Pane, bool) {
+	lowestWindow := -1
+	for _, p := range panes {
+		if lowestWindow < 0 || p.WindowIndex < lowestWindow {
+			lowestWindow = p.WindowIndex
+		}
+	}
+	for _, p := range panes {
+		if p.WindowIndex != lowestWindow || p.Index != 1 {
+			continue
+		}
+		canonical := p.Type.Canonical()
+		if (canonical == tmux.AgentUser || canonical == tmux.AgentUnknown || !canonical.IsValid()) && p.RunsBareShell() {
+			return p, true
+		}
+		return tmux.Pane{}, false
+	}
+	return tmux.Pane{}, false
+}
+
 func controllerAgentList(panes []tmux.Pane) ([]string, int) {
 	list := make([]string, 0, len(panes))
 	count := 0
 	for _, p := range panes {
 		canonical := p.Type.Canonical()
 		switch canonical {
-		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentMuse, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
+		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentMuse, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOmp, tmux.AgentOllama:
 			count++
 			list = append(list, fmt.Sprintf("- Pane %d: %s", p.Index, canonical))
 		}

@@ -24,7 +24,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard/panels"
-	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 const (
@@ -307,26 +306,9 @@ func (m *Model) fetchAlertsCmd() tea.Cmd {
 	gen := m.nextGen(refreshAlerts)
 	cfg := m.cfg
 	return func() tea.Msg {
-		projectDir := strings.TrimSpace(m.projectDir)
-		if projectDir == "" {
-			projectDir = util.ResolveProjectDir("")
-		}
-		var alertCfg alerts.Config
-		if cfg != nil {
-			alertCfg = alerts.ToConfigAlerts(
-				cfg.Alerts.Enabled,
-				cfg.Alerts.AgentStuckMinutes,
-				cfg.Alerts.DiskLowThresholdGB,
-				cfg.Alerts.MailBacklogThreshold,
-				cfg.Alerts.BeadStaleHours,
-				cfg.Alerts.ContextWarningThreshold,
-				cfg.Alerts.ResolvedPruneMinutes,
-				projectDir,
-			)
-		} else {
-			alertCfg = alerts.DefaultConfig()
-			alertCfg.ProjectsDir = projectDir
-		}
+		// The robot surfaces' builder: same thresholds, plus the transcript
+		// context-usage source behind context warnings.
+		alertCfg := robot.AlertConfigForProject(cfg, m.projectDir)
 
 		// Use GenerateAndTrack to benefit from lifecycle management and error handling
 		tracker := alerts.GenerateAndTrack(alertCfg)
@@ -555,10 +537,17 @@ func (m *Model) fetchHistoryCmd() tea.Cmd {
 // fetchFileChangesCmd queries tracker
 func (m *Model) fetchFileChangesCmd() tea.Cmd {
 	gen := m.nextGen(refreshFiles)
+	// Scope to the session's project rather than the process working directory.
+	// The dashboard is launched from anywhere — its project dir may come from
+	// the session's overlay, not the launch directory — so the cwd-resolving
+	// accessor would read the wrong project's ledger, or none, and show an
+	// empty panel while the monitor was recording normally. Passing it also
+	// keeps `git rev-parse` off a refresh loop.
+	projectDir := m.projectDir
 	return func() tea.Msg {
 		// The files panel owns time-window filtering, so fetch the full
 		// bounded change buffer instead of hard-capping the producer at 5m.
-		changes := tracker.RecordedChanges()
+		changes := tracker.ChangesForProject(projectDir)
 		return FileChangeMsg{Changes: changes, Gen: gen}
 	}
 }

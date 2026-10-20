@@ -635,57 +635,6 @@ func TestE2E_Timebox_ExpiredDeadline(t *testing.T) {
 // DryRun Budget Integration Tests
 // -------------------------------------------------------------------
 
-func TestE2E_Timebox_DryRunBudget_RobotJSON(t *testing.T) {
-	CommonE2EPrerequisites(t)
-
-	if !supportsNTMSubcommand("ensemble") {
-		t.Skip("ntm binary does not support `ensemble` command")
-	}
-
-	suite := NewTestSuite(t, "timebox_dryrun_budget")
-	defer suite.Teardown()
-
-	// Run dry-run with robot output to get budget information
-	result := runTimeboxCmd(t, suite, "dryrun_budget",
-		"ensemble", "dry-run", "project-diagnosis",
-		"--question", "What are the main architectural issues?",
-		"--robot-json",
-	)
-
-	if result.Err != nil {
-		// If the command isn't available, skip rather than fail
-		if strings.Contains(string(result.Stderr), "unknown command") {
-			t.Skip("ensemble dry-run command not available")
-		}
-		suite.Logger().Log("[E2E-TIMEBOX] dry-run command failed (may be expected): %v", result.Err)
-		t.Skip("ensemble dry-run command not available or failed")
-	}
-
-	var plan ensemble.DryRunPlan
-	parseTimeboxJSON(t, suite, "dryrun_plan", result.Stdout, &plan)
-
-	suite.Logger().Log("[E2E-TIMEBOX] DryRun budget: MaxTokensPerMode=%d MaxTotalTokens=%d ModeCount=%d EstimatedTotal=%d",
-		plan.Budget.MaxTokensPerMode, plan.Budget.MaxTotalTokens, plan.Budget.ModeCount, plan.Budget.EstimatedTotalTokens)
-
-	// Verify budget fields are populated
-	if plan.Budget.MaxTokensPerMode <= 0 {
-		t.Errorf("[E2E-TIMEBOX] expected MaxTokensPerMode > 0, got %d", plan.Budget.MaxTokensPerMode)
-	}
-	if plan.Budget.ModeCount <= 0 {
-		t.Errorf("[E2E-TIMEBOX] expected ModeCount > 0, got %d", plan.Budget.ModeCount)
-	}
-	if plan.Budget.EstimatedTotalTokens <= 0 {
-		t.Errorf("[E2E-TIMEBOX] expected EstimatedTotalTokens > 0, got %d", plan.Budget.EstimatedTotalTokens)
-	}
-
-	// EstimatedTotal should equal MaxTokensPerMode * ModeCount
-	expectedTotal := plan.Budget.MaxTokensPerMode * plan.Budget.ModeCount
-	if plan.Budget.EstimatedTotalTokens != expectedTotal {
-		t.Errorf("[E2E-TIMEBOX] estimated total %d != MaxTokensPerMode(%d) * ModeCount(%d) = %d",
-			plan.Budget.EstimatedTotalTokens, plan.Budget.MaxTokensPerMode, plan.Budget.ModeCount, expectedTotal)
-	}
-}
-
 func TestE2E_Timebox_DryRunModes_TierDistribution(t *testing.T) {
 	CommonE2EPrerequisites(t)
 
@@ -985,15 +934,17 @@ func TestE2E_Timebox_DryRunPlanValidation(t *testing.T) {
 	suite := NewTestSuite(t, "timebox_dryrun_validation")
 	defer suite.Teardown()
 
-	// Test the Validate() method on DryRunPlan
+	// DryRunPlan.Validate was removed in the G1 dead-code burndown (670f6380);
+	// plans report validity through the Validation struct, which is what the
+	// CLI surfaces. Assert those semantics directly (bd-xj28x).
 	validPlan := &ensemble.DryRunPlan{
 		SessionName: "test-session",
 		Question:    "What is the issue?",
 		Validation:  ensemble.DryRunValidation{Valid: true},
 	}
 
-	if err := validPlan.Validate(); err != nil {
-		t.Errorf("[E2E-TIMEBOX] valid plan should not return error: %v", err)
+	if !validPlan.Validation.Valid || len(validPlan.Validation.Errors) != 0 {
+		t.Errorf("[E2E-TIMEBOX] valid plan must report Valid with no errors: %+v", validPlan.Validation)
 	}
 	suite.Logger().Log("[E2E-TIMEBOX] Valid plan passed validation")
 
@@ -1006,55 +957,15 @@ func TestE2E_Timebox_DryRunPlanValidation(t *testing.T) {
 		},
 	}
 
-	if err := invalidPlan.Validate(); err == nil {
-		t.Error("[E2E-TIMEBOX] invalid plan should return error")
+	if invalidPlan.Validation.Valid {
+		t.Error("[E2E-TIMEBOX] invalid plan should report Valid=false")
+	} else if len(invalidPlan.Validation.Errors) == 0 {
+		t.Error("[E2E-TIMEBOX] invalid plan should carry validation errors")
 	} else {
-		suite.Logger().Log("[E2E-TIMEBOX] Invalid plan correctly rejected: %v", err)
+		suite.Logger().Log("[E2E-TIMEBOX] Invalid plan correctly rejected: %v", invalidPlan.Validation.Errors)
 	}
 
-	// Nil plan
-	var nilPlan *ensemble.DryRunPlan
-	if err := nilPlan.Validate(); err == nil {
-		t.Error("[E2E-TIMEBOX] nil plan should return error")
-	}
-
-	suite.Logger().Log("[E2E-TIMEBOX] DryRunPlan validation tested: valid, invalid, nil")
-}
-
-func TestE2E_Timebox_DryRunPlanMethods(t *testing.T) {
-	CommonE2EPrerequisites(t)
-	suite := NewTestSuite(t, "timebox_dryrun_methods")
-	defer suite.Teardown()
-
-	plan := &ensemble.DryRunPlan{
-		Modes: []ensemble.DryRunMode{
-			{ID: "mode-a", Tier: "core"},
-			{ID: "mode-b", Tier: "advanced"},
-			{ID: "mode-c", Tier: "core"},
-		},
-		Budget: ensemble.DryRunBudget{
-			EstimatedTotalTokens: 12000,
-		},
-		Validation: ensemble.DryRunValidation{Valid: true},
-	}
-
-	if plan.ModeCount() != 3 {
-		t.Errorf("[E2E-TIMEBOX] expected ModeCount=3, got %d", plan.ModeCount())
-	}
-	if plan.EstimatedTokens() != 12000 {
-		t.Errorf("[E2E-TIMEBOX] expected EstimatedTokens=12000, got %d", plan.EstimatedTokens())
-	}
-
-	suite.Logger().Log("[E2E-TIMEBOX] DryRunPlan methods: ModeCount=%d EstimatedTokens=%d", plan.ModeCount(), plan.EstimatedTokens())
-
-	// Nil plan methods should return 0
-	var nilPlan *ensemble.DryRunPlan
-	if nilPlan.ModeCount() != 0 {
-		t.Errorf("[E2E-TIMEBOX] nil plan ModeCount should be 0")
-	}
-	if nilPlan.EstimatedTokens() != 0 {
-		t.Errorf("[E2E-TIMEBOX] nil plan EstimatedTokens should be 0")
-	}
+	suite.Logger().Log("[E2E-TIMEBOX] DryRunPlan validation tested: valid, invalid")
 }
 
 // -------------------------------------------------------------------

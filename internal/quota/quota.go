@@ -15,7 +15,16 @@ const (
 	ProviderClaude Provider = "claude"
 	ProviderCodex  Provider = "codex"
 	ProviderGemini Provider = "gemini"
+	// ProviderOmp is Oh My Pi. omp exposes no quota or usage command, so its
+	// readings are always Unsupported (see OmpQuotaUnsupported).
+	ProviderOmp Provider = "omp"
 )
+
+// OmpQuotaUnsupported explains why an omp pane never has a quota reading and
+// where quota exhaustion shows up instead.
+const OmpQuotaUnsupported = "no quota API; relies on provider-error classification " +
+	"(omp ends a failed turn with a dismissable provider-error block, reported by " +
+	"--robot-is-working as ERROR_STATE with indicator_basis provider_error)"
 
 // QuotaInfo represents current quota state for an account
 type QuotaInfo struct {
@@ -34,6 +43,9 @@ type QuotaInfo struct {
 	FetchedAt    time.Time `json:"fetched_at"`
 	RawOutput    string    `json:"raw_output,omitempty"` // For debugging
 	Error        string    `json:"error,omitempty"`      // If fetch failed
+	// Unsupported explains why the provider has no quota reading at all (as
+	// opposed to a failed fetch). Such a reading is never healthy or limited.
+	Unsupported string `json:"unsupported,omitempty"`
 }
 
 // IsStale returns true if the quota info is older than the given duration
@@ -44,16 +56,44 @@ func (q *QuotaInfo) IsStale(maxAge time.Duration) bool {
 	return time.Since(q.FetchedAt) > maxAge
 }
 
-// IsHealthy returns true if quota usage is within safe limits
-func (q *QuotaInfo) IsHealthy() bool {
-	if q == nil {
-		return false
+// HealthState describes the trustworthiness of a quota reading.
+type HealthState string
+
+const (
+	// HealthUnknown means there is no trustworthy reading: the info is
+	// missing or the fetch recorded an error, so the (possibly all-zero)
+	// usage numbers cannot be trusted. Absence of data is never evidence
+	// of health.
+	HealthUnknown HealthState = "unknown"
+	// HealthUnhealthy means a successful reading shows the account rate
+	// limited or at/over the safe usage threshold.
+	HealthUnhealthy HealthState = "unhealthy"
+	// HealthHealthy means a successful reading shows usage within safe limits.
+	HealthHealthy HealthState = "healthy"
+)
+
+// Health classifies the quota reading. A failed fetch (Error set) or nil
+// info yields HealthUnknown, never HealthHealthy — a fetch failure leaves
+// usage fields at zero, and those zeros must not read as good news.
+func (q *QuotaInfo) Health() HealthState {
+	if q == nil || q.Error != "" || q.Unsupported != "" {
+		return HealthUnknown
 	}
 	if q.IsLimited {
-		return false
+		return HealthUnhealthy
 	}
-	// Consider unhealthy if any quota exceeds 90%
-	return q.SessionUsage < 90 && q.WeeklyUsage < 90 && q.PeriodUsage < 90
+	// Consider unhealthy if any quota reaches 90%
+	if q.SessionUsage >= 90 || q.WeeklyUsage >= 90 || q.PeriodUsage >= 90 {
+		return HealthUnhealthy
+	}
+	return HealthHealthy
+}
+
+// IsHealthy returns true only for a successful reading with quota usage
+// within safe limits. A failed fetch reads HealthUnknown and is therefore
+// not healthy; a successful fetch at 0% usage is healthy.
+func (q *QuotaInfo) IsHealthy() bool {
+	return q.Health() == HealthHealthy
 }
 
 // HighestUsage returns the highest usage percentage across all quota types
@@ -103,197 +143,6 @@ type Fetcher interface {
 // TrackerOption configures the Tracker
 type TrackerOption func(*Tracker)
 
-// WithCacheTTL sets the cache TTL
-func WithCacheTTL(ttl time.Duration) TrackerOption {
-	return func(t *Tracker) {
-		t.cacheTTL = ttl
-	}
-}
-
 // MinPollInterval is the minimum allowed poll interval to prevent ticker panics.
 // time.NewTicker requires a positive duration.
 const MinPollInterval = 100 * time.Millisecond
-
-// WithPollInterval sets the polling interval
-func WithPollInterval(interval time.Duration) TrackerOption {
-	return func(t *Tracker) {
-		if interval >= MinPollInterval {
-			t.pollInterval = interval
-		}
-		// If interval is too small, keep the default (2 minutes)
-	}
-}
-
-// WithFetcher sets a custom fetcher (for testing)
-func WithFetcher(f Fetcher) TrackerOption {
-	return func(t *Tracker) {
-		t.fetcher = f
-	}
-}
-
-// NewTracker creates a new quota tracker
-func NewTracker(opts ...TrackerOption) *Tracker {
-	t := &Tracker{
-		cache:        make(map[string]*cachedQuota),
-		cacheTTL:     5 * time.Minute, // Default 5 min cache
-		pollInterval: 2 * time.Minute, // Default poll every 2 min
-		pollers:      make(map[string]*pollerHandle),
-	}
-
-	for _, opt := range opts {
-		opt(t)
-	}
-
-	// Use default PTY fetcher if none provided
-	if t.fetcher == nil {
-		t.fetcher = &PTYFetcher{}
-	}
-
-	return t
-}
-
-// GetQuota retrieves quota info for a pane, using cache if fresh
-func (t *Tracker) GetQuota(paneID string) *QuotaInfo {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	cached, ok := t.cache[paneID]
-	if !ok {
-		return nil
-	}
-
-	if time.Now().After(cached.expiresAt) {
-		return nil // Expired
-	}
-
-	return cached.info
-}
-
-// QueryQuota fetches fresh quota info for a pane, bypassing cache
-func (t *Tracker) QueryQuota(ctx context.Context, paneID string, provider Provider) (*QuotaInfo, error) {
-	info, err := t.fetcher.FetchQuota(ctx, paneID, provider)
-	if err != nil {
-		return nil, err
-	}
-
-	t.updateCache(paneID, info)
-	return info, nil
-}
-
-// updateCache stores quota info in the cache
-func (t *Tracker) updateCache(paneID string, info *QuotaInfo) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.cache[paneID] = &cachedQuota{
-		info:      info,
-		expiresAt: time.Now().Add(t.cacheTTL),
-	}
-}
-
-// StartPolling begins continuous quota polling for a pane.
-// Safe for concurrent calls — old pollers are cancelled before new ones start.
-func (t *Tracker) StartPolling(ctx context.Context, paneID string, provider Provider) {
-	t.mu.Lock()
-
-	// Cancel existing poller if any
-	if handle, ok := t.pollers[paneID]; ok {
-		handle.cancel()
-		delete(t.pollers, paneID)
-	}
-
-	// Create and register the new poller under the same lock to prevent
-	// concurrent StartPolling calls from leaking goroutines (the old code
-	// had a window between unlock and re-lock where a second call could
-	// overwrite the handle, losing the cancel function).
-	pollCtx, cancel := context.WithCancel(ctx)
-	handle := &pollerHandle{cancel: cancel}
-	t.pollers[paneID] = handle
-	t.mu.Unlock()
-
-	go func() {
-		defer cancel()
-		t.pollLoop(pollCtx, paneID, provider)
-
-		t.mu.Lock()
-		if t.pollers[paneID] == handle {
-			delete(t.pollers, paneID)
-		}
-		t.mu.Unlock()
-	}()
-}
-
-// StopPolling stops polling for a pane
-func (t *Tracker) StopPolling(paneID string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if handle, ok := t.pollers[paneID]; ok {
-		handle.cancel()
-		delete(t.pollers, paneID)
-	}
-}
-
-// StopAllPolling stops all active pollers
-func (t *Tracker) StopAllPolling() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	for paneID, handle := range t.pollers {
-		handle.cancel()
-		delete(t.pollers, paneID)
-	}
-}
-
-// pollLoop continuously polls quota at the configured interval
-func (t *Tracker) pollLoop(ctx context.Context, paneID string, provider Provider) {
-	ticker := time.NewTicker(t.pollInterval)
-	defer ticker.Stop()
-
-	// Initial fetch
-	_, _ = t.QueryQuota(ctx, paneID, provider)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// If we were cancelled concurrently with the tick, avoid doing one last fetch.
-			if ctx.Err() != nil {
-				return
-			}
-			_, _ = t.QueryQuota(ctx, paneID, provider)
-		}
-	}
-}
-
-// GetAllQuotas returns all cached quota info
-func (t *Tracker) GetAllQuotas() map[string]*QuotaInfo {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	result := make(map[string]*QuotaInfo)
-	now := time.Now()
-
-	for paneID, cached := range t.cache {
-		if !now.After(cached.expiresAt) {
-			result[paneID] = cached.info
-		}
-	}
-
-	return result
-}
-
-// ClearCache removes all cached quota info
-func (t *Tracker) ClearCache() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.cache = make(map[string]*cachedQuota)
-}
-
-// InvalidatePane removes cached quota for a specific pane
-func (t *Tracker) InvalidatePane(paneID string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.cache, paneID)
-}

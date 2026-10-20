@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -26,13 +28,30 @@ func TestCMAdapterConnectSetsDiscoveredServerPort(t *testing.T) {
 	}
 }
 
-func TestCMAdapterIsDaemonRunningUsesConnectedClientEndpoint(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/health" {
-			t.Errorf("path = %s, want /health", r.URL.Path)
+// newMCPHealthServer fakes a `cm serve` daemon: MCP JSON-RPC at the root
+// path, answering tools/list (the health probe) with an empty tool set.
+func newMCPHealthServer(t *testing.T, delay time.Duration) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			t.Errorf("path = %s, want /", r.URL.Path)
 		}
-		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0", "id": 1,
+			"result": map[string]any{"tools": []any{}},
+		})
 	}))
+}
+
+func TestCMAdapterIsDaemonRunningUsesConnectedClientEndpoint(t *testing.T) {
+	ts := newMCPHealthServer(t, 0)
 	defer ts.Close()
 
 	port := mustServerPort(t, ts.URL)
@@ -53,9 +72,7 @@ func TestCMAdapterIsDaemonRunningUsesConnectedClientEndpoint(t *testing.T) {
 }
 
 func TestCMAdapterIsDaemonRunningFallsBackToConfiguredPort(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	ts := newMCPHealthServer(t, 0)
 	defer ts.Close()
 
 	adapter := NewCMAdapter()
@@ -67,15 +84,10 @@ func TestCMAdapterIsDaemonRunningFallsBackToConfiguredPort(t *testing.T) {
 }
 
 func TestCMAdapterIsDaemonRunningFallbackAfterClientTimeout(t *testing.T) {
-	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(3 * time.Second)
-		w.WriteHeader(http.StatusOK)
-	}))
+	slowServer := newMCPHealthServer(t, 3*time.Second)
 	defer slowServer.Close()
 
-	fastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	fastServer := newMCPHealthServer(t, 0)
 	defer fastServer.Close()
 
 	tmpDir := t.TempDir()
@@ -124,4 +136,70 @@ func mustServerPort(t *testing.T, rawURL string) int {
 		t.Fatalf("Atoi(port=%q) error = %v", u.Port(), err)
 	}
 	return port
+}
+
+func TestCMAdapterContextUsesRequestedWorkspace(t *testing.T) {
+	caller := filepath.Join(t.TempDir(), "client A", "app")
+	target := filepath.Join(t.TempDir(), "client B", "app")
+	for _, dir := range []string{caller, target} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(caller)
+	var callerQueries atomic.Int32
+	callerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callerQueries.Add(1)
+		t.Error("context retrieval used the caller's connected daemon")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer callerServer.Close()
+	workspaces := make(chan string, 1)
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Params struct {
+				Name      string `json:"name"`
+				Arguments struct {
+					Workspace string `json:"workspace"`
+					Task      string `json:"task"`
+				} `json:"arguments"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		gotWorkspace := request.Params.Arguments.Workspace
+		workspaces <- gotWorkspace
+		if request.Params.Name != "cm_context" || request.Params.Arguments.Task != "fix auth" || gotWorkspace != target {
+			t.Errorf("wrong scoped query: %+v", request)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0", "id": 1,
+			"result": map[string]any{"relevantBullets": []map[string]string{{"id": "target", "content": "target project guidance"}}},
+		})
+	}))
+	defer targetServer.Close()
+	writeCMPIDFile(t, caller, "demo", mustServerPort(t, callerServer.URL))
+	writeCMPIDFile(t, target, "demo", mustServerPort(t, targetServer.URL))
+	adapter := NewCMAdapter()
+	if err := adapter.Connect(caller, "demo"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := adapter.GetContext(t.Context(), "fix auth", target, "demo")
+	var gotWorkspace string
+	select {
+	case gotWorkspace = <-workspaces:
+	default:
+	}
+	if err != nil || !strings.Contains(string(data), "target project guidance") || gotWorkspace != target || callerQueries.Load() != 0 {
+		t.Fatalf("scoped context = %s, workspace=%q caller queries=%d err=%v", data, gotWorkspace, callerQueries.Load(), err)
+	}
+	if _, err := adapter.GetContext(t.Context(), "fix auth", "", "demo"); err == nil {
+		t.Fatal("empty workspace inherited the caller's project")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := adapter.GetContext(ctx, "fix auth", target, "demo"); err == nil {
+		t.Fatal("canceled query was accepted")
+	}
 }

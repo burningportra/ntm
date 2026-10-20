@@ -15,11 +15,10 @@ import (
 
 // LogsOptions configures the robot-logs operation.
 type LogsOptions struct {
-	Session string        // Session name
-	Since   time.Duration // Only show logs since this duration ago
-	Panes   []int         // Filter to specific pane indices (empty = all)
-	Limit   int           // Max lines per pane (default: 100)
-	Filter  string        // Regex filter pattern
+	Session string // Session name
+	Panes   []int  // Filter to specific pane indices (empty = all)
+	Limit   int    // Max lines per pane (default: 100)
+	Filter  string // Regex filter pattern
 }
 
 // LogEntry represents a single log line from a pane.
@@ -277,44 +276,6 @@ func GetAggregatedLogs(opts LogsOptions) (*AggregatedLogsOutput, error) {
 	return output, nil
 }
 
-// FormatAggregatedLog formats a log entry with pane prefix for CLI display.
-// Format: "[cc:2] line content..."
-func FormatAggregatedLog(entry AggregatedLogEntry) string {
-	return fmt.Sprintf("[%s:%d] %s", shortAgentType(entry.AgentType), entry.Pane, entry.Line)
-}
-
-// shortAgentType returns a short agent type identifier.
-func shortAgentType(agentType string) string {
-	switch normalizeAgentType(agentType) {
-	case "claude":
-		return "cc"
-	case "codex":
-		return "cod"
-	case "gemini":
-		return "gmi"
-	case "antigravity":
-		return "agy"
-	case "cursor":
-		return "cur"
-	case "windsurf":
-		return "ws"
-	case "aider":
-		return "aid"
-	case "oc", "opencode":
-		return "oc"
-	case "ollama":
-		return "oll"
-	case "user":
-		return "usr"
-	default:
-		agentType = normalizeAgentType(agentType)
-		if len(agentType) > 3 {
-			return agentType[:3]
-		}
-		return agentType
-	}
-}
-
 // StreamLogsOptions configures the logs streaming operation.
 type StreamLogsOptions struct {
 	Session  string
@@ -438,9 +399,4 @@ func (ls *LogsStreamer) Poll(ctx context.Context) ([]LogsStreamEntry, error) {
 	})
 
 	return entries, nil
-}
-
-// Reset clears the streamer's state.
-func (ls *LogsStreamer) Reset() {
-	ls.lastCapture = make(map[int]int)
 }

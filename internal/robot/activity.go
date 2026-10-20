@@ -4,8 +4,10 @@ package robot
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 // liveThinkingWindowLines is the number of trailing lines from a pane
@@ -35,6 +38,63 @@ type WatermarkStore interface {
 
 // WatermarkTypeVelocity is the watermark type used for velocity tracker baselines.
 const WatermarkTypeVelocity = "velocity"
+
+// WatermarkTypeActivityState is the watermark type that records when a pane
+// entered the activity state it is currently in. A StateClassifier is
+// per-process state, so a one-shot `ntm activity` always reported a state that
+// had "just" started; the watermark is what makes state age survive separate
+// invocations.
+const WatermarkTypeActivityState = "activity_state"
+
+// ObserveActivityState reconciles one classified pane state against its durable
+// watermark and returns the time that state was first observed.
+//
+// scope must identify a single pane LIFETIME — session, tmux pane ID, and the
+// pane's PID — so a recycled tmux pane ID cannot inherit the age of whatever
+// ran there before.
+//
+// A nil store degrades to the observation time. Store errors are returned so a
+// caller can fall back to its in-process classifier result instead of failing
+// an otherwise healthy query; the returned time is always usable.
+func ObserveActivityState(store WatermarkStore, scope string, activityState AgentState, observedAt time.Time) (time.Time, error) {
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	observedAt = observedAt.UTC()
+	if store == nil {
+		return observedAt, nil
+	}
+
+	previous, err := store.GetWatermark(WatermarkTypeActivityState, scope)
+	if err != nil {
+		return observedAt, err
+	}
+	// Same state as last time, with a watermark that is not in the future:
+	// keep the original entry time so duration grows across invocations.
+	if previous != nil &&
+		previous.Consumer == string(activityState) &&
+		previous.LastTs != nil &&
+		!previous.LastTs.After(observedAt) {
+		return previous.LastTs.UTC(), nil
+	}
+
+	createdAt := observedAt
+	if previous != nil && !previous.CreatedAt.IsZero() {
+		createdAt = previous.CreatedAt
+	}
+	stateSince := observedAt
+	if err := store.SetWatermark(&state.OutputWatermark{
+		WatermarkType: WatermarkTypeActivityState,
+		Scope:         scope,
+		LastTs:        &stateSince,
+		Consumer:      string(activityState),
+		CreatedAt:     createdAt,
+		UpdatedAt:     observedAt,
+	}); err != nil {
+		return observedAt, err
+	}
+	return stateSince, nil
+}
 
 // VelocitySample represents a single velocity measurement at a point in time.
 type VelocitySample struct {
@@ -83,23 +143,6 @@ func NewVelocityTracker(paneID string, opts ...VelocityTrackerOption) *VelocityT
 		PaneID:     paneID,
 		Samples:    make([]VelocitySample, 0, DefaultMaxSamples),
 		MaxSamples: DefaultMaxSamples,
-	}
-	for _, opt := range opts {
-		opt(vt)
-	}
-	vt.restoreFromStore()
-	return vt
-}
-
-// NewVelocityTrackerWithSize creates a tracker with a custom buffer size.
-func NewVelocityTrackerWithSize(paneID string, maxSamples int, opts ...VelocityTrackerOption) *VelocityTracker {
-	if maxSamples <= 0 {
-		maxSamples = DefaultMaxSamples
-	}
-	vt := &VelocityTracker{
-		PaneID:     paneID,
-		Samples:    make([]VelocitySample, 0, maxSamples),
-		MaxSamples: maxSamples,
 	}
 	for _, opt := range opts {
 		opt(vt)
@@ -489,110 +532,172 @@ type VelocityManager struct {
 // VelocityManagerOption configures a VelocityManager.
 type VelocityManagerOption func(*VelocityManager)
 
-// WithManagerStore configures the manager to pass the store to all new trackers.
-func WithManagerStore(store WatermarkStore) VelocityManagerOption {
-	return func(vm *VelocityManager) {
-		vm.store = store
-	}
+// =============================================================================
+// Durable output-change sequence (#246)
+// =============================================================================
+
+// WatermarkTypeOutputSeq is the watermark type for the durable per-pane
+// output-change sequence. For rows of this type the generic watermark
+// columns are used as follows:
+//
+//	LastCursor   — the output sequence (advances by 1 per detected change)
+//	BaselineHash — truncated SHA-256 of the last cleaned capture (private;
+//	               never exposed to consumers)
+//	Consumer     — the opaque epoch for this scope, minted when the row is
+//	               first created; a new row (state DB reset/rebuild, pane
+//	               scope recreation) mints a new epoch
+//	LastTs       — when the sequence last advanced
+const WatermarkTypeOutputSeq = "output_seq"
+
+// OutputSequenceInfo is the privacy-preserving output-change signal exposed
+// on activity/status surfaces. It proves an agent produced new terminal
+// output since a prior observation without revealing pane content or a
+// content digest.
+//
+// Contract:
+//   - Sequence advances monotonically when NTM detects a real output change
+//     for the scope, and stays stable across repeated observations that see
+//     no change.
+//   - Sequences are only comparable within the same Epoch. A new epoch means
+//     the durable scope was recreated (state store reset, pane replacement);
+//     consumers must discard prior sequence state instead of comparing.
+//   - ChangedAt is when the sequence last advanced (RFC 3339); empty until
+//     the first detected change in this epoch.
+type OutputSequenceInfo struct {
+	Epoch     string `json:"epoch"`
+	Sequence  int64  `json:"sequence"`
+	ChangedAt string `json:"changed_at,omitempty"`
+
+	// advanced records whether THIS observation moved the sequence, i.e. the
+	// pane tail differs from what the previous observer (possibly another
+	// process) saw. Internal: it feeds the status classifier's output
+	// evidence (#288) and is not part of the wire schema.
+	advanced bool
 }
 
-// NewVelocityManager creates a new velocity manager.
-func NewVelocityManager(opts ...VelocityManagerOption) *VelocityManager {
-	vm := &VelocityManager{
-		trackers: make(map[string]*VelocityTracker),
-	}
-	for _, opt := range opts {
-		opt(vm)
-	}
-	return vm
+// outputSeqScope builds the durable watermark scope for a pane. The tmux
+// pane ID alone can alias across tmux server restarts, so the session name
+// is included; residual aliasing at worst reports one spurious change
+// (sequence advance), never a missed one.
+func outputSeqScope(sessionName, paneID string) string {
+	return sessionName + "|" + paneID
 }
 
-// GetOrCreate returns the tracker for a pane, creating one if needed.
-func (vm *VelocityManager) GetOrCreate(paneID string) *VelocityTracker {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	if tracker, ok := vm.trackers[paneID]; ok {
-		return tracker
+// newOutputEpoch mints an opaque epoch identifier.
+func newOutputEpoch() string {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// Fallback: a nanosecond timestamp still satisfies "changes when
+		// the scope is recreated" with overwhelming probability.
+		return strconv.FormatInt(time.Now().UTC().UnixNano(), 16)
 	}
-
-	var opts []VelocityTrackerOption
-	if vm.store != nil {
-		opts = append(opts, WithWatermarkStore(vm.store))
-	}
-	tracker := NewVelocityTracker(paneID, opts...)
-	vm.trackers[paneID] = tracker
-	return tracker
+	return hex.EncodeToString(buf[:])
 }
 
-// Get returns the tracker for a pane, or nil if not found.
-func (vm *VelocityManager) Get(paneID string) *VelocityTracker {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-	return vm.trackers[paneID]
-}
-
-// Remove removes the tracker for a pane.
-func (vm *VelocityManager) Remove(paneID string) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-	delete(vm.trackers, paneID)
-}
-
-// UpdateAll updates all registered trackers.
-// Returns a map of pane IDs to their current samples, and any errors.
-func (vm *VelocityManager) UpdateAll() (map[string]*VelocitySample, map[string]error) {
-	vm.mu.RLock()
-	paneIDs := make([]string, 0, len(vm.trackers))
-	for id := range vm.trackers {
-		paneIDs = append(paneIDs, id)
+// advanceOutputSequence records one observation of a pane's cleaned content
+// hash and returns the scope's current output sequence, advancing it when
+// the content changed since the previous durable observation.
+//
+// The first observation for a scope establishes the baseline at sequence 0
+// with a fresh epoch: creating a scope is not a detected change. A nil store
+// returns (nil, nil) so callers degrade gracefully when no runtime
+// projection store is configured.
+//
+// Concurrency: the read-modify-write is not transactional across processes.
+// Two concurrent observers may collapse two rapid changes into one sequence
+// advance; the sequence still never moves backward and never advances
+// without a real change, which is the load-bearing half of the contract.
+func advanceOutputSequence(store WatermarkStore, scope, contentHash string, observedAt time.Time) (*OutputSequenceInfo, error) {
+	if store == nil {
+		return nil, nil
 	}
-	vm.mu.RUnlock()
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
 
-	samples := make(map[string]*VelocitySample)
-	errors := make(map[string]error)
+	wm, err := store.GetWatermark(WatermarkTypeOutputSeq, scope)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, paneID := range paneIDs {
-		tracker := vm.Get(paneID)
-		if tracker == nil {
-			continue
+	now := time.Now().UTC()
+	if wm == nil || wm.Consumer == "" {
+		created := &state.OutputWatermark{
+			WatermarkType: WatermarkTypeOutputSeq,
+			Scope:         scope,
+			LastCursor:    0,
+			BaselineHash:  contentHash,
+			Consumer:      newOutputEpoch(),
+			CreatedAt:     now,
+			UpdatedAt:     now,
 		}
-
-		sample, err := tracker.Update()
-		if err != nil {
-			errors[paneID] = err
-		} else {
-			samples[paneID] = sample
+		if err := store.SetWatermark(created); err != nil {
+			return nil, err
 		}
+		return &OutputSequenceInfo{Epoch: created.Consumer, Sequence: 0}, nil
 	}
 
-	return samples, errors
-}
-
-// GetAllVelocities returns the current velocity for all tracked panes.
-func (vm *VelocityManager) GetAllVelocities() map[string]float64 {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	result := make(map[string]float64, len(vm.trackers))
-	for paneID, tracker := range vm.trackers {
-		result[paneID] = tracker.CurrentVelocity()
+	info := &OutputSequenceInfo{Epoch: wm.Consumer, Sequence: wm.LastCursor}
+	if wm.LastTs != nil {
+		info.ChangedAt = wm.LastTs.UTC().Format(time.RFC3339)
 	}
-	return result
+	if wm.BaselineHash == contentHash {
+		// No change: leave the row alone except for a coarse liveness touch.
+		// UpdatedAt drives GC retention, so an alive-but-idle scope must
+		// refresh it occasionally or a month of pure idleness would prune
+		// the row and spuriously rotate the epoch. Once per day bounds the
+		// write amplification to one upsert per scope per day.
+		if now.Sub(wm.UpdatedAt) > 24*time.Hour {
+			wm.UpdatedAt = now
+			_ = store.SetWatermark(wm)
+		}
+		return info, nil
+	}
+
+	changedAt := observedAt.UTC()
+	wm.LastCursor++
+	wm.BaselineHash = contentHash
+	wm.LastTs = &changedAt
+	wm.UpdatedAt = now
+	if err := store.SetWatermark(wm); err != nil {
+		return nil, err
+	}
+	info.Sequence = wm.LastCursor
+	info.ChangedAt = changedAt.Format(time.RFC3339)
+	info.advanced = true
+	return info, nil
 }
 
-// Clear removes all trackers.
-func (vm *VelocityManager) Clear() {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-	vm.trackers = make(map[string]*VelocityTracker)
+// outputSeqHashLines is how many trailing lines feed the output-sequence
+// hash. Multiple surfaces observe the same scope with different capture
+// depths (status uses a 20-line detection capture, activity uses the
+// observer's deeper RawOutput); hashing only the shared trailing window
+// keeps their baselines identical so the sequence never advances on an
+// idle pane merely because a different surface looked at it.
+const outputSeqHashLines = 20
+
+// outputSeqContentHash normalizes raw pane content into the durable
+// output-sequence fingerprint: ANSI stripped, trailing whitespace trimmed,
+// last outputSeqHashLines lines only.
+func outputSeqContentHash(rawContent string) string {
+	clean := strings.TrimRight(status.StripANSI(rawContent), " \t\r\n")
+	return computeContentHash(lastNLines(clean, outputSeqHashLines))
 }
 
-// TrackerCount returns the number of active trackers.
-func (vm *VelocityManager) TrackerCount() int {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-	return len(vm.trackers)
+// observeOutputSequence hashes the normalized tail of raw pane content, then
+// advances the durable output sequence for the pane's scope. Errors and a
+// missing store both degrade to nil: the signal is additive and must never
+// break the surface that carries it.
+func observeOutputSequence(sessionName, paneID, rawContent string, observedAt time.Time) *OutputSequenceInfo {
+	store := currentProjectionStore()
+	if store == nil {
+		return nil
+	}
+	info, err := advanceOutputSequence(store, outputSeqScope(sessionName, paneID), outputSeqContentHash(rawContent), observedAt)
+	if err != nil {
+		return nil
+	}
+	return info
 }
 
 // =============================================================================
@@ -654,6 +759,8 @@ type StateClassifier struct {
 	velocityTracker    *VelocityTracker
 	patternLibrary     *PatternLibrary
 	agentType          string
+	paneWidth          int
+	paneHeight         int
 	stallThreshold     time.Duration
 	hysteresisDuration time.Duration
 
@@ -673,7 +780,15 @@ type StateClassifier struct {
 
 // ClassifierConfig holds configuration for state classification.
 type ClassifierConfig struct {
-	AgentType          string
+	AgentType string
+	// PaneWidth is the real tmux pane width; used to widen the live tail
+	// window on narrow panes (bd-eeifh). Zero keeps the calibrated budget.
+	PaneWidth int
+	// PaneHeight is the real tmux pane height. When set, transient state
+	// markers are classified from the pane's VISIBLE screen only: a capture
+	// includes scrollback, so on a short pane a spinner that scrolled off
+	// hours ago otherwise stays inside the "live tail" forever.
+	PaneHeight         int
 	StallThreshold     time.Duration
 	HysteresisDuration time.Duration
 	PatternLibrary     *PatternLibrary
@@ -711,6 +826,8 @@ func NewStateClassifier(paneID string, cfg *ClassifierConfig) *StateClassifier {
 		velocityTracker:    NewVelocityTracker(paneID, vtOpts...),
 		patternLibrary:     patternLib,
 		agentType:          cfg.AgentType,
+		paneWidth:          cfg.PaneWidth,
+		paneHeight:         cfg.PaneHeight,
 		stallThreshold:     stallThreshold,
 		hysteresisDuration: hysteresis,
 		currentState:       StateUnknown,
@@ -772,17 +889,31 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	// lets classifyState fall through to the correct idle/unknown path.
 	//
 	// CategoryError matches are filtered with the same live-window logic
-	// when an idle prompt is present in the live tail: stale "failed" or
-	// "api error" text high in scrollback above a current chevron prompt
-	// would otherwise pin the pane to ERROR forever, even though the agent
-	// is sitting at a healthy prompt waiting for input. Fresh errors that
-	// land inside the live tail still classify as ERROR.
-	liveContent := lastNLines(content, liveThinkingWindowLines)
+	// when a current idle or authoritative provider work signal is present in
+	// the live tail:
+	// stale "failed" or "api error" text high in scrollback must not pin a
+	// pane to ERROR after its TUI has visibly moved on. Fresh errors inside
+	// the live tail still classify as ERROR.
+	// The live window can never be larger than what is actually on screen:
+	// capture-pane returns scrollback too, so a fixed tail on a short pane
+	// keeps a long-gone spinner permanently "live".
+	visibleContent := content
+	if sc.paneHeight > 0 {
+		visibleContent = util.GetLastNLines(content, sc.paneHeight)
+	}
+	liveContent := lastNLines(visibleContent, util.WidthAdaptiveTailLines(sc.paneWidth, liveThinkingWindowLines))
 	liveMatches := sc.patternLibrary.Match(liveContent, sc.agentType)
 	effectiveMatches := filterThinkingToLive(matches, liveMatches)
-	effectiveMatches = filterErrorToLiveWhenIdle(effectiveMatches, liveMatches)
+	effectiveMatches = filterErrorToLiveWithCurrentSignal(effectiveMatches, liveMatches)
 	if normalizeAgentType(sc.agentType) == "oc" {
 		effectiveMatches = opencodeFailureMatches(effectiveMatches, content)
+	}
+	effectiveMatches = filterClaudeToolOutputErrors(effectiveMatches, visibleContent, sc.agentType, sc.paneWidth)
+	effectiveMatches = reconcileClaudeLiveness(effectiveMatches, visibleContent, sc.agentType, sc.paneWidth)
+	for _, m := range effectiveMatches {
+		if m.Pattern == claudeFinishedTurnPattern {
+			detectedPatterns = append(detectedPatterns, m.Pattern)
+		}
 	}
 
 	// Calculate proposed state and confidence
@@ -794,7 +925,7 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	// Check whether any matched pattern is a rate-limit indicator so the
 	// RateLimited flag on AgentActivity is set from real pattern evidence.
 	// We scan `effectiveMatches` rather than `matches` so the flag stays
-	// consistent with the state classification: when filterErrorToLiveWhenIdle
+	// consistent with the state classification: when filterErrorToLiveWithCurrentSignal
 	// drops a stale rate-limit pattern that scrolled above a current idle
 	// prompt, the pane is no longer rate-limited and downstream consumers
 	// (`internal/health/health.go`, `internal/resilience/monitor.go`) must
@@ -828,6 +959,8 @@ var rateLimitPatternNames = map[string]bool{
 	"http_429":             true,
 	"too_many_requests":    true,
 	"quota_exceeded":       true,
+	"usage_limit_hit":      true,
+	"usage_limit_reached":  true,
 	"oc_rate_limit_notice": true,
 }
 
@@ -857,6 +990,68 @@ func opencodeFailureMatches(matches []PatternMatch, content string) []PatternMat
 // known rate-limit pattern.  This bridges the gap between the generic
 // CategoryError classification and the explicit RateLimited flag that wait
 // conditions and health surfaces depend on.
+// filterClaudeToolOutputErrors drops error matches from a Claude pane whose
+// newest turn marker is a live spinner or a completed turn. Claude prints its
+// own tool results inline ("⎿  Error: Exit code 1", compiler and test output),
+// and the generic error patterns cannot tell those from the agent failing; the
+// ordering-aware turn parser can. Rate-limit banners are kept: they are the
+// provider talking, and their own live-window rules decide them.
+func filterClaudeToolOutputErrors(matches []PatternMatch, content, agentType string, paneWidth int) []PatternMatch {
+	if normalizeAgentType(agentType) != "claude" {
+		return matches
+	}
+	switch agent.DetectClaudeTurnState(content, paneWidth) {
+	case agent.ClaudeTurnWorking, agent.ClaudeTurnEnded:
+	default:
+		return matches
+	}
+	out := make([]PatternMatch, 0, len(matches))
+	for _, m := range matches {
+		if m.Category == CategoryError && !rateLimitPatternNames[m.Pattern] {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// claudeFinishedTurnPattern names the idle evidence reconcileClaudeLiveness
+// contributes for a Claude pane at its input box after a finished turn.
+const claudeFinishedTurnPattern = "claude_finished_turn"
+
+// reconcileClaudeLiveness makes a Claude pane's activity agree with the
+// ordering-aware liveness rule dispatch already trusts (IsLiveBusy defers to
+// agent.ClaudeActivelyWorking). Without it, idle Claude panes classified
+// UNKNOWN, or THINKING on a stale spinner frame, while --robot-is-working
+// called them idle.
+//
+// Thinking matches are dropped only on positive evidence that the turn is
+// over: a completion line is Claude's newest marker, which Claude prints only
+// after the turn ends. Absent that, generic thinking evidence stays, so an
+// unrecognized spinner variant still fails closed as busy. The finished-turn
+// layouts the generic prompt pattern misses (the input box holding queued
+// text, the "⏵⏵" footer) count as idle evidence whenever no live spinner is
+// Claude's newest marker, the gating ClaudeIdlePromptShowing requires.
+func reconcileClaudeLiveness(matches []PatternMatch, content, agentType string, paneWidth int) []PatternMatch {
+	if normalizeAgentType(agentType) != "claude" || agent.ClaudeActivelyWorking(content, paneWidth) {
+		return matches
+	}
+	turnEnded := agent.DetectClaudeTurnState(content, paneWidth) == agent.ClaudeTurnEnded
+	out := make([]PatternMatch, 0, len(matches)+1)
+	hasIdle := false
+	for _, m := range matches {
+		if m.Category == CategoryThinking && turnEnded {
+			continue
+		}
+		hasIdle = hasIdle || m.Category == CategoryIdle
+		out = append(out, m)
+	}
+	if !hasIdle && agent.ClaudeIdlePromptShowing(content) {
+		out = append(out, PatternMatch{Pattern: claudeFinishedTurnPattern, Category: CategoryIdle, State: StateWaiting})
+	}
+	return out
+}
+
 func isRateLimitPatternMatch(matches []PatternMatch) bool {
 	for _, m := range matches {
 		if rateLimitPatternNames[m.Pattern] {
@@ -879,7 +1074,13 @@ func isRateLimitPatternMatch(matches []PatternMatch) bool {
 // (`ntm send`, an external orchestrator, manual operator) because the
 // internal assignment ledger has no record of it. The live-window check
 // closes that gap by reading the same surface that `--robot-activity` uses.
-func IsLiveBusy(scrollback string, agentType string) bool {
+//
+// The live window is width-adaptive (bd-eeifh): the fixed
+// liveThinkingWindowLines budget counts physical capture rows, so on a
+// ~26-column pane a wrapped spinner frame scrolls out of the window and an
+// actively-working pane reads idle. paneWidth is the real tmux pane width;
+// pass 0 when unknown.
+func IsLiveBusy(scrollback string, agentType string, paneWidth int) bool {
 	if scrollback == "" {
 		return false
 	}
@@ -898,7 +1099,13 @@ func IsLiveBusy(scrollback string, agentType string) bool {
 	// it keeps IsLiveBusy in agreement with the rest of the Claude detection
 	// layer (parser, status, ClaudeIdlePromptShowing).
 	if normalizeAgentType(agentType) == "claude" {
-		return agent.ClaudeActivelyWorking(scrollback)
+		return agent.ClaudeActivelyWorking(scrollback, paneWidth)
+	}
+	// omp: the composer-anchored structural parser is the single source of
+	// truth (spinner+timer, Esc-hint line, pending steering), shared with the
+	// parser, status, and delivery layers.
+	if normalizeAgentType(agentType) == "omp" {
+		return agent.OmpActivelyWorking(scrollback, paneWidth)
 	}
 	// Muse panes likewise defer to the Muse recognizer: it looks for the
 	// working line just above the composer, where a long draft typed during
@@ -916,10 +1123,10 @@ func IsLiveBusy(scrollback string, agentType string) bool {
 	// line below the prompt box, where opencode draws its progress bar for
 	// the whole turn, and never the transcript.
 	if normalizeAgentType(agentType) == "oc" {
-		return agent.OpencodeActivelyWorking(scrollback)
+		return agent.OpencodeActivelyWorking(scrollback, paneWidth)
 	}
 
-	live := lastNLines(scrollback, liveThinkingWindowLines)
+	live := lastNLines(scrollback, util.WidthAdaptiveTailLines(paneWidth, liveThinkingWindowLines))
 	if live == "" {
 		return false
 	}
@@ -930,12 +1137,13 @@ func IsLiveBusy(scrollback string, agentType string) bool {
 // isAIAgentLiveBusy applies the live-window classifier only to known AI panes.
 // IsLiveBusy intentionally exposes wildcard thinking patterns, so callers must
 // not apply it to user or unknown panes where ordinary shell output can match.
-func isAIAgentLiveBusy(scrollback, agentType string) bool {
+// paneWidth is the real tmux pane width (bd-eeifh); pass 0 when unknown.
+func isAIAgentLiveBusy(scrollback, agentType string, paneWidth int) bool {
 	canonicalType := agent.AgentType(agentType).Canonical()
 	if !canonicalType.IsValid() || canonicalType == agent.AgentTypeUser || canonicalType == agent.AgentTypeUnknown {
 		return false
 	}
-	return IsLiveBusy(scrollback, string(canonicalType))
+	return IsLiveBusy(scrollback, string(canonicalType), paneWidth)
 }
 
 // lastNLines returns the last n non-empty-slice lines of s, preserving
@@ -1007,25 +1215,23 @@ func filterThinkingToLive(full, live []PatternMatch) []PatternMatch {
 	return out
 }
 
-// filterErrorToLiveWhenIdle drops CategoryError matches from `full` whose
+// filterErrorToLiveWithCurrentSignal drops CategoryError matches from `full` whose
 // pattern name is not also present in `live`, but only when `live` contains a
-// CategoryIdle prompt match. The combination of "no live error + a live idle
-// prompt" is the signature of historical error text scrolled high in the
-// buffer above a current healthy chevron/prompt: the agent has finished the
-// failure path, recovered, and is now waiting for the next input. Fresh
-// errors (rate limits, auth failures, crashes that just happened) still
-// match in `live` and survive the filter as ERROR. When no idle prompt is in
-// the live tail the pane is not currently waiting and `full` is returned
-// unchanged so error priority is preserved.
+// current-state signal: an idle prompt or an allowlisted provider-specific
+// thinking marker that is only rendered while a turn is in flight.
+// That combination proves the TUI has visibly moved past historical error text.
+// Fresh errors still match in `live` and survive the filter as ERROR. When no
+// current-state signal is present, `full` is returned unchanged so an ambiguous
+// pane fails closed.
 //
 // Plain-text error patterns (failed_text, api_error, exception, …) are the
 // load-bearing instances of this false positive because their regexes match
 // raw substrings ("failed", "error:", "exception:") that linger in
 // scrollback long after the offending operation completed. The filter is
 // pattern-agnostic though — it applies to every CategoryError match that
-// exists in `full` but not in `live` once a fresh idle prompt is observed,
-// including rate-limit, auth, network, and crash patterns.
-func filterErrorToLiveWhenIdle(full, live []PatternMatch) []PatternMatch {
+// exists in `full` but not in `live` once a fresh current-state signal is
+// observed, including rate-limit, auth, network, and crash patterns.
+func filterErrorToLiveWithCurrentSignal(full, live []PatternMatch) []PatternMatch {
 	// Fast path: no error matches at all → nothing to filter.
 	hasError := false
 	for _, m := range full {
@@ -1037,18 +1243,17 @@ func filterErrorToLiveWhenIdle(full, live []PatternMatch) []PatternMatch {
 	if !hasError {
 		return full
 	}
-	// Only debounce when the live tail shows the pane is actively waiting
-	// at an idle prompt. Without this guard a pane that just rolled an
-	// error past the live window with no follow-up prompt would silently
-	// drop the error and misclassify as the next-best non-error state.
-	hasLiveIdle := false
+	// Only debounce when the live tail supplies positive current-state
+	// evidence. Without this guard a pane that merely rolled an error past
+	// the live window could silently lose the error while stalled.
+	hasLiveCurrentSignal := false
 	for _, m := range live {
-		if m.Category == CategoryIdle {
-			hasLiveIdle = true
+		if m.Category == CategoryIdle || isAuthoritativeLiveWorkPattern(m.Pattern) {
+			hasLiveCurrentSignal = true
 			break
 		}
 	}
-	if !hasLiveIdle {
+	if !hasLiveCurrentSignal {
 		return full
 	}
 	// Build the set of error-pattern names that are still in the live tail.
@@ -1082,6 +1287,30 @@ func filterErrorToLiveWhenIdle(full, live []PatternMatch) []PatternMatch {
 		out = append(out, m)
 	}
 	return out
+}
+
+// isAuthoritativeLiveWorkPattern is deliberately an allowlist. Generic
+// thinking matches such as "processing..." or a braille glyph can occur in
+// ordinary output and are not strong enough evidence to discard an error from
+// the wider capture. These provider-specific patterns describe TUI chrome that
+// is documented to exist only during an active turn.
+func isAuthoritativeLiveWorkPattern(name string) bool {
+	switch name {
+	case "codex_working",
+		"codex_waiting_background",
+		"codex_esc_interrupt",
+		"codex_thinking_bullet",
+		"agy_esc_cancel",
+		"grok_spinner_phase",
+		"grok_esc_cancel",
+		"omp_status_timer",
+		"omp_esc_hint",
+		"omp_steering",
+		"omp_subagents":
+		return true
+	default:
+		return false
+	}
 }
 
 // classifyState determines state based on velocity and patterns.

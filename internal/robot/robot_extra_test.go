@@ -3,6 +3,10 @@ package robot
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -59,15 +63,6 @@ func TestPrintTerseNoTmux(t *testing.T) {
 		}
 	}
 
-	for _, part := range parts {
-		state, err := ParseTerse(part)
-		if err != nil {
-			t.Errorf("Failed to parse terse part %q: %v", part, err)
-		}
-		if state.Session == "" {
-			t.Error("Session is empty in parsed state")
-		}
-	}
 }
 
 func TestTerseKeyMapUnique(t *testing.T) {
@@ -80,21 +75,6 @@ func TestTerseKeyMapUnique(t *testing.T) {
 			t.Fatalf("short key %q collision: %q and %q", shortKey, existing, longKey)
 		}
 		seen[shortKey] = longKey
-	}
-}
-
-func TestTerseKeyMapRoundTrip(t *testing.T) {
-	reverse := TerseKeyReverseMap()
-	for longKey, shortKey := range TerseKeyMap {
-		if got, ok := TerseKeyFor(longKey); !ok || got != shortKey {
-			t.Fatalf("TerseKeyFor(%q) = %q, ok=%v; want %q", longKey, got, ok, shortKey)
-		}
-		if got, ok := reverse[shortKey]; !ok || got != longKey {
-			t.Fatalf("reverse[%q] = %q, ok=%v; want %q", shortKey, got, ok, longKey)
-		}
-		if got, ok := ExpandTerseKey(shortKey); !ok || got != longKey {
-			t.Fatalf("ExpandTerseKey(%q) = %q, ok=%v; want %q", shortKey, got, ok, longKey)
-		}
 	}
 }
 
@@ -116,6 +96,115 @@ func TestGetACFSStatus_MissingBinary(t *testing.T) {
 	}
 }
 
+// --robot-suggest decoded bv's SuggestionSet object as a list and failed on
+// every call. Run it against the installed bv on two near-duplicate issues.
+func TestGetSuggestReadsInstalledBV(t *testing.T) {
+	if _, err := exec.LookPath("bv"); err != nil {
+		t.Skip("bv not installed")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issue := func(id, title string) string {
+		return `{"id":"` + id + `","title":"` + title + `","description":"Users get logged out when the session token expires during a long form.","status":"open","priority":2,"issue_type":"bug","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}`
+	}
+	jsonl := issue("sg-a", "Fix login timeout when session expires") + "\n" + issue("sg-b", "Fix login timeout when the session expires") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "issues.jsonl"), []byte(jsonl), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	out, err := GetSuggest()
+	if err != nil || !out.Success || out.Suggestions == nil {
+		t.Fatalf("GetSuggest = %+v, %v; want bv's suggestions", out, err)
+	}
+	found := false
+	for _, s := range out.Suggestions.Suggestions.Suggestions {
+		if s.Type == "potential_duplicate" && (s.TargetBead == "sg-a" || s.TargetBead == "sg-b") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("suggestions = %+v, want the sg-a/sg-b duplicate", out.Suggestions.Suggestions)
+	}
+}
+
+// --robot-file-beads decoded an invented files[] shape and returned success
+// with nothing in it; bv answers {file_path,total_beads,open_beads,closed_beads}.
+func TestGetFileBeadsReadsInstalledBV(t *testing.T) {
+	if _, err := exec.LookPath("bv"); err != nil {
+		t.Skip("bv not installed")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "issues.jsonl"), []byte(`{"id":"fb-a","title":"A","status":"open","priority":2,"issue_type":"task","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// bv's file correlation reads git history, so it needs a commit.
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"add", "-A"},
+		{"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fb-a: add app"},
+	} {
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	t.Chdir(dir)
+
+	out, err := GetFileBeads(FileBeadsOptions{FilePath: "app.go"})
+	if err != nil || !out.Success || out.Beads == nil {
+		t.Fatalf("GetFileBeads = %+v, %v", out, err)
+	}
+	if out.Beads.FilePath != "app.go" || out.Beads.OpenBeads == nil {
+		t.Fatalf("file beads = %+v, want bv's file_path and bead lists", out.Beads)
+	}
+}
+
+// br dep tree lists the queried issue itself at depth 0, so --robot-graph's
+// correlation reported every bead as its own blocker and dependent.
+func TestGetBeadNeighborsExcludesTheQueriedIssue(t *testing.T) {
+	if _, err := exec.LookPath("br"); err != nil {
+		t.Skip("br not installed")
+	}
+	dir := t.TempDir()
+	brRun := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("br", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("br %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	brRun("init", "--prefix", "zz")
+	newID := func(title string) string {
+		var created struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(brRun("create", "--title", title, "--type", "task", "--json")), &created); err != nil || created.ID == "" {
+			t.Fatalf("br create %q: %v", title, err)
+		}
+		return created.ID
+	}
+	blocked, blocker := newID("Blocked work"), newID("Blocker")
+	brRun("dep", "add", blocked, blocker)
+
+	if ids, _, err := getBeadNeighbors(dir, blocked, "down"); err != nil || len(ids) != 1 || ids[0] != blocker {
+		t.Fatalf("down neighbors of %s = %v, %v; want [%s]", blocked, ids, err, blocker)
+	}
+	if ids, _, err := getBeadNeighbors(dir, blocker, "up"); err != nil || len(ids) != 1 || ids[0] != blocked {
+		t.Fatalf("up neighbors of %s = %v, %v; want [%s]", blocker, ids, err, blocked)
+	}
+}
+
 func TestAdditionalBVSurfacesReportTypedMissingDependency(t *testing.T) {
 	t.Setenv("PATH", "")
 
@@ -129,7 +218,7 @@ func TestAdditionalBVSurfacesReportTypedMissingDependency(t *testing.T) {
 			out, err := GetImpact("internal/robot/robot.go")
 			return out.RobotResponse, err
 		}},
-		{"search", func() (RobotResponse, error) { out, err := GetSearch("assignment"); return out.RobotResponse, err }},
+		{"search", func() (RobotResponse, error) { out, err := GetSearch("assignment", 0); return out.RobotResponse, err }},
 		{"label-attention", func() (RobotResponse, error) {
 			out, err := GetLabelAttention(LabelAttentionOptions{})
 			return out.RobotResponse, err
@@ -164,8 +253,7 @@ func TestAdditionalBVSurfacesReportTypedMissingDependency(t *testing.T) {
 }
 
 func TestGetACFSStatus_WithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	output, err := GetACFSStatus()
 	if err != nil {
@@ -443,5 +531,104 @@ func TestRenderMarkdownFromSnapshotRejectsUnknownSections(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "supported: summary, sessions, work, alerts, attention") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestBVSurfacesWithoutBeadsWorkspace: run where the project has no .beads,
+// bv-backed analyses fail as DEPENDENCY_MISSING with a br init hint, not as
+// INTERNAL_ERROR; an unreadable workspace stays INTERNAL_ERROR. The fake bv
+// prints bv's real stderr for each case.
+func TestBVSurfacesWithoutBeadsWorkspace(t *testing.T) {
+	for _, tc := range []struct {
+		name, stderr, wantCode string
+	}{
+		{"no workspace", "Error loading beads: failed to read beads directory: open $PWD/.beads: no such file or directory", ErrCodeDependencyMissing},
+		{"unreadable workspace", "Error loading beads: failed to inspect redirect file $PWD/.beads/redirect: stat $PWD/.beads/redirect: permission denied", ErrCodeInternalError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			script := "#!/bin/sh\necho \"" + tc.stderr + "\" >&2\necho \"Make sure you are in a project initialized with 'br init'.\" >&2\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(bin, "bv"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Chdir(t.TempDir())
+			bv.InvalidateTriageCache()
+			t.Cleanup(bv.InvalidateTriageCache)
+
+			check := func(surface string, resp RobotResponse) {
+				t.Helper()
+				if resp.Success || resp.ErrorCode != tc.wantCode {
+					t.Errorf("%s: success=%v code=%q error=%q, want %s", surface, resp.Success, resp.ErrorCode, resp.Error, tc.wantCode)
+				}
+				if wantInit := tc.wantCode == ErrCodeDependencyMissing; wantInit != strings.Contains(resp.Hint, "br init") {
+					t.Errorf("%s: hint %q, br init hint wanted=%v", surface, resp.Hint, wantInit)
+				}
+			}
+			triage, err := GetTriage(TriageOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("triage", triage.RobotResponse)
+			graph, err := GetGraph()
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("graph", graph.RobotResponse)
+			labels, err := GetLabelAttention(LabelAttentionOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("label-attention", labels.RobotResponse)
+		})
+	}
+}
+
+// TestCASSSurfacesWithoutIndex: an installed cass that has never indexed
+// exits 3 with a missing-index error; search, insights and context report
+// DEPENDENCY_MISSING naming `cass index --full` instead of INTERNAL_ERROR,
+// while any other cass failure stays INTERNAL_ERROR.
+func TestCASSSurfacesWithoutIndex(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		exitCode int
+		wantCode string
+	}{
+		{"never indexed", 3, ErrCodeDependencyMissing},
+		{"other failure", 1, ErrCodeInternalError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			script := fmt.Sprintf("#!/bin/sh\necho '{\"error\":{\"code\":3,\"kind\":\"missing-index\",\"message\":\"cass has not been initialized yet\"}}'\nexit %d\n", tc.exitCode)
+			if err := os.WriteFile(filepath.Join(bin, "cass"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			check := func(surface string, resp RobotResponse) {
+				t.Helper()
+				if resp.Success || resp.ErrorCode != tc.wantCode {
+					t.Errorf("%s: success=%v code=%q error=%q, want %s", surface, resp.Success, resp.ErrorCode, resp.Error, tc.wantCode)
+				}
+				if wantIndex := tc.wantCode == ErrCodeDependencyMissing; wantIndex != strings.Contains(resp.Hint, "cass index --full") {
+					t.Errorf("%s: hint %q, index hint wanted=%v", surface, resp.Hint, wantIndex)
+				}
+			}
+			search, err := GetCASSSearch(CASSSearchOptions{Query: "auth"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("cass-search", search.RobotResponse)
+			insights, err := GetCASSInsights("7d")
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("cass-insights", insights.RobotResponse)
+			ctxOut, err := GetCASSContext("auth")
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("cass-context", ctxOut.RobotResponse)
+		})
 	}
 }

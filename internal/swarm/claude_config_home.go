@@ -72,12 +72,6 @@ func NewClaudeConfigProvisioner(baseDir string) *ClaudeConfigProvisioner {
 	return &ClaudeConfigProvisioner{BaseDir: baseDir}
 }
 
-// WithSourceDir overrides the config dir that entries are linked from.
-func (p *ClaudeConfigProvisioner) WithSourceDir(dir string) *ClaudeConfigProvisioner {
-	p.SourceDir = dir
-	return p
-}
-
 func (p *ClaudeConfigProvisioner) sourceDir() (string, error) {
 	if source := strings.TrimSpace(p.SourceDir); source != "" {
 		// Symlink targets are interpreted relative to the link's parent, not
@@ -292,6 +286,14 @@ func ProvisionClaudeIsolation(cfg *config.Config, projectDir, session string, pa
 		return ClaudeLaunchEnv{}, err
 	}
 	return provisioner.EnvForPane(session, pane, tokenFile), nil
+}
+
+// CheckClaudeCredentialIsolation reports whether this platform's credential
+// store supports pane-private configuration. It performs only the existing
+// read-only store probe, so recovery can reject unsupported isolation before
+// replacing a running session or provisioning any files.
+func CheckClaudeCredentialIsolation() error {
+	return credentialStoreIsolable()
 }
 
 // ResolveClaudeSetupTokenFile validates the non-rotating setup token file and

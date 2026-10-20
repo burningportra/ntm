@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
+	"github.com/Dicklesworthstone/ntm/internal/privacy"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 )
 
@@ -18,13 +19,20 @@ import (
 type BusBridge struct {
 	session     string
 	manager     *WebhookManager
+	bus         *events.EventBus
 	unsubscribe events.UnsubscribeFunc
 }
+
+// bridgeDrainTimeout bounds how long Close waits for events already emitted to
+// reach the bridge.
+const bridgeDrainTimeout = 2 * time.Second
 
 // StartBridgeFromProjectConfig loads .ntm.yaml/.ntm.yml webhooks from projectDir,
 // starts a WebhookManager, and subscribes it to the provided event bus.
 //
 // If no webhooks are configured for the project, it returns (nil, nil).
+// NTM_WEBHOOK_OUTBOX_DIR opts into durable, project-namespaced delivery on Unix.
+// Privacy-mode sessions keep volatile delivery; existing receipts are gated on replay too.
 func StartBridgeFromProjectConfig(projectDir, session string, bus *events.EventBus, redactionCfg *redaction.Config) (*BusBridge, error) {
 	if strings.TrimSpace(projectDir) == "" {
 		return nil, nil
@@ -32,21 +40,55 @@ func StartBridgeFromProjectConfig(projectDir, session string, bus *events.EventB
 	if bus == nil {
 		bus = events.DefaultBus
 	}
+	mgr, err := NewProjectWebhookManager(projectDir, redactionCfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(mgr.webhooks) == 0 {
+		return nil, nil
+	}
+	if err := mgr.Start(); err != nil {
+		return nil, err
+	}
 
+	unsub := bus.SubscribeAll(func(e events.BusEvent) {
+		if strings.TrimSpace(session) != "" && e.EventSession() != session {
+			return
+		}
+		ev, ok := toWebhookEvent(e)
+		if !ok {
+			return
+		}
+		if err := mgr.Dispatch(ev); err != nil {
+			slog.Warn("webhook event was not fully accepted", "event_type", ev.Type, "error", err)
+		}
+	})
+	return &BusBridge{session: session, manager: mgr, bus: bus, unsubscribe: unsub}, nil
+}
+
+// NewProjectWebhookManager loads the same endpoint, privacy and redaction
+// configuration for event delivery and operator recovery. It starts no worker
+// and writes no storage, including when no endpoints remain configured.
+func NewProjectWebhookManager(projectDir string, redactionCfg *redaction.Config) (*WebhookManager, error) {
 	projectCfgs, err := config.LoadProjectWebhooks(projectDir)
 	if err != nil {
 		return nil, err
 	}
-	if len(projectCfgs) == 0 {
-		return nil, nil
-	}
 
+	managerCfg := DefaultManagerConfig()
+	managerCfg.OutboxDir, err = projectWebhookOutboxDir(projectDir)
+	if err != nil {
+		return nil, err
+	}
+	managerCfg.PersistenceAllowed = func(session string) bool {
+		return privacy.GetDefaultManager().CanPersist(session, privacy.OpEventLog) == nil
+	}
 	var mgr *WebhookManager
 	if redactionCfg != nil && redactionCfg.Mode != redaction.ModeOff {
 		cfgCopy := *redactionCfg
-		mgr = NewManagerWithRedaction(DefaultManagerConfig(), cfgCopy)
+		mgr = NewManagerWithRedaction(managerCfg, cfgCopy)
 	} else {
-		mgr = NewManager(DefaultManagerConfig())
+		mgr = NewManager(managerCfg)
 	}
 	mgr.Logger = func(format string, args ...interface{}) {
 		slog.Default().Debug("webhook", "msg", fmt.Sprintf(format, args...))
@@ -62,29 +104,7 @@ func StartBridgeFromProjectConfig(projectDir, session string, bus *events.EventB
 		}
 	}
 
-	if err := mgr.Start(); err != nil {
-		return nil, err
-	}
-
-	unsub := bus.SubscribeAll(func(e events.BusEvent) {
-		if strings.TrimSpace(session) != "" && e.EventSession() != session {
-			return
-		}
-
-		ev, ok := toWebhookEvent(e)
-		if !ok {
-			return
-		}
-
-		// Dispatch is already non-blocking; ignore errors for best-effort delivery.
-		_ = mgr.Dispatch(ev)
-	})
-
-	return &BusBridge{
-		session:     session,
-		manager:     mgr,
-		unsubscribe: unsub,
-	}, nil
+	return mgr, nil
 }
 
 func toWebhookEvent(e events.BusEvent) (Event, bool) {
@@ -183,6 +203,7 @@ func toWebhookEvent(e events.BusEvent) (Event, bool) {
 		Session:   e.EventSession(),
 		Pane:      pane,
 		Agent:     agent,
+		AgentType: stringFromAny(m["agent_type"]),
 		Message:   message,
 		Details:   details,
 	}, true
@@ -246,6 +267,13 @@ func projectConfigToWebhookConfig(cfg config.WebhookConfig) (WebhookConfig, erro
 		Format:  strings.TrimSpace(cfg.Formatter),
 		Secret:  strings.TrimSpace(cfg.Secret),
 	}
+	if cfg.Filter.Session != "" || len(cfg.Filter.AgentType) > 0 || len(cfg.Filter.Severity) > 0 {
+		out.Filter = &EventFilter{
+			Session:   cfg.Filter.Session,
+			AgentType: append([]string(nil), cfg.Filter.AgentType...),
+			Severity:  append([]string(nil), cfg.Filter.Severity...),
+		}
+	}
 
 	if strings.TrimSpace(cfg.Timeout) != "" {
 		d, err := time.ParseDuration(strings.TrimSpace(cfg.Timeout))
@@ -304,10 +332,21 @@ func trimStrings(in []string) []string {
 	return out
 }
 
-// Close unsubscribes from the event bus and stops the underlying webhook manager.
+// Close unsubscribes from the event bus and stops the underlying webhook
+// manager, which delivers what was already dispatched. Commands emit their
+// lifecycle events through the asynchronous default emitter and then return
+// (kill does so last thing), so those events can still be queued or in a bus
+// handler goroutine here; they are drained first, or the bridge unsubscribes
+// before they arrive and the webhook never fires.
 func (b *BusBridge) Close() error {
 	if b == nil {
 		return nil
+	}
+	if b.bus == events.DefaultBus {
+		events.DefaultEmitter().Flush(bridgeDrainTimeout)
+	}
+	if b.bus != nil {
+		b.bus.WaitHandlers(bridgeDrainTimeout)
 	}
 	if b.unsubscribe != nil {
 		b.unsubscribe()

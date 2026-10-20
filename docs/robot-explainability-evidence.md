@@ -249,12 +249,16 @@ Surfaces default to appropriate levels:
 
 ### 4.3 Requesting Levels
 
+The shipped knob is the verbosity profile (`--robot-verbosity`, env
+`NTM_ROBOT_VERBOSITY`), which scales explanation detail alongside payload
+detail; there is no separate `--explain` flag.
+
 ```bash
 # Force verbose explanations
-ntm --robot-snapshot --explain=verbose
+ntm --robot-snapshot --robot-verbosity=debug
 
-# Disable explanations for minimal output
-ntm --robot-status --explain=none
+# Minimal output
+ntm --robot-status --robot-verbosity=terse
 ```
 
 ### 4.4 Level Example
@@ -457,7 +461,7 @@ snapshot → status → inspect → diagnose
         "short": "Process exited 5m ago",
         "drill_down": {
           "label": "Full diagnostics",
-          "command": "ntm --robot-diagnose=myproject --panes=2",
+          "command": "ntm --robot-diagnose=myproject --diagnose-pane=2",
           "depth": "diagnose"
         }
       }

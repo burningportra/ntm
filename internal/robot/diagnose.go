@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -37,6 +39,9 @@ type DiagnoseOutput struct {
 	Recommendations []DiagnoseRecommendation `json:"recommendations"`
 	AutoFixAvail    bool                     `json:"auto_fix_available"`
 	AutoFixCommand  string                   `json:"auto_fix_command,omitempty"`
+	// BuildSlots reports the stale Agent Mail build-slot lease check
+	// (ntm-83dz). Nil only for error responses that never ran the check.
+	BuildSlots *BuildSlotDiagnosis `json:"build_slots,omitempty"`
 }
 
 // DiagnoseSummary contains counts by health state
@@ -74,6 +79,10 @@ type DiagnoseRecommendation struct {
 	Reason      string `json:"reason"`       // human-readable explanation
 	AutoFixable bool   `json:"auto_fixable"` // can --fix handle this?
 	FixCommand  string `json:"fix_command"`  // command to fix (manual or auto)
+	// BuildSlot carries the lease details for action "release_build_slot"
+	// so --fix can call the Agent Mail release tool without re-listing.
+	// Nil for pane-scoped recommendations.
+	BuildSlot *StaleBuildSlotLease `json:"build_slot,omitempty"`
 }
 
 // DiagnoseOptions configures the diagnose output
@@ -81,14 +90,22 @@ type DiagnoseOptions struct {
 	Session string // session name (required)
 	Pane    int    // specific pane to diagnose (-1 for all)
 	Fix     bool   // attempt auto-fix
-	Brief   bool   // minimal output
 }
 
 type diagnoseDependencies struct {
 	sessionExists func(context.Context, string) (bool, error)
 	listPanes     func(context.Context, string) ([]tmux.Pane, error)
 	restartPane   diagnoseRestartPaneFunc
-	sendKeyName   func(context.Context, string, string) error
+	// sendKeyName presses a tmux key NAME ("C-c", "Escape"). tmux.SendKeys
+	// sends literally (-l), which typed the three characters "C-c" into the
+	// pane instead of interrupting it.
+	sendKeyName func(context.Context, string, string) error
+	// Build-slot lease check dependencies (ntm-83dz). All are best-effort:
+	// failures degrade the check, never the diagnosis.
+	projectKey          func() (string, error)
+	loadAgentRegistry   func(session string, projectKeys ...string) (*agentmail.SessionAgentRegistry, error)
+	listBuildSlotLeases func(projectKey string, now time.Time) ([]agentmail.BuildSlotLease, error)
+	releaseBuildSlot    func(ctx context.Context, projectKey string, registry *agentmail.SessionAgentRegistry, lease agentmail.BuildSlotLease) error
 }
 
 func defaultDiagnoseDependencies() diagnoseDependencies {
@@ -96,7 +113,13 @@ func defaultDiagnoseDependencies() diagnoseDependencies {
 		sessionExists: tmux.SessionExistsContext,
 		listPanes:     tmux.GetPanesContext,
 		restartPane:   GetRestartPaneContext,
-		sendKeyName:   tmux.SendKeyNameContext,
+		sendKeyName: func(ctx context.Context, target, keyName string) error {
+			return tmux.DefaultClient.SendKeyNameContext(ctx, target, keyName)
+		},
+		projectKey:          defaultDiagnoseProjectKey,
+		loadAgentRegistry:   defaultLoadAgentRegistry,
+		listBuildSlotLeases: defaultListBuildSlotLeases,
+		releaseBuildSlot:    defaultReleaseBuildSlot,
 	}
 }
 
@@ -113,6 +136,18 @@ func (deps diagnoseDependencies) withDefaults() diagnoseDependencies {
 	}
 	if deps.sendKeyName == nil {
 		deps.sendKeyName = defaults.sendKeyName
+	}
+	if deps.projectKey == nil {
+		deps.projectKey = defaults.projectKey
+	}
+	if deps.loadAgentRegistry == nil {
+		deps.loadAgentRegistry = defaults.loadAgentRegistry
+	}
+	if deps.listBuildSlotLeases == nil {
+		deps.listBuildSlotLeases = defaults.listBuildSlotLeases
+	}
+	if deps.releaseBuildSlot == nil {
+		deps.releaseBuildSlot = defaults.releaseBuildSlot
 	}
 	return deps
 }
@@ -191,6 +226,10 @@ func getDiagnoseWithDependencies(ctx context.Context, opts DiagnoseOptions, deps
 		return output, nil
 	}
 
+	// Keep the full pane list for holder-liveness correlation in the
+	// build-slot check even when diagnosing a single pane.
+	allPanes := panes
+
 	// Filter to specific pane if requested
 	if opts.Pane >= 0 {
 		filtered := []tmux.Pane{}
@@ -225,7 +264,7 @@ func getDiagnoseWithDependencies(ctx context.Context, opts DiagnoseOptions, deps
 		output.Summary.TotalPanes++
 
 		// Perform comprehensive health check (pass shell PID for authoritative liveness)
-		check, err := CheckAgentHealthWithActivity(pane.ID, agentType, pane.PID)
+		check, err := CheckAgentHealthWithActivity(pane.ID, agentType, pane.PID, pane.Width)
 		if err != nil {
 			// Error during health check - mark as unknown
 			output.Summary.Unknown++
@@ -328,6 +367,12 @@ func getDiagnoseWithDependencies(ctx context.Context, opts DiagnoseOptions, deps
 		}
 	}
 
+	// Stale build-slot lease check (ntm-83dz): active Agent Mail leases
+	// whose holder identity has no live pane are attention items. The check
+	// never fails the diagnosis; unavailable sources degrade with a note.
+	output.BuildSlots = collectBuildSlotDiagnosis(opts.Session, allPanes, deps)
+	output.Recommendations = append(output.Recommendations, buildSlotRecommendations(opts.Session, output.BuildSlots)...)
+
 	// Sort all pane lists for consistent output
 	sort.Ints(output.Panes.Healthy)
 	sort.Ints(output.Panes.Degraded)
@@ -343,6 +388,13 @@ func getDiagnoseWithDependencies(ctx context.Context, opts DiagnoseOptions, deps
 
 	// Determine overall health
 	output.OverallHealth = determineOverallHealth(output.Summary)
+
+	// Stale leases are real coordination hazards (they block other agents'
+	// builds for up to an hour), so they degrade an otherwise healthy
+	// session. A degraded lease *source* does not: it only annotates.
+	if output.OverallHealth == "healthy" && output.BuildSlots != nil && len(output.BuildSlots.StaleLeases) > 0 {
+		output.OverallHealth = "degraded"
+	}
 
 	// Check if auto-fix is available
 	for _, rec := range output.Recommendations {
@@ -420,7 +472,13 @@ func buildRateLimitRecommendation(paneIndex int, paneTarget string, session stri
 	} else {
 		rec.Action = "wait_or_switch"
 		rec.Reason = "Rate limited, consider switching accounts or waiting"
-		rec.FixCommand = "caam switch  # or wait for rate limit to reset"
+		// caam needs the provider to switch; ntm maps it to caam's tool name.
+		switch provider := canonicalRobotProvider(check.AgentType); provider {
+		case "claude", "openai", "gemini":
+			rec.FixCommand = fmt.Sprintf("ntm --robot-switch-account=%s  # or wait for rate limit to reset", provider)
+		default:
+			rec.FixCommand = "ntm --robot-switch-account=PROVIDER  # or wait for rate limit to reset"
+		}
 	}
 
 	return rec
@@ -494,9 +552,13 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 	// hold a pane 1, and an index-keyed map silently kept only the last one — so
 	// --fix respawned a pane in the wrong window.
 	fixMultiWindow := tmux.PanesSpanMultipleWindows(fixPanes)
-	paneByTarget := map[string]tmux.Pane{}
+	paneIDByTarget := map[string]string{}
+	paneTypeByTarget := map[string]tmux.AgentType{}
 	for _, p := range fixPanes {
-		paneByTarget[paneTargetKey(p, fixMultiWindow)] = p
+		paneIDByTarget[paneTargetKey(p, fixMultiWindow)] = p.ID
+		// Typed from the title when the pane's type is unset, so a Muse pane
+		// still gets its Escape interrupt.
+		paneTypeByTarget[paneTargetKey(p, fixMultiWindow)] = interruptPaneTMUXAgentType(p)
 	}
 	if err := validateDiagnoseFixTargets(diag, fixPanes); err != nil {
 		fixReport.RobotResponse = NewErrorResponse(err, ErrCodeNotImplemented, agent.GrokPhaseOneCapabilityHint)
@@ -521,7 +583,20 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 			Action: rec.Action,
 		}
 
-		pane, paneFound := paneByTarget[diagnoseRecommendationKey(rec)]
+		// Build-slot releases are not pane-scoped: handle them before the
+		// pane lookup, which would otherwise reject the synthetic target.
+		if rec.Action == "release_build_slot" {
+			attempt.Success, attempt.Message = executeBuildSlotRelease(ctx, opts.Session, rec, deps)
+			if attempt.Success {
+				fixedCount++
+			} else {
+				failedCount++
+			}
+			fixReport.FixAttempts = append(fixReport.FixAttempts, attempt)
+			continue
+		}
+
+		paneTarget, paneFound := paneIDByTarget[diagnoseRecommendationKey(rec)]
 		if !paneFound {
 			attempt.Success = false
 			attempt.Message = fmt.Sprintf("Pane %s not found in session %q", diagnoseRecommendationLabel(rec), opts.Session)
@@ -533,7 +608,7 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 		switch rec.Action {
 		case "restart":
 			var restartErr error
-			attempt.Success, attempt.Message, restartErr = executeDiagnoseRestart(ctx, opts.Session, pane.ID, deps.restartPane)
+			attempt.Success, attempt.Message, restartErr = executeDiagnoseRestart(ctx, opts.Session, paneTarget, deps.restartPane)
 			if attempt.Success {
 				fixedCount++
 			} else {
@@ -544,17 +619,17 @@ func executeDiagnoseFixWithDependencies(ctx context.Context, diag DiagnoseOutput
 			}
 
 		case "interrupt":
-			// Press the interrupt key (Escape for Muse Code, Ctrl+C otherwise)
-			// via the pane ID, as a key name rather than literal text.
-			key := interruptKeyForAgent(interruptPaneTMUXAgentType(pane))
-			interruptErr := deps.sendKeyName(ctx, pane.ID, key.tmuxKey)
+			// Interrupt via the pane ID with the agent's own interrupt key
+			// (Ctrl+C; Escape for omp and Muse Code).
+			paneType := paneTypeByTarget[diagnoseRecommendationKey(rec)]
+			interruptErr := deps.sendKeyName(ctx, paneTarget, tmux.InterruptKeyForAgent(paneType))
 			if interruptErr != nil {
 				attempt.Success = false
 				attempt.Message = fmt.Sprintf("Failed to interrupt: %v", interruptErr)
 				failedCount++
 			} else {
 				attempt.Success = true
-				attempt.Message = fmt.Sprintf("Interrupt sent (%s)", key.label)
+				attempt.Message = fmt.Sprintf("Interrupt sent (%s)", tmux.InterruptKeyLabel(paneType))
 				fixedCount++
 			}
 			if cancelErr := diagnoseCancellationError(ctx, interruptErr); cancelErr != nil {
@@ -744,7 +819,7 @@ func getDiagnoseBriefWithDependencies(ctx context.Context, session string, deps 
 
 		summary.TotalPanes++
 
-		check, err := CheckAgentHealthWithActivity(pane.ID, agentType, pane.PID)
+		check, err := CheckAgentHealthWithActivity(pane.ID, agentType, pane.PID, pane.Width)
 		if err != nil {
 			summary.Unknown++
 			continue

@@ -381,7 +381,7 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 	stoppedCount := 0
 	var stopErrors []error
 
-	// Graceful shutdown: interrupt each pane
+	// Graceful shutdown: send each pane its agent's interrupt key
 	if !opts.Force && len(panes) > 0 {
 		interruptEnsemblePanes(panes, tmux.SendKeyName)
 
@@ -440,13 +440,14 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 	return renderEnsembleStopOutput(w, result, format, opts.Quiet)
 }
 
-// interruptEnsemblePanes presses each pane's interrupt key (Escape for Muse
-// Code, Ctrl+C otherwise) through sendKeyName, which must send tmux key names:
-// tmux.SendKeys sends literal text and would type the characters "C-c". A
-// failed send is logged and the rest of the panes still get interrupted.
+// interruptEnsemblePanes presses each pane's interrupt key
+// (tmux.InterruptKeyForAgent: Escape for omp and Muse Code, Ctrl+C otherwise)
+// through sendKeyName, which must send tmux key names: tmux.SendKeys sends
+// literal text and would type the characters "C-c". A failed send is logged
+// and the rest of the panes still get interrupted.
 func interruptEnsemblePanes(panes []tmux.Pane, sendKeyName func(target, keyName string) error) {
 	for _, pane := range panes {
-		if err := sendKeyName(pane.ID, interruptKeyForPane(pane)); err != nil {
+		if err := sendKeyName(pane.ID, tmux.InterruptKeyForAgent(pane.Type)); err != nil {
 			slog.Default().Warn("failed to send interrupt to pane",
 				"pane", pane.ID,
 				"error", err,
@@ -1427,10 +1428,6 @@ func streamEnsembleSynthesis(
 	return nil
 }
 
-func resolveSynthesisResumeSession(session, runID string, _ io.Writer) (string, error) {
-	return resolveSynthesisResumeSessionForOutput(session, runID, io.Discard, IsJSONOutput())
-}
-
 func resolveSynthesisResumeSessionForOutput(session, runID string, _ io.Writer, machineJSON bool) (string, error) {
 	store, _, err := resolveEnsembleCheckpointStoreForRunID(runID)
 	if err != nil {
@@ -1812,10 +1809,6 @@ func renderExportFindingsOutput(w io.Writer, payload exportFindingsOutput, forma
 		}
 		return nil
 	}
-}
-
-func loadExportFindingsContext(commandCtx context.Context, w io.Writer, session string, opts exportFindingsOptions) (*exportFindingsContext, error) {
-	return loadExportFindingsContextForOutput(commandCtx, w, session, opts, IsJSONOutput())
 }
 
 func loadExportFindingsContextForOutput(commandCtx context.Context, w io.Writer, session string, opts exportFindingsOptions, machineJSON bool) (*exportFindingsContext, error) {
@@ -2418,14 +2411,6 @@ Formats:
 	cmd.Flags().BoolVar(&opts.Stats, "stats", false, "Show provenance statistics")
 	cmd.ValidArgsFunction = completeSessionArgs
 	return cmd
-}
-
-func resolveEnsembleSession(session string, w io.Writer) (SessionResolution, error) {
-	return resolveEnsembleSessionForOutput(session, w, IsJSONOutput())
-}
-
-func resolveEnsembleStateCommandSession(session string, w io.Writer) (SessionResolution, error) {
-	return resolveEnsembleStateCommandSessionForOutput(session, w, IsJSONOutput())
 }
 
 func resolveEnsembleSessionForOutput(session string, w io.Writer, machineJSON bool) (SessionResolution, error) {

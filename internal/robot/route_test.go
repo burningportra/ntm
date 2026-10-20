@@ -2,11 +2,19 @@ package robot
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 func TestParseExcludePanes(t *testing.T) {
@@ -73,6 +81,149 @@ func TestParseExcludePanes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The transport supplies two physical panes with the same window-local
+// index. Context collection, pane parsing, classification and route selection
+// all use their production implementations.
+func installRouteIdentityTmux(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux fixture requires /bin/sh")
+	}
+	hermeticGlobalConfig(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	dir := t.TempDir()
+	const script = `#!/bin/sh
+case "$1" in
+  has-session)
+    if [ "$3" != "=route-identity" ]; then
+      printf "can't find session: %s\n" "$3" >&2
+      exit 1
+    fi
+    ;;
+  list-panes)
+    printf '%s\n' '%41_NTM_SEP_1_NTM_SEP_route-identity__cc_1_NTM_SEP_claude_NTM_SEP_120_NTM_SEP_40_NTM_SEP_1_NTM_SEP_1041_NTM_SEP_0_NTM_SEP_cc_NTM_SEP__NTM_SEP__NTM_SEP_0'
+    printf '%s\n' '%51_NTM_SEP_1_NTM_SEP_route-identity__cc_2_NTM_SEP_claude_NTM_SEP_120_NTM_SEP_40_NTM_SEP_0_NTM_SEP_1051_NTM_SEP_1_NTM_SEP_cc_NTM_SEP__NTM_SEP__NTM_SEP_0'
+    ;;
+  capture-pane) printf 'claude >\n' ;;
+  *) printf 'unexpected tmux command: %s\n' "$*" >&2; exit 97 ;;
+esac
+`
+	path := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", path)
+	previous := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = previous })
+}
+
+func TestRouteKeepsContextAndExclusionsWithPhysicalPane(t *testing.T) {
+	installRouteIdentityTmux(t)
+	prevProcess, prevCwd, prevPath := transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath
+	t.Cleanup(func() {
+		transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath = prevProcess, prevCwd, prevPath
+	})
+	paneCurrentPath = func(string) (string, bool) { return "", false }
+	transcriptUsageForCwd = func(string, string) (*ntmctx.TranscriptUsage, bool) { return nil, false }
+	transcriptUsageForProcess = func(_ string, pid int) (*ntmctx.TranscriptUsage, bool) {
+		tokens, ok := map[int]int{1041: 190000, 1051: 10000}[pid]
+		if !ok {
+			return nil, false
+		}
+		return &ntmctx.TranscriptUsage{Tokens: tokens, ContextWindow: 200000, UpdatedAt: time.Now()}, true
+	}
+
+	contextOutput, err := GetContext("route-identity", 1000)
+	if err != nil || !contextOutput.Success || len(contextOutput.Agents) != 2 {
+		t.Fatalf("context = %+v, %v; want two agents", contextOutput, err)
+	}
+	for _, agent := range contextOutput.Agents {
+		wantPane, wantUsage := "0.1", 95.0
+		if agent.PaneID == "%51" {
+			wantPane, wantUsage = "1.1", 5
+		} else if agent.PaneID != "%41" {
+			t.Fatalf("context returned unexpected physical identity: %+v", agent)
+		}
+		if agent.Pane != wantPane || agent.PaneIdx != 1 || agent.UsagePercent != wantUsage || agent.Source != "transcript" {
+			t.Errorf("context agent = %+v, want %s at %.0f%%", agent, wantPane, wantUsage)
+		}
+	}
+
+	scored, err := NewAgentScorer(DefaultRoutingConfig()).ScoreAgents("route-identity", "")
+	if err != nil || len(scored) != 2 {
+		t.Fatalf("scored agents = %+v, %v; want both physical panes", scored, err)
+	}
+	for _, agent := range scored {
+		wantUsage, wantExcluded := 95.0, true
+		if agent.PaneID == "%51" {
+			wantUsage, wantExcluded = 5, false
+		}
+		if agent.ContextUsage != wantUsage || agent.Excluded != wantExcluded {
+			t.Errorf("scored agent = %+v, want context %.0f%% excluded=%t", agent, wantUsage, wantExcluded)
+		}
+	}
+
+	tests := []struct {
+		name       string
+		threshold  float64
+		excludeIDs []string
+		excludeIdx []int
+		want       string
+		candidates int
+	}{
+		{name: "full pane is excluded", threshold: 85, want: "%51", candidates: 1},
+		{name: "threshold boundary is eligible", threshold: 95, want: "%41", candidates: 2},
+		{name: "exclude first window only", threshold: 100, excludeIDs: []string{"%41"}, want: "%51", candidates: 1},
+		{name: "exclude second window only", threshold: 100, excludeIDs: []string{"%51"}, want: "%41", candidates: 1},
+		{name: "numeric exclusion still matches local index", threshold: 100, excludeIdx: []int{1}, candidates: 0},
+		{name: "unknown identity excludes nothing", threshold: 100, excludeIDs: []string{"%99"}, want: "%41", candidates: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Routing.ExcludeContextAbove = tt.threshold
+			opts := RouteOptions{
+				Session: "route-identity", Strategy: StrategySticky, LastAgent: "%41",
+				ExcludePanes: tt.excludeIdx, ExcludePaneIDs: tt.excludeIDs,
+				Config: cfg, NoPersist: true,
+			}
+			output, code := GetRoute(opts)
+			if code != 0 || !output.Success || len(output.Candidates) != tt.candidates {
+				t.Fatalf("route = %+v, code %d; want %d candidates", output, code, tt.candidates)
+			}
+			recommendation, err := GetRouteRecommendation(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for surface, rec := range map[string]*RouteRecommendation{"robot": output.Recommendation, "send": recommendation} {
+				if tt.want == "" {
+					if rec != nil {
+						t.Errorf("%s recommended excluded pane: %+v", surface, rec)
+					}
+					continue
+				}
+				if rec == nil || rec.PaneID != tt.want {
+					t.Errorf("%s recommendation = %+v, want %s", surface, rec, tt.want)
+				}
+			}
+			if tt.threshold == 85 && (len(output.Excluded) != 1 || output.Excluded[0].PaneID != "%41" || !strings.Contains(output.Excluded[0].Reason, "context")) {
+				t.Errorf("full pane missing from context exclusions: %+v", output.Excluded)
+			}
+			if tt.want != "" {
+				wantCommand := fmt.Sprintf("ntm --robot-send=route-identity --panes=%s --msg='YOUR_MESSAGE'", tt.want)
+				if output.AgentHints == nil || output.AgentHints.SendCommand != wantCommand {
+					t.Errorf("route hint lost physical target: %+v, want %q", output.AgentHints, wantCommand)
+				}
+			}
+		})
+	}
+	if usage := getContextUsageByPane("missing-session"); usage != nil {
+		t.Errorf("unavailable context = %v, want nil", usage)
 	}
 }
 
@@ -205,8 +356,8 @@ func TestRouteExcluded(t *testing.T) {
 
 func TestRouteAgentHints(t *testing.T) {
 	hints := RouteAgentHints{
-		Summary:     "Route to cc (pane 1) with score 85.5 - WAITING",
-		SendCommand: "ntm --robot-send=test --panes=1 --msg='YOUR_MESSAGE'",
+		Summary:     "Route to cc (pane %41) with score 85.5 - WAITING",
+		SendCommand: "ntm --robot-send=test --panes=%41 --msg='YOUR_MESSAGE'",
 		Suggestions: []string{"Primary strategy succeeded"},
 	}
 
@@ -226,7 +377,7 @@ func TestGenerateRouteHints(t *testing.T) {
 		opts := RouteOptions{Session: "test"}
 		output := RouteOutput{
 			Recommendation: &RouteRecommendation{
-				PaneID:    "cc_1",
+				PaneID:    "%41",
 				PaneIndex: 1,
 				AgentType: "cc",
 				Score:     85.5,
@@ -238,8 +389,8 @@ func TestGenerateRouteHints(t *testing.T) {
 		if hints.Summary == "" {
 			t.Error("Summary should not be empty")
 		}
-		if hints.SendCommand == "" {
-			t.Error("SendCommand should not be empty")
+		if hints.SendCommand != "ntm --robot-send=test --panes=%41 --msg='YOUR_MESSAGE'" {
+			t.Errorf("SendCommand = %q, want the exact physical pane ID", hints.SendCommand)
 		}
 	})
 
@@ -280,12 +431,26 @@ func TestGenerateRouteHints(t *testing.T) {
 			t.Error("Should mention fallback was used")
 		}
 	})
+
+	t.Run("affinity fallback explains the missing holder", func(t *testing.T) {
+		opts := RouteOptions{Session: "test", Strategy: StrategyAffinity}
+		output := RouteOutput{
+			FallbackUsed: true,
+			Candidates:   []RouteCandidate{{PaneID: "cc_1"}},
+		}
+
+		hints := generateRouteHints(opts, output)
+		joined := strings.Join(hints.Suggestions, "\n")
+		if !strings.Contains(joined, "No available agent holds Agent Mail reservations") || !strings.Contains(joined, "least-loaded fallback") {
+			t.Errorf("affinity fallback suggestions = %q, want the no-holder explanation", hints.Suggestions)
+		}
+	})
 }
 
 func TestRouteStrategyNames(t *testing.T) {
 	names := strategyNames()
-	if len(names) != 7 {
-		t.Errorf("strategyNames() returned %d names, want 7", len(names))
+	if len(names) != 8 {
+		t.Errorf("strategyNames() returned %d names, want 8", len(names))
 	}
 
 	expected := map[string]bool{
@@ -296,6 +461,7 @@ func TestRouteStrategyNames(t *testing.T) {
 		"random":                true,
 		"sticky":                true,
 		"explicit":              true,
+		"affinity":              true,
 	}
 
 	for _, name := range names {
@@ -340,6 +506,36 @@ func TestGetRoute_InvalidStrategy(t *testing.T) {
 	}
 }
 
+// TestGetRoute_AffinityRequiresMessage: affinity ranks agents by the files
+// the routed message names, so an affinity route with no message could only
+// ever fall back to least-loaded. It must fail as INVALID_ARGS (before any
+// tmux lookup) rather than quietly answer a different question.
+func TestGetRoute_AffinityRequiresMessage(t *testing.T) {
+	for _, prompt := range []string{"", "   \n\t"} {
+		out, code := GetRoute(RouteOptions{
+			Session:  "fake-session",
+			Strategy: StrategyAffinity,
+			Prompt:   prompt,
+		})
+		if code == 0 || out.Success {
+			t.Fatalf("prompt %q: affinity route without a message succeeded (code %d)", prompt, code)
+		}
+		if out.ErrorCode != ErrCodeInvalidArgs {
+			t.Errorf("prompt %q: ErrorCode = %q, want %q", prompt, out.ErrorCode, ErrCodeInvalidArgs)
+		}
+		if !strings.Contains(out.Error, "needs the message being routed") || !strings.Contains(out.Hint, "--msg") {
+			t.Errorf("prompt %q: error/hint do not explain the missing message: %q / %q", prompt, out.Error, out.Hint)
+		}
+	}
+
+	// With a message the request is valid and proceeds to the session check.
+	session := fmt.Sprintf("ntm-missing-%d", time.Now().UnixNano())
+	out, _ := GetRoute(RouteOptions{Session: session, Strategy: StrategyAffinity, Prompt: "Fix internal/robot/routing.go"})
+	if out.ErrorCode != ErrCodeSessionNotFound {
+		t.Fatalf("affinity route with a message: ErrorCode = %q, want %q (validation must pass)", out.ErrorCode, ErrCodeSessionNotFound)
+	}
+}
+
 func TestGetRoute_SessionNotFound(t *testing.T) {
 	session := fmt.Sprintf("ntm-missing-%d", time.Now().UnixNano())
 	out, code := GetRoute(RouteOptions{
@@ -372,11 +568,181 @@ func TestGetRouteRecommendation_Errors(t *testing.T) {
 		t.Fatal("expected error for invalid strategy")
 	}
 
+	if _, err := GetRouteRecommendation(RouteOptions{
+		Session:  "fake-session",
+		Strategy: StrategyAffinity,
+	}); err == nil || !strings.Contains(err.Error(), "needs the message being routed") {
+		t.Fatalf("affinity recommendation without a prompt: err = %v, want the missing-message error", err)
+	}
+
 	session := fmt.Sprintf("ntm-missing-%d", time.Now().UnixNano())
 	if _, err := GetRouteRecommendation(RouteOptions{
 		Session:  session,
 		Strategy: StrategyLeastLoaded,
 	}); err == nil {
 		t.Fatal("expected error for missing session")
+	}
+}
+
+// TestGetRoute_AffinityRoutesToReservationHolder is the end-to-end proof for
+// the affinity strategy on the --robot-route surface: a real tmux session
+// with two claude panes, a stub Agent Mail server holding a live reservation
+// on internal/robot/*.go for GreenCastle, and the persisted session agent
+// registry mapping GreenCastle to the pane least-loaded passes over. With
+// [routing] affinity_enabled left off, affinity must still route a prompt
+// naming a reserved file to the holder as its primary selection, and a
+// prompt naming no reserved file must fall back to least-loaded, saying so.
+func TestGetRoute_AffinityRoutesToReservationHolder(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	hermeticGlobalConfig(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AGENT_MAIL_URL", "")
+	t.Setenv("AGENT_MAIL_TOKEN", "")
+	resetSharedReservationCaches(t)
+
+	session := fmt.Sprintf("ntm-affinity-route-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(session, ""); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+	if _, err := tmux.DefaultClient.Run("split-window", "-d", "-t", session); err != nil {
+		t.Fatalf("split window: %v", err)
+	}
+	panes, err := tmux.GetPanes(session)
+	if err != nil {
+		t.Fatalf("get panes: %v", err)
+	}
+	if len(panes) != 2 {
+		t.Fatalf("setup produced %d panes, want 2: %+v", len(panes), panes)
+	}
+	for _, pane := range panes {
+		if _, err := tmux.DefaultClient.Run("respawn-pane", "-k", "-t", pane.ID, "cat"); err != nil {
+			t.Fatalf("respawn %s: %v", pane.ID, err)
+		}
+		if err := tmux.DefaultClient.SetPaneAgentType(pane.ID, tmux.AgentClaude); err != nil {
+			t.Fatalf("record agent type on %s: %v", pane.ID, err)
+		}
+	}
+
+	expires := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	created := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339)
+	server := newStubAgentMailReservationServer(t, fmt.Sprintf(
+		`[{"id":1,"agent":"GreenCastle","path_pattern":"internal/robot/*.go","exclusive":true,"reason":"affinity","created_ts":%q,"expires_ts":%q}]`,
+		created, expires))
+	cfg := affinityWireConfig(server.URL)
+	cfg.Routing.AffinityEnabled = false // the affinity strategy is its own opt-in
+
+	baseline, code := GetRoute(RouteOptions{Session: session, Strategy: StrategyLeastLoaded, Config: cfg})
+	if code != 0 || baseline.Recommendation == nil || len(baseline.Candidates) != 2 {
+		t.Fatalf("least-loaded baseline = code %d recommendation %+v candidates %+v excluded %+v, want a pick over 2 candidates",
+			code, baseline.Recommendation, baseline.Candidates, baseline.Excluded)
+	}
+	holderID := ""
+	for _, candidate := range baseline.Candidates {
+		if candidate.PaneID != baseline.Recommendation.PaneID {
+			holderID = candidate.PaneID
+		}
+	}
+	if err := agentmail.SaveSessionAgentRegistry(&agentmail.SessionAgentRegistry{
+		SessionName: session,
+		ProjectKey:  t.TempDir(),
+		PaneIDMap:   map[string]string{holderID: "GreenCastle"},
+	}); err != nil {
+		t.Fatalf("save session agent registry: %v", err)
+	}
+
+	routed, code := GetRoute(RouteOptions{
+		Session:  session,
+		Strategy: StrategyAffinity,
+		Prompt:   "Fix the scoring bug in internal/robot/routing.go",
+		Config:   cfg,
+	})
+	if code != 0 || routed.Recommendation == nil {
+		t.Fatalf("affinity route = code %d %+v, want a recommendation", code, routed)
+	}
+	if routed.Recommendation.PaneID != holderID || routed.FallbackUsed {
+		t.Fatalf("affinity recommendation = %s (fallback_used %v), want reservation holder %s as the primary selection (least-loaded picked %s)",
+			routed.Recommendation.PaneID, routed.FallbackUsed, holderID, baseline.Recommendation.PaneID)
+	}
+	for _, candidate := range routed.Candidates {
+		want := 0.0
+		if candidate.PaneID == holderID {
+			want = 1
+		}
+		if candidate.AffinityMatch != want {
+			t.Errorf("candidate %s affinity_match = %v, want %v", candidate.PaneID, candidate.AffinityMatch, want)
+		}
+	}
+	if w := routed.Recommendation.ReservationWarning; w != nil {
+		t.Errorf("routing to the only holder warned %+v, want no reservation_warning", w)
+	}
+
+	// With the holder excluded the pick edits GreenCastle's reserved file.
+	other, code := GetRoute(RouteOptions{
+		Session:        session,
+		Strategy:       StrategyAffinity,
+		Prompt:         "Fix the scoring bug in internal/robot/routing.go",
+		Config:         cfg,
+		ExcludePaneIDs: []string{holderID},
+	})
+	if code != 0 || other.Recommendation == nil || other.Recommendation.PaneID == holderID {
+		t.Fatalf("route excluding the holder = code %d %+v, want a non-holder recommendation", code, other.Recommendation)
+	}
+	w := other.Recommendation.ReservationWarning
+	if w == nil || w.SelectedHas || !reflect.DeepEqual(w.Holders, []string{"GreenCastle"}) ||
+		!reflect.DeepEqual(w.Paths, []string{"internal/robot/routing.go"}) {
+		t.Fatalf("reservation_warning = %+v, want GreenCastle holding internal/robot/routing.go", w)
+	}
+	if other.AgentHints == nil || !strings.Contains(strings.Join(other.AgentHints.Suggestions, "\n"), "reserved by GreenCastle") {
+		t.Errorf("route hints %+v do not mention the reservation holder", other.AgentHints)
+	}
+
+	unreserved, code := GetRoute(RouteOptions{
+		Session:  session,
+		Strategy: StrategyAffinity,
+		Prompt:   "Update docs/README.md",
+		Config:   cfg,
+	})
+	if code != 0 || unreserved.Recommendation == nil {
+		t.Fatalf("unreserved affinity route = code %d %+v, want a recommendation", code, unreserved)
+	}
+	if !unreserved.FallbackUsed || unreserved.Recommendation.PaneID != baseline.Recommendation.PaneID {
+		t.Fatalf("unreserved affinity route = %s (fallback_used %v), want the least-loaded fallback %s",
+			unreserved.Recommendation.PaneID, unreserved.FallbackUsed, baseline.Recommendation.PaneID)
+	}
+}
+
+// TestRouteReservationWarning pins when a routing pick reports reservations:
+// only when another agent holds a file the message names, never for the sole
+// holder, and never without a wired reservation cache.
+func TestRouteReservationWarning(t *testing.T) {
+	cfg := DefaultRoutingConfig()
+	cfg.AgentMail.Enabled = true
+	scorer := NewAgentScorer(cfg)
+	cache := NewReservationCache(nil, "/test", 30*time.Second)
+	cache.pathToAgents = map[string][]string{
+		"internal/robot/*.go": {"GreenCastle"},
+		"docs/*.md":           {"GreenCastle", "BlueLake"},
+	}
+	scorer.SetReservationCache(cache)
+	scorer.MapPaneToAgent("%1", "GreenCastle")
+	scorer.MapPaneToAgent("%2", "RedFox")
+
+	if w := routeReservationWarning(scorer, "Fix internal/robot/routing.go", "%1"); w != nil {
+		t.Errorf("sole holder selected: warning %+v, want nil", w)
+	}
+	w := routeReservationWarning(scorer, "Fix internal/robot/routing.go", "%2")
+	if w == nil || w.SelectedHas || !reflect.DeepEqual(w.Holders, []string{"GreenCastle"}) {
+		t.Errorf("other agent selected: warning %+v, want GreenCastle as the holder", w)
+	}
+	w = routeReservationWarning(scorer, "Update docs/README.md", "%1")
+	if w == nil || !w.SelectedHas || !reflect.DeepEqual(w.Holders, []string{"BlueLake", "GreenCastle"}) {
+		t.Errorf("shared reservation: warning %+v, want sorted holders [BlueLake GreenCastle] incl. the selected agent", w)
+	}
+	if w := routeReservationWarning(scorer, "Explain the router", "%2"); w != nil {
+		t.Errorf("no files named: warning %+v, want nil", w)
+	}
+	if w := routeReservationWarning(NewAgentScorer(cfg), "Fix internal/robot/routing.go", "%2"); w != nil {
+		t.Errorf("no reservation cache: warning %+v, want nil", w)
 	}
 }

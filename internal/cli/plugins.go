@@ -15,6 +15,15 @@ func newPluginsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plugins",
 		Short: "Manage and list installed plugins",
+		Long: `Manage and list installed plugins.
+
+Agent plugins load from the "agents/" directory next to the selected config
+file (default: ~/.config/ntm/agents/*.toml; with XDG_CONFIG_HOME set:
+$XDG_CONFIG_HOME/ntm/agents/; with an explicit --config: the config file's
+sibling agents/ directory). Command plugins load from "commands/" in the same
+location. Copy a preset there to install it. Oh My Pi (omp) is a built-in
+agent type and needs no preset; built-in agent types always take precedence
+over a plugin of the same name. NTM never overwrites files in agents/.`,
 	}
 
 	cmd.AddCommand(newPluginsListCmd())

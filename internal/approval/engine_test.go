@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +13,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	"github.com/Dicklesworthstone/ntm/internal/tools"
 )
 
 func setupTestStore(t *testing.T) *state.Store {
@@ -36,6 +37,99 @@ func setupTestStore(t *testing.T) *state.Store {
 	})
 
 	return store
+}
+
+// TestRequestMirrorsToInstalledSLB files SLB-required approvals in a temp slb
+// project and checks that a requester session in the environment is what
+// makes the engine mirror them into slb.
+func TestRequestMirrorsToInstalledSLB(t *testing.T) {
+	if _, err := exec.LookPath("slb"); err != nil {
+		t.Skip("slb not installed")
+	}
+	store := setupTestStore(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	if out, err := exec.Command("slb", "init", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("slb init: %v\n%s", err, out)
+	}
+	raw, err := exec.Command("slb", "session", "start", "--agent", "requester", "--program", "ntm-test", "--model", "test", "--json").Output()
+	var session struct {
+		SessionID string `json:"session_id"`
+	}
+	if err != nil || json.Unmarshal(raw, &session) != nil || session.SessionID == "" {
+		t.Fatalf("slb session start: %s, %v", raw, err)
+	}
+
+	engine := New(store, nil, nil, DefaultConfig())
+	ctx := context.Background()
+	request := func(resource string) *state.Approval {
+		t.Helper()
+		approval, err := engine.Request(ctx, RequestParams{
+			Action: "force_release", Resource: resource, Reason: "holder is stale",
+			RequestedBy: "alice", RequiresSLB: true,
+		})
+		if err != nil {
+			t.Fatalf("Request(%s): %v", resource, err)
+		}
+		return approval
+	}
+
+	t.Setenv("SLB_SESSION_ID", "")
+	if plain := request("internal/a.go"); plain.CorrelationID != "" {
+		t.Fatalf("without an slb session the approval was correlated to %q", plain.CorrelationID)
+	}
+
+	t.Setenv("SLB_SESSION_ID", session.SessionID)
+	mirrored := request("internal/b.go")
+	requestID, ok := strings.CutPrefix(mirrored.CorrelationID, "slb:")
+	if !ok || requestID == "" {
+		t.Fatalf("CorrelationID = %q, want slb:<request_id>", mirrored.CorrelationID)
+	}
+	raw, err = exec.Command("slb", "pending", "--json").Output()
+	var pending []struct {
+		RequestID string `json:"request_id"`
+		Command   string `json:"command"`
+	}
+	if err != nil || json.Unmarshal(raw, &pending) != nil {
+		t.Fatalf("slb pending: %s, %v", raw, err)
+	}
+	if len(pending) != 1 || pending[0].RequestID != requestID || pending[0].Command != "ntm approval: force_release internal/b.go" {
+		t.Fatalf("slb pending = %+v, want only request %s for internal/b.go", pending, requestID)
+	}
+
+	// A decision a reviewer makes in slb flows back into the ntm approval.
+	raw, err = exec.Command("slb", "session", "start", "--agent", "reviewer", "--program", "ntm-test", "--model", "test", "--json").Output()
+	var reviewer tools.SLBSession
+	var started map[string]any
+	if err != nil || json.Unmarshal(raw, &started) != nil {
+		t.Fatalf("slb session start (reviewer): %s, %v", raw, err)
+	}
+	reviewer.ID, _ = started["session_id"].(string)
+	reviewer.Key, _ = started["session_key"].(string)
+	review := func(verb, slbRequest string, extra ...string) {
+		t.Helper()
+		args := append([]string{verb, "--json", "--session-id", reviewer.ID, "--session-key", reviewer.Key}, extra...)
+		if out, err := exec.Command("slb", append(args, "--", slbRequest)...).CombinedOutput(); err != nil {
+			t.Fatalf("slb %s: %v\n%s", verb, err, out)
+		}
+	}
+
+	if checked, err := engine.Check(ctx, mirrored.ID); err != nil || checked.Status != state.ApprovalPending {
+		t.Fatalf("before any slb review: %+v, %v; want pending", checked, err)
+	}
+	review("approve", requestID)
+	approved, err := engine.Check(ctx, mirrored.ID)
+	if err != nil || approved.Status != state.ApprovalApproved || approved.ApprovedBy != "slb:reviewer" {
+		t.Fatalf("after slb approve: %+v, %v; want approved by slb:reviewer", approved, err)
+	}
+
+	rejected := request("internal/c.go")
+	rejectedRequest, _ := strings.CutPrefix(rejected.CorrelationID, "slb:")
+	review("reject", rejectedRequest, "--reason", "holder is still active")
+	denied, err := engine.Check(ctx, rejected.ID)
+	if err != nil || denied.Status != state.ApprovalDenied || denied.DeniedReason != "holder is still active" {
+		t.Fatalf("after slb reject: %+v, %v; want denied with the reviewer's reason", denied, err)
+	}
 }
 
 func TestNewEngine(t *testing.T) {
@@ -287,286 +381,107 @@ func TestListPending(t *testing.T) {
 	}
 }
 
-func TestExpireStale(t *testing.T) {
+// TestHistoryThreeStates is the H9 close condition
+// (bd-ws7-docs-ux-truth-tqh3l.9): a fixture with one pending, one approved,
+// and one denied approval — plus a consumed one for the full resolved set —
+// against a REAL temp SQLite store. History must return every record with
+// correct status, decider, and decision timestamp; the pre-fix code returned
+// pending-only while self-labeling as history.
+func TestHistoryThreeStates(t *testing.T) {
 	store := setupTestStore(t)
 	engine := New(store, nil, nil, DefaultConfig())
-
 	ctx := context.Background()
 
-	// Create an approval with short expiry
-	// Use 500ms expiry to be robust across CI environments with heavy load
-	engine.Request(ctx, RequestParams{
-		Action:      "test_action",
-		Resource:    "test_resource",
-		RequestedBy: "requester",
-		ExpiresIn:   500 * time.Millisecond,
-	})
-
-	// Wait for expiry - use 1s to ensure expiry even with CI scheduling delays
-	time.Sleep(1 * time.Second)
-
-	// Expire stale
-	count, err := engine.ExpireStale(ctx)
-	if err != nil {
-		t.Fatalf("ExpireStale failed: %v", err)
-	}
-
-	if count != 1 {
-		t.Errorf("Expected 1 expired, got %d", count)
-	}
-}
-
-func TestWaitForApproval(t *testing.T) {
-	store := setupTestStore(t)
-	engine := New(store, nil, nil, DefaultConfig())
-
-	ctx := context.Background()
-	approval, _ := engine.Request(ctx, RequestParams{
-		Action:      "test_action",
-		Resource:    "test_resource",
-		RequestedBy: "requester",
-	})
-
-	// Approve in background
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		engine.Approve(ctx, approval.ID, "approver")
-	}()
-
-	// Wait for approval
-	result, err := engine.WaitForApproval(ctx, approval.ID, 1*time.Second)
-	if err != nil {
-		t.Fatalf("WaitForApproval failed: %v", err)
-	}
-
-	if result.Status != state.ApprovalApproved {
-		t.Errorf("Status should be approved, got %s", result.Status)
-	}
-	assertNoWaiterBucket(t, engine, approval.ID)
-}
-
-func TestWaitForApprovalWakesWhenLateApproveExpiresRequest(t *testing.T) {
-	store := setupTestStore(t)
-	engine := New(store, nil, nil, DefaultConfig())
-
-	ctx := context.Background()
-	approval, _ := engine.Request(ctx, RequestParams{
-		Action:      "test_action",
-		Resource:    "test_resource",
-		RequestedBy: "requester",
-		ExpiresIn:   20 * time.Millisecond,
-	})
-
-	type waitResult struct {
-		approval *state.Approval
-		err      error
-	}
-	done := make(chan waitResult, 1)
-	go func() {
-		result, err := engine.WaitForApproval(ctx, approval.ID, time.Second)
-		done <- waitResult{approval: result, err: err}
-	}()
-
-	deadline := time.Now().Add(time.Second)
-	for {
-		engine.waitersMu.Lock()
-		waiterCount := len(engine.waiters[approval.ID])
-		engine.waitersMu.Unlock()
-		if waiterCount > 0 {
-			break
+	mkReq := func(action string) string {
+		t.Helper()
+		appr, err := engine.Request(ctx, RequestParams{
+			Action:      action,
+			Resource:    "res-" + action,
+			RequestedBy: "requester",
+		})
+		if err != nil {
+			t.Fatalf("Request(%s) failed: %v", action, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("waiter was not registered")
-		}
-		time.Sleep(5 * time.Millisecond)
+		return appr.ID
 	}
 
-	time.Sleep(40 * time.Millisecond)
-	if err := engine.Approve(ctx, approval.ID, "approver"); err == nil {
-		t.Fatal("late approval should fail once request has expired")
-	}
+	pendingID := mkReq("stay_pending")
+	approvedID := mkReq("get_approved")
+	deniedID := mkReq("get_denied")
+	consumedID := mkReq("get_consumed")
 
-	select {
-	case result := <-done:
-		if result.err != nil {
-			t.Fatalf("WaitForApproval returned error: %v", result.err)
-		}
-		if result.approval == nil {
-			t.Fatal("WaitForApproval returned nil approval")
-		}
-		if result.approval.Status != state.ApprovalExpired {
-			t.Fatalf("expected expired status, got %s", result.approval.Status)
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("WaitForApproval did not wake after approval expired")
-	}
-}
-
-func TestWaitForApprovalTimeout(t *testing.T) {
-	store := setupTestStore(t)
-	engine := New(store, nil, nil, DefaultConfig())
-
-	ctx := context.Background()
-	approval, _ := engine.Request(ctx, RequestParams{
-		Action:      "test_action",
-		Resource:    "test_resource",
-		RequestedBy: "requester",
-	})
-
-	// Wait with short timeout (no approval will come)
-	result, err := engine.WaitForApproval(ctx, approval.ID, 50*time.Millisecond)
-	if err != nil {
-		t.Fatalf("WaitForApproval failed: %v", err)
-	}
-
-	// Should still be pending after timeout
-	if result.Status != state.ApprovalPending {
-		t.Errorf("Status should be pending after timeout, got %s", result.Status)
-	}
-	assertNoWaiterBucket(t, engine, approval.ID)
-}
-
-func TestWaitForApprovalCleansWaiterBucketOnImmediateReturn(t *testing.T) {
-	store := setupTestStore(t)
-	engine := New(store, nil, nil, DefaultConfig())
-
-	ctx := context.Background()
-	approval, err := engine.Request(ctx, RequestParams{
-		Action:      "test_action",
-		Resource:    "test_resource",
-		RequestedBy: "requester",
-	})
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
-	if err := engine.Approve(ctx, approval.ID, "approver"); err != nil {
+	if err := engine.Approve(ctx, approvedID, "alice"); err != nil {
 		t.Fatalf("Approve failed: %v", err)
 	}
+	if err := engine.Deny(ctx, deniedID, "bob", "not safe"); err != nil {
+		t.Fatalf("Deny failed: %v", err)
+	}
+	if err := engine.Approve(ctx, consumedID, "carol"); err != nil {
+		t.Fatalf("Approve (for consume) failed: %v", err)
+	}
+	if err := engine.Consume(ctx, consumedID, "gate"); err != nil {
+		t.Fatalf("Consume failed: %v", err)
+	}
 
-	result, err := engine.WaitForApproval(ctx, approval.ID, time.Second)
+	history, err := engine.History(ctx)
 	if err != nil {
-		t.Fatalf("WaitForApproval failed: %v", err)
+		t.Fatalf("History failed: %v", err)
 	}
-	if result.Status != state.ApprovalApproved {
-		t.Fatalf("status = %s, want approved", result.Status)
-	}
-	assertNoWaiterBucket(t, engine, approval.ID)
-}
-
-func TestWaitForApprovalCleansWaiterBucketOnCheckError(t *testing.T) {
-	store := setupTestStore(t)
-	engine := New(store, nil, nil, DefaultConfig())
-
-	const missingID = "missing-approval"
-	if _, err := engine.WaitForApproval(context.Background(), missingID, time.Second); err == nil {
-		t.Fatal("WaitForApproval returned nil error for missing approval")
-	}
-	assertNoWaiterBucket(t, engine, missingID)
-}
-
-// bd-e2qk2: pre-fix, WaitForApproval did Check-then-register. If
-// Approve() ran between the Check and the register-waitCh step, the
-// waiter missed the notification (its channel wasn't yet in the
-// e.waiters[id] slice when notifyWaiters fired) and the caller blocked
-// for the full timeout — even though the decision had already been
-// made. The fix is register-then-Check: register the waitCh first,
-// then re-check status; either the second Check sees the decision or
-// any future decision arrives via the registered channel.
-//
-// This test restricts the store to one connection and checks that connection
-// out before starting WaitForApproval. That deterministically blocks the
-// initial Check while allowing the test to verify that the waiter is already
-// registered. The assertion directly proves the ordering that closes the race
-// instead of inferring it from goroutine scheduling latency.
-func TestWaitForApproval_NoRaceWithApproveBetweenCheckAndRegister(t *testing.T) {
-	store := setupTestStore(t)
-	engine := New(store, nil, nil, DefaultConfig())
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	approval, err := engine.Request(ctx, RequestParams{
-		Action:      "race_action",
-		Resource:    "race_resource",
-		RequestedBy: "requester",
-	})
-	if err != nil {
-		t.Fatalf("Request: %v", err)
+	if len(history) != 4 {
+		t.Fatalf("History returned %d records, want 4 (pending+approved+denied+consumed)", len(history))
 	}
 
-	db := store.DB()
-	db.SetMaxOpenConns(1)
-	blockingConn, err := db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("check out blocking database connection: %v", err)
-	}
-	connectionOpen := true
-	defer func() {
-		if connectionOpen {
-			_ = blockingConn.Close()
-		}
-	}()
-
-	type waitResult struct {
-		approval *state.Approval
-		err      error
-	}
-	done := make(chan waitResult, 1)
-	waitCountBefore := db.Stats().WaitCount
-	go func() {
-		result, waitErr := engine.WaitForApproval(ctx, approval.ID, 30*time.Second)
-		done <- waitResult{approval: result, err: waitErr}
-	}()
-
-	// WaitCount is incremented only after WaitForApproval reaches its initial
-	// database read and blocks for the sole connection held above.
-	blockedDeadline := time.NewTimer(10 * time.Second)
-	defer blockedDeadline.Stop()
-	for db.Stats().WaitCount == waitCountBefore {
-		select {
-		case result := <-done:
-			t.Fatalf("WaitForApproval returned before its status read blocked: approval=%v err=%v", result.approval, result.err)
-		case <-blockedDeadline.C:
-			t.Fatal("WaitForApproval did not reach its blocked status read")
-		default:
-			runtime.Gosched()
-		}
+	byID := map[string]state.Approval{}
+	for _, a := range history {
+		byID[a.ID] = a
 	}
 
-	engine.waitersMu.Lock()
-	waiterCount := len(engine.waiters[approval.ID])
-	engine.waitersMu.Unlock()
-	registeredBeforeCheck := waiterCount == 1
-
-	if err := blockingConn.Close(); err != nil {
-		t.Fatalf("release blocking database connection: %v", err)
+	p, ok := byID[pendingID]
+	if !ok {
+		t.Fatalf("pending record %s missing from history", pendingID)
 	}
-	connectionOpen = false
-
-	if err := engine.Approve(ctx, approval.ID, "approver"); err != nil {
-		t.Fatalf("Approve: %v", err)
+	if p.Status != state.ApprovalPending {
+		t.Errorf("pending record status = %s, want pending", p.Status)
 	}
 
-	completionDeadline := time.NewTimer(10 * time.Second)
-	defer completionDeadline.Stop()
-	select {
-	case result := <-done:
-		if result.err != nil {
-			t.Fatalf("WaitForApproval: %v", result.err)
-		}
-		if result.approval == nil {
-			t.Fatal("WaitForApproval returned nil approval")
-		}
-		if result.approval.Status != state.ApprovalApproved {
-			t.Errorf("status = %s, want approved", result.approval.Status)
-		}
-	case <-completionDeadline.C:
-		t.Fatal("WaitForApproval did not return after approval notification")
+	a, ok := byID[approvedID]
+	if !ok {
+		t.Fatalf("approved record %s missing from history — resolved records must be included", approvedID)
+	}
+	if a.Status != state.ApprovalApproved {
+		t.Errorf("approved record status = %s, want approved", a.Status)
+	}
+	if a.ApprovedBy != "alice" {
+		t.Errorf("approved record decider = %q, want alice", a.ApprovedBy)
+	}
+	if a.ApprovedAt == nil {
+		t.Error("approved record has no decision timestamp")
 	}
 
-	if !registeredBeforeCheck {
-		t.Errorf("waiter count before initial status check = %d, want 1", waiterCount)
+	d, ok := byID[deniedID]
+	if !ok {
+		t.Fatalf("denied record %s missing from history — resolved records must be included", deniedID)
 	}
-	assertNoWaiterBucket(t, engine, approval.ID)
+	if d.Status != state.ApprovalDenied {
+		t.Errorf("denied record status = %s, want denied", d.Status)
+	}
+	if d.ApprovedBy != "bob" {
+		t.Errorf("denied record decider = %q, want bob", d.ApprovedBy)
+	}
+	if d.DeniedReason != "not safe" {
+		t.Errorf("denied record reason = %q, want %q", d.DeniedReason, "not safe")
+	}
+	if d.ApprovedAt == nil {
+		t.Error("denied record has no decision timestamp")
+	}
+
+	c, ok := byID[consumedID]
+	if !ok {
+		t.Fatalf("consumed record %s missing from history", consumedID)
+	}
+	if c.Status != state.ApprovalConsumed {
+		t.Errorf("consumed record status = %s, want consumed", c.Status)
+	}
 }
 
 func assertNoWaiterBucket(t *testing.T, engine *Engine, id string) {
@@ -655,9 +570,10 @@ func TestParseSLBRequestID(t *testing.T) {
 	}{
 		{"empty", nil, ""},
 		{"empty bytes", json.RawMessage{}, ""},
-		{"valid id", json.RawMessage(`{"id":"req-123"}`), "req-123"},
+		{"valid request_id", json.RawMessage(`{"request_id":"a04e0596-845a-48fe-8e6f-1b88c8698b31","status":"pending"}`), "a04e0596-845a-48fe-8e6f-1b88c8698b31"},
+		{"bare id is not slb's key", json.RawMessage(`{"id":"req-123"}`), ""},
 		{"no id field", json.RawMessage(`{"status":"pending"}`), ""},
-		{"id not string", json.RawMessage(`{"id":42}`), ""},
+		{"id not string", json.RawMessage(`{"request_id":42}`), ""},
 		{"invalid json", json.RawMessage(`{invalid}`), ""},
 	}
 

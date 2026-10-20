@@ -324,44 +324,6 @@ func TestFetchHistoryCmd(t *testing.T) {
 	_ = historyMsg
 }
 
-func TestFetchFileChangesCmd(t *testing.T) {
-	origStore := tracker.GlobalFileChanges
-	store := tracker.NewFileChangeStore(100)
-	tracker.GlobalFileChanges = store
-	t.Cleanup(func() { tracker.GlobalFileChanges = origStore })
-
-	now := time.Now()
-	store.Add(tracker.RecordedFileChange{
-		Timestamp: now.Add(-30 * time.Minute),
-		Session:   "s",
-		Change:    tracker.FileChange{Path: "/older.go", Type: tracker.FileModified},
-	})
-	store.Add(tracker.RecordedFileChange{
-		Timestamp: now.Add(-2 * time.Minute),
-		Session:   "s",
-		Change:    tracker.FileChange{Path: "/recent.go", Type: tracker.FileModified},
-	})
-
-	m := newTestModel(120)
-	cmd := m.fetchFileChangesCmd()
-
-	msg := cmd()
-	fileChangeMsg, ok := msg.(FileChangeMsg)
-	if !ok {
-		t.Fatalf("expected FileChangeMsg, got %T", msg)
-	}
-
-	if len(fileChangeMsg.Changes) != 2 {
-		t.Fatalf("expected full bounded file-change buffer, got %d entries", len(fileChangeMsg.Changes))
-	}
-	if fileChangeMsg.Changes[0].Change.Path != "/older.go" {
-		t.Fatalf("expected older buffered change to be returned for wider panel windows, got %q first", fileChangeMsg.Changes[0].Change.Path)
-	}
-	if fileChangeMsg.Changes[1].Change.Path != "/recent.go" {
-		t.Fatalf("expected recent change second, got %q", fileChangeMsg.Changes[1].Change.Path)
-	}
-}
-
 func TestFetchCASSContextCmd_NoCass(t *testing.T) {
 
 	m := newTestModel(120)
@@ -574,7 +536,56 @@ func TestFetchAttentionCmdRetainsRequestedCursorOutsideReplayWindow(t *testing.T
 	}
 }
 
+// writeDashboardForceReleasePolicy pins automation.force_release in a
+// hermetic HOME so dashboard conflict-action tests exercise a chosen policy
+// verdict (bd-2y2on) instead of inheriting ~/.ntm/policy.yaml.
+func writeDashboardForceReleasePolicy(t *testing.T, value string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".ntm")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir hermetic .ntm: %v", err)
+	}
+	yaml := fmt.Sprintf("version: 1\nautomation:\n  force_release: %s\n", value)
+	if err := os.WriteFile(filepath.Join(dir, "policy.yaml"), []byte(yaml), 0o644); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+}
+
+// TestHandleConflictAction_ForceBlockedByPolicy: bd-2y2on — the dashboard's
+// force action must honor automation.force_release. Under the default
+// ("approval") policy it fails closed, pointing at the gated CLI workflow,
+// and never touches Agent Mail.
+func TestHandleConflictAction_ForceBlockedByPolicy(t *testing.T) {
+	// Hermetic empty HOME: LoadOrDefault falls back to the default policy,
+	// whose force_release is "approval".
+	t.Setenv("HOME", t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("policy gate bypassed: Agent Mail was contacted")
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	model := &Model{session: "sess", projectDir: "/tmp/ntm"}
+	err := model.handleConflictAction(watcher.FileConflict{
+		Path:                 "internal/robot/attention_feed.go",
+		RequestorAgent:       "worker-a",
+		HolderReservationIDs: []int{42},
+	}, watcher.ConflictActionForce)
+	if err == nil {
+		t.Fatal("force action should be blocked under the default approval policy")
+	}
+	if !strings.Contains(err.Error(), "automation.force_release=approval") {
+		t.Fatalf("error should name the policy setting, got %q", err.Error())
+	}
+}
+
 func TestHandleConflictAction_ForceRegistersDashboardAgent(t *testing.T) {
+	writeDashboardForceReleasePolicy(t, "auto")
+
 	var (
 		mu    sync.Mutex
 		calls []string
@@ -689,6 +700,9 @@ func TestHandleConflictActionForceReportsOutcome(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// The force action honors automation.force_release (bd-2y2on);
+			// only "auto" reaches Agent Mail, whose reply is under test here.
+			writeDashboardForceReleasePolicy(t, "auto")
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var req map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -751,6 +765,10 @@ func TestFetchAgentMailStatusDoesNotRegisterProject(t *testing.T) {
 		tools []any
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		var req map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -892,6 +910,10 @@ func TestFetchAgentMailInboxesPeek(t *testing.T) {
 		markReads []any
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		var req map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)

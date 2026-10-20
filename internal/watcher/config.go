@@ -85,26 +85,16 @@ func NewFileReservationWatcherFromConfig(
 		opts = append(opts, WithCaptureLines(cfg.CaptureLinesForDetect))
 	}
 
-	// Apply conflict callback if notification is enabled
-	if cfg.NotifyOnConflict && conflictCallback != nil {
-		opts = append(opts, WithConflictCallback(conflictCallback))
+	// Notification is a real event even when no optional logging callback is
+	// installed. Publish a detached snapshot before invoking caller code.
+	if cfg.NotifyOnConflict {
+		opts = append(opts, WithConflictCallback(func(conflict FileConflict) {
+			publishFileConflict(projectDir, conflict)
+			if conflictCallback != nil {
+				conflictCallback(conflict)
+			}
+		}))
 	}
 
 	return NewFileReservationWatcher(opts...)
-}
-
-// DefaultFileReservationConfigValues returns the default values for file reservation config.
-// Use this when config is not available or as a fallback.
-func DefaultFileReservationConfigValues() FileReservationConfigValues {
-	return FileReservationConfigValues{
-		Enabled:               true,
-		AutoReserve:           true,
-		AutoReleaseIdleMin:    10,
-		NotifyOnConflict:      true,
-		ExtendOnActivity:      true,
-		DefaultTTLMin:         15,
-		PollIntervalSec:       10,
-		CaptureLinesForDetect: 100,
-		Debug:                 false,
-	}
 }

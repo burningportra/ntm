@@ -167,7 +167,9 @@ spec:
 	}
 
 	t.Logf("[E2E-TEMPLATE] Loading custom user template: %s", templateName)
-	loader := templates.NewSessionTemplateLoaderWithProject(tmpDir)
+	// NewSessionTemplateLoaderWithProject was removed as dead code; the default
+	// loader resolves the same user template dir via XDG_CONFIG_HOME (set above).
+	loader := templates.NewSessionTemplateLoader()
 	tmpl, err := loader.Load(templateName)
 	if err != nil {
 		t.Fatalf("Load(custom-e2e) failed: %v", err)
@@ -435,7 +437,7 @@ func captureStdout(t *testing.T, f func() error) (string, error) {
 func configureSessionTemplateFakeAgents(testCfg *config.Config) {
 	const modelPrefix = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}`
 	testCfg.Agents.Claude = modelPrefix + `/bin/sh -c 'stty -echo; printf "Claude Code v0.0.0\n\342\235\257 \n"; while IFS= read -r line; do printf "RECEIVED:%s\n\342\235\257 \n" "$line"; done'`
-	testCfg.Agents.Codex = modelPrefix + `/bin/sh -c 'stty -echo; printf "Codex CLI\ncodex>\n"; while IFS= read -r line; do printf "RECEIVED:%s\ncodex>\n" "$line"; done'`
+	testCfg.Agents.Codex = modelPrefix + `/bin/sh -c 'stty -echo; printf "Codex CLI\n\342\200\272 \n"; while IFS= read -r line; do printf "RECEIVED:%s\n\342\200\272 \n" "$line"; done'`
 	testCfg.Agents.Gemini = modelPrefix + `/bin/sh -c 'stty -echo; printf "Gemini CLI\ngemini>\n"; while IFS= read -r line; do printf "RECEIVED:%s\ngemini>\n" "$line"; done'`
 }
 

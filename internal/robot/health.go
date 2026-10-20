@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -17,7 +18,10 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/errsig"
+	ntmevents "github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/process"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -335,6 +339,14 @@ func getAgentHealth(session string, pane tmux.Pane) AgentHealthInfo {
 		if state == "error" {
 			health.Responsive = false
 			health.Issue = "error_state_detected"
+		} else if agentType != string(agent.AgentTypeUser) && agentType != string(agent.AgentTypeUnknown) {
+			// Interactive gate screens (bd-jf22c): trust dialogs, auth/login
+			// gates, and onboarding choices leave the pane alive but unable
+			// to accept work; without this it reads "responsive" forever.
+			if gate, ok := agent.DetectInteractiveGate(captured, pane.Width); ok {
+				health.Responsive = false
+				health.Issue = fmt.Sprintf("interactive_gate: %s", gate)
+			}
 		}
 	}
 
@@ -398,47 +410,61 @@ type StallCheckResult struct {
 
 // ErrorCheckResult contains the result of error pattern detection
 type ErrorCheckResult struct {
-	HasErrors   bool     `json:"has_errors"`
-	RateLimited bool     `json:"rate_limited"`
+	HasErrors   bool `json:"has_errors"`
+	RateLimited bool `json:"rate_limited"`
+	// Blocked: the pane is parked on an interactive gate screen (trust
+	// dialog, login gate). Deliberately NOT an error: auto-restart cannot
+	// answer a dialog — the gate reappears on relaunch with the session
+	// context destroyed — so this state must never feed the restart path.
+	Blocked     bool     `json:"blocked,omitempty"`
 	Patterns    []string `json:"patterns,omitempty"`
 	WaitSeconds int      `json:"wait_seconds,omitempty"` // suggested wait time for rate limit
 	Reason      string   `json:"reason,omitempty"`
 }
 
-// Error patterns for detailed detection (literal string patterns for strings.Contains)
+// healthErrorPatterns classify captured pane output into operational failure
+// kinds. They are regexes, not substrings, because substring matching over the
+// last 50 lines made a bare "429" — inside a SHA-256 digest the agent had
+// printed — authoritative rate-limit evidence, walling off a working reviewer
+// pane that every other surface reported healthy (ntm#299).
+//
+// The rule: a numeric code counts only in a structured position, and a
+// single-word keyword counts only when it starts the line's content
+// (errsig.Anchored strips TUI and log decoration first). Multi-token runtime
+// signatures such as "connection refused" need neither.
 var healthErrorPatterns = []struct {
-	Pattern string
+	Pattern *regexp.Regexp
 	Type    string
 }{
 	// Rate limit patterns
-	{"rate limit", "rate_limit"},
-	{"ratelimit", "rate_limit"},
-	{"rate-limit", "rate_limit"},
-	{"429", "rate_limit"},
-	{"too many requests", "rate_limit"},
-	{"quota exceeded", "rate_limit"},
+	{regexp.MustCompile(errsig.Anchored(`(?i:rate[\s_-]?limit)`) + `|(?i)\brate[\s_-]?limits?\s+(?:exceeded|reached)\b|(?i)\brate_limit_error\b|(?i)\b(?:hit|hitting|reached)\s+(?:the\s+|a\s+|your\s+)?rate[\s_-]?limit\b`), "rate_limit"},
+	{regexp.MustCompile(errsig.HTTPStatus("429", "too many requests", "rate limit")), "rate_limit"},
+	{regexp.MustCompile(`(?i)\btoo many requests\b`), "rate_limit"},
+	{regexp.MustCompile(`(?i)\bquota exceeded\b`), "rate_limit"},
 	// Auth error patterns
-	{"authentication failed", "auth_error"},
-	{"authentication error", "auth_error"},
-	{"401", "auth_error"},
-	{"unauthorized", "auth_error"},
+	{regexp.MustCompile(`(?i)\bauthentication (?:failed|error)\b`), "auth_error"},
+	{regexp.MustCompile(errsig.HTTPStatus("401", "unauthorized")), "auth_error"},
+	{regexp.MustCompile(errsig.Anchored(`(?i:unauthorized)\b`)), "auth_error"},
 	// Crash patterns
-	{"panic:", "crash"},
-	{"fatal error", "crash"},
-	{"segmentation fault", "crash"},
-	{"stack trace", "crash"},
+	{regexp.MustCompile(errsig.Anchored(`(?i:panic):\s`)), "crash"},
+	{regexp.MustCompile(errsig.Anchored(`(?i:fatal error)\b`) + `|(?i)\bfatal error:\s*\S`), "crash"},
+	{regexp.MustCompile(`(?i)\bsegmentation fault\b`), "crash"},
+	{regexp.MustCompile(errsig.FatalSignalPattern), "crash"},
+	{regexp.MustCompile(errsig.Anchored(`(?i:(?:stack trace|traceback))\b`)), "crash"},
 	// Network error patterns
-	{"connection refused", "network_error"},
-	{"connection reset", "network_error"},
-	{"connection timeout", "network_error"},
-	{"network error", "network_error"},
-	{"network unreachable", "network_error"},
+	{regexp.MustCompile(`(?i)\bconnection refused\b`), "network_error"},
+	{regexp.MustCompile(`(?i)\bconnection reset\b`), "network_error"},
+	{regexp.MustCompile(`(?i)\bconnection timed? ?out\b`), "network_error"},
+	{regexp.MustCompile(`(?i)\bnetwork error\b`), "network_error"},
+	{regexp.MustCompile(`(?i)\bnetwork (?:is )?unreachable\b`), "network_error"},
 }
 
 // CheckAgentHealthWithActivity performs a comprehensive health check using activity detection.
 // shellPID is the tmux pane's shell PID used for authoritative PID-based liveness checking.
 // Pass 0 if the PID is unknown (falls back to text-based detection).
-func CheckAgentHealthWithActivity(paneID string, agentType string, shellPID int) (*HealthCheck, error) {
+// paneWidth is the real tmux pane width for the width-adaptive gate scan
+// (bd-eeifh); pass 0 when unknown.
+func CheckAgentHealthWithActivity(paneID string, agentType string, shellPID int, paneWidth int) (*HealthCheck, error) {
 	check := &HealthCheck{
 		PaneID:      paneID,
 		AgentType:   agentType,
@@ -454,7 +480,7 @@ func CheckAgentHealthWithActivity(paneID string, agentType string, shellPID int)
 	check.StallCheck = checkStallWithActivity(paneID, agentType)
 
 	// 3. Error check - detect error patterns
-	check.ErrorCheck = checkErrors(paneID)
+	check.ErrorCheck = checkErrors(paneID, agentType, paneWidth)
 
 	// Calculate overall health state
 	check.HealthState, check.Reason = calculateHealthState(check)
@@ -600,8 +626,12 @@ func checkStallWithActivity(paneID string, agentType string) *StallCheckResult {
 	return result
 }
 
-// checkErrors detects error patterns in pane output
-func checkErrors(paneID string) *ErrorCheckResult {
+// checkErrors detects error patterns in pane output. agentType gates the
+// interactive-gate scan: only real agent panes render gate screens, so
+// user/unknown/empty types skip it (a user shell tailing a log that prints
+// a gate phrase must not read as blocked). paneWidth feeds the
+// width-adaptive gate scan; pass 0 when unknown.
+func checkErrors(paneID string, agentType string, paneWidth int) *ErrorCheckResult {
 	result := &ErrorCheckResult{
 		HasErrors:   false,
 		RateLimited: false,
@@ -618,12 +648,11 @@ func checkErrors(paneID string) *ErrorCheckResult {
 	}
 
 	output = stripANSI(output)
-	outputLower := strings.ToLower(output)
 
 	// Check for error patterns
 	seenPatterns := make(map[string]bool)
 	for _, ep := range healthErrorPatterns {
-		if strings.Contains(outputLower, strings.ToLower(ep.Pattern)) {
+		if ep.Pattern.MatchString(output) {
 			if !seenPatterns[ep.Type] {
 				result.Patterns = append(result.Patterns, ep.Type)
 				seenPatterns[ep.Type] = true
@@ -640,9 +669,29 @@ func checkErrors(paneID string) *ErrorCheckResult {
 		}
 	}
 
+	// Interactive gate screens (bd-jf22c): a pane parked on a modal trust /
+	// login / onboarding screen is alive, produces no errors, and previously
+	// read "healthy" while it could never accept work. The shared detector
+	// scans only the live tail and vetoes matches while working chrome is
+	// visible. Only real agent panes are scanned: user/unknown panes never
+	// render gate screens, and a shell tailing a log that happens to print
+	// a gate phrase must not read as blocked.
+	var gate string
+	var gateFound bool
+	canonicalType := agent.AgentType(agentType).Canonical()
+	if canonicalType.IsValid() && canonicalType != agent.AgentTypeUser && canonicalType != agent.AgentTypeUnknown {
+		gate, gateFound = agent.DetectInteractiveGate(output, paneWidth)
+		if gateFound {
+			result.Patterns = append(result.Patterns, "interactive_gate")
+			result.Blocked = true
+		}
+	}
+
 	if result.RateLimited {
 		result.HasErrors = true
 		result.Reason = "rate limit detected"
+	} else if gateFound {
+		result.Reason = fmt.Sprintf("blocked on interactive gate screen (%q); needs a keystroke", gate)
 	} else if len(result.Patterns) > 0 {
 		result.Reason = fmt.Sprintf("detected: %v", result.Patterns)
 	}
@@ -712,6 +761,11 @@ func calculateHealthState(check *HealthCheck) (HealthState, string) {
 		return HealthUnhealthy, "error detected: " + check.ErrorCheck.Reason
 	}
 
+	// Interactive gate (blocked): needs a human keystroke, never a restart.
+	if check.ErrorCheck != nil && check.ErrorCheck.Blocked {
+		return HealthBlocked, check.ErrorCheck.Reason
+	}
+
 	// Check for rate limit
 	if check.ErrorCheck != nil && check.ErrorCheck.RateLimited {
 		return HealthRateLimited, "rate limit detected"
@@ -757,7 +811,22 @@ type SessionHealthOutput struct {
 	Session   string               `json:"session"`
 	CheckedAt time.Time            `json:"checked_at"`
 	Agents    []SessionAgentHealth `json:"agents"`
-	Summary   SessionHealthSummary `json:"summary"`
+	// Services lists the session's tagged non-agent service panes. They carry
+	// no agent health of their own and are excluded from Summary (ntm#305);
+	// they are listed so a session made entirely of services reads as "two
+	// services, no agents" instead of as an empty session.
+	Services []SessionServicePane `json:"services,omitempty"`
+	Summary  SessionHealthSummary `json:"summary"`
+}
+
+// SessionServicePane is a long-lived, non-agent service pane identified by its
+// durable pane-option tag (see tmux.PaneOptionACFSService).
+type SessionServicePane struct {
+	Pane       int    `json:"pane"`
+	PaneTarget string `json:"pane_target"`
+	Name       string `json:"name"`
+	Manager    string `json:"manager"`
+	Command    string `json:"command,omitempty"`
 }
 
 // SessionAgentHealth contains health metrics for a single agent pane
@@ -785,6 +854,10 @@ type SessionHealthSummary struct {
 	Degraded    int `json:"degraded"`
 	Unhealthy   int `json:"unhealthy"`
 	RateLimited int `json:"rate_limited"`
+	// Blocked counts panes parked on an interactive gate screen — they
+	// need a human keystroke and are never auto-restart candidates
+	// (bd-jf22c / bd-qz5wk).
+	Blocked int `json:"blocked"`
 }
 
 // GetSessionHealth collects per-agent health for a specific session.
@@ -825,6 +898,19 @@ func GetSessionHealth(session string) (*SessionHealthOutput, error) {
 
 	// Check health for each pane
 	for _, pane := range panes {
+		// A tagged service pane is not an agent — record it separately and
+		// never let it reach the agent health summary (ntm#305).
+		if pane.IsServicePane() {
+			output.Services = append(output.Services, SessionServicePane{
+				Pane:       pane.Index,
+				PaneTarget: tmux.PaneTargetKey(pane, multiWindow),
+				Name:       pane.Service,
+				Manager:    pane.ServiceManager,
+				Command:    pane.Command,
+			})
+			continue
+		}
+
 		agentType := detectAgentTypeFromPane(pane)
 		if agentType == "user" || agentType == "unknown" {
 			continue // Skip non-agent panes
@@ -844,7 +930,7 @@ func GetSessionHealth(session string) (*SessionHealthOutput, error) {
 		}
 
 		// Perform comprehensive health check (pass shell PID for authoritative liveness)
-		check, err := CheckAgentHealthWithActivity(pane.ID, agentType, pane.PID)
+		check, err := CheckAgentHealthWithActivity(pane.ID, agentType, pane.PID, pane.Width)
 		if err == nil {
 			agentHealth.Confidence = check.Confidence
 
@@ -856,6 +942,9 @@ func GetSessionHealth(session string) (*SessionHealthOutput, error) {
 				agentHealth.Health = "degraded"
 			case HealthUnhealthy:
 				agentHealth.Health = "unhealthy"
+				agentHealth.LastError = check.Reason
+			case HealthBlocked:
+				agentHealth.Health = "blocked"
 				agentHealth.LastError = check.Reason
 			case HealthRateLimited:
 				agentHealth.Health = "rate_limited"
@@ -885,6 +974,8 @@ func GetSessionHealth(session string) (*SessionHealthOutput, error) {
 			output.Summary.Unhealthy++
 		case "rate_limited":
 			output.Summary.RateLimited++
+		case "blocked":
+			output.Summary.Blocked++
 		}
 	}
 
@@ -907,365 +998,109 @@ func detectAgentTypeFromPane(pane tmux.Pane) string {
 }
 
 // =============================================================================
-// Health State Tracking (ntm-v5if)
+// Agent Lifecycle Readings (uptime, restarts, crashes)
 // =============================================================================
 //
-// HealthTracker maintains health state history for agents over time.
-// It tracks state transitions, restarts, errors, and rate limits in memory.
+// One implementation serves every surface that reports an agent's uptime or
+// its restart/crash history: --robot-metrics, `ntm health` and the
+// dashboard's health badges. An in-memory HealthTracker used to back the last
+// two; no code path ever wrote to it, so they never showed an uptime or a
+// restart.
 
-// HealthStateTransition records a state change
-type HealthStateTransition struct {
-	From      HealthState `json:"from"`
-	To        HealthState `json:"to"`
-	Reason    string      `json:"reason"`
-	Timestamp time.Time   `json:"timestamp"`
-}
-
-// AgentErrorInfo captures details about an error
-type AgentErrorInfo struct {
-	Type      string    `json:"type"` // e.g., "rate_limit", "crash", "auth_error"
-	Message   string    `json:"message"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// AgentHealthMetrics holds all tracked metrics for a single agent
-type AgentHealthMetrics struct {
-	PaneID    string `json:"pane_id"`
-	AgentType string `json:"agent_type"`
-	SessionID string `json:"session_id"`
-
-	// Current state
-	CurrentState HealthState `json:"current_state"`
-	StateReason  string      `json:"state_reason"`
-
-	// State transition history (most recent first)
-	Transitions []HealthStateTransition `json:"transitions"`
-
-	// Uptime tracking
-	StartTime       time.Time `json:"start_time"`        // When agent was first tracked
-	LastRestartTime time.Time `json:"last_restart_time"` // Time of last restart
-	TotalRestarts   int       `json:"total_restarts"`    // Total restarts ever
-
-	// Restart tracking per window
-	RestartTimestamps []time.Time `json:"-"` // Internal: for counting restarts in windows
-
-	// Error tracking
-	LastError   *AgentErrorInfo `json:"last_error,omitempty"`
-	TotalErrors int             `json:"total_errors"`
-
-	// Rate limit tracking
-	RateLimitCount      int       `json:"rate_limit_count"`       // Total rate limits hit
-	RateLimitWindowHits int       `json:"rate_limit_window_hits"` // Hits in current window
-	RateLimitWindowEnd  time.Time `json:"rate_limit_window_end"`  // When window expires
-
-	// Consecutive failure tracking
-	ConsecutiveFailures int `json:"consecutive_failures"`
-
-	// Last check time
-	LastCheckTime time.Time `json:"last_check_time"`
-}
-
-// HealthTracker manages health state for all agents in a session
-type HealthTracker struct {
-	mu      sync.RWMutex
-	agents  map[string]*AgentHealthMetrics // keyed by pane ID
-	session string
-
-	// Configuration
-	maxTransitions  int           // Max state transitions to keep in history
-	restartWindow   time.Duration // Window for counting restarts (e.g., 1 hour)
-	rateLimitWindow time.Duration // Window for counting rate limits
-}
-
-// HealthTrackerConfig holds configuration for HealthTracker
-type HealthTrackerConfig struct {
-	MaxTransitions  int           // Default: 50
-	RestartWindow   time.Duration // Default: 1 hour
-	RateLimitWindow time.Duration // Default: 1 hour
-}
-
-// DefaultHealthTrackerConfig returns sensible defaults
-func DefaultHealthTrackerConfig() HealthTrackerConfig {
-	return HealthTrackerConfig{
-		MaxTransitions:  50,
-		RestartWindow:   time.Hour,
-		RateLimitWindow: time.Hour,
+// PaneStartedAt is when the pane's current shell incarnation started: the
+// shell PID's process start time. tmux has no per-pane creation-time format,
+// and the shell PID is replaced on respawn, so this is the "current
+// incarnation" age --robot-is-working reports as agent_uptime_seconds. ok is
+// false when the PID is unknown or no longer running.
+func PaneStartedAt(pid int) (time.Time, bool) {
+	if pid <= 0 {
+		return time.Time{}, false
 	}
+	startedAt, err := process.StartTime(pid)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return startedAt, true
 }
 
-// NewHealthTracker creates a new health tracker for a session
-func NewHealthTracker(session string, config *HealthTrackerConfig) *HealthTracker {
-	cfg := DefaultHealthTrackerConfig()
-	if config != nil {
-		if config.MaxTransitions > 0 {
-			cfg.MaxTransitions = config.MaxTransitions
+// AgentLifecycleCounts is what the session monitor recorded for one pane.
+type AgentLifecycleCounts struct {
+	// Crashes counts agent_crash records: the monitor found the agent
+	// process gone (exited, or its pane dead).
+	Crashes int
+	// Restarts counts agent_restart records: automatic restarts the monitor
+	// delivered to the pane. Operator restarts (--robot-restart-pane,
+	// ntm respawn) replace the pane's shell and show as a reset uptime.
+	Restarts int
+}
+
+// agentLifecycleLogPath is the analytics event log the session monitor
+// records crashes and restarts in, resolved per read so it follows HOME.
+func agentLifecycleLogPath() string { return ntmevents.DefaultOptions().Path }
+
+// RecordedAgentLifecycle counts the crashes and restarts the session monitor
+// recorded for session's panes after since, keyed by tmux pane ID. A missing
+// event log means nothing was ever recorded and is not an error. Pane IDs are
+// unique only per tmux server lifetime, so callers bound since by the
+// session's creation time to keep a previous same-named session's records out.
+func RecordedAgentLifecycle(session string, since time.Time) (map[string]AgentLifecycleCounts, error) {
+	counts := make(map[string]AgentLifecycleCounts)
+	records, err := ntmevents.ReadTypesSince(agentLifecycleLogPath(), since, ntmevents.EventAgentCrash, ntmevents.EventAgentRestart)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return counts, nil
 		}
-		if config.RestartWindow > 0 {
-			cfg.RestartWindow = config.RestartWindow
+		return nil, err
+	}
+	for _, record := range records {
+		if record.Session != session {
+			continue
 		}
-		if config.RateLimitWindow > 0 {
-			cfg.RateLimitWindow = config.RateLimitWindow
+		paneID, _ := record.Data["pane_id"].(string)
+		if paneID == "" {
+			continue
+		}
+		c := counts[paneID]
+		switch record.Type {
+		case ntmevents.EventAgentCrash:
+			c.Crashes++
+		case ntmevents.EventAgentRestart:
+			c.Restarts++
+		}
+		counts[paneID] = c
+	}
+	return counts, nil
+}
+
+// RecentAgentRestarts counts the automatic restarts the session monitor
+// recorded for session's panes within window before now (never before the
+// session's creation), keyed by pane ID; panes without one are absent. It is
+// best effort for display surfaces (the dashboard's restart badges, ntm
+// health's "restarts in last hour"): an unreadable log yields no counts.
+func RecentAgentRestarts(session string, window time.Duration, now time.Time) map[string]int {
+	since := now.Add(-window)
+	if created, err := tmux.SessionCreatedAt(session); err == nil && created.After(since) {
+		since = created
+	}
+	restarts := make(map[string]int)
+	counts, err := RecordedAgentLifecycle(session, since)
+	if err != nil {
+		return restarts
+	}
+	for paneID, c := range counts {
+		if c.Restarts > 0 {
+			restarts[paneID] = c.Restarts
 		}
 	}
-
-	return &HealthTracker{
-		agents:          make(map[string]*AgentHealthMetrics),
-		session:         session,
-		maxTransitions:  cfg.MaxTransitions,
-		restartWindow:   cfg.RestartWindow,
-		rateLimitWindow: cfg.RateLimitWindow,
-	}
+	return restarts
 }
 
-// RecordState records a health state for an agent
-func (ht *HealthTracker) RecordState(paneID string, agentType string, state HealthState, reason string) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
-
-	now := time.Now()
-	metrics := ht.getOrCreateMetrics(paneID, agentType)
-
-	// Record state transition if changed
-	if metrics.CurrentState != state {
-		transition := HealthStateTransition{
-			From:      metrics.CurrentState,
-			To:        state,
-			Reason:    reason,
-			Timestamp: now,
-		}
-
-		// Prepend to transitions (most recent first)
-		metrics.Transitions = append([]HealthStateTransition{transition}, metrics.Transitions...)
-
-		// Trim to max size
-		if len(metrics.Transitions) > ht.maxTransitions {
-			metrics.Transitions = metrics.Transitions[:ht.maxTransitions]
-		}
-
-		// Reset consecutive failures on healthy transition
-		if state == HealthHealthy {
-			metrics.ConsecutiveFailures = 0
-		}
-	}
-
-	// Update current state
-	metrics.CurrentState = state
-	metrics.StateReason = reason
-	metrics.LastCheckTime = now
-
-	// Track failures
-	if state == HealthUnhealthy || state == HealthRateLimited {
-		metrics.ConsecutiveFailures++
-	}
-
-	// Track rate limits specifically
-	if state == HealthRateLimited {
-		ht.recordRateLimitInternal(metrics, now)
-	}
-}
-
-// RecordError records an error for an agent
-func (ht *HealthTracker) RecordError(paneID string, errType string, message string) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
-
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		return // Agent not yet tracked
-	}
-
-	metrics.LastError = &AgentErrorInfo{
-		Type:      errType,
-		Message:   message,
-		Timestamp: time.Now(),
-	}
-	metrics.TotalErrors++
-}
-
-// RecordRestart records a restart for an agent
-func (ht *HealthTracker) RecordRestart(paneID string) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
-
-	now := time.Now()
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		return // Agent not yet tracked
-	}
-
-	metrics.TotalRestarts++
-	metrics.LastRestartTime = now
-	metrics.RestartTimestamps = append(metrics.RestartTimestamps, now)
-
-	// Clean old timestamps outside the window
-	metrics.RestartTimestamps = ht.filterTimestampsInWindow(metrics.RestartTimestamps, ht.restartWindow)
-}
-
-// recordRateLimitInternal records a rate limit hit (must hold lock)
-func (ht *HealthTracker) recordRateLimitInternal(metrics *AgentHealthMetrics, now time.Time) {
-	metrics.RateLimitCount++
-
-	// Check if we're in a tracking window
-	if now.After(metrics.RateLimitWindowEnd) {
-		// Start new window
-		metrics.RateLimitWindowHits = 1
-		metrics.RateLimitWindowEnd = now.Add(ht.rateLimitWindow)
-	} else {
-		// Increment in current window
-		metrics.RateLimitWindowHits++
-	}
-}
-
-// GetHealth returns current health metrics for an agent
-func (ht *HealthTracker) GetHealth(paneID string) (*AgentHealthMetrics, bool) {
-	ht.mu.RLock()
-	defer ht.mu.RUnlock()
-
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		return nil, false
-	}
-
-	// Return a copy to avoid race conditions
-	metricsCopy := *metrics
-	metricsCopy.Transitions = append([]HealthStateTransition(nil), metrics.Transitions...)
-	metricsCopy.RestartTimestamps = append([]time.Time(nil), metrics.RestartTimestamps...)
-	if metrics.LastError != nil {
-		errCopy := *metrics.LastError
-		metricsCopy.LastError = &errCopy
-	}
-	return &metricsCopy, true
-}
-
-// GetAllHealth returns health metrics for all tracked agents
-func (ht *HealthTracker) GetAllHealth() map[string]*AgentHealthMetrics {
-	ht.mu.RLock()
-	defer ht.mu.RUnlock()
-
-	result := make(map[string]*AgentHealthMetrics, len(ht.agents))
-	for k, v := range ht.agents {
-		metricsCopy := *v
-		metricsCopy.Transitions = append([]HealthStateTransition(nil), v.Transitions...)
-		metricsCopy.RestartTimestamps = append([]time.Time(nil), v.RestartTimestamps...)
-		if v.LastError != nil {
-			errCopy := *v.LastError
-			metricsCopy.LastError = &errCopy
-		}
-		result[k] = &metricsCopy
-	}
-	return result
-}
-
-// GetUptime returns the uptime since last restart for an agent
-func (ht *HealthTracker) GetUptime(paneID string) time.Duration {
-	ht.mu.RLock()
-	defer ht.mu.RUnlock()
-
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		return 0
-	}
-
-	// If never restarted, uptime is since start
-	if metrics.LastRestartTime.IsZero() {
-		return time.Since(metrics.StartTime)
-	}
-	return time.Since(metrics.LastRestartTime)
-}
-
-// GetRestartsInWindow returns the number of restarts in the configured window
-func (ht *HealthTracker) GetRestartsInWindow(paneID string) int {
-	ht.mu.RLock()
-	defer ht.mu.RUnlock()
-
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		return 0
-	}
-
-	// Filter to timestamps in window
-	filtered := ht.filterTimestampsInWindow(metrics.RestartTimestamps, ht.restartWindow)
-	return len(filtered)
-}
-
-// GetRateLimitsInWindow returns rate limit hits in current window
-func (ht *HealthTracker) GetRateLimitsInWindow(paneID string) int {
-	ht.mu.RLock()
-	defer ht.mu.RUnlock()
-
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		return 0
-	}
-
-	// Check if window has expired
-	if time.Now().After(metrics.RateLimitWindowEnd) {
-		return 0
-	}
-	return metrics.RateLimitWindowHits
-}
-
-// GetTransitionHistory returns state transition history for an agent
-func (ht *HealthTracker) GetTransitionHistory(paneID string, limit int) []HealthStateTransition {
-	ht.mu.RLock()
-	defer ht.mu.RUnlock()
-
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		return nil
-	}
-
-	if limit <= 0 || limit > len(metrics.Transitions) {
-		limit = len(metrics.Transitions)
-	}
-
-	result := make([]HealthStateTransition, limit)
-	copy(result, metrics.Transitions[:limit])
-	return result
-}
-
-// ClearAgent removes tracking for an agent (e.g., when pane is destroyed)
-func (ht *HealthTracker) ClearAgent(paneID string) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
-	delete(ht.agents, paneID)
-}
-
-// Reset clears all tracked state
-func (ht *HealthTracker) Reset() {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
-	ht.agents = make(map[string]*AgentHealthMetrics)
-}
-
-// getOrCreateMetrics gets or creates metrics for an agent (must hold lock)
-func (ht *HealthTracker) getOrCreateMetrics(paneID string, agentType string) *AgentHealthMetrics {
-	metrics, ok := ht.agents[paneID]
-	if !ok {
-		now := time.Now()
-		metrics = &AgentHealthMetrics{
-			PaneID:       paneID,
-			AgentType:    agentType,
-			SessionID:    ht.session,
-			CurrentState: HealthHealthy,
-			StartTime:    now,
-			Transitions:  []HealthStateTransition{},
-		}
-		ht.agents[paneID] = metrics
-	}
-	return metrics
-}
-
-// filterTimestampsInWindow filters timestamps to those within the window
-func (ht *HealthTracker) filterTimestampsInWindow(timestamps []time.Time, window time.Duration) []time.Time {
-	cutoff := time.Now().Add(-window)
-	result := make([]time.Time, 0, len(timestamps))
-	for _, ts := range timestamps {
-		if ts.After(cutoff) {
-			result = append(result, ts)
-		}
-	}
-	return result
+// SessionMonitorRecords reports whether a session monitor has run for the
+// session. Only the monitor records crashes and restarts, so without one a
+// zero count means "never watched", not "never crashed".
+func SessionMonitorRecords(session string) bool {
+	_, err := resilience.ReadSessionMonitorStatus(session)
+	return err == nil
 }
 
 // =============================================================================
@@ -1311,67 +1146,6 @@ func NewBackoffManager(session string) *BackoffManager {
 	}
 }
 
-// RecordRateLimit records a rate limit hit and starts/extends backoff
-func (bm *BackoffManager) RecordRateLimit(paneID string) time.Duration {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	now := time.Now()
-	backoff, exists := bm.backoffs[paneID]
-
-	if !exists {
-		backoff = &RateLimitBackoff{
-			PaneID:          paneID,
-			BackoffCount:    0,
-			TotalRateLimits: 0,
-		}
-		bm.backoffs[paneID] = backoff
-	}
-
-	// If already in backoff, increment the count (escalate)
-	if now.Before(backoff.BackoffEndsAt) {
-		backoff.BackoffCount++
-	} else {
-		// First rate limit or backoff expired - start fresh
-		backoff.BackoffCount = 0
-	}
-
-	backoff.LastRateLimitAt = now
-	backoff.TotalRateLimits++
-
-	// Calculate backoff duration: 30s * 2^n, capped at 5 minutes
-	duration := calculateBackoffDuration(backoff.BackoffCount)
-	backoff.BackoffEndsAt = now.Add(duration)
-
-	return duration
-}
-
-// calculateBackoffDuration calculates the backoff duration for a given count
-func calculateBackoffDuration(count int) time.Duration {
-	// 30s * 2^n
-	duration := BackoffBase
-	for i := 0; i < count; i++ {
-		duration *= BackoffMultiplier
-		if duration > BackoffMax {
-			return BackoffMax
-		}
-	}
-	return duration
-}
-
-// IsInBackoff returns true if the agent is currently in backoff
-func (bm *BackoffManager) IsInBackoff(paneID string) bool {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-
-	backoff, exists := bm.backoffs[paneID]
-	if !exists {
-		return false
-	}
-
-	return time.Now().Before(backoff.BackoffEndsAt)
-}
-
 // GetBackoffRemaining returns the time remaining in backoff (0 if not in backoff)
 func (bm *BackoffManager) GetBackoffRemaining(paneID string) time.Duration {
 	bm.mu.RLock()
@@ -1402,63 +1176,6 @@ func (bm *BackoffManager) GetBackoff(paneID string) *RateLimitBackoff {
 	// Return a copy
 	backoffCopy := *backoff
 	return &backoffCopy
-}
-
-// ClearBackoff clears the backoff state for an agent (e.g., after recovery)
-func (bm *BackoffManager) ClearBackoff(paneID string) {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	delete(bm.backoffs, paneID)
-}
-
-// ClearExpiredBackoffs removes all expired backoffs
-func (bm *BackoffManager) ClearExpiredBackoffs() int {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	now := time.Now()
-	cleared := 0
-
-	for paneID, backoff := range bm.backoffs {
-		if now.After(backoff.BackoffEndsAt) {
-			delete(bm.backoffs, paneID)
-			cleared++
-		}
-	}
-
-	return cleared
-}
-
-// GetAllBackoffs returns all active backoffs
-func (bm *BackoffManager) GetAllBackoffs() map[string]*RateLimitBackoff {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-
-	now := time.Now()
-	result := make(map[string]*RateLimitBackoff)
-
-	for paneID, backoff := range bm.backoffs {
-		if now.Before(backoff.BackoffEndsAt) {
-			backoffCopy := *backoff
-			result[paneID] = &backoffCopy
-		}
-	}
-
-	return result
-}
-
-// GetRateLimitCount returns the total rate limit count for an agent
-func (bm *BackoffManager) GetRateLimitCount(paneID string) int {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-
-	backoff, exists := bm.backoffs[paneID]
-	if !exists {
-		return 0
-	}
-
-	return backoff.TotalRateLimits
 }
 
 // =============================================================================
@@ -1493,80 +1210,9 @@ func GetBackoffManager(session string) *BackoffManager {
 	return manager
 }
 
-// ClearBackoffManager removes the backoff manager for a session
-func ClearBackoffManager(session string) {
-	backoffManagerRegistryMu.Lock()
-	defer backoffManagerRegistryMu.Unlock()
-	delete(backoffManagerRegistry, session)
-}
-
 // =============================================================================
 // Integration: Check Rate Limit Before Send
 // =============================================================================
-
-// CheckSendAllowed checks if sending to an agent is allowed (not in backoff)
-// Returns: allowed, backoffRemaining, rateLimitCount
-func CheckSendAllowed(session, paneID string) (bool, time.Duration, int) {
-	manager := GetBackoffManager(session)
-
-	remaining := manager.GetBackoffRemaining(paneID)
-	count := manager.GetRateLimitCount(paneID)
-
-	return remaining == 0, remaining, count
-}
-
-// RecordAgentRateLimit records a rate limit for an agent and returns backoff duration
-func RecordAgentRateLimit(session, paneID string) time.Duration {
-	manager := GetBackoffManager(session)
-	return manager.RecordRateLimit(paneID)
-}
-
-// ClearAgentBackoff clears backoff state for an agent after recovery
-func ClearAgentBackoff(session, paneID string) {
-	manager := GetBackoffManager(session)
-	manager.ClearBackoff(paneID)
-}
-
-// =============================================================================
-// Global Health Tracker Registry
-// =============================================================================
-//
-// For convenience, we maintain a registry of trackers per session
-
-var (
-	healthTrackerRegistry   = make(map[string]*HealthTracker)
-	healthTrackerRegistryMu sync.RWMutex
-)
-
-// GetHealthTracker returns the health tracker for a session, creating if needed
-func GetHealthTracker(session string) *HealthTracker {
-	healthTrackerRegistryMu.RLock()
-	tracker, ok := healthTrackerRegistry[session]
-	healthTrackerRegistryMu.RUnlock()
-
-	if ok {
-		return tracker
-	}
-
-	healthTrackerRegistryMu.Lock()
-	defer healthTrackerRegistryMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if tracker, ok = healthTrackerRegistry[session]; ok {
-		return tracker
-	}
-
-	tracker = NewHealthTracker(session, nil)
-	healthTrackerRegistry[session] = tracker
-	return tracker
-}
-
-// ClearHealthTracker removes the tracker for a session
-func ClearHealthTracker(session string) {
-	healthTrackerRegistryMu.Lock()
-	defer healthTrackerRegistryMu.Unlock()
-	delete(healthTrackerRegistry, session)
-}
 
 // =============================================================================
 // Auto-Restart Stuck Agents (bd-krqz)
@@ -1579,9 +1225,12 @@ type AutoRestartStuckOutput struct {
 	StuckPanes []int  `json:"stuck_panes"`
 	Restarted  []int  `json:"restarted"`
 	Failed     []int  `json:"failed,omitempty"`
-	Threshold  string `json:"threshold"`
-	DryRun     bool   `json:"dry_run,omitempty"`
-	CheckedAt  string `json:"checked_at"`
+	// Skipped lists threshold-exceeding panes deliberately not restarted,
+	// each with its typed health-state reason (bd-qz5wk).
+	Skipped   []AutoRestartSkip `json:"skipped,omitempty"`
+	Threshold string            `json:"threshold"`
+	DryRun    bool              `json:"dry_run,omitempty"`
+	CheckedAt string            `json:"checked_at"`
 }
 
 // AutoRestartStuckOptions configures the auto-restart-stuck operation.
@@ -1595,23 +1244,54 @@ type AutoRestartStuckOptions struct {
 // DefaultStuckThreshold is the default idle duration before a pane is considered stuck.
 const DefaultStuckThreshold = 5 * time.Minute
 
-// ClassifyStuckPanes identifies panes that are stuck based on health data.
-// A pane is stuck if it is an agent pane (not user/unknown) and has been idle
-// longer than the threshold duration. This is a pure function for testability.
-func ClassifyStuckPanes(agents []SessionAgentHealth, threshold time.Duration) []int {
+// AutoRestartSkip records a pane that met the stuck threshold but was
+// deliberately NOT restarted, with the typed reason (bd-qz5wk). Previously
+// these panes were invisible: a blocked pane was protected only by accident
+// (repaints keeping IdleSinceSeconds low) and the refusal reason from
+// shouldAutoRestartHealthState was unreachable from this surface.
+type AutoRestartSkip struct {
+	Pane       int    `json:"pane"`
+	PaneTarget string `json:"pane_target,omitempty"`
+	Health     string `json:"health"`
+	Reason     string `json:"reason"`
+}
+
+// ClassifyStuckPanes returns the panes idle past the threshold that are
+// eligible for auto-restart, plus typed skips for threshold-exceeding panes
+// whose health state forbids restarting (blocked: a restart cannot answer a
+// gate screen; rate_limited: restarting will not lift the limit).
+func ClassifyStuckPanes(agents []SessionAgentHealth, threshold time.Duration) ([]int, []AutoRestartSkip) {
 	var stuck []int
+	var skipped []AutoRestartSkip
 	thresholdSec := int(threshold.Seconds())
 	for _, agent := range agents {
-		if agent.Health == "unhealthy" || agent.Health == "degraded" {
-			if agent.IdleSinceSeconds >= thresholdSec {
-				stuck = append(stuck, agent.Pane)
+		if agent.IdleSinceSeconds < thresholdSec {
+			continue
+		}
+		switch agent.Health {
+		case "blocked":
+			skipped = append(skipped, AutoRestartSkip{
+				Pane:       agent.Pane,
+				PaneTarget: agent.PaneTarget,
+				Health:     agent.Health,
+				Reason:     "blocked on an interactive gate screen; a restart cannot answer it — needs a human keystroke",
+			})
+		case "rate_limited":
+			reason := "rate_limited; waiting for reset"
+			if agent.BackoffRemaining > 0 {
+				reason = fmt.Sprintf("rate_limited; waiting for reset (backoff %ds remaining)", agent.BackoffRemaining)
 			}
-		} else if agent.IdleSinceSeconds >= thresholdSec {
-			// Healthy but idle for too long - also stuck
+			skipped = append(skipped, AutoRestartSkip{
+				Pane:       agent.Pane,
+				PaneTarget: agent.PaneTarget,
+				Health:     agent.Health,
+				Reason:     reason,
+			})
+		default:
 			stuck = append(stuck, agent.Pane)
 		}
 	}
-	return stuck
+	return stuck, skipped
 }
 
 // BuildAutoRestartStuckOutput constructs the output struct from health data
@@ -1684,16 +1364,20 @@ func GetAutoRestartStuck(ctx context.Context, opts AutoRestartStuckOptions) (*Au
 		return output, nil
 	}
 
-	// Classify stuck panes
-	stuckPanes := ClassifyStuckPanes(healthOutput.Agents, opts.Threshold)
+	// Classify stuck panes; blocked/rate-limited panes past the threshold
+	// become typed skips instead of restart candidates (bd-qz5wk).
+	stuckPanes, skipped := ClassifyStuckPanes(healthOutput.Agents, opts.Threshold)
 	// Preview is observational: report every candidate even when its lifecycle
 	// protocol is intentionally unavailable. Capability validation belongs at
 	// the actuation boundary below.
 	if opts.DryRun {
-		return BuildAutoRestartStuckOutput(opts.Session, stuckPanes, nil, nil, opts.Threshold, true), nil
+		output := BuildAutoRestartStuckOutput(opts.Session, stuckPanes, nil, nil, opts.Threshold, true)
+		output.Skipped = skipped
+		return output, nil
 	}
 	if err := validateAutoRestartStuckAgents(healthOutput.Agents, stuckPanes); err != nil {
 		output := BuildAutoRestartStuckOutput(opts.Session, stuckPanes, nil, nil, opts.Threshold, opts.DryRun)
+		output.Skipped = skipped
 		output.RobotResponse = NewErrorResponse(err, ErrCodeNotImplemented, agent.GrokPhaseOneCapabilityHint)
 		return output, nil
 	}
@@ -1702,6 +1386,7 @@ func GetAutoRestartStuck(ctx context.Context, opts AutoRestartStuckOptions) (*Au
 	restarted, failed, restartErr := restartAutoRestartStuckPanes(ctx, opts, healthOutput.Agents, stuckPanes, GetRestartPaneContext)
 	if restartErr != nil {
 		output := BuildAutoRestartStuckOutput(opts.Session, stuckPanes, restarted, failed, opts.Threshold, false)
+		output.Skipped = skipped
 		code := ErrCodeNotImplemented
 		hint := agent.GrokPhaseOneCapabilityHint
 		if errors.Is(restartErr, context.Canceled) || errors.Is(restartErr, context.DeadlineExceeded) {
@@ -1712,7 +1397,9 @@ func GetAutoRestartStuck(ctx context.Context, opts AutoRestartStuckOptions) (*Au
 		return output, nil
 	}
 
-	return BuildAutoRestartStuckOutput(opts.Session, stuckPanes, restarted, failed, opts.Threshold, false), nil
+	output := BuildAutoRestartStuckOutput(opts.Session, stuckPanes, restarted, failed, opts.Threshold, false)
+	output.Skipped = skipped
+	return output, nil
 }
 
 func validateAutoRestartStuckAgents(agents []SessionAgentHealth, stuckPanes []int) error {

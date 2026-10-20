@@ -7,9 +7,11 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
 	"github.com/Dicklesworthstone/ntm/internal/models"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/tokens"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -84,8 +86,10 @@ func TestModelNameForPane(t *testing.T) {
 	cfg = nil
 
 	defaults := config.DefaultModels()
-	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentClaude}); got != defaults.DefaultClaude {
-		t.Errorf("default claude model = %q, want %q", got, defaults.DefaultClaude)
+	// The built-in Claude launch model is delegated to Claude Code (ntm#334);
+	// estimates still run against the Claude family instead of vanishing.
+	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentClaude}); got != config.ClaudeEstimationModel {
+		t.Errorf("default claude model = %q, want %q", got, config.ClaudeEstimationModel)
 	}
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentCodex}); got != defaults.DefaultCodex {
 		t.Errorf("default codex model = %q, want %q", got, defaults.DefaultCodex)
@@ -228,11 +232,11 @@ func TestSessionPanePresentationCanonicalizesAliases(t *testing.T) {
 }
 
 // TestStatusAgentSummaryShowsEveryAgentType checks `ntm status` prints a row
-// for Pi, Kimi and Opencode panes and counts a session of only those as
+// for Pi, Kimi, OpenCode and omp panes and counts a session of only those as
 // running agents instead of "No agents running".
 func TestStatusAgentSummaryShowsEveryAgentType(t *testing.T) {
 	counts := output.AgentCountsResponse{}
-	for _, paneType := range []tmux.AgentType{tmux.AgentPi, tmux.AgentKimi, tmux.AgentType("moonshot"), tmux.AgentOpencode} {
+	for _, paneType := range []tmux.AgentType{tmux.AgentPi, tmux.AgentKimi, tmux.AgentType("moonshot"), tmux.AgentOpencode, tmux.AgentOmp} {
 		incrementAgentCounts(&counts, paneType)
 	}
 
@@ -240,7 +244,7 @@ func TestStatusAgentSummaryShowsEveryAgentType(t *testing.T) {
 	plain := func(interface{}) string { return "" }
 	writeStatusAgentSummary(&buf, counts, theme.CatppuccinMocha, icons.ASCII, plain, "")
 	got := buf.String()
-	for _, want := range []string{"Pi      1 instance(s)", "Kimi    2 instance(s)", "Opencode 1 instance(s)"} {
+	for _, want := range []string{"Pi      1 instance(s)", "Kimi    2 instance(s)", "OpenCode 1 instance(s)", "OMP     1 instance(s)"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("status agent summary missing %q:\n%s", want, got)
 		}
@@ -278,8 +282,8 @@ func TestModelNameForPaneCanonicalizesAliases(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	aliasDefaults := config.DefaultModels()
-	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("claude_code")}); got != aliasDefaults.DefaultClaude {
-		t.Fatalf("claude alias model = %q, want %q", got, aliasDefaults.DefaultClaude)
+	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("claude_code")}); got != config.ClaudeEstimationModel {
+		t.Fatalf("claude alias model = %q, want %q", got, config.ClaudeEstimationModel)
 	}
 	if got := modelNameForPane(tmux.Pane{Type: tmux.AgentType("openai-codex")}); got != aliasDefaults.DefaultCodex {
 		t.Fatalf("codex alias model = %q, want %q", got, aliasDefaults.DefaultCodex)
@@ -344,5 +348,31 @@ func TestPaneIsControllerByTypeNotIndex(t *testing.T) {
 				t.Errorf("paneIsController(%+v) = %v, want %v", tc.pane, got, tc.want)
 			}
 		})
+	}
+}
+
+// GH #338: a pane whose agent's transcript was resolved reports what that
+// transcript measured, not a scrollback guess; no pane capture is needed.
+func TestEstimatePaneContextUsagePrefersTheTranscript(t *testing.T) {
+	pane := tmux.Pane{ID: "%9", Type: tmux.AgentClaude, Variant: "claude-opus-4"}
+	usage, ok := estimatePaneContextUsage(pane, &ntmctx.TranscriptUsage{Tokens: 108_000, Model: "claude-opus-4", ContextWindow: 200_000})
+	if !ok || usage.Source != contextSourceTranscript || usage.Tokens != 108_000 || usage.Percent != 54 || usage.Limit != 200_000 {
+		t.Fatalf("usage = %+v, %v; want the transcript's 108K of 200K (54%%)", usage, ok)
+	}
+}
+
+func TestTranscriptContextUsage(t *testing.T) {
+	// The window a transcript reports wins.
+	if got := transcriptContextUsage(&ntmctx.TranscriptUsage{Tokens: 50_000, Model: "gpt-5-codex", ContextWindow: 200_000}, "pane-model"); got.Percent != 25 || got.Limit != 200_000 || got.Model != "gpt-5-codex" {
+		t.Errorf("reported window: %+v, want 25%% of 200K under the transcript's model", got)
+	}
+	// Otherwise the model's window; the pane's model fills a missing name.
+	limit := tokens.GetContextLimit("claude-opus-4")
+	if got := transcriptContextUsage(&ntmctx.TranscriptUsage{Tokens: limit / 4}, "claude-opus-4"); got.Limit != limit || got.Model != "claude-opus-4" || got.Percent != 25 {
+		t.Errorf("model window: %+v, want 25%% of %d", got, limit)
+	}
+	// Over 100% means the window is wrong, not that the context overflowed.
+	if got := transcriptContextUsage(&ntmctx.TranscriptUsage{Tokens: 500_000, ContextWindow: 200_000}, ""); got.Percent != 100 {
+		t.Errorf("over-full reading = %v%%, want capped at 100", got.Percent)
 	}
 }

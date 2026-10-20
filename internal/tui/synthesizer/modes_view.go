@@ -287,6 +287,8 @@ func modeAssignmentAgentLabel(agentType string) string {
 		return "agy"
 	case agent.AgentTypeMuse:
 		return "muse"
+	case agent.AgentTypeOmp:
+		return "omp"
 	case agent.AgentTypeCursor:
 		return "cur"
 	case agent.AgentTypeWindsurf:
@@ -316,7 +318,7 @@ func modeAssignmentAgentColor(agentType string, t theme.Theme) lipgloss.Color {
 		return t.Gemini
 	case agent.AgentTypeAntigravity:
 		return t.Lavender
-	case agent.AgentTypeMuse:
+	case agent.AgentTypeMuse, agent.AgentTypeOmp:
 		return t.Sky
 	case agent.AgentTypeCursor:
 		return t.Cursor

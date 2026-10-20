@@ -64,9 +64,22 @@ type Preferences struct {
 // Performance tracks historical performance metrics for an agent.
 type Performance struct {
 	AvgCompletionTime time.Duration `json:"avg_completion_time"`
-	SuccessRate       float64       `json:"success_rate"` // 0.0 to 1.0
-	TasksCompleted    int           `json:"tasks_completed"`
-	LastUpdated       time.Time     `json:"last_updated"`
+	// SuccessRate is the seeded routing prior until ApplyObservedPerformance
+	// replaces it with the observed completed/(completed+failed) ratio of
+	// recorded assignment outcomes. Callers must not present it as observed
+	// performance without checking Measured first — `ntm agents profile`
+	// once printed "Tasks Completed: 0" directly above "Success Rate: 90.0%".
+	SuccessRate    float64 `json:"success_rate"` // 0.0 to 1.0
+	TasksCompleted int     `json:"tasks_completed"`
+	// LastUpdated is the latest recorded outcome; zero when none.
+	LastUpdated time.Time `json:"last_updated"`
+}
+
+// Measured reports whether any real task outcome has been recorded for this
+// profile. While false, SuccessRate and AvgCompletionTime are seeded defaults
+// and must not be displayed as statistics.
+func (p Performance) Measured() bool {
+	return p.TasksCompleted > 0 || !p.LastUpdated.IsZero()
 }
 
 // ProfileMatcher matches tasks to the best available agents based on capabilities.
@@ -359,7 +372,9 @@ func (pm *ProfileMatcher) ScoreAssignment(agentType AgentType, task TaskInfo) Sc
 	result.LabelMatchScore = labelScore
 	score *= labelScore
 
-	// 5. Historical performance bonus
+	// 5. Performance. Observed task outcomes when ApplyObservedPerformance
+	// supplied them; otherwise the seeded SuccessRate, where (0.9 for claude,
+	// 0.85 elsewhere) neither branch fires.
 	if profile.Performance.SuccessRate > 0.9 {
 		score *= 1.1
 		result.PerformanceBonus = 0.1
@@ -557,40 +572,20 @@ func (pm *ProfileMatcher) RecommendAgent(task TaskInfo) (AgentType, ScoreResult)
 	return bestAgent, bestResult
 }
 
-// RecordCompletion updates an agent's performance metrics after task completion.
-func (pm *ProfileMatcher) RecordCompletion(agentType AgentType, success bool, duration time.Duration) {
+// ApplyObservedPerformance replaces each profile's seeded performance prior
+// with the observed task outcomes of the agent types that have any, so
+// statistics and the ScoreAssignment performance bonus read real history.
+func (pm *ProfileMatcher) ApplyObservedPerformance(observed map[AgentType]Performance) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-
-	profile := pm.profiles[agentType]
-	if profile == nil {
-		return
+	for agentType, perf := range observed {
+		if !perf.Measured() {
+			continue
+		}
+		if profile, ok := pm.profiles[agentType]; ok {
+			profile.Performance = perf
+		}
 	}
-
-	profile.Performance.TasksCompleted++
-
-	// Exponential moving average for success rate
-	const alphaSuccess = 0.1
-	if success {
-		profile.Performance.SuccessRate = alphaSuccess + (1-alphaSuccess)*profile.Performance.SuccessRate
-	} else {
-		profile.Performance.SuccessRate = (1 - alphaSuccess) * profile.Performance.SuccessRate
-	}
-
-	// Exponential moving average for completion time
-	// Use alpha=0.2 (20% weight to new sample) to smooth out volatility while staying responsive
-	const alphaDuration = 0.2
-	if profile.Performance.AvgCompletionTime == 0 {
-		profile.Performance.AvgCompletionTime = duration
-	} else {
-		// Calculate using float64 for precision then convert back
-		newVal := float64(duration)
-		oldVal := float64(profile.Performance.AvgCompletionTime)
-		avg := alphaDuration*newVal + (1-alphaDuration)*oldVal
-		profile.Performance.AvgCompletionTime = time.Duration(avg)
-	}
-
-	profile.Performance.LastUpdated = time.Now()
 }
 
 // GetPerformanceStats returns performance statistics for all agents.
@@ -611,7 +606,7 @@ func NormalizeAgentType(t string) string {
 	switch normalized {
 	case "opus", "sonnet", "haiku":
 		return "claude"
-	case "gpt", "gpt-5", "gpt-5.5", "gpt-5.6-sol", "gpt-5-codex", "gpt-5.3-codex":
+	case "gpt", "gpt-5", "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-5-codex", "gpt-5.3-codex":
 		return "codex"
 	case "gemini-pro", "gemini-ultra", "gemini-3-pro-preview":
 		return "gemini"
@@ -636,6 +631,8 @@ func NormalizeAgentType(t string) string {
 		return "kimi"
 	case agentpkg.AgentTypeMuse:
 		return "muse"
+	case agentpkg.AgentTypeOmp:
+		return "omp"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:
@@ -648,28 +645,5 @@ func NormalizeAgentType(t string) string {
 		return "user"
 	default:
 		return normalized
-	}
-}
-
-// ParseAgentType converts a string to AgentType.
-func ParseAgentType(s string) AgentType {
-	normalized := NormalizeAgentType(s)
-	switch normalized {
-	case "claude":
-		return AgentTypeClaude
-	case "codex":
-		return AgentTypeCodex
-	case "gemini":
-		return AgentTypeGemini
-	case "antigravity":
-		return AgentTypeAntigravity
-	case "pi":
-		return AgentTypePi
-	case "kimi":
-		return AgentTypeKimi
-	case "muse":
-		return AgentTypeMuse
-	default:
-		return AgentType(normalized)
 	}
 }

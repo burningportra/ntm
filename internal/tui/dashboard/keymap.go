@@ -32,17 +32,21 @@ type KeyMap struct {
 	SpawnWizard    key.Binding // ctrl+w opens spawn wizard [tui-upgrade: bd-uz09d]
 	WorkflowToggle key.Binding // 'w' toggles the workflow status panel
 	ViewToggle     key.Binding // 'v' to toggle table/list view [tui-upgrade: bd-ijnu3]
-	Tab            key.Binding
-	ShiftTab       key.Binding
-	Num1           key.Binding
-	Num2           key.Binding
-	Num3           key.Binding
-	Num4           key.Binding
-	Num5           key.Binding
-	Num6           key.Binding
-	Num7           key.Binding
-	Num8           key.Binding
-	Num9           key.Binding
+	// C6-wire panel toggles [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+	QuotaToggle     key.Binding // '$' toggles the usage/quota panel
+	RateLimitToggle key.Binding // 'o' toggles the OAuth/rate-limit panel
+	AccountsToggle  key.Binding // 'a' toggles the CAAM accounts panel
+	Tab             key.Binding
+	ShiftTab        key.Binding
+	Num1            key.Binding
+	Num2            key.Binding
+	Num3            key.Binding
+	Num4            key.Binding
+	Num5            key.Binding
+	Num6            key.Binding
+	Num7            key.Binding
+	Num8            key.Binding
+	Num9            key.Binding
 }
 
 // ShortHelp returns the short help bindings for the footer bar.
@@ -55,9 +59,9 @@ func (k KeyMap) ShortHelp() []key.Binding {
 // Implements help.KeyMap interface.
 func (k KeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Down, k.Zoom},                                     // Navigation
-		{k.NextPanel, k.PrevPanel, k.ViewToggle},                   // Panels & Actions
-		{k.Refresh, k.ContextRefresh, k.MailRefresh, k.CassSearch}, // Data
+		{k.Up, k.Down, k.Zoom}, // Navigation
+		{k.NextPanel, k.PrevPanel, k.ViewToggle, k.QuotaToggle, k.RateLimitToggle, k.AccountsToggle},              // Panels & Actions
+		{k.Refresh, k.ContextRefresh, k.MailRefresh, k.CassSearch},                                                // Data
 		{k.Help, k.Quit, k.Pause, k.Diagnostics, k.ToastDismiss, k.ToastHistory, k.SpawnWizard, k.WorkflowToggle}, // Control
 	}
 }
@@ -100,15 +104,19 @@ var dashKeys = KeyMap{
 	SpawnWizard:    key.NewBinding(key.WithKeys("ctrl+w"), key.WithHelp("ctrl+w", "spawn wizard")),
 	WorkflowToggle: key.NewBinding(key.WithKeys("w"), key.WithHelp("w", "toggle workflow")),
 	ViewToggle:     key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "toggle table view")),
-	Tab:            key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
-	ShiftTab:       key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev panel")),
-	Num1:           key.NewBinding(key.WithKeys("1")),
-	Num2:           key.NewBinding(key.WithKeys("2")),
-	Num3:           key.NewBinding(key.WithKeys("3")),
-	Num4:           key.NewBinding(key.WithKeys("4")),
-	Num5:           key.NewBinding(key.WithKeys("5")),
-	Num6:           key.NewBinding(key.WithKeys("6")),
-	Num7:           key.NewBinding(key.WithKeys("7")),
-	Num8:           key.NewBinding(key.WithKeys("8")),
-	Num9:           key.NewBinding(key.WithKeys("9")),
+	// C6-wire panel toggles [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+	QuotaToggle:     key.NewBinding(key.WithKeys("$"), key.WithHelp("$", "toggle usage/quota")),
+	RateLimitToggle: key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "toggle oauth/rate status")),
+	AccountsToggle:  key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "toggle accounts")),
+	Tab:             key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
+	ShiftTab:        key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev panel")),
+	Num1:            key.NewBinding(key.WithKeys("1")),
+	Num2:            key.NewBinding(key.WithKeys("2")),
+	Num3:            key.NewBinding(key.WithKeys("3")),
+	Num4:            key.NewBinding(key.WithKeys("4")),
+	Num5:            key.NewBinding(key.WithKeys("5")),
+	Num6:            key.NewBinding(key.WithKeys("6")),
+	Num7:            key.NewBinding(key.WithKeys("7")),
+	Num8:            key.NewBinding(key.WithKeys("8")),
+	Num9:            key.NewBinding(key.WithKeys("9")),
 }

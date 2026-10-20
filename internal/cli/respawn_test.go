@@ -123,14 +123,15 @@ func TestSelectRespawnTargetsSkipsUserPaneByDefault(t *testing.T) {
 	}
 }
 
-func TestValidateRespawnTargetsRejectsGrokInMixedBatch(t *testing.T) {
+// GH#251 phase 2: Grok Build relaunch is implemented, so mixed batches with
+// grok panes validate like claude/codex batches.
+func TestValidateRespawnTargetsAcceptsGrokInMixedBatch(t *testing.T) {
 	panes := []tmux.Pane{
 		{ID: "%1", Index: 1, Type: tmux.AgentClaude},
 		{ID: "%2", Index: 2, Type: tmux.AgentGrok},
 	}
-	err := validateRespawnTargets(panes)
-	if !errors.Is(err, agent.ErrAutomatedRelaunchNotImplemented) {
-		t.Fatalf("validateRespawnTargets() error = %v, want Grok relaunch sentinel", err)
+	if err := validateRespawnTargets(panes); err != nil {
+		t.Fatalf("validateRespawnTargets() error = %v, want nil", err)
 	}
 	if err := validateRespawnTargets(panes[:1]); err != nil {
 		t.Fatalf("supported target unexpectedly rejected: %v", err)
@@ -323,5 +324,24 @@ func TestRespawnWithPaneFilter(t *testing.T) {
 	err = runRespawn(t.Context(), sessionName, true, "1", "", false, false)
 	if err != nil {
 		t.Errorf("respawn with pane filter failed: %v", err)
+	}
+}
+
+// A malformed --panes selector must fail before the confirmation prompt (and
+// dry-run listing) instead of silently narrowing the restart to the
+// well-formed part of the list.
+func TestRespawnRejectsMalformedPaneSelector(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	sessionName := fmt.Sprintf("ntm-respawn-selector-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(sessionName, t.TempDir()); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	defer func() { _ = tmux.KillSession(sessionName) }()
+
+	for _, panes := range []string{"0,0.x", "all", "0,"} {
+		err := runRespawn(t.Context(), sessionName, true, panes, "", false, true)
+		if err == nil || !strings.Contains(err.Error(), "invalid pane selector") {
+			t.Fatalf("runRespawn(--panes=%q) error = %v, want an invalid pane selector error", panes, err)
+		}
 	}
 }

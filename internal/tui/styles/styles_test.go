@@ -116,52 +116,6 @@ func TestGradientText(t *testing.T) {
 	})
 }
 
-func TestGradientBar(t *testing.T) {
-	t.Run("with colors", func(t *testing.T) {
-		result := GradientBar(10, "#ff0000", "#0000ff")
-		if result == "" {
-			t.Error("GradientBar should return non-empty string")
-		}
-	})
-
-	t.Run("too few colors", func(t *testing.T) {
-		result := GradientBar(10, "#ff0000")
-		if !strings.Contains(result, "█") {
-			t.Error("GradientBar with <2 colors should return plain blocks")
-		}
-	})
-
-	t.Run("non-positive width", func(t *testing.T) {
-		if result := GradientBar(0, "#ff0000", "#0000ff"); result != "" {
-			t.Fatalf("GradientBar with width 0 = %q, want empty string", result)
-		}
-		if result := GradientBar(-1, "#ff0000", "#0000ff"); result != "" {
-			t.Fatalf("GradientBar with width -1 = %q, want empty string", result)
-		}
-	})
-}
-
-func TestGradientBorder(t *testing.T) {
-	result := GradientBorder("Hello\nWorld", 20)
-	if result == "" {
-		t.Error("GradientBorder should return non-empty string")
-	}
-	if !strings.Contains(result, "╭") {
-		t.Error("GradientBorder should contain box corners")
-	}
-
-	if result := GradientBorder("Hello", 3); result != "" {
-		t.Fatalf("GradientBorder with width 3 = %q, want empty string", result)
-	}
-}
-
-func TestGlow(t *testing.T) {
-	result := Glow("test", "#ff0000", "#00ff00")
-	if result == "" {
-		t.Error("Glow should return non-empty string")
-	}
-}
-
 func TestShimmer(t *testing.T) {
 	t.Setenv("NTM_ANIMATIONS", "1")
 	t.Setenv("NTM_REDUCE_MOTION", "0")
@@ -220,13 +174,6 @@ func TestShimmer(t *testing.T) {
 			t.Error("expected Shimmer to be stable under reduced motion")
 		}
 	})
-}
-
-func TestRainbow(t *testing.T) {
-	result := Rainbow("hello")
-	if result == "" {
-		t.Error("Rainbow should return non-empty string")
-	}
 }
 
 func TestPulse(t *testing.T) {
@@ -366,72 +313,6 @@ func TestProgressBar(t *testing.T) {
 	})
 }
 
-func TestGetSpinnerFrame(t *testing.T) {
-	t.Run("default frames", func(t *testing.T) {
-		frame := GetSpinnerFrame(0, SpinnerFrames)
-		if frame != SpinnerFrames[0] {
-			t.Errorf("GetSpinnerFrame(0) = %q, want %q", frame, SpinnerFrames[0])
-		}
-	})
-
-	t.Run("wraps around", func(t *testing.T) {
-		frame := GetSpinnerFrame(10, SpinnerFrames)
-		if frame != SpinnerFrames[0] {
-			t.Errorf("GetSpinnerFrame(10) should wrap to first frame")
-		}
-	})
-
-	t.Run("empty frames", func(t *testing.T) {
-		frame := GetSpinnerFrame(0, []string{})
-		if frame != "⠋" {
-			t.Errorf("GetSpinnerFrame with empty frames should return default")
-		}
-	})
-}
-
-func TestRenderBox(t *testing.T) {
-	result := RenderBox("Hello", 20, RoundedBox, lipgloss.Color("#ff0000"))
-	if result == "" {
-		t.Error("RenderBox should return non-empty string")
-	}
-	if !strings.Contains(result, "╭") {
-		t.Error("RenderBox should contain rounded corners")
-	}
-
-	if result := RenderBox("Hello", 3, RoundedBox, lipgloss.Color("#ff0000")); result != "" {
-		t.Fatalf("RenderBox with width 3 = %q, want empty string", result)
-	}
-}
-
-func TestDivider(t *testing.T) {
-	tests := []struct {
-		style    string
-		expected string
-	}{
-		{"heavy", "━"},
-		{"double", "═"},
-		{"dotted", "·"},
-		{"dashed", "╌"},
-		{"", "─"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.style, func(t *testing.T) {
-			result := Divider(5, tt.style, lipgloss.Color("#ff0000"))
-			if result == "" {
-				t.Error("Divider should return non-empty string")
-			}
-		})
-	}
-
-	if result := Divider(0, "heavy", lipgloss.Color("#ff0000")); result != "" {
-		t.Fatalf("Divider with width 0 = %q, want empty string", result)
-	}
-	if result := Divider(-1, "heavy", lipgloss.Color("#ff0000")); result != "" {
-		t.Fatalf("Divider with width -1 = %q, want empty string", result)
-	}
-}
-
 func TestGradientDivider(t *testing.T) {
 	t.Run("with colors", func(t *testing.T) {
 		result := GradientDivider(10, "#ff0000", "#0000ff")
@@ -482,65 +363,6 @@ func TestAnimatedGradientDivider(t *testing.T) {
 	})
 }
 
-// [tui-upgrade: bd-28vsw]
-func TestAnimatedBorderColor(t *testing.T) {
-	t.Run("returns valid color", func(t *testing.T) {
-		color := AnimatedBorderColor(0, "#89b4fa", "#cba6f7")
-		if color == "" {
-			t.Error("AnimatedBorderColor should return non-empty color")
-		}
-	})
-
-	t.Run("different ticks may return different colors", func(t *testing.T) {
-		c1 := AnimatedBorderColor(0, "#ff0000", "#0000ff")
-		c2 := AnimatedBorderColor(15, "#ff0000", "#0000ff")
-		// Both should be valid lipgloss colors
-		if c1 == "" || c2 == "" {
-			t.Error("AnimatedBorderColor should return valid colors")
-		}
-	})
-}
-
-func TestBadge(t *testing.T) {
-	result := Badge("test", lipgloss.Color("#ff0000"), lipgloss.Color("#ffffff"))
-	if result == "" {
-		t.Error("Badge should return non-empty string")
-	}
-}
-
-func TestGlowBadge(t *testing.T) {
-	result := GlowBadge("test", "#ff0000")
-	if result == "" {
-		t.Error("GlowBadge should return non-empty string")
-	}
-}
-
-func TestKeyHint(t *testing.T) {
-	result := KeyHint("q", "quit", lipgloss.Color("#ff0000"), lipgloss.Color("#ffffff"))
-	if result == "" {
-		t.Error("KeyHint should return non-empty string")
-	}
-	if !strings.Contains(result, "q") {
-		t.Error("KeyHint should contain the key")
-	}
-}
-
-func TestStatusDot(t *testing.T) {
-	t.Run("static", func(t *testing.T) {
-		result := StatusDot(lipgloss.Color("#ff0000"), false, 0)
-		if result == "" {
-			t.Error("StatusDot should return non-empty string")
-		}
-	})
-
-	t.Run("animated", func(t *testing.T) {
-		result := StatusDot(lipgloss.Color("#ff0000"), true, 0)
-		if result == "" {
-			t.Error("StatusDot animated should return non-empty string")
-		}
-	})
-}
-
 func TestTruncate(t *testing.T) {
 	tests := []struct {
 		text     string
@@ -578,27 +400,6 @@ func TestCenterText(t *testing.T) {
 			got := CenterText(tt.text, tt.width)
 			if got != tt.expected {
 				t.Errorf("CenterText(%q, %d) = %q, want %q", tt.text, tt.width, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestRightAlign(t *testing.T) {
-	tests := []struct {
-		text     string
-		width    int
-		expected string
-	}{
-		{"hi", 6, "    hi"},
-		{"hello", 5, "hello"},
-		{"a", 5, "    a"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.text, func(t *testing.T) {
-			got := RightAlign(tt.text, tt.width)
-			if got != tt.expected {
-				t.Errorf("RightAlign(%q, %d) = %q, want %q", tt.text, tt.width, got, tt.expected)
 			}
 		})
 	}

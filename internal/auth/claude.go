@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -36,6 +37,9 @@ type ClaudeAuthFlow struct {
 	captureOutput func(string, int) (string, error)
 	pollInterval  time.Duration
 	sleep         func(time.Duration)
+
+	baselineMu sync.Mutex
+	baselines  map[string]string // Last observed pane output, seeded before /login.
 }
 
 // NewClaudeAuthFlow creates a new Claude auth flow handler
@@ -52,10 +56,26 @@ func NewClaudeAuthFlow(isRemote bool) *ClaudeAuthFlow {
 
 // InitiateAuth starts the authentication process
 func (f *ClaudeAuthFlow) InitiateAuth(paneID string) error {
-	return f.sendKeys(paneID, "/login", true)
+	// Sending /login does not immediately erase scrollback. Capture the old
+	// output first so a previous login cannot authorize this attempt's work.
+	baseline, err := f.captureOutput(paneID, 30)
+	if err != nil {
+		return fmt.Errorf("capture auth baseline for pane %q: %w", paneID, err)
+	}
+	if err := f.sendKeys(paneID, "/login", true); err != nil {
+		return err
+	}
+	f.baselineMu.Lock()
+	if f.baselines == nil {
+		f.baselines = make(map[string]string)
+	}
+	f.baselines[paneID] = baseline
+	f.baselineMu.Unlock()
+	return nil
 }
 
-// MonitorAuth watches the pane output for auth prompts and handles them
+// MonitorAuth watches pane output for auth prompts and terminal results.
+// After InitiateAuth, only newly observed output can advance the attempt.
 func (f *ClaudeAuthFlow) MonitorAuth(ctx context.Context, paneID string) (*AuthResult, error) {
 	pollInterval := f.pollInterval
 	if pollInterval <= 0 {
@@ -65,45 +85,99 @@ func (f *ClaudeAuthFlow) MonitorAuth(ctx context.Context, paneID string) (*AuthR
 	defer ticker.Stop()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ticker.C:
 			output, err := f.captureOutput(paneID, 30)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if err != nil {
 				return nil, fmt.Errorf("capture auth pane %q: %w", paneID, err)
 			}
 
-			// Pane capture includes scrollback, so a completed earlier login can
-			// coexist with the current attempt's result. The most recent terminal
-			// result is authoritative; treating any old success as decisive masks a
-			// newer failure and lets rotation continue on an unauthenticated pane.
+			f.baselineMu.Lock()
+			baseline, initiated := f.baselines[paneID]
+			if initiated {
+				// Advance with the viewport. Keeping the original baseline forever
+				// suppresses a genuinely new, identical success after a screen redraw.
+				f.baselines[paneID] = output
+			}
+			f.baselineMu.Unlock()
+			output = authOutputAfterBaseline(baseline, output)
+
+			// Pending signals participate in ordering too: a newer browser URL
+			// or code prompt invalidates an older terminal success or failure.
 			switch f.latestAuthResult(output) {
 			case AuthSuccess:
 				return &AuthResult{State: AuthSuccess}, nil
 			case AuthFailed:
 				return &AuthResult{State: AuthFailed, Error: fmt.Errorf("authentication failed")}, nil
-			}
-
-			// Check for challenge code (remote/SSH flow)
-			if _, found := f.DetectChallengeCode(output); found {
-				// Challenge handling would go here, or we return status to let caller handle it
+			case AuthNeedsChallenge:
 				return &AuthResult{State: AuthNeedsChallenge}, nil
-			}
-
-			// Check for browser URL
-			if url, found := f.DetectBrowserURL(output); found {
-				if f.isRemote {
-					// In remote mode, we return the URL for the user/caller to handle
-					return &AuthResult{State: AuthNeedsBrowser, URL: url}, nil
-				}
-				// In local mode, Claude usually opens the browser automatically,
-				// but we might need to confirm or detect that state.
-				// For now, if we see a URL, we treat it as 'needs browser' if it's waiting.
+			case AuthNeedsBrowser:
+				url, _ := f.DetectBrowserURL(output)
 				return &AuthResult{State: AuthNeedsBrowser, URL: url}, nil
 			}
 		}
 	}
+}
+
+// WaitForAuth waits for a terminal result, reporting changed pending prompts.
+// Repeated prompts are normal while the operator works in the browser; neither
+// a repeated prompt nor a browser-to-challenge transition is an auth failure.
+func (f *ClaudeAuthFlow) WaitForAuth(ctx context.Context, paneID string, progress func(AuthResult)) error {
+	var previous AuthResult
+	for {
+		result, err := f.MonitorAuth(ctx, paneID)
+		if err != nil {
+			return err
+		}
+		switch result.State {
+		case AuthSuccess:
+			return nil
+		case AuthFailed:
+			if result.Error != nil {
+				return result.Error
+			}
+			return fmt.Errorf("authentication failed")
+		case AuthNeedsBrowser, AuthNeedsChallenge:
+			if progress != nil && (result.State != previous.State || result.URL != previous.URL) {
+				progress(*result)
+			}
+			previous = *result
+		default:
+			return fmt.Errorf("unexpected authentication state %q", result.State)
+		}
+	}
+}
+
+// authOutputAfterBaseline removes unchanged leading lines already visible
+// in the preceding capture. The viewport may scroll or replace its last prompt
+// line, so match complete lines at each possible old viewport offset, not byte
+// prefixes that could accidentally strip part of a new authentication signal.
+func authOutputAfterBaseline(baseline, output string) string {
+	baseline = strings.TrimRight(baseline, " \t\r\n")
+	if baseline == "" {
+		return output
+	}
+	before := strings.Split(baseline, "\n")
+	after := strings.Split(strings.TrimRight(output, " \t\r\n"), "\n")
+	matched := 0
+	for start := range before {
+		n := 0
+		for start+n < len(before) && n < len(after) && before[start+n] == after[n] {
+			n++
+		}
+		if n > matched {
+			matched = n
+		}
+	}
+	return strings.Join(after[matched:], "\n")
 }
 
 // SendContinuation sends a prompt to continue after auth is complete
@@ -122,49 +196,32 @@ var claudeLoginURLRegex = regexp.MustCompile(`https://claude\.ai/login\S*`)
 func (f *ClaudeAuthFlow) DetectBrowserURL(output string) (string, bool) {
 	// Pattern: "Visit https://claude.ai/login?..." or "Open this URL: https://..."
 	// We'll look for standard https links associated with claude/login
-	match := claudeLoginURLRegex.FindString(output)
-	if match != "" {
-		return strings.TrimRight(match, ".,;:!?)]}\"'"), true
+	matches := claudeLoginURLRegex.FindAllString(output, -1)
+	if len(matches) > 0 {
+		return strings.TrimRight(matches[len(matches)-1], ".,;:!?)]}\"'"), true
 	}
 	return "", false
-}
-
-// DetectChallengeCode finds the challenge code prompt
-func (f *ClaudeAuthFlow) DetectChallengeCode(output string) (string, bool) {
-	// Pattern: "Enter the code displayed in your browser" or similar
-	// This might be context-dependent.
-	// For now, we look for the prompt asking for a code.
-	if strings.Contains(output, "Enter code:") || strings.Contains(output, "Enter the code") {
-		return "", true
-	}
-	return "", false
-}
-
-// DetectAuthSuccess checks if authentication was successful
-func (f *ClaudeAuthFlow) DetectAuthSuccess(output string) bool {
-	return strings.Contains(output, "Successfully logged in") ||
-		strings.Contains(output, "Login successful")
-}
-
-// DetectAuthFailure checks if authentication failed
-func (f *ClaudeAuthFlow) DetectAuthFailure(output string) bool {
-	return strings.Contains(output, "Login failed") ||
-		strings.Contains(output, "Authentication failed") ||
-		strings.Contains(output, "Error logging in")
 }
 
 func (f *ClaudeAuthFlow) latestAuthResult(output string) AuthState {
-	successAt := latestAuthSignal(output, "Successfully logged in", "Login successful")
-	failureAt := latestAuthSignal(output, "Login failed", "Authentication failed", "Error logging in")
-
-	switch {
-	case successAt > failureAt:
-		return AuthSuccess
-	case failureAt >= 0:
-		return AuthFailed
-	default:
-		return AuthInProgress
+	state, latest := AuthInProgress, -1
+	for _, candidate := range []struct {
+		state AuthState
+		index int
+	}{
+		{AuthSuccess, latestAuthSignal(output, "Successfully logged in", "Login successful")},
+		{AuthFailed, latestAuthSignal(output, "Login failed", "Authentication failed", "Error logging in")},
+		{AuthNeedsChallenge, latestAuthSignal(output, "Enter code:", "Enter the code")},
+	} {
+		if candidate.index > latest {
+			state, latest = candidate.state, candidate.index
+		}
 	}
+	urls := claudeLoginURLRegex.FindAllStringIndex(output, -1)
+	if len(urls) > 0 && urls[len(urls)-1][0] > latest {
+		state = AuthNeedsBrowser
+	}
+	return state
 }
 
 func latestAuthSignal(output string, signals ...string) int {

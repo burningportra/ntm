@@ -57,8 +57,8 @@ func TestCheck_Blocked(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := p.IsBlocked(tc.command); got != tc.blocked {
-				t.Errorf("IsBlocked(%q) = %v, want %v", tc.command, got, tc.blocked)
+			if got := checkAction(p, tc.command) == ActionBlock; got != tc.blocked {
+				t.Errorf("Check(%q) blocks = %v, want %v", tc.command, got, tc.blocked)
 			}
 		})
 	}
@@ -83,8 +83,8 @@ func TestCheck_ApprovalRequired(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := p.NeedsApproval(tc.command); got != tc.approval {
-				t.Errorf("NeedsApproval(%q) = %v, want %v", tc.command, got, tc.approval)
+			if got := checkAction(p, tc.command) == ActionApprove; got != tc.approval {
+				t.Errorf("Check(%q) needs approval = %v, want %v", tc.command, got, tc.approval)
 			}
 		})
 	}
@@ -154,20 +154,6 @@ func TestAutomationConfig(t *testing.T) {
 	}
 	if p.Automation.ForceRelease != "approval" {
 		t.Errorf("expected ForceRelease to be 'approval', got %q", p.Automation.ForceRelease)
-	}
-}
-
-func TestAutomationEnabled(t *testing.T) {
-	p := DefaultPolicy()
-
-	if !p.AutomationEnabled("auto_commit") {
-		t.Error("expected auto_commit to be enabled")
-	}
-	if p.AutomationEnabled("auto_push") {
-		t.Error("expected auto_push to be disabled")
-	}
-	if p.AutomationEnabled("unknown_feature") {
-		t.Error("expected unknown feature to be disabled")
 	}
 }
 
@@ -552,116 +538,6 @@ func TestCompileInvalidPatterns(t *testing.T) {
 // BlockedLogger tests
 // =============================================================================
 
-func TestBlockedLogger(t *testing.T) {
-	t.Parallel()
-
-	t.Run("create log and write entries", func(t *testing.T) {
-		t.Parallel()
-		dir := t.TempDir()
-		logPath := filepath.Join(dir, "blocked.jsonl")
-
-		logger, err := NewBlockedLogger(logPath)
-		if err != nil {
-			t.Fatalf("NewBlockedLogger: %v", err)
-		}
-		defer logger.Close()
-
-		// Write via Log
-		err = logger.Log(&BlockedEntry{
-			Timestamp: time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC),
-			Session:   "sess1",
-			Agent:     "agent1",
-			Command:   "rm -rf /",
-			Pattern:   `rm\s+-rf\s+/`,
-			Reason:    "destructive",
-			Action:    ActionBlock,
-		})
-		if err != nil {
-			t.Fatalf("Log: %v", err)
-		}
-
-		// Write via LogBlocked
-		err = logger.LogBlocked("sess2", "agent2", "git reset --hard", `git\s+reset\s+--hard`, "dangerous")
-		if err != nil {
-			t.Fatalf("LogBlocked: %v", err)
-		}
-
-		logger.Close()
-
-		// Read back
-		entries, err := ReadBlockedLog(logPath)
-		if err != nil {
-			t.Fatalf("ReadBlockedLog: %v", err)
-		}
-		if len(entries) != 2 {
-			t.Fatalf("expected 2 entries, got %d", len(entries))
-		}
-		if entries[0].Command != "rm -rf /" {
-			t.Errorf("entries[0].Command = %q, want %q", entries[0].Command, "rm -rf /")
-		}
-		if entries[1].Agent != "agent2" {
-			t.Errorf("entries[1].Agent = %q, want %q", entries[1].Agent, "agent2")
-		}
-	})
-
-	t.Run("log with nil file", func(t *testing.T) {
-		t.Parallel()
-		logger := &BlockedLogger{path: "unused"}
-		// file is nil, should return nil error
-		err := logger.Log(&BlockedEntry{Command: "test"})
-		if err != nil {
-			t.Errorf("Log with nil file should return nil, got %v", err)
-		}
-	})
-
-	t.Run("log auto-sets timestamp", func(t *testing.T) {
-		t.Parallel()
-		dir := t.TempDir()
-		logPath := filepath.Join(dir, "blocked.jsonl")
-
-		logger, err := NewBlockedLogger(logPath)
-		if err != nil {
-			t.Fatalf("NewBlockedLogger: %v", err)
-		}
-		defer logger.Close()
-
-		before := time.Now()
-		logger.Log(&BlockedEntry{
-			Command: "test",
-			Pattern: "test",
-			Reason:  "test",
-			Action:  ActionBlock,
-		})
-		logger.Close()
-
-		entries, _ := ReadBlockedLog(logPath)
-		if len(entries) != 1 {
-			t.Fatalf("expected 1 entry, got %d", len(entries))
-		}
-		if entries[0].Timestamp.Before(before) {
-			t.Error("auto-set timestamp should be >= before")
-		}
-	})
-
-	t.Run("close idempotent", func(t *testing.T) {
-		t.Parallel()
-		dir := t.TempDir()
-		logPath := filepath.Join(dir, "blocked.jsonl")
-
-		logger, err := NewBlockedLogger(logPath)
-		if err != nil {
-			t.Fatalf("NewBlockedLogger: %v", err)
-		}
-
-		if err := logger.Close(); err != nil {
-			t.Errorf("first Close: %v", err)
-		}
-		if err := logger.Close(); err != nil {
-			t.Errorf("second Close should be nil, got %v", err)
-		}
-	})
-}
-
 func TestReadBlockedLog(t *testing.T) {
 	t.Parallel()
 
@@ -716,29 +592,32 @@ func TestRecentBlocked(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "blocked.jsonl")
 
-	logger, err := NewBlockedLogger(path)
-	if err != nil {
-		t.Fatalf("NewBlockedLogger: %v", err)
-	}
-
-	// Write an old entry and a recent entry
-	oldEntry := &BlockedEntry{
+	// Write an old entry and a recent entry directly as JSONL.
+	oldEntry := BlockedEntry{
 		Timestamp: time.Now().Add(-48 * time.Hour),
 		Command:   "old command",
 		Pattern:   "old",
 		Reason:    "old",
 		Action:    ActionBlock,
 	}
-	recentEntry := &BlockedEntry{
+	recentEntry := BlockedEntry{
 		Timestamp: time.Now(),
 		Command:   "recent command",
 		Pattern:   "recent",
 		Reason:    "recent",
 		Action:    ActionBlock,
 	}
-	logger.Log(oldEntry)
-	logger.Log(recentEntry)
-	logger.Close()
+	oldLine, err := json.Marshal(oldEntry)
+	if err != nil {
+		t.Fatalf("marshal old entry: %v", err)
+	}
+	recentLine, err := json.Marshal(recentEntry)
+	if err != nil {
+		t.Fatalf("marshal recent entry: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(string(oldLine)+"\n"+string(recentLine)+"\n"), 0o644); err != nil {
+		t.Fatalf("write blocked log fixture: %v", err)
+	}
 
 	// Recent within last 24 hours should return only 1
 	recent, err := RecentBlocked(path, 24)
@@ -953,4 +832,12 @@ func chdir(t *testing.T, dir string) {
 		t.Fatalf("chdir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(prev) })
+}
+
+// checkAction is what Check decides for command ("" when no rule matches).
+func checkAction(p *Policy, command string) Action {
+	if m := p.Check(command); m != nil {
+		return m.Action
+	}
+	return ""
 }

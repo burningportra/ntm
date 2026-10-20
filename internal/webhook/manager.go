@@ -12,8 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,14 +39,18 @@ const (
 
 // Event represents a webhook event to be dispatched
 type Event struct {
-	ID        string            `json:"id"`
-	Type      string            `json:"type"`
-	Timestamp time.Time         `json:"timestamp"`
-	Session   string            `json:"session,omitempty"`
-	Pane      string            `json:"pane,omitempty"`
-	Agent     string            `json:"agent,omitempty"`
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+	Session   string    `json:"session,omitempty"`
+	Pane      string    `json:"pane,omitempty"`
+	Agent     string    `json:"agent,omitempty"`
+	// AgentType is explicit provider metadata; Agent may instead be an identity.
+	AgentType string            `json:"agent_type,omitempty"`
 	Message   string            `json:"message"`
 	Details   map[string]string `json:"details,omitempty"`
+	// Transient forbids persistence (for example, events from privacy-mode sessions).
+	Transient bool `json:"-"`
 }
 
 // WebhookConfig holds configuration for a single webhook endpoint
@@ -60,6 +66,8 @@ type WebhookConfig struct {
 	Headers map[string]string `toml:"headers" json:"headers"`
 	Events  []string          `toml:"events" json:"events"` // Event types to receive (empty = all)
 	Enabled bool              `toml:"enabled" json:"enabled"`
+	// Filter restricts subscriptions further. Nil preserves unfiltered receipts' fingerprints.
+	Filter *EventFilter `toml:"filter" json:"filter,omitempty"`
 
 	// Per-webhook timeout (overrides default)
 	Timeout time.Duration `toml:"timeout" json:"timeout,omitempty"`
@@ -79,13 +87,16 @@ type RetryConfig struct {
 	MaxDelay   time.Duration `toml:"max_delay" json:"max_delay,omitempty"`
 }
 
-// DefaultRetryConfig returns the default retry configuration
+// DefaultRetryConfig returns the default retry configuration. The values
+// come from the central [retry] policy (ApplyRetryPolicy); compiled-in
+// defaults match the historical constants.
 func DefaultRetryConfig() RetryConfig {
+	p := currentRetryPolicy()
 	return RetryConfig{
 		Enabled:    true,
-		MaxRetries: DefaultMaxRetries,
-		BaseDelay:  DefaultBaseBackoff,
-		MaxDelay:   DefaultMaxBackoff,
+		MaxRetries: p.maxRetries,
+		BaseDelay:  p.baseDelay,
+		MaxDelay:   p.maxDelay,
 	}
 }
 
@@ -97,6 +108,8 @@ type Delivery struct {
 	Attempt   int
 	NextRetry time.Time
 	Error     error
+	outboxKey string
+	payload   []byte // Frozen wire bytes for a durable receipt, including an empty payload.
 }
 
 // DeadLetter represents a failed delivery that exhausted retries
@@ -122,6 +135,12 @@ type ManagerConfig struct {
 	WorkerCount     int           `toml:"worker_count" json:"worker_count"`
 	DefaultTimeout  time.Duration `toml:"default_timeout" json:"default_timeout,omitempty"`
 	DeadLetterLimit int           `toml:"dead_letter_limit" json:"dead_letter_limit"`
+	// OutboxDir opts into durable acceptance and restart recovery. It must be private.
+	OutboxDir string `toml:"outbox_dir" json:"outbox_dir,omitempty"`
+	// OutboxLimit bounds pending plus terminal disk records independently of the HTTP queue.
+	OutboxLimit int `toml:"outbox_limit" json:"outbox_limit,omitempty"`
+	// PersistenceAllowed is consulted at admission and replay. Callbacks must be concurrency-safe.
+	PersistenceAllowed func(session string) bool `toml:"-" json:"-"`
 }
 
 // DefaultManagerConfig returns the default manager configuration
@@ -177,6 +196,8 @@ type WebhookManager struct {
 	retryQueue   []Delivery
 	retryQueueMu sync.Mutex
 	retryCond    *sync.Cond
+	retryReady   chan Delivery // Unbuffered handoff to the bounded worker pool.
+	retryStop    chan struct{} // Closed at the beginning of each shutdown.
 
 	// Dead letter queue
 	deadLetters   []DeadLetter
@@ -201,6 +222,7 @@ type WebhookManager struct {
 	Logger func(format string, args ...interface{})
 
 	redactionCfg *redaction.Config
+	outbox       *deliveryOutbox
 }
 
 // NewManager creates a new WebhookManager with the given configuration
@@ -217,12 +239,16 @@ func NewManager(cfg ManagerConfig) *WebhookManager {
 	if cfg.DeadLetterLimit <= 0 {
 		cfg.DeadLetterLimit = DefaultDeadLetterLimit
 	}
+	if cfg.OutboxLimit <= 0 {
+		cfg.OutboxLimit = DefaultQueueSize
+	}
 
 	m := &WebhookManager{
 		config:      cfg,
 		webhooks:    make(map[string]*WebhookConfig),
 		queue:       make(chan Delivery, cfg.QueueSize),
 		retryQueue:  make([]Delivery, 0, 100),
+		retryReady:  make(chan Delivery),
 		deadLetters: make([]DeadLetter, 0, cfg.DeadLetterLimit),
 		httpClient: &http.Client{
 			Timeout: cfg.DefaultTimeout,
@@ -242,7 +268,7 @@ func NewManager(cfg ManagerConfig) *WebhookManager {
 // (message + details) before serialization/dispatch.
 func NewManagerWithRedaction(cfg ManagerConfig, redactionCfg redaction.Config) *WebhookManager {
 	m := NewManager(cfg)
-	cfgCopy := redactionCfg
+	cfgCopy := redactionCfg.DeepCopy()
 	m.redactionCfg = &cfgCopy
 	return m
 }
@@ -265,10 +291,10 @@ func (m *WebhookManager) Register(cfg WebhookConfig) error {
 		cfg.Retry = DefaultRetryConfig()
 	}
 	if cfg.Retry.BaseDelay <= 0 {
-		cfg.Retry.BaseDelay = DefaultBaseBackoff
+		cfg.Retry.BaseDelay = currentRetryPolicy().baseDelay
 	}
 	if cfg.Retry.MaxDelay <= 0 {
-		cfg.Retry.MaxDelay = DefaultMaxBackoff
+		cfg.Retry.MaxDelay = currentRetryPolicy().maxDelay
 	}
 	if cfg.Template == "" && cfg.Format != "" {
 		if _, err := buildBuiltInPayload(Event{}, cfg.Format); err != nil {
@@ -280,6 +306,15 @@ func (m *WebhookManager) Register(cfg WebhookConfig) error {
 			return err
 		}
 	}
+	// Registration transfers a snapshot, not ownership of caller-owned maps
+	// and slices. Queued attempts must keep the same headers and subscriptions.
+	cfg.Headers = maps.Clone(cfg.Headers)
+	cfg.Events = slices.Clone(cfg.Events)
+	filter, err := normalizeEventFilter(cfg.Filter)
+	if err != nil {
+		return err
+	}
+	cfg.Filter = filter
 
 	m.webhooksMu.Lock()
 	defer m.webhooksMu.Unlock()
@@ -288,37 +323,42 @@ func (m *WebhookManager) Register(cfg WebhookConfig) error {
 	return nil
 }
 
-// Unregister removes a webhook by ID
-func (m *WebhookManager) Unregister(id string) error {
-	m.webhooksMu.Lock()
-	defer m.webhooksMu.Unlock()
-
-	if _, ok := m.webhooks[id]; !ok {
-		return fmt.Errorf("webhook %q not found", id)
-	}
-	delete(m.webhooks, id)
-	return nil
-}
-
 // Dispatch queues an event for delivery to all matching webhooks
 func (m *WebhookManager) Dispatch(event Event) error {
+	// Fence acceptance against Stop's drain. Logging callbacks run only after
+	// releasing the lifecycle lock, so a callback can inspect or stop us.
+	var notices []string
+	defer func() {
+		for _, notice := range notices {
+			m.log("%s", notice)
+		}
+	}()
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	if !m.started.Load() {
 		return errors.New("webhook manager not started")
 	}
 
 	if event.ID == "" {
-		event.ID = fmt.Sprintf("evt_%d", time.Now().UnixNano())
+		var err error
+		event.ID, err = newWebhookEventID()
+		if err != nil {
+			return fmt.Errorf("create webhook event identity: %w", err)
+		}
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
 	}
 
+	// Keep payloads stable across asynchronous delivery and retries even when
+	// redaction is disabled and callers reuse their Details map after return.
+	event.Details = maps.Clone(event.Details)
 	event = m.sanitizeEvent(event)
 
 	m.webhooksMu.RLock()
 	webhooks := make([]*WebhookConfig, 0, len(m.webhooks))
 	for _, wh := range m.webhooks {
-		if wh.Enabled && m.matchesEvent(wh, event.Type) {
+		if wh.Enabled && m.matchesWebhook(wh, event) {
 			webhooks = append(webhooks, wh)
 		}
 	}
@@ -326,6 +366,9 @@ func (m *WebhookManager) Dispatch(event Event) error {
 
 	if len(webhooks) == 0 {
 		return nil // No webhooks registered for this event type
+	}
+	if m.outbox != nil && m.mayPersistWebhook(event) {
+		return m.dispatchOutbox(event, webhooks)
 	}
 
 	// Queue delivery for each matching webhook
@@ -348,8 +391,8 @@ func (m *WebhookManager) Dispatch(event Event) error {
 			case dropped := <-m.queue:
 				// Count actual dropped deliveries (oldest).
 				m.queueFull.Add(1)
-				m.completePendingDelivery()
-				m.log("webhook queue full, dropping oldest delivery %s", dropped.ID)
+				m.finishUndelivered(dropped, "delivery queue full: replaced by newer event")
+				notices = append(notices, fmt.Sprintf("webhook queue full, dropping oldest delivery %s", dropped.ID))
 			default:
 				// Race: another worker/drainer freed space before we could drop.
 			}
@@ -358,8 +401,8 @@ func (m *WebhookManager) Dispatch(event Event) error {
 			default:
 				// Queue still full. Drop the new delivery too.
 				m.queueFull.Add(1)
-				m.completePendingDelivery()
-				m.log("webhook queue full, dropping event %s for webhook %s", event.ID, wh.ID)
+				m.finishUndelivered(delivery, "delivery queue full: event not queued")
+				notices = append(notices, fmt.Sprintf("webhook queue full, dropping event %s for webhook %s", event.ID, wh.ID))
 			}
 		}
 	}
@@ -417,7 +460,16 @@ func (m *WebhookManager) Start() error {
 			return errors.New("webhook manager already started")
 		}
 
+		if m.config.OutboxDir != "" {
+			outbox, err := newDeliveryOutbox(m.config.OutboxDir, m.config.OutboxLimit)
+			if err != nil {
+				m.lifecycleMu.Unlock()
+				return fmt.Errorf("open webhook outbox: %w", err)
+			}
+			m.outbox = outbox
+		}
 		m.ctx, m.cancel = newManagerContext()
+		m.retryStop = make(chan struct{})
 		m.stopping.Store(false)
 		m.started.Store(true)
 
@@ -430,6 +482,10 @@ func (m *WebhookManager) Start() error {
 		// Start retry processor
 		m.wg.Add(1)
 		go m.retryProcessor()
+		if m.outbox != nil {
+			m.wg.Add(1)
+			go m.outboxFeeder()
+		}
 		m.lifecycleMu.Unlock()
 
 		m.log("webhook manager started with %d workers", m.config.WorkerCount)
@@ -452,20 +508,11 @@ func (m *WebhookManager) Stop() error {
 
 	m.started.Store(false)
 	m.stopping.Store(true)
+	close(m.retryStop)
 	cancel := m.cancel
+	ctx := m.ctx
 	done := make(chan struct{})
 	m.stopDone = done
-	go func(done chan struct{}) {
-		m.wg.Wait()
-		close(done)
-		m.lifecycleMu.Lock()
-		if m.stopDone == done {
-			m.stopDone = nil
-			m.ctx = nil
-			m.cancel = nil
-		}
-		m.lifecycleMu.Unlock()
-	}(done)
 	m.lifecycleMu.Unlock()
 
 	m.log("stopping webhook manager...")
@@ -473,9 +520,14 @@ func (m *WebhookManager) Stop() error {
 	// Retries that have not started yet cannot outlive shutdown. Convert them to
 	// dead letters now so Stop only has to wait for queued or in-flight work.
 	m.abandonPendingRetries()
+	// Pair the signal with the predicate lock: otherwise shutdown can race
+	// between retryProcessor's empty-queue check and its Cond.Wait.
+	m.retryQueueMu.Lock()
+	m.retryCond.Broadcast()
+	m.retryQueueMu.Unlock()
 
 	deadline := time.Now().Add(10 * time.Second)
-	for m.pending.Load() > 0 && time.Now().Before(deadline) {
+	for m.pending.Load() > 0 && ctx.Err() == nil && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -483,9 +535,21 @@ func (m *WebhookManager) Stop() error {
 	if cancel != nil {
 		cancel()
 	}
-
-	// Signal retry processor to wake up and exit.
-	m.retryCond.Broadcast()
+	// Only open the generation fence after this Stop has finished its own
+	// queue work as well as the workers. Otherwise a concurrent Start could
+	// race the old Stop's cleanup and lose new-generation deliveries.
+	go func() {
+		m.wg.Wait()
+		m.abandonPendingDeliveries()
+		m.lifecycleMu.Lock()
+		if m.stopDone == done {
+			m.stopDone = nil
+			m.ctx = nil
+			m.cancel = nil
+		}
+		close(done)
+		m.lifecycleMu.Unlock()
+	}()
 
 	// Give workers a small grace period to acknowledge cancellation and exit
 	waitTimeout := time.Until(deadline)
@@ -515,52 +579,6 @@ type Stats struct {
 	WebhookCount    int   `json:"webhook_count"`
 }
 
-// Stats returns current manager statistics
-func (m *WebhookManager) Stats() Stats {
-	m.webhooksMu.RLock()
-	webhookCount := len(m.webhooks)
-	m.webhooksMu.RUnlock()
-
-	m.retryQueueMu.Lock()
-	retryLen := len(m.retryQueue)
-	m.retryQueueMu.Unlock()
-
-	m.deadLettersMu.Lock()
-	deadLetterCount := len(m.deadLetters)
-	m.deadLettersMu.Unlock()
-
-	return Stats{
-		QueueLength:     len(m.queue),
-		QueueCapacity:   cap(m.queue),
-		RetryQueueLen:   retryLen,
-		DeadLetterCount: deadLetterCount,
-		Deliveries:      m.deliveries.Load(),
-		Failures:        m.failures.Load(),
-		DroppedEvents:   m.queueFull.Load(),
-		WebhookCount:    webhookCount,
-	}
-}
-
-// DeadLetters returns a copy of the dead letter queue
-func (m *WebhookManager) DeadLetters() []DeadLetter {
-	m.deadLettersMu.Lock()
-	defer m.deadLettersMu.Unlock()
-
-	result := make([]DeadLetter, len(m.deadLetters))
-	copy(result, m.deadLetters)
-	return result
-}
-
-// ClearDeadLetters removes all entries from the dead letter queue
-func (m *WebhookManager) ClearDeadLetters() int {
-	m.deadLettersMu.Lock()
-	defer m.deadLettersMu.Unlock()
-
-	count := len(m.deadLetters)
-	m.deadLetters = m.deadLetters[:0]
-	return count
-}
-
 // worker processes deliveries from the queue
 func (m *WebhookManager) worker(id int) {
 	defer m.wg.Done()
@@ -572,6 +590,12 @@ func (m *WebhookManager) worker(id int) {
 		case delivery, ok := <-m.queue:
 			if !ok {
 				return
+			}
+			m.processDelivery(&delivery)
+		case delivery := <-m.retryReady:
+			if m.stopping.Load() {
+				m.finishUndelivered(delivery, "manager stopping before retry")
+				continue
 			}
 			m.processDelivery(&delivery)
 		}
@@ -586,12 +610,12 @@ func (m *WebhookManager) retryProcessor() {
 		m.retryQueueMu.Lock()
 
 		// Wait until there's something to retry or we're shutting down
-		for len(m.retryQueue) == 0 && m.ctx.Err() == nil {
+		for len(m.retryQueue) == 0 && !m.stopping.Load() && m.ctx.Err() == nil {
 			m.retryCond.Wait()
 		}
 
 		// Check for shutdown
-		if m.ctx.Err() != nil {
+		if m.stopping.Load() || m.ctx.Err() != nil {
 			m.retryQueueMu.Unlock()
 			return
 		}
@@ -616,10 +640,15 @@ func (m *WebhookManager) retryProcessor() {
 		m.retryQueue = notReady
 		m.retryQueueMu.Unlock()
 
-		// Process ready deliveries
-		for i := range ready {
-			delivery := ready[i]
-			m.processDelivery(&delivery)
+		// Scheduling must never execute HTTP synchronously: one slow endpoint
+		// used to stall every other due retry. Reuse the same bounded workers
+		// as first attempts, without an unbounded goroutine per failed event.
+		for _, delivery := range ready {
+			select {
+			case <-m.retryStop:
+				m.finishUndelivered(delivery, "manager stopping before retry")
+			case m.retryReady <- delivery:
+			}
 		}
 
 		// If we processed items, check again immediately as new items might have been added
@@ -642,7 +671,7 @@ func (m *WebhookManager) retryProcessor() {
 		// Sleep until next retry or shutdown
 		timer := time.NewTimer(sleepDuration)
 		select {
-		case <-m.ctx.Done():
+		case <-m.retryStop:
 			timer.Stop()
 			return
 		case <-timer.C:
@@ -652,9 +681,51 @@ func (m *WebhookManager) retryProcessor() {
 
 // processDelivery attempts to deliver a webhook
 func (m *WebhookManager) processDelivery(d *Delivery) {
+	var claim *outboxClaim
+	attempted := false
+	if d.outboxKey != "" {
+		defer func() {
+			m.releaseOutboxDelivery(*d)
+			// Wake after releasing local ownership, or the feeder can miss
+			// the newly available slot. Do not spin on busy claim misses.
+			if attempted {
+				select {
+				case m.outbox.wake <- struct{}{}:
+				default:
+				}
+			}
+		}()
+		var err error
+		claim, err = m.claimOutboxDelivery(d)
+		if err != nil {
+			slog.Error("webhook outbox claim failed; receipt retained", "record", d.outboxKey, "error", err)
+			return
+		}
+		if claim == nil {
+			return
+		}
+		defer claim.lock.Close()
+	}
+	// Queue acceptance is not permanent permission to send. Registration may
+	// have changed while this delivery waited for a worker or retry deadline.
+	// Durable claims already reload the receipt; recheck here too, after any
+	// persistence-policy callback and before recording an attempt.
+	if !m.deliveryPolicyAllows(d) {
+		if claim == nil {
+			m.finishUndelivered(*d, "webhook policy revoked or configuration changed before attempt")
+		}
+		return
+	}
 	d.Attempt++
+	if claim != nil {
+		if err := claim.begin(d.Attempt); err != nil {
+			slog.Error("webhook attempt not sent: receipt could not be persisted", "delivery", d.ID, "error", err)
+			return
+		}
+	}
 	start := time.Now()
 
+	attempted = true
 	statusCode, err := m.send(d)
 	duration := time.Since(start)
 
@@ -666,6 +737,10 @@ func (m *WebhookManager) processDelivery(d *Delivery) {
 	}
 	if err != nil {
 		attemptLog.Error = err.Error()
+	}
+	if claim != nil {
+		m.settleOutbox(claim, d, attemptLog, err)
+		return
 	}
 
 	if err == nil {
@@ -690,9 +765,10 @@ func (m *WebhookManager) processDelivery(d *Delivery) {
 	// Schedule retry
 	d.Error = err
 	d.NextRetry = m.calculateNextRetry(d)
-	m.scheduleRetry(*d)
-	m.log("webhook %s failed (attempt %d), retrying at %s: %v",
-		d.ID, d.Attempt, d.NextRetry.Format(time.RFC3339), err)
+	if m.scheduleRetry(*d) {
+		m.log("webhook %s failed (attempt %d), retrying at %s: %v",
+			d.ID, d.Attempt, d.NextRetry.Format(time.RFC3339), err)
+	}
 }
 
 // send performs the actual HTTP request
@@ -715,13 +791,15 @@ func (m *WebhookManager) send(d *Delivery) (int, error) {
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "NTM-Webhook/1.0")
-	req.Header.Set("X-NTM-Delivery-ID", d.ID)
-	req.Header.Set("X-NTM-Event-Type", d.Event.Type)
-	req.Header.Set("X-NTM-Attempt", fmt.Sprintf("%d", d.Attempt))
 
 	for k, v := range d.Webhook.Headers {
 		req.Header.Set(k, v)
 	}
+	// Transport identity is authoritative: custom headers must not collapse
+	// distinct durable receipts into one receiver-side deduplication key.
+	req.Header.Set("X-NTM-Delivery-ID", d.ID)
+	req.Header.Set("X-NTM-Event-Type", d.Event.Type)
+	req.Header.Set("X-NTM-Attempt", fmt.Sprintf("%d", d.Attempt))
 
 	// Add HMAC signature if secret is configured
 	if d.Webhook.Secret != "" {
@@ -729,28 +807,14 @@ func (m *WebhookManager) send(d *Delivery) (int, error) {
 		req.Header.Set("X-NTM-Signature", "sha256="+sig)
 	}
 
-	// Send request
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read response body (limited to prevent memory issues)
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if readErr != nil {
-		m.log("failed to read response body: %v", readErr)
-	}
-
-	if resp.StatusCode >= 400 {
-		return resp.StatusCode, fmt.Errorf("webhook returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	return resp.StatusCode, nil
+	return sendWebhookRequest(m.httpClient, req)
 }
 
 // buildPayload constructs the webhook payload from the template
 func (m *WebhookManager) buildPayload(d *Delivery) ([]byte, error) {
+	if d.payload != nil {
+		return d.payload, nil
+	}
 	tmplStr := d.Webhook.Template
 	if tmplStr == "" {
 		if d.Webhook.Format != "" {
@@ -788,34 +852,38 @@ func (m *WebhookManager) shouldRetry(d *Delivery, statusCode int, err error) boo
 		return false
 	}
 
-	// Don't retry 4xx errors (client errors) except rate limiting
-	if statusCode >= 400 && statusCode < 500 && statusCode != 429 {
+	return retryableWebhookFailure(statusCode, err)
+}
+
+// calculateNextRetry determines when to retry with exponential backoff. The
+// backoff shape (factor, cap, jitter) follows the central [retry] policy;
+// per-webhook base/max delays take precedence when set. Receiver Retry-After
+// deadlines are a lower bound, even when they exceed the local backoff cap.
+func (m *WebhookManager) calculateNextRetry(d *Delivery) time.Time {
+	delay := nextRetryDelay(d.Attempt, d.Webhook.Retry.BaseDelay, d.Webhook.Retry.MaxDelay)
+	return webhookRetryDeadline(d.Error, time.Now().Add(delay))
+}
+
+// scheduleRetry admits a retry only while the manager is accepting retries.
+// QueueSize also bounds this queue so a long receiver cooldown cannot cause
+// unbounded memory growth during a sustained outage.
+func (m *WebhookManager) scheduleRetry(d Delivery) bool {
+	m.retryQueueMu.Lock()
+	if m.stopping.Load() {
+		m.retryQueueMu.Unlock()
+		m.finishUndelivered(d, "manager stopping before retry")
 		return false
 	}
-
-	// Retry on 5xx, 429 (rate limit), and connection errors
-	return true
-}
-
-// calculateNextRetry determines when to retry with exponential backoff
-func (m *WebhookManager) calculateNextRetry(d *Delivery) time.Time {
-	delay := d.Webhook.Retry.BaseDelay
-	for i := 1; i < d.Attempt; i++ {
-		delay *= 2
-		if delay > d.Webhook.Retry.MaxDelay {
-			delay = d.Webhook.Retry.MaxDelay
-			break
-		}
+	if len(m.retryQueue) >= m.config.QueueSize {
+		m.retryQueueMu.Unlock()
+		m.queueFull.Add(1)
+		m.finishUndelivered(d, "retry queue full")
+		return false
 	}
-	return time.Now().Add(delay)
-}
-
-// scheduleRetry adds a delivery to the retry queue
-func (m *WebhookManager) scheduleRetry(d Delivery) {
-	m.retryQueueMu.Lock()
 	m.retryQueue = append(m.retryQueue, d)
-	m.retryQueueMu.Unlock()
 	m.retryCond.Signal()
+	m.retryQueueMu.Unlock()
+	return true
 }
 
 func webhookTemplateFuncMap() template.FuncMap {
@@ -847,18 +915,47 @@ func (m *WebhookManager) abandonPendingRetries() {
 	m.retryQueueMu.Unlock()
 
 	for _, delivery := range pendingRetries {
-		lastError := "manager stopping before retry"
-		if delivery.Error != nil {
-			lastError = fmt.Sprintf("manager stopping before retry: %v", delivery.Error)
-		}
-		m.addToDeadLetter(delivery, AttemptLog{
-			Attempt:   delivery.Attempt,
-			Timestamp: time.Now().UTC(),
-			Error:     lastError,
-		})
-		m.failures.Add(1)
-		m.completePendingDelivery()
+		m.finishUndelivered(delivery, "manager stopping before retry")
 	}
+}
+
+// abandonPendingDeliveries runs only after every worker exits and admission
+// is closed. All accepted deliveries then have a terminal outcome before the
+// stopDone fence opens and permits another generation to start.
+func (m *WebhookManager) abandonPendingDeliveries() {
+	for {
+		select {
+		case delivery := <-m.queue:
+			m.finishUndelivered(delivery, "manager stopped before delivery")
+		default:
+			m.abandonPendingRetries()
+			return
+		}
+	}
+}
+
+// finishUndelivered records local loss/backpressure without inventing an HTTP
+// attempt. Preserve the last receiver status when a retry could not be queued.
+func (m *WebhookManager) finishUndelivered(d Delivery, reason string) {
+	if d.outboxKey != "" {
+		// The disk receipt remains pending; queue pressure and shutdown are not
+		// permanent delivery failures in durable mode.
+		m.releaseOutboxDelivery(d)
+		return
+	}
+	statusCode := 0
+	if d.Error != nil {
+		var responseErr *webhookHTTPError
+		if errors.As(d.Error, &responseErr) {
+			statusCode = responseErr.statusCode
+		}
+		reason = fmt.Sprintf("%s: %v", reason, d.Error)
+	}
+	m.addToDeadLetter(d, AttemptLog{
+		Attempt: d.Attempt, Timestamp: time.Now().UTC(), StatusCode: statusCode, Error: reason,
+	})
+	m.failures.Add(1)
+	m.completePendingDelivery()
 }
 
 // addToDeadLetter adds a failed delivery to the dead letter queue

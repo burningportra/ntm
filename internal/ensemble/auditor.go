@@ -1,9 +1,7 @@
 package ensemble
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -19,16 +17,23 @@ type DisagreementAuditor struct {
 // SynthesisResult represents the combined output from a synthesis stage.
 // This will be extended by the synthesis subsystem as it matures.
 type SynthesisResult struct {
-	Summary          string              `json:"summary" yaml:"summary"`
-	Findings         []Finding           `json:"findings,omitempty" yaml:"findings,omitempty"`
-	Risks            []Risk              `json:"risks,omitempty" yaml:"risks,omitempty"`
-	Recommendations  []Recommendation    `json:"recommendations,omitempty" yaml:"recommendations,omitempty"`
-	QuestionsForUser []Question          `json:"questions_for_user,omitempty" yaml:"questions_for_user,omitempty"`
-	Confidence       Confidence          `json:"confidence,omitempty" yaml:"confidence,omitempty"`
-	RawOutput        string              `json:"raw_output,omitempty" yaml:"raw_output,omitempty"`
-	GeneratedAt      time.Time           `json:"generated_at,omitempty" yaml:"generated_at,omitempty"`
-	Explanation      *ExplanationLayer   `json:"explanation,omitempty" yaml:"explanation,omitempty"`
-	Contributions    *ContributionReport `json:"contributions,omitempty" yaml:"contributions,omitempty"`
+	Summary          string           `json:"summary" yaml:"summary"`
+	Findings         []Finding        `json:"findings,omitempty" yaml:"findings,omitempty"`
+	Risks            []Risk           `json:"risks,omitempty" yaml:"risks,omitempty"`
+	Recommendations  []Recommendation `json:"recommendations,omitempty" yaml:"recommendations,omitempty"`
+	QuestionsForUser []Question       `json:"questions_for_user,omitempty" yaml:"questions_for_user,omitempty"`
+	Confidence       Confidence       `json:"confidence,omitempty" yaml:"confidence,omitempty"`
+	RawOutput        string           `json:"raw_output,omitempty" yaml:"raw_output,omitempty"`
+	GeneratedAt      time.Time        `json:"generated_at,omitempty" yaml:"generated_at,omitempty"`
+	// SynthesizedBy records which path produced this result:
+	// SynthesisPathAgent (lead synthesizer agent) or SynthesisPathMechanical.
+	SynthesizedBy string `json:"synthesized_by,omitempty" yaml:"synthesized_by,omitempty"`
+	// FallbackReason is set when an agent-based strategy degraded to
+	// mechanical merging ("fell back to mechanical: <reason>"). Empty
+	// when the requested path ran as promised.
+	FallbackReason string              `json:"fallback_reason,omitempty" yaml:"fallback_reason,omitempty"`
+	Explanation    *ExplanationLayer   `json:"explanation,omitempty" yaml:"explanation,omitempty"`
+	Contributions  *ContributionReport `json:"contributions,omitempty" yaml:"contributions,omitempty"`
 }
 
 // AuditReport captures disagreement analysis across modes.
@@ -135,43 +140,6 @@ func (a *DisagreementAuditor) IdentifyConflicts() []DetailedConflict {
 
 	return conflicts
 }
-
-// SuggestResolutions returns high-level resolution paths for conflicts.
-func (a *DisagreementAuditor) SuggestResolutions() []string {
-	if a == nil {
-		return nil
-	}
-	return suggestResolutions(a.IdentifyConflicts())
-}
-
-// GeneratePrompt builds the prompt for an auditor agent.
-func (a *DisagreementAuditor) GeneratePrompt() string {
-	return fmt.Sprintf(auditorPromptTemplate,
-		formatOutputs(a.Outputs),
-		formatSynthesis(a.SynthesisResult),
-		auditSchemaJSON(),
-	)
-}
-
-const auditorPromptTemplate = `You are the DISAGREEMENT AUDITOR for a reasoning ensemble.
-
-Your role: Identify where mode agents DISAGREE and what evidence would resolve conflicts.
-
-## Mode Outputs
-%s
-
-## Synthesizer's Merged Report
-%s
-
-## Your Task
-1. Identify all points of disagreement
-2. For each conflict, state what evidence would resolve it
-3. Note which modes are most/least in alignment
-4. Do NOT try to resolve conflicts - just surface them clearly
-
-## Output Format
-%s
-`
 
 func buildConflict(topic string, outputs []ModeOutput, positionFn func(ModeOutput) string) (DetailedConflict, bool) {
 	positions := buildPositions(outputs, positionFn)
@@ -438,78 +406,6 @@ func suggestResolutions(conflicts []DetailedConflict) []string {
 	}
 
 	return suggestions
-}
-
-func auditSchemaJSON() string {
-	sample := AuditReport{
-		Conflicts: []DetailedConflict{
-			{
-				Topic: "Conflicting assessment of root cause",
-				Positions: []ConflictPosition{
-					{
-						ModeID:     "deductive",
-						ModeName:   "Deductive",
-						Position:   "Root cause is a missing nil check in handler X.",
-						Evidence:   "internal/handler.go:42",
-						Confidence: 0.72,
-					},
-					{
-						ModeID:     "counterfactual",
-						ModeName:   "Counterfactual",
-						Position:   "Root cause is an upstream config mismatch.",
-						Evidence:   "config/settings.yaml:12",
-						Confidence: 0.61,
-					},
-				},
-				ResolutionPath: "Gather logs and reproduce the failure to isolate the root cause.",
-				EvidenceNeeded: "Stack trace or failing test evidence that confirms the trigger.",
-				Severity:       ConflictMedium,
-			},
-		},
-		EvidenceNeeded: []EvidenceRequest{
-			{
-				Topic:       "Root cause evidence",
-				RequestedBy: []string{"deductive", "counterfactual"},
-				Rationale:   "Provide evidence to resolve the disagreement.",
-			},
-		},
-		ModeDisagreements: map[string][]string{
-			"deductive":      {"counterfactual"},
-			"counterfactual": {"deductive"},
-		},
-		ResolutionSuggestions: []string{
-			"Collect runtime logs and failing stack traces.",
-			"Review recent changes that could explain the divergence.",
-		},
-	}
-
-	data, err := json.MarshalIndent(sample, "", "  ")
-	if err != nil {
-		return "{}"
-	}
-	return string(data)
-}
-
-func formatOutputs(outputs []ModeOutput) string {
-	if len(outputs) == 0 {
-		return "[]"
-	}
-	data, err := json.MarshalIndent(outputs, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("error: %v", err)
-	}
-	return string(data)
-}
-
-func formatSynthesis(synthesis *SynthesisResult) string {
-	if synthesis == nil {
-		return "{}"
-	}
-	data, err := json.MarshalIndent(synthesis, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("error: %v", err)
-	}
-	return string(data)
 }
 
 func extractModeIDs(positions []ConflictPosition) []string {

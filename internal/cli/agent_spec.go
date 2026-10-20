@@ -18,7 +18,7 @@ var (
 
 	// agyModelPattern is the RELAXED model charset for the Antigravity (agy)
 	// provider. Antigravity's model *display* names contain spaces and
-	// parentheses — e.g. "Gemini 3.1 Pro (High)" — which the standard
+	// parentheses — e.g. "Gemini 4 Argon (High)" — which the standard
 	// modelPattern rejects. agy always renders its model through
 	// {{shellQuote .Model}} in the launch template (and, in practice, the value
 	// is hard-pinned by config.AntigravityRequiredModel before it ever reaches a
@@ -56,6 +56,10 @@ const (
 	// the wrong pane title / detection. Launch command resolves through the
 	// `[agents] oc = "..."` config key (or the default `opencode` binary).
 	AgentTypeOpencode AgentType = "oc"
+	// AgentTypeOmp covers Oh My Pi (`omp`) panes: `--omp=N[:model[:effort]]`
+	// on spawn/add/adopt/send, launched through `[agents] omp` or
+	// config.DefaultOmpCommand.
+	AgentTypeOmp AgentType = "omp"
 )
 
 // AgentSpec represents a parsed agent specification with optional model
@@ -116,7 +120,7 @@ func (s *AgentSpecs) Type() string {
 // separator (ntm-mjf7).
 func agentTypeSupportsEffortSuffix(agentType AgentType) bool {
 	switch agentType {
-	case AgentTypeClaude, AgentTypeCodex, AgentTypeGrok, AgentTypeMuse:
+	case AgentTypeClaude, AgentTypeCodex, AgentTypeGrok, AgentTypeMuse, AgentTypeOmp:
 		return true
 	default:
 		return false
@@ -134,7 +138,7 @@ func ParseAgentSpec(value string) (AgentSpec, error) {
 
 // parseAgentSpec parses a spec string, optionally relaxing the model charset for
 // the Antigravity (agy) provider whose display model names contain spaces and
-// parentheses (e.g. "Gemini 3.1 Pro (High)"). See agyModelPattern for why the
+// parentheses (e.g. "Gemini 4 Argon (High)"). See agyModelPattern for why the
 // widened charset is injection-safe. effortAtSuffix enables the `model@effort`
 // shorthand; callers that know the agent type pass it per
 // agentTypeSupportsEffortSuffix.
@@ -313,6 +317,104 @@ func validateAgentSpecs(specs AgentSpecs) error {
 	return nil
 }
 
+// validateAgentModelOverrides rejects model metadata that cannot affect the
+// launched process. Antigravity is intentionally hard-pinned by both NTM and
+// agy-locked; preserving a requested override would make the pane title and
+// robot metadata advertise a model that is not running (GH#269).
+func validateAgentModelOverride(agentType AgentType, model string) error {
+	if agentType == AgentTypeAntigravity && strings.TrimSpace(model) != "" {
+		return fmt.Errorf(
+			"antigravity model overrides are not supported; model is pinned to %q (use --agy=N)",
+			config.AntigravityRequiredModel,
+		)
+	}
+	return nil
+}
+
+func validateAntigravityPersonaModel(p *persona.Persona) error {
+	if p == nil {
+		return nil
+	}
+	model := strings.TrimSpace(p.Model)
+	if model == "" || model == config.AntigravityRequiredModel {
+		return nil
+	}
+	return fmt.Errorf(
+		"antigravity persona %q requests model %q, but model is pinned to %q",
+		p.Name,
+		model,
+		config.AntigravityRequiredModel,
+	)
+}
+
+// validateAgentModelOverrides distinguishes a persona's declared pinned model
+// from an explicit launch override. Persona/profile expansion carries model
+// metadata in FlatAgent.Model even though Antigravity itself is not
+// user-selectable; treating those two sources alike breaks supported persona
+// launches. Any divergent persona declaration still fails closed because the
+// launcher would otherwise run a different model from the recorded metadata.
+func validateAgentModelOverrides(agents []FlatAgent, personaMap map[string]*persona.Persona) error {
+	for _, agent := range agents {
+		if agent.Type == AgentTypeAntigravity {
+			if agent.Persona != nil {
+				if strings.TrimSpace(agent.Model) != strings.TrimSpace(agent.Persona.Model) {
+					return fmt.Errorf(
+						"antigravity persona %q has inconsistent model metadata %q; expected %q",
+						agent.Persona.Name,
+						agent.Model,
+						agent.Persona.Model,
+					)
+				}
+				if err := validateAntigravityPersonaModel(agent.Persona); err != nil {
+					return err
+				}
+				continue
+			}
+			if p, ok := personaMap[agent.Model]; ok && p != nil {
+				if err := validateAntigravityPersonaModel(p); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if err := validateAgentModelOverride(agent.Type, agent.Model); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAgentSpecModelOverrides is the pre-flattened counterpart used by
+// add, where a persona is represented by its name in AgentSpec.Model.
+func validateAgentSpecModelOverrides(specs AgentSpecs, personaMap map[string]*persona.Persona) error {
+	for _, spec := range specs {
+		if spec.Type == AgentTypeAntigravity {
+			if p, ok := personaMap[spec.Model]; ok && p != nil {
+				if err := validateAntigravityPersonaModel(p); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if err := validateAgentModelOverride(spec.Type, spec.Model); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseTypedAgentSpec(value string, agentType AgentType) (AgentSpec, error) {
+	spec, err := parseAgentSpec(value, agentType == AgentTypeAntigravity, agentTypeSupportsEffortSuffix(agentType))
+	if err != nil {
+		return AgentSpec{}, err
+	}
+	spec.Type = agentType
+	if err := validateAgentModelOverride(spec.Type, spec.Model); err != nil {
+		return AgentSpec{}, err
+	}
+	return spec, nil
+}
+
 // AgentSpecsValue creates a flag value that accumulates into the given slice
 // with the specified agent type
 func NewAgentSpecsValue(agentType AgentType, specs *AgentSpecs) *agentSpecsValue {
@@ -333,15 +435,12 @@ func (v *agentSpecsValue) String() string {
 }
 
 func (v *agentSpecsValue) Set(value string) error {
-	// agy carries a display model name with spaces/parentheses (e.g.
-	// "Gemini 3.1 Pro (High)"), so it uses the relaxed model charset. The
-	// model@effort shorthand only applies to types with an effort knob so
-	// '@' stays literal in other providers' model names.
-	spec, err := parseAgentSpec(value, v.agentType == AgentTypeAntigravity, agentTypeSupportsEffortSuffix(v.agentType))
+	// Parse with the provider's grammar and enforce provider-specific launch
+	// constraints before appending anything to the accumulated flag value.
+	spec, err := parseTypedAgentSpec(value, v.agentType)
 	if err != nil {
 		return err
 	}
-	spec.Type = v.agentType
 	*v.specs = append(*v.specs, spec)
 	return nil
 }

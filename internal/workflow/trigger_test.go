@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -142,8 +143,104 @@ func TestFileModifiedTriggerWatchesNewNestedDirectories(t *testing.T) {
 	if err := os.WriteFile(path, []byte("package workflow\n"), 0o644); err != nil {
 		t.Fatalf("create nested file: %v", err)
 	}
-	if err := os.WriteFile(path, []byte("package workflow\n// modified\n"), 0o644); err != nil {
-		t.Fatalf("modify nested file: %v", err)
+	// On kqueue platforms the brand-new file's own watch registers
+	// asynchronously after its Create event, so a single immediate Write can
+	// land before the watch exists and never produce an event (load-dependent
+	// race). Keep modifying until the watcher observes one; the assertion —
+	// modifications inside a newly created nested directory fire the trigger
+	// — is unchanged.
+	deadline := time.Now().Add(triggerWaitDeadline)
+	for revision := 0; ; revision++ {
+		content := fmt.Sprintf("package workflow\n// modified %d\n", revision)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("modify nested file: %v", err)
+		}
+		fired, err := trigger.Check(ctx)
+		if err != nil {
+			t.Fatalf("Check(): %v", err)
+		}
+		if fired {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("trigger did not fire before deadline")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// The red-green pattern: a file_modified target is created and written once
+// in quick succession. On kqueue platforms the write notification can be lost
+// (the new file's own watch registers asynchronously after its Create event),
+// so the trigger's stat fallback must still fire — with NO further writes.
+func TestFileModifiedTriggerFiresOnCreateThenSingleWrite(t *testing.T) {
+	dir := t.TempDir()
+	trigger, err := NewTriggerRegistry().Create(Trigger{Type: TriggerFileModified, Pattern: "*.go"})
+	if err != nil {
+		t.Fatalf("Create(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := trigger.Stop(); err != nil {
+			t.Errorf("Stop(): %v", err)
+		}
+	})
+	ctx := &TriggerContext{ProjectRoot: dir}
+	if err := trigger.Start(ctx); err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	// One create+write: os.WriteFile creates the file and writes its content
+	// immediately, before fsnotify can have watched the new file itself.
+	if err := os.WriteFile(filepath.Join(dir, "fresh.go"), []byte("package example\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(): %v", err)
+	}
+	waitForTrigger(t, trigger, ctx)
+}
+
+// A file created empty and written later must fire via the stat fallback even
+// if the write notification never arrives.
+func TestFileModifiedTriggerStatFallbackDetectsLaterWrite(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := NewTriggerRegistry().Create(Trigger{Type: TriggerFileModified, Pattern: "*.go"})
+	if err != nil {
+		t.Fatalf("Create(): %v", err)
+	}
+	trigger := raw.(*fileTrigger)
+	t.Cleanup(func() {
+		if err := trigger.Stop(); err != nil {
+			t.Errorf("Stop(): %v", err)
+		}
+	})
+	ctx := &TriggerContext{ProjectRoot: dir}
+	if err := trigger.Start(ctx); err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	path := filepath.Join(dir, "empty.go")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("create empty file: %v", err)
+	}
+	// Wait until the Create event has been processed (pending or watch-based
+	// firing are both acceptable observations of the event).
+	deadline := time.Now().Add(triggerWaitDeadline)
+	for {
+		trigger.mu.Lock()
+		_, tracked := trigger.pending[path]
+		fired := trigger.fired
+		trigger.mu.Unlock()
+		if tracked || fired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Create event was not observed before deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fired, err := trigger.Check(ctx); err != nil {
+		t.Fatalf("Check(): %v", err)
+	} else if fired {
+		return // platform delivered a Write for the empty create; fine
+	}
+	if err := os.WriteFile(path, []byte("package example\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
 	}
 	waitForTrigger(t, trigger, ctx)
 }
@@ -438,9 +535,15 @@ func TestTimeElapsedTrigger(t *testing.T) {
 	}
 }
 
+// triggerWaitDeadline bounds the fsnotify-backed waits below. Filesystem
+// notification latency is load-dependent (multi-agent swarm hosts routinely
+// run at load averages where 2s was not enough); polling returns on the
+// first observation, so a generous bound only costs time on real failures.
+const triggerWaitDeadline = 15 * time.Second
+
 func waitForTrigger(t *testing.T, trigger RuntimeTrigger, ctx *TriggerContext) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(triggerWaitDeadline)
 	for time.Now().Before(deadline) {
 		fired, err := trigger.Check(ctx)
 		if err != nil {
@@ -456,7 +559,7 @@ func waitForTrigger(t *testing.T, trigger RuntimeTrigger, ctx *TriggerContext) {
 
 func waitForCheckError(t *testing.T, trigger RuntimeTrigger, ctx *TriggerContext) error {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(triggerWaitDeadline)
 	for time.Now().Before(deadline) {
 		fired, err := trigger.Check(ctx)
 		if err != nil {

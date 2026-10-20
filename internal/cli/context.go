@@ -2,8 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log/slog"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,7 +50,7 @@ func newContextBuildCmd() *cobra.Command {
 - BV triage data (priority and planning)
 - CM rules (learned guidelines)
 - CASS history (prior solutions)
-- S2P file context
+- Native, project-confined file context
 
 			The context is rendered in agent-appropriate format:
 			- Claude (cc), Cursor, Windsurf, Aider: XML format
@@ -75,7 +76,7 @@ func newContextBuildCmd() *cobra.Command {
 			}
 
 			// Build context pack
-			builder := ntmctx.NewContextPackBuilder(store)
+			builder := ntmctx.NewContextPackBuilder(nil)
 
 			opts := ntmctx.BuildOptions{
 				BeadID:          beadID,
@@ -85,11 +86,17 @@ func newContextBuildCmd() *cobra.Command {
 				Files:           files,
 				ProjectDir:      dir,
 				SessionID:       session,
+				Remote:          tmux.DefaultClient.Remote != "",
 				IncludeMSSkills: cfg != nil && cfg.Context.MSSkills,
 			}
 
 			pack, err := builder.Build(cmd.Context(), opts)
 			if err != nil {
+				return err
+			}
+			// Do not report a reusable ID when persistence failed. Cache hits
+			// must also be saved in the currently selected state store.
+			if err := persistContextPack(cmd.Context(), store, &pack.ContextPack); err != nil {
 				return err
 			}
 
@@ -126,7 +133,7 @@ func newContextBuildCmd() *cobra.Command {
 	cmd.Flags().StringVar(&beadID, "bead", "", "Bead ID for context")
 	cmd.Flags().StringVar(&agentType, "agent", "cc", "Agent type (cc, cod, gmi, cursor, windsurf, aider)")
 	cmd.Flags().StringVar(&task, "task", "", "Task description for CM context")
-	cmd.Flags().StringSliceVar(&files, "files", nil, "Files to include in S2P context")
+	cmd.Flags().StringSliceVar(&files, "files", nil, "Project-relative files or globs to include in native source context")
 	cmd.Flags().Bool("verbose", false, "Show full rendered prompt")
 
 	return cmd
@@ -244,17 +251,26 @@ func newContextClearCmd() *cobra.Command {
 
 // ContextInjectResult is the JSON output for the context inject command.
 type ContextInjectResult struct {
-	Success       bool     `json:"success"`
-	Session       string   `json:"session"`
-	InjectedFiles []string `json:"injected_files"`
-	TotalBytes    int      `json:"total_bytes"`
-	Truncated     bool     `json:"truncated"`
-	PanesInjected []int    `json:"panes_injected"`
-	Error         string   `json:"error,omitempty"`
+	Success       bool                  `json:"success"`
+	Session       string                `json:"session"`
+	InjectedFiles []string              `json:"injected_files"`
+	TotalBytes    int                   `json:"total_bytes"`
+	Truncated     bool                  `json:"truncated"`
+	PanesInjected []int                 `json:"panes_injected"`
+	Error         string                `json:"error,omitempty"`
+	DryRun        bool                  `json:"dry_run"`
+	PanesPlanned  []int                 `json:"panes_planned,omitempty"`
+	Deliveries    []ContextPaneDelivery `json:"deliveries,omitempty"`
+	Mode          string                `json:"mode,omitempty"`
+	SelectedFiles []string              `json:"selected_files,omitempty"`
+	Warnings      []string              `json:"warnings,omitempty"`
 }
 
 func init() {
 	robot.MustRegisterSchemaCommand("context_inject", ContextInjectResult{})
+	robot.MustRegisterSchemaPagination("context_inject", robot.SchemaPaginationFlag{
+		Reason: "bounded: per-request injection echo (files/panes for one inject)",
+	})
 }
 
 // defaultContextFiles returns the default files to inject.
@@ -312,39 +328,24 @@ func selectContextInjectTargetPanes(panes []tmux.Pane, paneIdx int, targetAll bo
 
 type contextInjectSender func(target, content string, enter bool) error
 
-// injectContextIntoPanes preflights the complete batch before the first write.
-// This preserves all-or-nothing admission even though individual tmux delivery
-// failures retain the command's existing best-effort behavior.
+// injectContextIntoPanes adapts the uniform-content robot injection path to
+// the same batch dispatcher used by context inject. Its error includes the
+// delivered pane IDs so a partial delivery must not be blindly replayed.
 func injectContextIntoPanes(session string, panes []tmux.Pane, content string, dryRun bool, sender contextInjectSender) ([]int, error) {
-	for _, pane := range panes {
-		if err := pane.Type.ValidateAutomatedPromptDelivery(); err != nil {
-			return []int{}, fmt.Errorf("context injection for pane %d: %w", pane.Index, err)
+	var send contextPaneSender
+	if sender != nil {
+		send = func(_ context.Context, pane tmux.Pane, text string) error {
+			return sender(pane.ID, text, true)
 		}
 	}
-
-	injectedPanes := make([]int, 0, len(panes))
-	if dryRun {
-		for _, pane := range panes {
-			injectedPanes = append(injectedPanes, pane.Index)
+	receipts, err := dispatchContextRequests(context.Background(), session, uniformContextRequests(panes, content), dryRun, send)
+	injected := make([]int, 0, len(receipts))
+	for _, receipt := range receipts {
+		if receipt.Status == "delivered" || (dryRun && receipt.Status == "planned") {
+			injected = append(injected, receipt.Pane)
 		}
-		return injectedPanes, nil
 	}
-	if sender == nil {
-		return []int{}, fmt.Errorf("context injection sender is required")
-	}
-
-	for _, pane := range panes {
-		if err := sender(pane.ID, content, true); err != nil {
-			slog.Warn("failed to send context to pane",
-				"session", session,
-				"pane", pane.Index,
-				"error", err,
-			)
-			continue
-		}
-		injectedPanes = append(injectedPanes, pane.Index)
-	}
-	return injectedPanes, nil
+	return injected, err
 }
 
 // formatContextInjectContent reads files and formats them for injection.
@@ -415,162 +416,111 @@ func formatContextInjectContent(projectDir string, files []string, maxBytes int)
 }
 
 func newContextInjectCmd() *cobra.Command {
-	var (
-		filesArg  string
-		maxBytes  int
-		targetAll bool
-		paneIdx   int
-		dryRun    bool
-	)
+	return newContextInjectCmdWithDeps(nil)
+}
+
+// newContextInjectCmdWithDeps keeps the real Cobra surface testable without
+// a live tmux server or context providers. Production uses the same handler.
+func newContextInjectCmdWithDeps(deps *contextInjectDeps) *cobra.Command {
+	opts := contextInjectOptions{Pane: -1}
 
 	cmd := &cobra.Command{
 		Use:   "inject <session>",
-		Short: "Inject project context files into agent panes",
+		Short: "Inject project files or agent-specific context packs",
 		Long: `Read AGENTS.md, README.md, and .claude/project_context.md from the
 project directory and send their contents to agent panes.
 
 Default files (skipped if missing): AGENTS.md, README.md, .claude/project_context.md
 
-Use --files to override the file list.`,
+Use --files to override the file list.
+Use --build to assemble native source, BV triage, CM rules, and CASS history
+once per target agent type, with that agent's format and token budget.
+These on-demand packs are transient; use context build to store an artifact.
+Use --pack ID to send a previously built artifact to matching agent types.
+Pack modes never truncate a rendered artifact; --max-bytes rejects an
+oversized pack instead. --dry-run prepares and validates but sends no keys.
+Failed sends may have partially written input: inspect uncertain receipts
+before retrying, rather than replaying the entire batch.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			sessionArg := strings.TrimSpace(args[0])
-			if sessionArg == "" {
-				return fmt.Errorf("session name is required")
+			opts.Session = strings.TrimSpace(args[0])
+			opts.FilesSet = cmd.Flags().Changed("files")
+			opts.PackSet = cmd.Flags().Changed("pack")
+			active := deps
+			if active == nil {
+				defaults := defaultContextInjectDeps(cmd.OutOrStdout())
+				active = &defaults
 			}
-
-			res, err := ResolveSessionWithOptions(sessionArg, cmd.OutOrStdout(), SessionResolveOptions{TreatAsJSON: IsJSONOutput()})
-			if err != nil {
-				return err
-			}
-			session := res.Session
-
-			// Resolve project directory
-			projectDir, err := resolveExplicitProjectDirForSessionContext(cmd.Context(), session)
-			if err != nil {
-				return err
-			}
-
-			// Determine files to inject
-			files := defaultContextFiles()
-			if filesArg != "" {
-				files = strings.Split(filesArg, ",")
-				for i := range files {
-					files[i] = strings.TrimSpace(files[i])
-				}
-			}
-
-			// bd-usgfy: emitInjectFailure writes the success:false envelope and
-			// signals non-zero exit so `ntm context inject --json` automation
-			// can gate on $? without re-parsing JSON (parity with #125).
-			emitInjectFailure := func(result ContextInjectResult) error {
-				if encErr := output.PrintJSON(result); encErr != nil {
+			result, err := runContextInjection(cmd.Context(), opts, *active)
+			if IsJSONOutput() {
+				if encErr := json.NewEncoder(cmd.OutOrStdout()).Encode(result); encErr != nil {
 					return encErr
 				}
-				return jsonFailureExit()
-			}
-
-			// Build the injection content
-			content, injected, truncated, err := formatContextInjectContent(projectDir, files, maxBytes)
-			if err != nil {
-				if IsJSONOutput() {
-					return emitInjectFailure(ContextInjectResult{
-						Success: false,
-						Session: session,
-						Error:   err.Error(),
-					})
+				if err != nil {
+					return jsonFailureExit()
 				}
-				return err
-			}
-
-			if len(injected) == 0 {
-				if IsJSONOutput() {
-					return output.PrintJSON(ContextInjectResult{
-						Success:       true,
-						Session:       session,
-						InjectedFiles: []string{},
-						PanesInjected: []int{},
-					})
-				}
-				fmt.Println("No context files found to inject.")
 				return nil
 			}
-
-			// Get panes
-			panes, err := tmux.GetPanes(session)
-			if err != nil {
-				if IsJSONOutput() {
-					return emitInjectFailure(ContextInjectResult{
-						Success: false,
-						Session: session,
-						Error:   fmt.Sprintf("get panes: %s", err),
-					})
+			w := cmd.OutOrStdout()
+			fmt.Fprintf(w, "Context injection: session=%s mode=%s dry-run=%t success=%t\n", result.Session, result.Mode, result.DryRun, result.Success)
+			for _, receipt := range result.Deliveries {
+				fmt.Fprintf(w, "  Pane %d (%s): %s, %d bytes", receipt.Pane, receipt.Target, receipt.Status, receipt.Bytes)
+				if receipt.PackID != "" {
+					fmt.Fprintf(w, ", pack=%s", receipt.PackID)
 				}
-				return fmt.Errorf("get panes: %w", err)
+				fmt.Fprintln(w)
 			}
-
-			targetPanes, err := selectContextInjectTargetPanes(panes, paneIdx, targetAll, session)
-			if err != nil {
-				if IsJSONOutput() {
-					return emitInjectFailure(ContextInjectResult{
-						Success: false,
-						Session: session,
-						Error:   err.Error(),
-					})
-				}
-				return err
+			for _, warning := range result.Warnings {
+				fmt.Fprintf(w, "  Warning: %s\n", warning)
 			}
-
-			injectedPanes, err := injectContextIntoPanes(session, targetPanes, content, dryRun, tmux.SendKeys)
-			if err != nil {
-				if IsJSONOutput() {
-					return emitInjectFailure(ContextInjectResult{
-						Success: false,
-						Session: session,
-						Error:   err.Error(),
-					})
-				}
-				return err
+			if result.Truncated {
+				fmt.Fprintln(w, "  Content was truncated to fit its budget.")
 			}
-
-			result := ContextInjectResult{
-				Success:       true,
-				Session:       session,
-				InjectedFiles: injected,
-				TotalBytes:    len(content),
-				Truncated:     truncated,
-				PanesInjected: injectedPanes,
-			}
-
-			if IsJSONOutput() {
-				return output.PrintJSON(result)
-			}
-
-			// Human-readable output
-			if dryRun {
-				fmt.Println("[dry-run] Would inject context:")
-			} else {
-				fmt.Println("Context injected:")
-			}
-			fmt.Printf("  Session: %s\n", session)
-			fmt.Printf("  Files:   %s\n", strings.Join(injected, ", "))
-			fmt.Printf("  Size:    %d bytes\n", len(content))
-			if truncated {
-				fmt.Println("  (content was truncated)")
-			}
-			fmt.Printf("  Panes:   %v\n", injectedPanes)
-
-			return nil
+			return err
 		},
 	}
 
-	cmd.Flags().StringVar(&filesArg, "files", "", "Comma-separated list of files to inject (overrides defaults)")
-	cmd.Flags().IntVar(&maxBytes, "max-bytes", 0, "Maximum total content size in bytes (0 = unlimited)")
-	cmd.Flags().BoolVar(&targetAll, "all", false, "Inject to all panes including user pane (default: agent panes only)")
-	cmd.Flags().IntVar(&paneIdx, "pane", -1, "Inject to specific pane index only")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be injected without sending")
+	cmd.Flags().StringVar(&opts.FilesArg, "files", "", "Comma-separated project files (--build also accepts globs)")
+	cmd.Flags().IntVar(&opts.MaxBytes, "max-bytes", 0, "Per-message byte limit (pack modes reject rather than truncate)")
+	cmd.Flags().BoolVar(&opts.All, "all", false, "Select all panes (pack modes require every target to be an agent)")
+	cmd.Flags().IntVar(&opts.Pane, "pane", -1, "Inject to a specific pane index")
+	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Prepare and validate without sending")
+	cmd.Flags().BoolVar(&opts.Build, "build", false, "Build a fresh context pack for each target agent type")
+	cmd.Flags().StringVar(&opts.PackID, "pack", "", "Inject a stored context pack into matching agent types")
+	cmd.Flags().StringVar(&opts.Task, "task", "", "Task description for context retrieval (requires --build)")
+	cmd.Flags().StringVar(&opts.BeadID, "bead", "", "Bead ID to include in built packs (requires --build)")
 
 	return cmd
+}
+
+func defaultContextInjectDeps(w io.Writer) contextInjectDeps {
+	builder := ntmctx.NewContextPackBuilder(nil)
+	return contextInjectDeps{
+		resolve: func(ctx context.Context, name string) (string, error) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			res, err := ResolveSessionWithOptions(name, w, SessionResolveOptions{TreatAsJSON: IsJSONOutput()})
+			if err != nil {
+				return "", err
+			}
+			return res.Session, nil
+		},
+		project: resolveExplicitProjectDirForSessionContext,
+		panes:   tmux.GetPanes,
+		build:   builder.Build,
+		load: func(id string) (*state.ContextPack, error) {
+			store, err := state.Open("")
+			if err != nil {
+				return nil, fmt.Errorf("open state store: %w", err)
+			}
+			defer store.Close()
+			return store.GetContextPack(id)
+		},
+		send:      sendContextToPane,
+		includeMS: cfg != nil && cfg.Context.MSSkills,
+		remote:    tmux.DefaultClient.Remote != "",
+	}
 }
 
 // getRepoRev returns the current git HEAD revision

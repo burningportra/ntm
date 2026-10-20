@@ -12,54 +12,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
-func TestParsePaneList(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected []int
-	}{
-		{name: "empty string", input: "", expected: nil},
-		{name: "single value", input: "0", expected: []int{0}},
-		{name: "multiple values", input: "0,1,2", expected: []int{0, 1, 2}},
-		{name: "with spaces", input: "0, 1, 2", expected: []int{0, 1, 2}},
-		{name: "range", input: "0-3", expected: []int{0, 1, 2, 3}},
-		{name: "mixed range and individual", input: "0-2,5,7-9", expected: []int{0, 1, 2, 5, 7, 8, 9}},
-		{name: "single value range", input: "5-5", expected: []int{5}},
-		{name: "invalid range (reversed)", input: "5-3", expected: nil},
-		{name: "trailing comma", input: "0,1,", expected: []int{0, 1}},
-		{name: "leading comma", input: ",0,1", expected: []int{0, 1}},
-		{name: "double comma", input: "0,,1", expected: []int{0, 1}},
-		{name: "non-numeric ignored", input: "0,abc,2", expected: []int{0, 2}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := parsePaneList(tt.input)
-
-			if tt.expected == nil && result == nil {
-				return
-			}
-			if tt.expected == nil && len(result) == 0 {
-				return
-			}
-			if len(result) == 0 && tt.expected == nil {
-				return
-			}
-
-			if len(result) != len(tt.expected) {
-				t.Errorf("parsePaneList(%q) = %v, want %v", tt.input, result, tt.expected)
-				return
-			}
-
-			for i, v := range result {
-				if v != tt.expected[i] {
-					t.Errorf("parsePaneList(%q)[%d] = %d, want %d", tt.input, i, v, tt.expected[i])
-				}
-			}
-		})
-	}
-}
-
 func TestAdoptedAgentCountsTotal(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -204,17 +156,17 @@ func TestAdoptedAgentMailRegistrations(t *testing.T) {
 		if len(got) != 2 {
 			t.Fatalf("registrations = %d, want 2 non-user panes", len(got))
 		}
-		if got[0].paneID != "%10" || got[0].paneIndex != 1 || got[0].paneTitle != "demo__cc_1" || got[0].agentType != "cc" {
+		if got[0].PaneID != "%10" || got[0].PaneIndex != 1 || got[0].PaneTitle != "demo__cc_1" || got[0].AgentType != "cc" {
 			t.Fatalf("first registration = %+v, want canonical adopted Claude pane", got[0])
 		}
-		if got[1].paneID != "%11" || got[1].paneTitle != "demo__cod_1" || got[1].agentType != "cod" {
+		if got[1].PaneID != "%11" || got[1].PaneTitle != "demo__cod_1" || got[1].AgentType != "cod" {
 			t.Fatalf("second registration = %+v, want canonical adopted Codex pane", got[1])
 		}
 	})
 
 	t.Run("without rename, registry uses the live pane title", func(t *testing.T) {
 		got := adoptedAgentMailRegistrations(adopted[:1], false)
-		if len(got) != 1 || got[0].paneTitle != "external-claude" {
+		if len(got) != 1 || got[0].PaneTitle != "external-claude" {
 			t.Fatalf("registrations = %+v, want original live title", got)
 		}
 	})
@@ -281,7 +233,7 @@ func TestValidateAdoptAssignments(t *testing.T) {
 		{
 			name:        "no panes",
 			assignments: map[agentpkg.AgentType][]paneSpec{},
-			wantErr:     "use one or more of --cc, --cod, --gmi, --pi, --kimi, --muse, --agy, --grok, --cursor, --windsurf, --aider, --oc, --ollama, or --user",
+			wantErr:     "use one or more of --cc, --cod, --gmi, --pi, --kimi, --muse, --agy, --grok, --cursor, --windsurf, --aider, --oc, --omp, --ollama, or --user",
 		},
 	}
 

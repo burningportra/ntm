@@ -47,7 +47,7 @@ var promptPatterns = []PromptPattern{
 
 	// Codex CLI patterns
 	{AgentType: "cod", Regex: regexp.MustCompile(`(?i)codex>?\s*$`), Description: "Codex prompt"},
-	{AgentType: "cod", Regex: regexp.MustCompile(`^\s*›\s*.*$`), Description: "Codex chevron prompt"},
+	{AgentType: "cod", Regex: regexp.MustCompile(`^\s*[›»]\s*.*$`), Description: "Codex chevron prompt (\"»\" at effort ultra, GH#273)"},
 
 	// Gemini CLI patterns
 	{AgentType: "gmi", Regex: regexp.MustCompile(`(?i)gemini>?\s*$`), Description: "Gemini prompt"},
@@ -64,6 +64,19 @@ var promptPatterns = []PromptPattern{
 
 	// Ollama patterns
 	{AgentType: "ollama", Regex: regexp.MustCompile(`(?i)ollama>?\s*$`), Description: "Ollama prompt"},
+
+	// Grok Build patterns (GH#251 phase 2, from live grok 1.0.5 captures).
+	// The bordered composer line ("│ ❯ …  │") is permanent chrome, so
+	// DetectIdleFromOutput vetoes it with agent.GrokActivelyWorking first.
+	{AgentType: "grok", Regex: regexp.MustCompile(`^│\s*❯`), Description: "Grok Build bordered composer line"},
+	{AgentType: "grok", Regex: regexp.MustCompile(`(?i)grok\s+build\s+\d+\.\d+`), Description: "Grok Build banner/status line"},
+
+	// OpenCode patterns (ntm#261). The composer hint text is rendered only
+	// while the prompt is empty. DetectIdleFromOutput reads an opencode pane
+	// with agent.OpencodeIdlePromptShowing, which vetoes these with the live
+	// turn first; IsPromptLine callers get them line by line.
+	{AgentType: "oc", Regex: regexp.MustCompile(`(?i)\bAsk anything\b`), Description: "OpenCode empty-composer hint text"},
+	{AgentType: "oc", Regex: regexp.MustCompile(`(?i)^Interrupted$`), Description: "OpenCode post-interrupt acknowledgement"},
 
 	// Generic shell prompts (for user panes and fallback)
 	// Match simple prompts like "$" or "user@host:~$ "
@@ -140,17 +153,20 @@ var knownAgentTypes = map[string]bool{
 	"cc":       true, // Claude Code uses "claude>" or ">" prompts
 	"cod":      true, // Codex uses "codex>" prompt
 	"gmi":      true, // Gemini uses "gemini>" prompt
-	"oc":       true, // opencode's prompt is a box, matched by agent.OpencodeIdlePromptShowing
+	"agy":      true, // Antigravity uses a bare > composer, not a shell $ prompt
 	"pi":       true, // Pi's prompt is an editor box, matched by agent.PiIdlePromptShowing
 	"cursor":   true,
 	"windsurf": true,
 	"aider":    true,
 	"ollama":   true,
+	"grok":     true, // Grok Build renders a bordered "│ ❯" composer (GH#251)
+	"oc":       true, // opencode's prompt is a box, matched by agent.OpencodeIdlePromptShowing (ntm#261)
+	"omp":      true, // Oh My Pi renders a status-line composer box
 }
 
 // knownAgentPromptPrefixes matches prompts that belong to specific agent types.
 // When agentType is empty, the generic ">" pattern should not match these.
-var knownAgentPromptPrefixes = regexp.MustCompile(`(?i)^(claude|codex|gemini|cursor|windsurf|aider|ollama)>\s*$`)
+var knownAgentPromptPrefixes = regexp.MustCompile(`(?i)^(claude|codex|gemini|cursor|windsurf|aider|ollama|opencode)>\s*$`)
 
 // ccActiveSpinnerPatterns detect Claude Code's "actively working" indicators
 // (randomized timing spinners like "Scurrying… (12s)", the extended-thinking
@@ -200,6 +216,24 @@ const maxIdleScanLines = 12
 func DetectIdleFromOutput(output string, agentType string) bool {
 	agentType = string(agent.AgentType(agentType).Canonical())
 
+	// These composers remain visible during work. The unified detector
+	// already trusts their live markers, but health checks and startup wait
+	// loops also call this helper directly. A marker ABOVE the prompt must
+	// veto idle here too; activeWorkBelow alone cannot protect those callers.
+	if agentType == string(agent.AgentTypeCodex) && agent.CodexActivelyWorking(output, 0) {
+		return false
+	}
+	if agentType == string(agent.AgentTypeAntigravity) && agent.AntigravityActivelyWorking(output, 0) {
+		return false
+	}
+
+	// Gemini's current composer and quota footer need structural handling.
+	// The shared classifier vetoes idle during live work or real rate limits
+	// and never treats a draft or a prompt above new output as readiness.
+	if agentType == string(agent.AgentTypeGemini) {
+		return agent.DetectGeminiTurn(StripANSI(output)) == agent.GeminiTurnIdle
+	}
+
 	// Claude Code: the shared classifier (internal/agent.ClaudeActivelyWorking)
 	// owns the working verdict and is authoritative. Claude pins its "❯ " input
 	// box to the BOTTOM of the screen at all times, so an idle-prompt match
@@ -208,7 +242,7 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 	// biased to false-WORKING, so gating on it here can never report a busy
 	// Claude pane as idle.
 	if agentType == string(agent.AgentTypeClaudeCode) {
-		if agent.ClaudeActivelyWorking(output) {
+		if agent.ClaudeActivelyWorking(output, 0) {
 			return false
 		}
 		// Not actively working → idle iff a finished-turn prompt is showing.
@@ -222,6 +256,15 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 		// prompts the shared recognizer doesn't enumerate (e.g. "claude>") are
 		// still caught, but without the activeWorkBelow guard — Claude work is
 		// already ruled out by ClaudeActivelyWorking above.
+	}
+
+	// Grok Build: the bordered composer is permanent chrome drawn during work,
+	// so the live in-flight markers (braille spinner activity line /
+	// "Esc:cancel" footer hint) must veto idle first. GrokActivelyWorking is
+	// biased to false-WORKING, so gating on it can never report a busy grok
+	// pane as idle (GH#251 phase 2).
+	if agentType == string(agent.AgentTypeGrok) && agent.GrokActivelyWorking(output, 0) {
+		return false
 	}
 
 	// Muse Code shares Claude's "❯" composer, keeps it drawn under the live
@@ -246,9 +289,25 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 	// opencode draws no prompt glyph either: its prompt is a box above the
 	// footer, drawn for the whole turn, and only the progress bar on the
 	// footer line marks a live turn. The shared recognizer is authoritative,
-	// as for Pi.
+	// as for Pi; where no box is drawn it reads the empty composer's hint
+	// text, vetoed by the `esc interrupt` footer (ntm#261).
 	if agentType == string(agent.AgentTypeOpencode) {
 		return agent.OpencodeIdlePromptShowing(output)
+	}
+
+	// Oh My Pi has no prompt glyph to scan for: its idle signal is the
+	// structurally parsed composer box with no in-flight spinner/timer or
+	// Esc-hint line and nothing rendered below it. A line scan would match
+	// look-alike tool-output box borders, so the shared parser decides.
+	if agentType == string(agent.AgentTypeOmp) {
+		return agent.OmpIdlePromptShowing(output)
+	}
+
+	// Registered plugin agents: declared Working patterns veto idle; declared
+	// Idle patterns are consulted alongside the generic prompt scan (ntm#260).
+	pluginPatterns, isPlugin := agent.LookupPluginPatterns(agent.AgentType(agentType))
+	if isPlugin && agent.PluginActivelyWorking(output, agent.AgentType(agentType), 0) {
+		return false
 	}
 
 	// Strip ANSI first for cleaner processing
@@ -266,6 +325,13 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 			continue
 		}
 		linesChecked++
+		if isPlugin && len(pluginPatterns.Idle) > 0 {
+			for _, re := range pluginPatterns.Idle {
+				if re.MatchString(line) {
+					return true
+				}
+			}
+		}
 		if IsPromptLine(line, agentType) {
 			// Guard against false idle: if the agent is actively working its
 			// input box is still drawn, but a spinner sits below the prompt.
@@ -318,24 +384,4 @@ func GetLastNonEmptyLine(output string) string {
 	}
 
 	return ""
-}
-
-// AddPromptPattern allows adding custom prompt patterns at runtime.
-// It is thread-safe and can be called concurrently with detection functions.
-func AddPromptPattern(agentType string, pattern string, description string) error {
-	regex, err := regexp.Compile(pattern)
-	if err != nil {
-		return err
-	}
-
-	promptPatternsMu.Lock()
-	defer promptPatternsMu.Unlock()
-
-	promptPatterns = append(promptPatterns, PromptPattern{
-		AgentType:   string(agent.AgentType(agentType).Canonical()),
-		Regex:       regex,
-		Description: description,
-	})
-
-	return nil
 }

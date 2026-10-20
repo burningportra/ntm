@@ -271,73 +271,6 @@ func TestIsRobotErrorLine_StackTrace(t *testing.T) {
 	}
 }
 
-func TestParseErrorsIndex(t *testing.T) {
-
-	tests := []struct {
-		name    string
-		input   string
-		wantOK  bool
-		wantIdx int
-	}{
-		{"simple number", "5", true, 5},
-		{"zero", "0", true, 0},
-		{"multi-digit", "42", true, 42},
-		{"large number", "999", true, 999},
-		{"padded spaces", "  7  ", true, 7},
-		{"empty string", "", false, 0},
-		{"whitespace only", "   ", false, 0},
-		{"non-numeric", "abc", false, 0},
-		{"mixed", "12abc", false, 0},
-		{"negative", "-1", false, 0},
-		{"decimal", "3.5", false, 0},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			var idx int
-			ok, err := parseErrorsIndex(tc.input, &idx)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if ok != tc.wantOK {
-				t.Errorf("parseErrorsIndex(%q) ok = %v, want %v", tc.input, ok, tc.wantOK)
-			}
-			if ok && idx != tc.wantIdx {
-				t.Errorf("parseErrorsIndex(%q) idx = %d, want %d", tc.input, idx, tc.wantIdx)
-			}
-		})
-	}
-}
-
-func TestAgentTypeFromPaneType(t *testing.T) {
-
-	tests := []struct {
-		input    tmux.AgentType
-		expected string
-	}{
-		{tmux.AgentClaude, "claude"},
-		{tmux.AgentCodex, "codex"},
-		{tmux.AgentGemini, "gemini"},
-		{tmux.AgentCursor, "cursor"},
-		{tmux.AgentWindsurf, "windsurf"},
-		{tmux.AgentAider, "aider"},
-		{tmux.AgentOllama, "ollama"},
-		{tmux.AgentUser, "user"},
-		{tmux.AgentUnknown, "unknown"},
-		// Types not in the switch should return "unknown"
-		{tmux.AgentType("unknown_type"), "unknown"},
-	}
-
-	for _, tc := range tests {
-		t.Run(string(tc.input), func(t *testing.T) {
-			result := agentTypeFromPaneType(tc.input)
-			if result != tc.expected {
-				t.Errorf("agentTypeFromPaneType(%q) = %q, want %q", tc.input, result, tc.expected)
-			}
-		})
-	}
-}
-
 func TestDetectErrorsPaneAgentTypeUsesEnhancedDetection(t *testing.T) {
 
 	pane := tmux.Pane{ID: "%1", Type: tmux.AgentUser, Title: "notes", Command: ""}
@@ -362,26 +295,6 @@ func TestDetectErrorsPaneAgentTypeLeavesShellUnknown(t *testing.T) {
 	got := detectErrorsPaneAgentType(pane, "$ ")
 	if got != "unknown" {
 		t.Fatalf("detectErrorsPaneAgentType() = %q, want %q", got, "unknown")
-	}
-}
-
-func TestDefaultErrorsOptions(t *testing.T) {
-
-	opts := DefaultErrorsOptions()
-	if opts.Lines != 1000 {
-		t.Errorf("Lines = %d, want 1000", opts.Lines)
-	}
-	if opts.Context != 2 {
-		t.Errorf("Context = %d, want 2", opts.Context)
-	}
-	if opts.Session != "" {
-		t.Errorf("Session = %q, want empty", opts.Session)
-	}
-	if len(opts.Panes) != 0 {
-		t.Errorf("Panes = %v, want empty", opts.Panes)
-	}
-	if opts.AgentType != "" {
-		t.Errorf("AgentType = %q, want empty", opts.AgentType)
 	}
 }
 

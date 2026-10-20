@@ -241,62 +241,6 @@ func TestComputeDegradedFeatures_TmuxDegraded(t *testing.T) {
 	t.Logf("DEGRADED_FEATURES tmux_degraded count=%d", len(features))
 }
 
-func TestComputeQuotaReasonCode(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name         string
-		usagePercent float64
-		expected     ReasonCode
-	}{
-		{"zero_usage", 0, ReasonQuotaOK},
-		{"low_usage", 50, ReasonQuotaOK},
-		{"warning_threshold", 80, ReasonQuotaWarningTokens},
-		{"high_usage", 90, ReasonQuotaWarningTokens},
-		{"critical_threshold", 95, ReasonQuotaCriticalTokens},
-		{"exceeded", 100, ReasonQuotaExceededTokens},
-		{"over_limit", 105, ReasonQuotaExceededTokens},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			result := computeQuotaReasonCode(tc.usagePercent)
-			if result != tc.expected {
-				t.Errorf("usagePercent=%.1f: expected %q, got %q", tc.usagePercent, tc.expected, result)
-			}
-			t.Logf("QUOTA_REASON usage=%.1f code=%q", tc.usagePercent, result)
-		})
-	}
-}
-
-func TestReasonToStatus(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		code     ReasonCode
-		expected string
-	}{
-		{ReasonQuotaExceededTokens, "exceeded"},
-		{ReasonQuotaExceededRequests, "exceeded"},
-		{ReasonQuotaSuspended, "exceeded"},
-		{ReasonQuotaCriticalTokens, "critical"},
-		{ReasonQuotaWarningTokens, "warning"},
-		{ReasonQuotaWarningRequests, "warning"},
-		{ReasonQuotaOK, "ok"},
-		{"", "ok"},
-		{"unknown_code", "ok"},
-	}
-
-	for _, tc := range tests {
-		t.Run(string(tc.code), func(t *testing.T) {
-			result := reasonToStatus(tc.code)
-			if result != tc.expected {
-				t.Errorf("code=%q: expected %q, got %q", tc.code, tc.expected, result)
-			}
-		})
-	}
-}
-
 func TestFormatTimestamp(t *testing.T) {
 	t.Parallel()
 
@@ -307,34 +251,6 @@ func TestFormatTimestamp(t *testing.T) {
 		t.Errorf("expected RFC3339 format, got %s", result)
 	}
 	t.Logf("FORMAT_TIMESTAMP input=%v output=%s", ts, result)
-}
-
-func TestMatchesPattern(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		pattern  string
-		value    string
-		expected bool
-	}{
-		{"*", "anything", true},
-		{"beads", "beads", true},
-		{"beads", "quota", false},
-		{"beads*", "beads_v2", true},
-		{"*beads", "my_beads", true},
-		{"", "", false},          // empty pattern returns false
-		{"", "something", false}, // empty pattern returns false
-		{"pattern", "", false},   // empty value returns false
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.pattern+"_"+tc.value, func(t *testing.T) {
-			result := matchesPattern(tc.pattern, tc.value)
-			if result != tc.expected {
-				t.Errorf("pattern=%q value=%q: expected %v, got %v", tc.pattern, tc.value, tc.expected, result)
-			}
-		})
-	}
 }
 
 func TestSourceHealthReasonCodes_Unavailable(t *testing.T) {

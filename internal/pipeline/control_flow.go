@@ -21,7 +21,10 @@ import (
 // the round overlay from withRoundOverrides instead of falling back to
 // the (post-bd-2ubxp.20 unpopulated) state.Variables["round"].
 func (e *Executor) resolveBranch(ctx context.Context, step *Step) (string, error) {
-	expr := e.substituteVariablesCtx(ctx, step.Branch)
+	expr, err := e.substituteVariablesStrictCtx(ctx, step.Branch)
+	if err != nil {
+		return "", fmt.Errorf("branch predicate substitution failed: %w", err)
+	}
 
 	if strings.HasPrefix(expr, "$(") && strings.HasSuffix(expr, ")") {
 		shellCmd := expr[2 : len(expr)-1]
@@ -33,14 +36,15 @@ func (e *Executor) resolveBranch(ctx context.Context, step *Step) (string, error
 			"command", shellCmd,
 		)
 
-		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
-		configureCommandProcessGroup(cmd)
-		cmd.Cancel = func() error { return cancelCommandProcessGroup(cmd) }
+		cmd := exec.Command("/bin/sh", "-c", shellCmd)
 		if e.config.ProjectDir != "" {
 			cmd.Dir = e.config.ProjectDir
 		}
 
-		out, err := cmd.Output()
+		// A partial key must not select a branch (including its default).
+		// Share command-step ownership and enforce the workflow's byte limits.
+		limits := e.limits.EffectiveLimits()
+		out, err := runCommandOutput(ctx, cmd, limits.MaxCommandStdoutBytes, limits.MaxCommandStderrBytes)
 		if err != nil {
 			return "", fmt.Errorf("branch shell command failed: %w", err)
 		}
@@ -117,6 +121,9 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 		Status:    StatusRunning,
 		StartedAt: time.Now(),
 	}
+	if e.stopBeforeDispatch(ctx, &result) {
+		return result
+	}
 
 	slog.Info("branch step starting",
 		"run_id", e.state.RunID,
@@ -136,16 +143,16 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 		return result
 	}
 
-	key, err := e.resolveBranch(ctx, step)
+	decision, branchSteps, err := e.prepareBranchDecision(ctx, step)
 	if err != nil {
 		result.Status = StatusFailed
 		result.Error = &StepError{
 			Type:      "branch",
-			Message:   fmt.Sprintf("branch predicate failed: %v", err),
+			Message:   err.Error(),
 			Timestamp: time.Now(),
 		}
 		result.FinishedAt = time.Now()
-		slog.Error("branch predicate failed",
+		slog.Error("branch decision failed",
 			"run_id", e.state.RunID,
 			"step_id", step.ID,
 			"error", err,
@@ -153,41 +160,12 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 		return result
 	}
 
-	branchVal, lookupErr := lookupBranch(step.Branches, key)
-	if lookupErr != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "branch",
-			Message:   lookupErr.Error(),
-			Timestamp: time.Now(),
-		}
-		result.FinishedAt = time.Now()
-		slog.Error("branch lookup failed",
-			"run_id", e.state.RunID,
-			"step_id", step.ID,
-			"branch_key", key,
-			"error", lookupErr,
-		)
-		return result
-	}
-
+	key := decision.SelectorKey
 	slog.Info("branch step resolved",
 		"run_id", e.state.RunID,
 		"step_id", step.ID,
 		"branch_key", key,
 	)
-
-	branchSteps, parseErr := parseBranchSteps(branchVal, step.ID, key)
-	if parseErr != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "branch",
-			Message:   fmt.Sprintf("failed to parse branch body: %v", parseErr),
-			Timestamp: time.Now(),
-		}
-		result.FinishedAt = time.Now()
-		return result
-	}
 
 	// Snapshot variables before the branch body for scoping.
 	//
@@ -209,6 +187,16 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 	e.varMu.RLock()
 	varSnapshot := captureAllVariables(e.state.Variables)
 	e.varMu.RUnlock()
+	if varSnapshot == nil && len(decision.Scope) > 0 {
+		varSnapshot = make(map[string]interface{})
+	}
+	for name, saved := range decision.Scope {
+		if saved.Exists {
+			varSnapshot[name] = cloneInterfaceValue(saved.Value)
+		} else {
+			delete(varSnapshot, name)
+		}
+	}
 	defer func() {
 		e.varMu.Lock()
 		runtimePersist := extractRuntimeKeys(e.state.Variables)
@@ -242,34 +230,43 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 		// keys this branch owns. Nested constructs namespace their own children
 		// under this ID, so a prefix match covers them too.
 		bodyStepIDs = append(bodyStepIDs, bs.ID)
-		sr := e.executeStepOnce(ctx, &bs, workflow)
-
-		// bd-afwly: branch body steps now honor the on_failure runtime
-		// action / recovery contract used by top-level executeStep, so
-		// fallback_to_ntm_inbox / suppress_failure work the same inside
-		// a branch as outside it.
-		if sr.Status == StatusFailed {
-			sr = e.executeOnFailureAction(&bs, sr)
-			if sr.Status == StatusFailed {
-				sr = e.executeOnFailureRecovery(ctx, &bs, workflow, sr)
-			}
+		// Preserve the identity fence for every recorded result, including
+		// unfinished work that will re-enter the canonical lifecycle.
+		e.stateMu.RLock()
+		saved, recorded := e.state.Steps[bs.ID]
+		e.stateMu.RUnlock()
+		if recorded && saved.StepID != bs.ID {
+			result.Status = StatusFailed
+			result.FinishedAt = time.Now()
+			result.Error = &StepError{Type: "recovery", Message: fmt.Sprintf("branch child %q has mismatched saved result identity %q; refusing replay", bs.ID, saved.StepID), Timestamp: result.FinishedAt}
+			return result
+		}
+		sr, adopted, err := e.adoptBranchChild(ctx, decision, &bs, workflow)
+		if err != nil {
+			result.Status = StatusFailed
+			result.Output = strings.Join(outputs, "\n")
+			result.FinishedAt = time.Now()
+			result.Error = &StepError{Type: "branch_recovery", Message: err.Error(), Timestamp: result.FinishedAt}
+			return result
+		}
+		if !adopted {
+			// Unsettled children retain the canonical retry, cancellation and
+			// external-effect receipt rules. Only proven completion is adopted.
+			sr = e.executeStep(ctx, &bs, workflow)
+		} else {
+			slog.Info("branch child result adopted", "run_id", e.state.RunID, "step_id", bs.ID, "status", sr.Status)
 		}
 		outputs = append(outputs, sr.Output)
 
-		e.stateMu.Lock()
-		e.state.Steps[bs.ID] = sr
-		e.stateMu.Unlock()
-
-		// bd-2g48y: branch body steps reach this seam via executeStepOnce
-		// (not the executeStep retry loop), so the OnSuccess hook at
-		// executor.go:847 was never fired for an on_success chain attached
-		// to a branch body step. Fire it here on the same Completed
-		// contract (matches command-step parents and bd-h8lc4's top-level
-		// Parallel/Loop fix). bs.ID is already namespaced via
-		// scopedChildStepID above so OnSuccess child results land at
-		// <branch.ID>_<branchKey>_<chosenChild>_on_success_<...>.
-		if sr.Status == StatusCompleted {
-			e.runOnSuccessSteps(ctx, &bs, workflow)
+		// executeStep has retired this child's in-flight marker. Persist the
+		// settled result before another child (or any of its side effects) can
+		// begin. A storage fault is fatal even under on_error: continue.
+		if err := e.checkpointBranchChild(ctx, step.ID, &bs, sr); err != nil {
+			result.Output = strings.Join(outputs, "\n")
+			result.Status = StatusFailed
+			result.FinishedAt = time.Now()
+			result.Error = &StepError{Type: "checkpoint", Message: err.Error(), Timestamp: result.FinishedAt}
+			return result
 		}
 
 		if sr.Status == StatusFailed || sr.Status == StatusCancelled {
@@ -392,6 +389,14 @@ func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow
 	for i := range parent.OnSuccess {
 		child := parent.OnSuccess[i]
 		child.ID = onSuccessChildStepID(parent.ID, child.ID, i+1)
+		e.stateMu.RLock()
+		prior, exists := e.state.Steps[child.ID]
+		e.stateMu.RUnlock()
+		if exists && !shouldRerunStep(prior) {
+			// The parent command/delivery receipt can be durable before its
+			// StepResult. Adopting it must not repeat already-finished hooks.
+			continue
+		}
 
 		result := e.executeStep(childCtx, &child, workflow)
 		if result.FinishedAt.IsZero() {
@@ -429,19 +434,45 @@ func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow
 // executeStep machinery so it inherits retries, on_failure, and routing.
 // Failures here are persisted into state.Steps but DO NOT change the
 // overall pipeline status — post-pipeline steps are for cleanup and
-// notification, not gating (bd-w6nth.5).
-func (e *Executor) runPostPipelineSteps(ctx context.Context, workflow *Workflow) {
+// notification, not gating (bd-w6nth.5). Only ambiguous ownership of persisted
+// step/dispatch identities is returned as a fatal workflow error.
+func (e *Executor) runPostPipelineSteps(ctx context.Context, workflow *Workflow) error {
 	if workflow == nil || len(workflow.PostPipelineSteps) == 0 {
-		return
+		return nil
+	}
+	checkOwnership := func() error {
+		e.stateMu.RLock()
+		defer e.stateMu.RUnlock()
+		if e.graph != nil {
+			if phaseErrors := e.graph.validatePhaseOwnership(e.state); len(phaseErrors) > 0 {
+				return phaseErrors[0]
+			}
+		}
+		return nil
 	}
 
 	for i := range workflow.PostPipelineSteps {
+		if ctx.Err() != nil || e.checkpointFailure() != nil {
+			return nil
+		}
+		// Main work or an earlier hook may materialize dynamic IDs after
+		// initial preflight. Do not adopt them as a different hook's result.
+		if err := checkOwnership(); err != nil {
+			return err
+		}
 		step := workflow.PostPipelineSteps[i]
 		if step.ID == "" {
 			step.ID = fmt.Sprintf("post_pipeline_%d", i+1)
 		}
 
 		e.stateMu.Lock()
+		if prior, exists := e.state.Steps[step.ID]; exists && !shouldRerunStep(prior) {
+			// A previous attempt may have checkpointed only part of the
+			// post-pipeline tail. Resume restores these outputs before the
+			// main graph runs; do not repeat a completed handoff's effects.
+			e.stateMu.Unlock()
+			continue
+		}
 		e.state.CurrentStep = step.ID
 		e.state.UpdatedAt = time.Now()
 		e.stateMu.Unlock()
@@ -483,6 +514,7 @@ func (e *Executor) runPostPipelineSteps(ctx context.Context, workflow *Workflow)
 
 		e.persistState()
 	}
+	return checkOwnership()
 }
 
 func (e *Executor) executeOnFailureAction(step *Step, failed StepResult) StepResult {

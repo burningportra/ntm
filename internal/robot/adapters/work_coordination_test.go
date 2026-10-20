@@ -483,6 +483,38 @@ func TestNormalizeCoordinationDerivesReservationConflicts(t *testing.T) {
 	}
 }
 
+// Reservation overlap compares the patterns' path languages, as the
+// coordinator does. Matching one glob against the other's literal spelling
+// missed globs that only intersect, and a plain string glob let * cross
+// directories.
+func TestNormalizeCoordinationReservationOverlapUsesPathSemantics(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 22, 4, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name          string
+		left, right   string
+		wantConflicts int
+	}{
+		{name: "intersecting globs", left: "src/*/main.go", right: "src/service/*.go", wantConflicts: 1},
+		{name: "star stays within a directory", left: "src/*.go", right: "src/deep/main.go", wantConflicts: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			section := NormalizeCoordination(CoordinationInputs{
+				Reservations: []agentmail.FileReservation{
+					{ID: 1, PathPattern: tc.left, AgentName: "BlueLake", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: now.Add(time.Hour)}},
+					{ID: 2, PathPattern: tc.right, AgentName: "GreenStone", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: now.Add(time.Hour)}},
+				},
+				Now: now,
+			})
+			if section.Reservations == nil || section.Reservations.Conflicts != tc.wantConflicts {
+				t.Fatalf("%s vs %s: reservations = %+v, want %d conflict(s)", tc.left, tc.right, section.Reservations, tc.wantConflicts)
+			}
+		})
+	}
+}
+
 func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 	t.Parallel()
 
@@ -508,6 +540,9 @@ func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerLivenessProbe(w, r) {
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
@@ -531,6 +566,13 @@ func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 			switch {
 			case strings.HasPrefix(uri, "resource://agents/"):
 				writeJSONRPCError(t, w, req.ID, -32602, "agents unavailable")
+			case strings.HasPrefix(uri, "resource://project/"):
+				// The reservation read resolves the project's identity first.
+				writeJSONRPCResult(t, w, req.ID, map[string]any{
+					"contents": []map[string]string{{
+						"text": mustJSONText(t, map[string]any{"id": 17, "human_key": projectDir, "slug": "data-projects-ntm"}),
+					}},
+				})
 			case strings.HasPrefix(uri, "resource://file_reservations/"):
 				writeJSONRPCResult(t, w, req.ID, map[string]any{
 					"contents": []map[string]string{{
@@ -547,7 +589,7 @@ func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 	defer server.Close()
 
 	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
-	adapter := NewCoordinationAdapter(WorkCoordinationAdapterConfig{
+	adapter := NewWorkCoordinationAdapter(WorkCoordinationAdapterConfig{
 		ProjectDir:      projectDir,
 		AgentMailClient: client,
 	})
@@ -574,14 +616,18 @@ func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 }
 
 // TestCollectCoordinationPeeksAtInboxes guards bd-izmjq: the projection refresh
-// observes every agent's inbox, and fetch_inbox marks messages read unless told
-// otherwise, so a status call would consume other agents' mail.
+// observes every agent's inbox but the human overseer's, and fetch_inbox marks
+// messages read unless told otherwise, so a status call would consume other
+// agents' mail.
 func TestCollectCoordinationPeeksAtInboxes(t *testing.T) {
 	t.Parallel()
 
 	var mu sync.Mutex
 	markReadByAgent := map[string]any{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerLivenessProbe(w, r) {
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -595,7 +641,7 @@ func TestCollectCoordinationPeeksAtInboxes(t *testing.T) {
 			uri, _ := params["uri"].(string)
 			text := "[]"
 			if strings.HasPrefix(uri, "resource://agents/") {
-				text = mustJSONText(t, []agentmail.Agent{{Name: "BlueLake"}, {Name: "GreenStone"}})
+				text = mustJSONText(t, []agentmail.Agent{{Name: agentmail.HumanOverseerAgentName}, {Name: "BlueLake"}, {Name: "GreenStone"}})
 			}
 			writeJSONRPCResult(t, w, req.ID, map[string]any{"contents": []map[string]string{{"text": text}}})
 		case "tools/call":
@@ -617,7 +663,7 @@ func TestCollectCoordinationPeeksAtInboxes(t *testing.T) {
 	}))
 	defer server.Close()
 
-	adapter := NewCoordinationAdapter(WorkCoordinationAdapterConfig{
+	adapter := NewWorkCoordinationAdapter(WorkCoordinationAdapterConfig{
 		ProjectDir:      t.TempDir(),
 		AgentMailClient: agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/")),
 	})
@@ -638,7 +684,7 @@ func TestCollectCoordinationPeeksAtInboxes(t *testing.T) {
 	}
 }
 
-func TestCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *testing.T) {
+func TestWorkCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *testing.T) {
 	requests := make(chan struct{}, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- struct{}{}
@@ -646,7 +692,7 @@ func TestCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *testin
 	}))
 	defer server.Close()
 
-	adapter := NewCoordinationAdapter(WorkCoordinationAdapterConfig{
+	adapter := NewWorkCoordinationAdapter(WorkCoordinationAdapterConfig{
 		ProjectDir:      t.TempDir(),
 		AgentMailClient: agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/")),
 	})
@@ -667,7 +713,7 @@ func TestCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *testin
 	}
 }
 
-func TestWorkAdapterCollectCancelsBlockedBVWork(t *testing.T) {
+func TestWorkCoordinationAdapterCollectCancelsBlockedBVWork(t *testing.T) {
 	projectDir := t.TempDir()
 	for _, name := range []string{".git", ".beads"} {
 		if err := os.Mkdir(filepath.Join(projectDir, name), 0o755); err != nil {
@@ -682,7 +728,7 @@ func TestWorkAdapterCollectCancelsBlockedBVWork(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	adapter := NewWorkAdapter(DefaultWorkCoordinationAdapterConfig(projectDir))
+	adapter := NewWorkCoordinationAdapter(DefaultWorkCoordinationAdapterConfig(projectDir))
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -746,10 +792,24 @@ func installFakeBeadsTools(t *testing.T, brScript, bvScript string) string {
 	return projectDir
 }
 
+// answerLivenessProbe answers the liveness GET the client sends before any
+// MCP call (ntm#295) the way a live server does, and reports whether it did.
+func answerLivenessProbe(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	return true
+}
+
 // newFakeAgentMail serves one agent whose inbox holds an urgent unread message.
 func newFakeAgentMail(t *testing.T) *agentmail.Client {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerLivenessProbe(w, r) {
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -782,18 +842,18 @@ func newFakeAgentMail(t *testing.T) *agentmail.Client {
 	return agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
 }
 
-// bd-jv2dq: work and coordination were one source, and the aggregator drops
-// the batch of a source whose Collect fails, so a slow br or bv also threw
-// away the coordination section Agent Mail had answered in time.
-func TestWorkAndCoordinationSourcesDegradeIndependently(t *testing.T) {
+// bd-jv2dq: a slow br or bv used to run the shared deadline out before
+// coordination was read, so the coordination section Agent Mail could answer
+// in time was lost with the work section. Coordination is now read alongside
+// work, and the aggregator keeps the sections a failed batch carries.
+func TestWorkCoordinationCollectKeepsCoordinationWhenWorkOverrunsTheBudget(t *testing.T) {
 	blocking := "#!/bin/sh\nexec /bin/sleep 30\n"
 	projectDir := installFakeBeadsTools(t, blocking, blocking)
 	config := DefaultWorkCoordinationAdapterConfig(projectDir)
 	config.AgentMailClient = newFakeAgentMail(t)
 
 	aggregator := NewSignalAggregator(0)
-	aggregator.RegisterAdapter(NewWorkAdapter(config))
-	aggregator.RegisterAdapter(NewCoordinationAdapter(config))
+	aggregator.RegisterAdapter(NewWorkCoordinationAdapter(config))
 	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 	defer cancel()
 	started := time.Now()
@@ -811,23 +871,21 @@ func TestWorkAndCoordinationSourcesDegradeIndependently(t *testing.T) {
 	if got := signals.Coordination.Mail.UrgentUnread; got != 1 {
 		t.Fatalf("urgent unread = %d, want 1", got)
 	}
-	if source := signals.Health.Sources["coordination"]; !source.Available || source.Degraded {
-		t.Fatalf("coordination health = %+v, want available", source)
-	}
-	work := signals.Health.Sources["work"]
-	if work.Available || !work.Degraded || !strings.Contains(work.LastError, "deadline") {
-		t.Fatalf("work health = %+v, want degraded by the deadline", work)
+	if source := signals.Health.Sources["work_coordination"]; source.LastError == "" {
+		t.Fatalf("work_coordination health = %+v, want the work deadline recorded", source)
 	}
 }
 
 // bd-jv2dq: triage took longer than the whole source budget, so the work
 // section was lost even though br had answered. Triage is enrichment: the
 // section now carries br's data and returns before the deadline.
-func TestWorkAdapterReturnsBRDataWhenTriageOverrunsTheBudget(t *testing.T) {
+func TestWorkCoordinationAdapterReturnsBRDataWhenTriageOverrunsTheBudget(t *testing.T) {
 	projectDir := installFakeBeadsTools(t, fakeBRScript, "#!/bin/sh\nexec /bin/sleep 30\n")
+	config := DefaultWorkCoordinationAdapterConfig(projectDir)
+	config.AgentMailClient = newFakeAgentMail(t)
 
 	aggregator := NewSignalAggregator(0)
-	aggregator.RegisterAdapter(NewWorkAdapter(DefaultWorkCoordinationAdapterConfig(projectDir)))
+	aggregator.RegisterAdapter(NewWorkCoordinationAdapter(config))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	signals, err := aggregator.Collect(ctx)
@@ -848,18 +906,20 @@ func TestWorkAdapterReturnsBRDataWhenTriageOverrunsTheBudget(t *testing.T) {
 	if len(work.Ready) != 1 || len(work.Blocked) != 1 || len(work.InProgress) != 1 {
 		t.Fatalf("work items ready=%v blocked=%v in_progress=%v, want one of each", work.Ready, work.Blocked, work.InProgress)
 	}
-	if source := signals.Health.Sources["work"]; !source.Available || source.Degraded {
-		t.Fatalf("work health = %+v, want available", source)
+	if source := signals.Health.Sources["work_coordination"]; !source.Available || source.Degraded {
+		t.Fatalf("work_coordination health = %+v, want available", source)
 	}
 }
 
-func TestWorkAdapterUsesTriageThatIsReadyInTime(t *testing.T) {
+func TestWorkCoordinationAdapterUsesTriageThatIsReadyInTime(t *testing.T) {
 	triage := `{"data_hash":"abc","triage":{"quick_ref":{"actionable_count":1},"recommendations":[{"id":"bd-r","title":"Ready bead","type":"task","priority":1,"score":0.5}]}}`
 	projectDir := installFakeBeadsTools(t, fakeBRScript, "#!/bin/sh\nprintf '%s\\n' '"+triage+"'\n")
+	config := DefaultWorkCoordinationAdapterConfig(projectDir)
+	config.AgentMailClient = newFakeAgentMail(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	batch, err := NewWorkAdapter(DefaultWorkCoordinationAdapterConfig(projectDir)).Collect(ctx)
+	batch, err := NewWorkCoordinationAdapter(config).Collect(ctx)
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
@@ -872,9 +932,10 @@ func TestWorkAdapterUsesTriageThatIsReadyInTime(t *testing.T) {
 	}
 }
 
-// The coordination source peeks at every inbox but the overseer's, with
-// bodies for the previews, and leaves out an inbox that failed to load.
-func TestFetchInboxesPeeksEveryAgentButTheOverseer(t *testing.T) {
+// The coordination source peeks at every inbox it is given, with bodies for
+// the previews, and leaves out an inbox that failed to load without calling
+// the sweep cut short.
+func TestPeekInboxesPeeksEveryAgentAndLeavesOutFailures(t *testing.T) {
 	t.Parallel()
 
 	var mu sync.Mutex
@@ -899,17 +960,19 @@ func TestFetchInboxesPeeksEveryAgentButTheOverseer(t *testing.T) {
 	}))
 	defer server.Close()
 
-	agents := []agentmail.Agent{{Name: agentmail.HumanOverseerAgentName}, {Name: "BlueLake"}, {Name: "Broken"}, {Name: "GreenCastle"}}
 	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
-	inboxes := fetchInboxes(context.Background(), client, "/data/projects/ntm", agents)
+	inboxes, timedOut := peekInboxes(context.Background(), client, "/data/projects/ntm", []string{"BlueLake", "Broken", "GreenCastle"})
 
 	if len(inboxes) != 2 || len(inboxes["BlueLake"]) != 1 || len(inboxes["GreenCastle"]) != 1 {
 		t.Fatalf("inboxes = %+v, want BlueLake and GreenCastle with one message each", inboxes)
 	}
+	if timedOut {
+		t.Fatal("a failed inbox read reported the sweep as cut short")
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	if _, ok := requested[agentmail.HumanOverseerAgentName]; ok {
-		t.Fatal("fetched the HumanOverseer inbox")
+	if len(requested) != 3 {
+		t.Fatalf("fetched inboxes for %v, want BlueLake, Broken and GreenCastle", requested)
 	}
 	for agent, args := range requested {
 		if args["mark_read"] != false || args["include_bodies"] != true {

@@ -1,0 +1,306 @@
+package status
+
+import (
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+)
+
+func TestAgentTranscriptPreservesTextAndExcludesChromeOnlyCapture(t *testing.T) {
+	transcript := "prior answer\n\n  indented response\n"
+	chrome := "╭──────────╮\n│ ❯       │\n╰──────────╯\ncustom status text"
+	if got := AgentTranscript(transcript+chrome, "cc"); got != strings.TrimSuffix(transcript, "\n") {
+		t.Fatalf("transcript text changed: got %q", got)
+	}
+	if got := AgentTranscript(chrome, "cc"); got != "" {
+		t.Fatalf("chrome-only capture became response evidence: %q", got)
+	}
+	if got := AgentTranscript("plain\n  output\n", "unknown"); got != "plain\n  output\n" {
+		t.Fatalf("plain output changed: %q", got)
+	}
+}
+
+// claudePaneWithStatusLine reproduces the pane shape from ntm#322: a
+// transcript, then Claude Code's bordered composer, then a two-line
+// user-configured status line pinned at the very bottom. The status line text
+// is the reporter's own, which is by itself longer than the 200-character
+// preview window — so a blind tail truncation returns nothing but chrome.
+const claudePaneWithStatusLine = `● I looked at internal/api/auth.go and the token refresh path never
+  retries on a 401, so an expired token surfaces as a hard failure.
+
+● Update(internal/api/auth.go)
+  ⎿  Added retry-on-401 with a single refresh attempt.
+
+● The auth refactor is done. Tests pass.
+
+╭──────────────────────────────────────────────────────────────────────╮
+│ ❯                                                                    │
+╰──────────────────────────────────────────────────────────────────────╯
+  velist-mvp ctx 173k/1000k (17%) | 5h 27% ↻1h50m | 7d 9% ↻6… jeff@...
+  ▶▶ bypass permissions on (shift+tab to cycle) · ✓ Update installed · Restart to update`
+
+// TestLastMeaningfulOutputSkipsClaudeStatusLine is the ntm#322 regression.
+func TestLastMeaningfulOutputSkipsClaudeStatusLine(t *testing.T) {
+	got := LastMeaningfulOutput(claudePaneWithStatusLine, "cc", 200)
+
+	if got == "" {
+		t.Fatal("preview is empty; the transcript above the composer must survive")
+	}
+
+	// Nothing from the status line or the composer box may appear.
+	for _, chrome := range []string{
+		"bypass permissions",
+		"ctx 173k/1000k",
+		"Restart to update",
+		"╭", "╰", "│", "❯",
+	} {
+		if strings.Contains(got, chrome) {
+			t.Errorf("preview still carries chrome %q:\n%s", chrome, got)
+		}
+	}
+
+	// And it must be actual transcript.
+	if !strings.Contains(got, "The auth refactor is done") {
+		t.Errorf("preview lost the agent's last real output:\n%s", got)
+	}
+	if len(got) > 200 {
+		t.Errorf("preview length %d exceeds the 200-char budget", len(got))
+	}
+}
+
+// TestLastMeaningfulOutputMatchesOldTailOnPlainPanes guards against
+// over-trimming: a pane with no composer box (a plain shell, an agent type we
+// know nothing about) keeps returning its tail.
+func TestLastMeaningfulOutputMatchesOldTailOnPlainPanes(t *testing.T) {
+	plain := "make: entering directory\nbuilding...\nbuild finished in 4.2s"
+
+	for _, agentType := range []string{"", "user", "unknown", "aider"} {
+		got := LastMeaningfulOutput(plain, agentType, 200)
+		if !strings.Contains(got, "build finished in 4.2s") {
+			t.Errorf("agentType %q: preview lost the tail:\n%s", agentType, got)
+		}
+	}
+}
+
+// TestLastMeaningfulOutputKeepsTranscriptBoxes verifies that a boxed tool
+// result inside the transcript is not mistaken for the composer: the cut
+// anchors on the bottom-most composer marker, and content below a transcript
+// box survives.
+func TestLastMeaningfulOutputKeepsTranscriptBoxes(t *testing.T) {
+	withTranscriptBox := `● Here is the diff:
+
+┌──────────────────────┐
+│ - old line           │
+│ + new line           │
+└──────────────────────┘
+
+● Applied cleanly and the suite is green.`
+
+	got := LastMeaningfulOutput(withTranscriptBox, "cc", 200)
+	if !strings.Contains(got, "Applied cleanly") {
+		t.Errorf("content below a transcript box was trimmed away:\n%s", got)
+	}
+}
+
+// TestLastMeaningfulOutputKeepsBoxGluedToComposer covers the case with no
+// blank line between a transcript box and the input box. The upward walk must
+// stop at the transcript box's closing rule rather than absorbing it and the
+// content inside it.
+func TestLastMeaningfulOutputKeepsBoxGluedToComposer(t *testing.T) {
+	glued := `● Here is the diff:
+┌──────────────────────┐
+│ - old line           │
+│ + new KEEPME line    │
+└──────────────────────┘
+╭──────────────────────╮
+│ ❯                    │
+╰──────────────────────╯
+  ctx 12% | bypass on`
+
+	got := LastMeaningfulOutput(glued, "cc", 300)
+
+	if !strings.Contains(got, "KEEPME") {
+		t.Errorf("a transcript box glued to the composer was absorbed as chrome:\n%s", got)
+	}
+	if strings.Contains(got, "bypass on") || strings.Contains(got, "❯") {
+		t.Errorf("composer/status chrome survived:\n%s", got)
+	}
+}
+
+// TestLastMeaningfulOutputKeepsMarkdownBlockquotes guards the other
+// over-trim: a markdown blockquote in the transcript starts with ">", and
+// must not be mistaken for Claude's input box.
+func TestLastMeaningfulOutputKeepsMarkdownBlockquotes(t *testing.T) {
+	withQuote := `● The spec says:
+
+> A token refresh must be attempted exactly once.
+
+● So the retry loop is capped at one attempt.`
+
+	got := LastMeaningfulOutput(withQuote, "cc", 200)
+	if !strings.Contains(got, "retry loop is capped") {
+		t.Errorf("content below a markdown blockquote was trimmed away:\n%s", got)
+	}
+}
+
+// TestLastMeaningfulOutputComposerOnlyPaneFallsBack covers a pane that is all
+// chrome (a freshly started agent with no transcript yet): trimming must not
+// turn a sparse preview into an empty one.
+func TestLastMeaningfulOutputComposerOnlyPaneFallsBack(t *testing.T) {
+	composerOnly := `╭────────────────────────╮
+│ ❯                      │
+╰────────────────────────╯
+  ready`
+
+	if got := LastMeaningfulOutput(composerOnly, "cc", 200); got == "" {
+		t.Error("a composer-only pane produced an empty preview instead of falling back to the raw tail")
+	}
+}
+
+// TestAnalyzeAtStripsChromeFromPreview pins the dashboard's actual producer,
+// not just the helper: AgentStatus.LastOutput is what "Recent Output" renders.
+func TestAnalyzeAtStripsChromeFromPreview(t *testing.T) {
+	d := NewDetector()
+
+	got := d.AnalyzeAt("%1", "proj__cc_1", "cc", claudePaneWithStatusLine, time.Time{}, time.Now()).LastOutput
+
+	if strings.Contains(got, "bypass permissions") || strings.Contains(got, "ctx 173k/1000k") {
+		t.Errorf("AnalyzeAt preview still carries the status line:\n%s", got)
+	}
+	if !strings.Contains(got, "The auth refactor is done") {
+		t.Errorf("AnalyzeAt preview lost the transcript:\n%s", got)
+	}
+}
+
+// TestBoxRuleLinesNeverReachThePreview covers the belt-and-braces filter: a
+// border row that escapes chrome trimming (a composer box taller than the
+// scan window, for instance) must still not be shown as recent output.
+func TestBoxRuleLinesNeverReachThePreview(t *testing.T) {
+	// No composer marker anywhere, so trimAgentChrome returns the input
+	// untouched and only the final filter can drop the rules.
+	withBareRules := "● build finished\n╭──────────────╮\n╰──────────────╯"
+
+	got := LastMeaningfulOutput(withBareRules, "cc", 200)
+	for _, glyph := range []string{"╭", "╰", "─"} {
+		if strings.Contains(got, glyph) {
+			t.Errorf("box glyph %q reached the preview:\n%s", glyph, got)
+		}
+	}
+	if !strings.Contains(got, "build finished") {
+		t.Errorf("filtering the rules also dropped the content:\n%s", got)
+	}
+}
+
+// TestLastMeaningfulOutputBudget covers the maxLen contract across the
+// boundary where the ellipsis no longer fits.
+func TestLastMeaningfulOutputBudget(t *testing.T) {
+	long := strings.Repeat("abcdefghij", 40) // 400 chars, single line
+
+	for _, maxLen := range []int{0, 1, 3, 4, 10, 200, 1000} {
+		got := LastMeaningfulOutput(long, "cc", maxLen)
+		if maxLen <= 0 {
+			if got != "" {
+				t.Errorf("maxLen %d returned %q, want empty", maxLen, got)
+			}
+			continue
+		}
+		if len(got) > maxLen {
+			t.Errorf("maxLen %d: result length %d exceeds the budget", maxLen, len(got))
+		}
+	}
+}
+
+// TestLastMeaningfulOutputEdgeCases covers the inputs a live pane actually
+// produces that a hand-written fixture tends to miss: CRLF endings, chrome
+// wrapped in ANSI colour (a status line is almost always dim), multi-byte
+// transcript text, and degenerate budgets.
+func TestLastMeaningfulOutputEdgeCases(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		agent   string
+		maxLen  int
+		wantNot []string
+		wantHas []string
+	}{
+		{name: "empty input", in: "", agent: "cc", maxLen: 200},
+		{name: "only newlines", in: "\n\n\n\n", agent: "cc", maxLen: 200},
+		{
+			name:    "CRLF line endings",
+			in:      "● done building\r\n╭────╮\r\n│ ❯  │\r\n╰────╯\r\n  ctx 5% | bypass on\r\n",
+			agent:   "cc",
+			maxLen:  200,
+			wantNot: []string{"bypass on", "❯", "╭"},
+			wantHas: []string{"done building"},
+		},
+		{
+			name:    "ANSI-dimmed chrome is still chrome",
+			in:      "● built ok\n\x1b[2m╭────╮\x1b[0m\n\x1b[2m│ ❯  │\x1b[0m\n\x1b[2m╰────╯\x1b[0m\n\x1b[2m ctx 9%\x1b[0m",
+			agent:   "cc",
+			maxLen:  200,
+			wantNot: []string{"ctx 9%"},
+			wantHas: []string{"built ok"},
+		},
+		{
+			name:    "multi-byte transcript survives intact",
+			in:      "● 完了しました — ünïcode ✓\n╭──╮\n│ ❯│\n╰──╯\n status",
+			agent:   "cc",
+			maxLen:  200,
+			wantHas: []string{"完了しました", "ünïcode"},
+		},
+		{
+			name:   "budget of one byte does not panic",
+			in:     "● hello world this is long\n│ ❯ │\n status",
+			agent:  "cc",
+			maxLen: 1,
+		},
+		{
+			name:    "unknown agent type falls back to the tail",
+			in:      "line one\nline two",
+			agent:   "totally-unknown",
+			maxLen:  200,
+			wantHas: []string{"line two"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := LastMeaningfulOutput(tc.in, tc.agent, tc.maxLen)
+
+			if tc.maxLen > 0 && len(got) > tc.maxLen {
+				t.Errorf("length %d exceeds maxLen %d: %q", len(got), tc.maxLen, got)
+			}
+			// Truncation walks bytes, so a mid-rune cut is a live hazard.
+			if !utf8.ValidString(got) {
+				t.Errorf("preview is not valid UTF-8: %q", got)
+			}
+			for _, bad := range tc.wantNot {
+				if strings.Contains(got, bad) {
+					t.Errorf("preview still contains %q:\n%s", bad, got)
+				}
+			}
+			for _, want := range tc.wantHas {
+				if !strings.Contains(got, want) {
+					t.Errorf("preview missing %q:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
+// TestLastMeaningfulOutputCodexComposer covers the second bordered-composer
+// agent, including codex's ultra-effort glyph swap.
+func TestLastMeaningfulOutputCodexComposer(t *testing.T) {
+	for _, marker := range []string{"›", "»"} {
+		pane := "● codex finished the refactor.\n\n│ " + marker + "                    │\n  context left: 42%"
+
+		got := LastMeaningfulOutput(pane, "cod", 200)
+		if !strings.Contains(got, "codex finished the refactor") {
+			t.Errorf("marker %q: lost the transcript:\n%s", marker, got)
+		}
+		if strings.Contains(got, "context left") {
+			t.Errorf("marker %q: status line below the composer survived:\n%s", marker, got)
+		}
+	}
+}

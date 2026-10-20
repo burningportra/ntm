@@ -671,3 +671,57 @@ type AuditDecision struct {
 	// Reference
 	AuditEventID *int64 `json:"audit_event_id,omitempty"`
 }
+
+// =============================================================================
+// Send Operations (idempotent robot actuations: send #245, interrupt)
+// =============================================================================
+
+// Send operation lifecycle states.
+const (
+	SendOperationInProgress = "in_progress"
+	SendOperationCompleted  = "completed"
+)
+
+// Operation kinds: the robot actuation an operation ID is bound to. Operation
+// IDs share one namespace per session across kinds, so reusing an ID for a
+// different kind is a conflict, never a replay.
+const (
+	OperationKindSend      = "send"
+	OperationKindInterrupt = "interrupt"
+)
+
+// SendOperation is the durable record of one idempotent robot actuation
+// (--robot-send or --robot-interrupt with --op-id, or the REST
+// Idempotency-Key equivalents). It binds a caller-supplied operation ID to
+// the actuation kind, the caller's canonical command spec, and the exact
+// payload NTM attempted to deliver (digest + byte count only — the payload
+// bytes themselves are never persisted), and carries the recorded outcome
+// once the operation completes.
+type SendOperation struct {
+	// Identity
+	OperationID string `json:"operation_id"`
+	SessionName string `json:"session_name"`
+	// Kind is the actuation the operation ID is bound to (OperationKindSend
+	// or OperationKindInterrupt). Empty is treated as OperationKindSend when
+	// claiming, matching rows written before kinds existed.
+	Kind string `json:"kind"`
+
+	// Binding — BindingHash covers canonical targets + payload digest so a
+	// conflicting reuse of the same operation ID is detectable.
+	BindingHash   string   `json:"binding_hash"`
+	PayloadSHA256 string   `json:"payload_sha256"`
+	PayloadBytes  int64    `json:"payload_bytes"`
+	Targets       []string `json:"targets"`
+
+	// ClaimToken fences each execution attempt. It is replaced on takeover
+	// and never exposed in public receipts. A stale claimant cannot start,
+	// release, or complete a successor's operation.
+	ClaimToken string `json:"-"`
+
+	// Lifecycle
+	Status            string     `json:"status"` // in_progress | completed
+	OutcomeJSON       string     `json:"outcome_json,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	DispatchStartedAt *time.Time `json:"dispatch_started_at,omitempty"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+}

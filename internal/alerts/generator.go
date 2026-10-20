@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/errsig"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -22,28 +24,43 @@ var (
 	// 2. OSC sequences: \x1b] ... \a or \x1b\
 	ansiRegex = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\a\x1b]*(\a|\x1b\\)`)
 
+	// errorPatterns decide whether a pane is generating an agent-error alert,
+	// which is then promoted into aggregate session health. They therefore have
+	// to distinguish a failure from a *discussion* of a failure: unanchored
+	// keywords like `exception` and `timeout` turned a healthy reviewer pane
+	// into three "agent_error" alerts and a degraded session while
+	// --robot-health reported the same session healthy (ntm#299).
+	//
+	// Every pattern below is either anchored to the start of a line's content
+	// (errsig.Anchored tolerates TUI/log decoration) or is a multi-token
+	// runtime signature that prose does not produce.
 	errorPatterns = []struct {
 		pattern  *regexp.Regexp
 		severity Severity
 		msg      string
 	}{
-		{regexp.MustCompile(`(?i)error:`), SeverityError, "Error detected in agent output"},
-		{regexp.MustCompile(`(?i)fatal:`), SeverityCritical, "Fatal error in agent"},
-		{regexp.MustCompile(`(?i)panic:`), SeverityCritical, "Panic in agent"},
-		{regexp.MustCompile(`(?i)failed:`), SeverityWarning, "Operation failed in agent"},
-		{regexp.MustCompile(`(?i)exception`), SeverityError, "Exception in agent"},
-		{regexp.MustCompile(`(?i)traceback`), SeverityError, "Exception traceback detected"},
-		{regexp.MustCompile(`(?i)permission denied`), SeverityError, "Permission denied error"},
-		{regexp.MustCompile(`(?i)connection refused`), SeverityWarning, "Connection refused"},
-		{regexp.MustCompile(`(?i)timeout`), SeverityWarning, "Timeout detected"},
+		{regexp.MustCompile(errsig.Anchored(`(?i:(?:[\w.-]+\s+)?[\w.-]*error)\s*:\s*\S`)), SeverityError, "Error detected in agent output"},
+		{regexp.MustCompile(errsig.Anchored(`(?i:fatal(?:\s+error)?)\s*:\s*\S`)), SeverityCritical, "Fatal error in agent"},
+		{regexp.MustCompile(errsig.Anchored(`(?i:panic):\s`)), SeverityCritical, "Panic in agent"},
+		{regexp.MustCompile(errsig.Anchored(`(?i:failed)\b(?:\s+to\b|\s+with\b|\s*[:.]|\s*$)`)), SeverityWarning, "Operation failed in agent"},
+		{regexp.MustCompile(errsig.NonzeroExitPattern), SeverityWarning, "Nonzero exit in agent output"},
+		{regexp.MustCompile(errsig.Anchored(`(?i:[\w.]*exception)\s*:\s*\S`)), SeverityError, "Exception in agent"},
+		{regexp.MustCompile(errsig.Anchored(`(?i:traceback)\b`)), SeverityError, "Exception traceback detected"},
+		{regexp.MustCompile(errsig.Anchored(`(?i:permission denied)\b`) + `|(?i):\s*permission denied\b`), SeverityError, "Permission denied error"},
+		{regexp.MustCompile(`(?i)\bconnection refused\b`), SeverityWarning, "Connection refused"},
+		{regexp.MustCompile(`(?i)\b(?:connection|request|operation|read|write|handshake|dial|deadline)\s+timed?\s*out\b|(?i)\bcontext deadline exceeded\b|(?i)\bi/o timeout\b|(?i)\betimedout\b|` + errsig.Anchored(`(?i:timeout|timed\s+out)\b`)), SeverityWarning, "Timeout detected"},
+		{regexp.MustCompile(errsig.FatalSignalPattern), SeverityCritical, "Fatal signal in agent"},
 	}
 
+	// rateLimitPatterns follow the same contract. A bare "429" is not evidence:
+	// it appears inside SHA-256 digests, IDs and byte counts, and classifying
+	// those as provider rate limits walled off working agents (ntm#299).
 	rateLimitPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)rate.?limit`),
-		regexp.MustCompile(`(?i)too many requests`),
-		regexp.MustCompile(`(?i)429`),
-		regexp.MustCompile(`(?i)quota exceeded`),
-		regexp.MustCompile(`(?i)throttl`),
+		regexp.MustCompile(errsig.Anchored(`(?i:rate[\s_-]?limit)`) + `|(?i)\brate[\s_-]?limits?\s+(?:exceeded|reached)\b|(?i)\brate_limit_error\b|(?i)\b(?:hit|hitting|reached)\s+(?:the\s+|a\s+|your\s+)?rate[\s_-]?limit\b`),
+		regexp.MustCompile(`(?i)\btoo many requests\b`),
+		regexp.MustCompile(errsig.HTTPStatus("429", "too many requests", "rate limit")),
+		regexp.MustCompile(`(?i)\bquota exceeded\b`),
+		regexp.MustCompile(`(?i)\b(?:being|is|was|are|were|got|getting)\s+throttled\b|(?i)\bthrottl(?:ed|ing)\s+(?:detected|active|by)\b|` + errsig.Anchored(`(?i:throttl(?:ed|ing))\b`)),
 	}
 )
 
@@ -131,7 +148,13 @@ func (g *Generator) scanAgentSessions(
 			continue
 		}
 
+		contextUsage := g.paneContextUsage(sess.Name, panes)
+
 		for _, pane := range panes {
+			if alert := g.contextWarning(sess.Name, pane, contextUsage); alert != nil {
+				alerts = append(alerts, *alert)
+			}
+
 			// Capture pane output for analysis
 			output, err := capturePaneOutput(pane.ID, 50)
 			if err != nil {
@@ -170,6 +193,49 @@ func (g *Generator) scanAgentSessions(
 	return alerts, failedSources
 }
 
+// paneContextUsage asks the injected usage source about one session's panes.
+// It returns nil when context warnings are off: no source, or no positive
+// threshold.
+func (g *Generator) paneContextUsage(session string, panes []tmux.Pane) map[string]float64 {
+	if g.config.PaneContextUsage == nil || g.config.ContextWarningThreshold <= 0 {
+		return nil
+	}
+	return g.config.PaneContextUsage(session, panes)
+}
+
+// contextWarning raises a warning for an agent pane whose context usage has
+// reached alerts.context_warning_threshold. It is keyed by session and pane
+// under the session's agent source, so the tracker resolves it once usage
+// drops (after a rotation or compaction) instead of leaving it stale.
+func (g *Generator) contextWarning(session string, pane tmux.Pane, usage map[string]float64) *Alert {
+	pct, ok := usage[pane.ID]
+	threshold := g.config.ContextWarningThreshold
+	if !ok || pct < threshold {
+		return nil
+	}
+	label := strings.TrimSpace(pane.Title)
+	if label == "" {
+		label = pane.ID
+	}
+	now := time.Now()
+	return &Alert{
+		ID:       generateAlertID(AlertContextWarning, session, pane.ID),
+		Type:     AlertContextWarning,
+		Severity: SeverityWarning,
+		Source:   agentAlertSource(session),
+		Message:  fmt.Sprintf("Agent %s is at %.0f%% of its context window (warning threshold %.0f%%)", label, pct, threshold),
+		Session:  session,
+		Pane:     pane.ID,
+		Context: map[string]interface{}{
+			"context_percent":   pct,
+			"threshold_percent": threshold,
+		},
+		CreatedAt:  now,
+		LastSeenAt: now,
+		Count:      1,
+	}
+}
+
 func agentAlertSource(session string) string {
 	session = strings.TrimSpace(session)
 	if session == "" {
@@ -180,6 +246,18 @@ func agentAlertSource(session string) string {
 
 // detectErrorState checks pane output for error patterns
 func (g *Generator) detectErrorState(session string, pane tmux.Pane, lines []string) *Alert {
+	// Claude Code prints its own tool results inline: "⎿  Error: Exit code 1"
+	// for a grep with no match, compiler and test output for a failing build.
+	// While a live spinner or a completed turn is the newest marker, those
+	// lines are the agent's work, not the agent failing. A terminal error
+	// marker, or no marker at all (the CLI exited to a shell), still alerts.
+	if agentpkg.AgentType(pane.Type).Canonical() == agentpkg.AgentTypeClaudeCode {
+		switch agentpkg.DetectClaudeTurnState(strings.Join(lines, "\n"), pane.Width) {
+		case agentpkg.ClaudeTurnWorking, agentpkg.ClaudeTurnEnded:
+			return nil
+		}
+	}
+
 	// Check last N lines for patterns — return the highest-severity match
 	checkLines := lines
 	if len(checkLines) > 20 {
@@ -390,7 +468,7 @@ func (g *Generator) checkDependencyCycles() *Alert {
 	if len(insights.Cycles) > 0 {
 		cycleNodes := make([]string, 0)
 		for _, cycle := range insights.Cycles {
-			cycleNodes = append(cycleNodes, strings.Join(cycle.Nodes, " -> "))
+			cycleNodes = append(cycleNodes, strings.Join(cycle, " -> "))
 		}
 
 		return &Alert{

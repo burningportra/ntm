@@ -75,7 +75,7 @@ func TestRenderEmptyState(t *testing.T) {
 		out := RenderEmptyState(EmptyStateOptions{
 			Icon:        IconExternal,
 			Title:       "Not initialized",
-			Description: "Run 'bd init' in your project",
+			Description: "Run 'br init' in your project",
 			Width:       40,
 			Centered:    true,
 		})
@@ -168,6 +168,18 @@ func TestEmptyStateIcons(t *testing.T) {
 }
 
 func TestRetryState(t *testing.T) {
+	// Local helper mirroring the removed RetryState wrapper; exercises the
+	// live StateRetrying branch of RenderState.
+	RetryState := func(message string, attempt, maxAttempts, width int) string {
+		return RenderState(StateOptions{
+			Kind:        StateRetrying,
+			Message:     message,
+			Attempt:     attempt,
+			MaxAttempts: maxAttempts,
+			Width:       width,
+		})
+	}
+
 	t.Run("basic retry state", func(t *testing.T) {
 		out := RetryState("Retrying connection", 1, 3, 40)
 		if out == "" {

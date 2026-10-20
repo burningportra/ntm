@@ -42,6 +42,17 @@ func TestGetRobotRegistry_SurfaceCoverage(t *testing.T) {
 	}
 }
 
+// findRegistrySection is a test-local replacement for the removed
+// RobotRegistry.Section convenience lookup.
+func findRegistrySection(r *RobotRegistry, name string) (RobotSectionDescriptor, bool) {
+	for _, s := range r.Sections {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return RobotSectionDescriptor{}, false
+}
+
 func TestGetRobotRegistry_SectionReferencesResolve(t *testing.T) {
 
 	registry := GetRobotRegistry()
@@ -51,7 +62,7 @@ func TestGetRobotRegistry_SectionReferencesResolve(t *testing.T) {
 
 	for _, surface := range registry.Surfaces {
 		for _, sectionName := range surface.Sections {
-			section, ok := registry.Section(sectionName)
+			section, ok := findRegistrySection(registry, sectionName)
 			if !ok {
 				t.Fatalf("surface %q references unknown section %q", surface.Name, sectionName)
 			}
@@ -387,7 +398,7 @@ func TestGetRobotRegistry_SectionConsumerMetadataPopulated(t *testing.T) {
 	}
 
 	for _, tc := range keySections {
-		section, ok := registry.Section(tc.name)
+		section, ok := findRegistrySection(registry, tc.name)
 		if !ok {
 			t.Fatalf("missing section %q", tc.name)
 		}
@@ -794,7 +805,7 @@ func TestSectionBoundedness_WellFormed(t *testing.T) {
 	sectionsWithBoundedness := []string{"sessions", "work", "attention"}
 
 	for _, name := range sectionsWithBoundedness {
-		section, ok := registry.Section(name)
+		section, ok := findRegistrySection(registry, name)
 		if !ok {
 			t.Errorf("expected section %q not found", name)
 			continue
@@ -1165,5 +1176,49 @@ func TestGetSchema_InvalidTypeError(t *testing.T) {
 
 	if output.Hint == "" {
 		t.Error("GetSchema should provide hint for invalid type")
+	}
+}
+
+func TestSurfaceParameterSupport(t *testing.T) {
+	tests := []struct {
+		command, parameter string
+		wantAccepts        bool
+		wantKnown          bool
+	}{
+		{"--robot-interrupt", "--panes", true, true},
+		{"robot-interrupt", "panes", true, true},
+		{"--robot-interrupt", "--pane", false, true},
+		{"--robot-send", "--pane", true, true},
+		{"--robot-history", "--panes", false, true},
+		{"--robot-not-a-surface", "--panes", false, false},
+		{"", "--panes", false, false},
+		{"--robot-interrupt", "", false, false},
+	}
+	for _, tt := range tests {
+		accepts, known := SurfaceParameterSupport(tt.command, tt.parameter)
+		if accepts != tt.wantAccepts || known != tt.wantKnown {
+			t.Errorf("SurfaceParameterSupport(%q, %q) = (%v, %v), want (%v, %v)", tt.command, tt.parameter, accepts, known, tt.wantAccepts, tt.wantKnown)
+		}
+	}
+}
+
+func TestSurfaceFlagsAcceptingParameter(t *testing.T) {
+	flags := SurfaceFlagsAcceptingParameter("--pane")
+	want := map[string]bool{"--robot-send": false, "--robot-history": false}
+	for _, flag := range flags {
+		if _, ok := want[flag]; ok {
+			want[flag] = true
+		}
+		if flag == "--robot-interrupt" {
+			t.Errorf("--robot-interrupt must not be listed as accepting --pane: %v", flags)
+		}
+	}
+	for flag, seen := range want {
+		if !seen {
+			t.Errorf("%s missing from surfaces accepting --pane: %v", flag, flags)
+		}
+	}
+	if got := SurfaceFlagsAcceptingParameter(""); got != nil {
+		t.Errorf("empty parameter should yield nil, got %v", got)
 	}
 }

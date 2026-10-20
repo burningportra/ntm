@@ -685,6 +685,58 @@ func (s *Store) GetApproval(id string) (*Approval, error) {
 	return appr, nil
 }
 
+// ConsumeApproval atomically transitions an approval from approved to
+// consumed, reporting whether this call performed the transition. The status
+// guard runs inside the UPDATE itself (bd-2y2on): two concurrent gate
+// invocations — separate processes, so the engine's in-process mutex cannot
+// serialize them — may both read status=approved, but exactly one UPDATE
+// matches `status = 'approved'`; the loser matches zero rows and must treat
+// the approval as already spent.
+func (s *Store) ConsumeApproval(id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(
+		`UPDATE approvals SET status = ? WHERE id = ? AND status = ? AND expires_at > ?`,
+		ApprovalConsumed, id, ApprovalApproved, time.Now().UTC(),
+	)
+	if err != nil {
+		return false, fmt.Errorf("consume approval: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// UpdateApprovalFrom applies UpdateApproval's write only while the record's
+// status in the database still equals from, reporting whether this call
+// performed the transition. Status transitions (pending->approved,
+// pending->denied, pending->expired) MUST use this guard rather than the
+// blind UpdateApproval: like ConsumeApproval above, the deciding callers are
+// independent `ntm` processes sharing state.db, so an unguarded UPDATE would
+// let a racing approver silently overwrite a concurrent denial (or vice
+// versa) after both read status=pending.
+func (s *Store) UpdateApprovalFrom(appr *Approval, from ApprovalStatus) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(`
+		UPDATE approvals SET status = ?, approved_by = ?, approved_at = ?, denied_reason = ?
+		WHERE id = ? AND status = ?`,
+		appr.Status, appr.ApprovedBy, appr.ApprovedAt, appr.DeniedReason, appr.ID, from,
+	)
+	if err != nil {
+		return false, fmt.Errorf("update approval: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected: %w", err)
+	}
+	return rows > 0, nil
+}
+
 // UpdateApproval updates an existing approval.
 func (s *Store) UpdateApproval(appr *Approval) error {
 	s.mu.Lock()
@@ -721,6 +773,35 @@ func (s *Store) ListPendingApprovals() ([]Approval, error) {
 
 	if err != nil {
 		return nil, fmt.Errorf("list pending approvals: %w", err)
+	}
+	defer rows.Close()
+
+	var approvals []Approval
+	for rows.Next() {
+		var appr Approval
+		if err := rows.Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedAt, &appr.DeniedReason); err != nil {
+			return nil, fmt.Errorf("scan approval: %w", err)
+		}
+		approvals = append(approvals, appr)
+	}
+	return approvals, rows.Err()
+}
+
+// ListApprovalHistory returns ALL approval records regardless of status —
+// pending, approved, denied, consumed, and expired — newest first. This is
+// the backing query for `ntm approve history` (bd-ws7-docs-ux-truth-tqh3l.9):
+// history means resolved records too, each row carrying its status, decider,
+// and decision timestamp, not a pending-only list relabeled as history.
+func (s *Store) ListApprovalHistory() ([]Approval, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), approved_at, COALESCE(denied_reason, '')
+		FROM approvals
+		ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list approval history: %w", err)
 	}
 	defer rows.Close()
 

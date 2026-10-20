@@ -12,15 +12,33 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
-	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/config"
-	"github.com/Dicklesworthstone/ntm/internal/swarm"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
+var stopRestoreSessionMonitor = resilience.StopSessionMonitor
+
 // Restore recreates a session from saved state.
 func Restore(state *SessionState, opts RestoreOptions) (err error) {
+	return RestoreContext(context.Background(), state, opts)
+}
+
+// RestoreContext restores topology with cancellation, without launching agents.
+func RestoreContext(ctx context.Context, state *SessionState, opts RestoreOptions) error {
+	return restoreSession(ctx, state, opts, nil)
+}
+
+// launch receives the physical panes captured before restoring active windows
+// and zoom. Recovery must not rediscover positional targets after layout changes.
+func restoreSession(ctx context.Context, state *SessionState, opts RestoreOptions, launch func([]tmux.Pane) error) (err error) {
+	if ctx == nil {
+		return fmt.Errorf("session restore requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if state == nil {
 		return fmt.Errorf("session state is nil")
 	}
@@ -28,6 +46,33 @@ func Restore(state *SessionState, opts RestoreOptions) (err error) {
 	name := opts.Name
 	if name == "" {
 		name = state.Name
+	}
+	if err := tmux.ValidateSessionName(name); err != nil {
+		return fmt.Errorf("invalid session name: %w", err)
+	}
+	// Validate the complete topology before --force can replace a live session.
+	// Duplicate coordinates make the positional pane/agent mapping ambiguous.
+	seen := make(map[[2]int]bool, len(state.Panes))
+	for _, pane := range state.Panes {
+		coord := [2]int{pane.WindowIndex, pane.Index}
+		if pane.WindowIndex < 0 || pane.Index < 0 || seen[coord] {
+			return fmt.Errorf("invalid saved pane coordinates %d.%d", pane.WindowIndex, pane.Index)
+		}
+		seen[coord] = true
+	}
+	workDir, err := restoreWorkingDirectory(state.WorkDir)
+	if err != nil {
+		return err
+	}
+	for _, pane := range state.Panes {
+		if _, err := restorePaneDirectory(pane, workDir); err != nil {
+			return fmt.Errorf("saved pane %d.%d: %w", pane.WindowIndex, pane.Index, err)
+		}
+		if pane.LaunchSpec != nil {
+			if err := pane.LaunchSpec.Validate(tmux.ParsePaneAgentTypeOption(pane.AgentType)); err != nil {
+				return fmt.Errorf("saved pane %d.%d launch settings: %w", pane.WindowIndex, pane.Index, err)
+			}
+		}
 	}
 
 	correlationID := audit.NewCorrelationID()
@@ -64,43 +109,28 @@ func Restore(state *SessionState, opts RestoreOptions) (err error) {
 		_ = audit.LogEvent(name, audit.EventTypeCommand, audit.ActorSystem, "session.restore", payload, nil)
 	}()
 
-	// Check if session already exists
-	if tmux.SessionExists(name) {
+	// A probe failure is not proof that the session is absent. In particular,
+	// permission/socket errors must not let restore proceed with a mutation.
+	exists, err := tmux.SessionExistsContext(ctx, name)
+	if err != nil {
+		return fmt.Errorf("checking existing session: %w", err)
+	}
+	if exists {
 		if !opts.Force {
 			return fmt.Errorf("session '%s' already exists (use --force to overwrite)", name)
 		}
-		if err := tmux.KillSession(name); err != nil {
+		// Local residents must finish in-flight recovery before replacement.
+		// Their names do not identify monitors on an SSH target: stopping a
+		// local namesake would affect an unrelated session on this host.
+		if tmux.DefaultClient.Remote == "" {
+			if err := stopRestoreSessionMonitor(ctx, name); err != nil {
+				return fmt.Errorf("stopping existing session monitor: %w", err)
+			}
+		}
+		if err := tmux.DefaultClient.RunSilentContext(ctx, "kill-session", "-t", tmux.TargetSession(name)); err != nil {
 			return fmt.Errorf("killing existing session: %w", err)
 		}
 		killedExisting = true
-	}
-
-	// Validate and prepare working directory
-	workDir := state.WorkDir
-	if workDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("getting home directory: %w", err)
-		}
-		workDir = home
-	}
-
-	// Check if directory exists
-	if _, err := os.Stat(workDir); os.IsNotExist(err) {
-		// Try to create it if it looks like a project path
-		if shouldCreateDir(workDir) {
-			if err := os.MkdirAll(workDir, 0755); err != nil {
-				return fmt.Errorf("creating directory %s: %w", workDir, err)
-			}
-		} else {
-			// Fall back to home directory
-			home, err := os.UserHomeDir()
-			if err != nil {
-				workDir = os.TempDir()
-			} else {
-				workDir = home
-			}
-		}
 	}
 
 	// Sort panes by WindowIndex, then Index to ensure creation order matches structure.
@@ -116,16 +146,20 @@ func Restore(state *SessionState, opts RestoreOptions) (err error) {
 
 	if len(panes) == 0 {
 		// Create empty session if no panes
-		if err := tmux.CreateSession(name, workDir); err != nil {
+		if err := tmux.CreateSessionContext(ctx, name, workDir); err != nil {
 			return fmt.Errorf("creating session: %w", err)
 		}
 		sessionCreated = true
 	} else {
 		lastWindowIndex := -1
 		for i, p := range panes {
+			paneDir, err := restorePaneDirectory(p, workDir)
+			if err != nil {
+				return fmt.Errorf("saved pane %d.%d working directory changed: %w", p.WindowIndex, p.Index, err)
+			}
 			if i == 0 {
 				// First pane of first window -> Create Session
-				if err := tmux.CreateSession(name, workDir); err != nil {
+				if err := tmux.CreateSessionContext(ctx, name, paneDir); err != nil {
 					return fmt.Errorf("creating session: %w", err)
 				}
 				sessionCreated = true
@@ -135,14 +169,14 @@ func Restore(state *SessionState, opts RestoreOptions) (err error) {
 
 			if p.WindowIndex != lastWindowIndex {
 				// New window
-				if err := tmux.DefaultClient.RunSilent("new-window", "-t", name, "-c", workDir); err != nil {
+				if err := tmux.DefaultClient.RunSilentContext(ctx, "new-window", "-t", tmux.TargetSession(name), "-c", paneDir); err != nil {
 					return fmt.Errorf("creating window for pane %d: %w", i+1, err)
 				}
 				lastWindowIndex = p.WindowIndex
 			} else {
 				// Split window
 				// We target the session, which defaults to the active window (the one we just created or split)
-				if _, err := tmux.DefaultClient.Run("split-window", "-t", name, "-c", workDir); err != nil {
+				if _, err := tmux.DefaultClient.RunContext(ctx, "split-window", "-t", tmux.TargetSession(name), "-c", paneDir); err != nil {
 					return fmt.Errorf("creating pane %d: %w", i+1, err)
 				}
 			}
@@ -150,20 +184,33 @@ func Restore(state *SessionState, opts RestoreOptions) (err error) {
 	}
 
 	// Get pane list
-	tmuxPanes, err := tmux.GetPanes(name)
+	tmuxPanes, err := tmux.GetPanesContext(ctx, name)
 	if err != nil {
 		return fmt.Errorf("getting panes: %w", err)
 	}
 
-	// Set pane titles
+	// Restore visible titles and durable agent types before relaunching. The
+	// pane option remains authoritative after wrappers or TUIs rewrite titles.
+	// User panes deliberately remain title-only so later agent processes can be
+	// discovered from their title, command, or process tree.
 	for i, paneState := range panes {
 		if i >= len(tmuxPanes) {
 			break
 		}
-		if paneState.Title != "" {
+		agentType := tmux.ParsePaneAgentTypeOption(paneState.AgentType)
+		if agentType != tmux.AgentUnknown && agentType != tmux.AgentUser {
+			if err := tmux.SetPaneAgentIdentityContext(ctx, tmuxPanes[i].ID, paneState.Title, agentType); err != nil {
+				return fmt.Errorf("setting restored pane %d identity: %w", i, err)
+			}
+			tmuxPanes[i].Type = agentType
+		} else if paneState.Title != "" {
 			if err := tmux.SetPaneTitle(tmuxPanes[i].ID, paneState.Title); err != nil {
-				// Non-fatal - continue with other panes
-				continue
+				return fmt.Errorf("setting restored pane %d title: %w", i, err)
+			}
+		}
+		if paneState.LaunchSpec != nil {
+			if err := tmux.SetPaneLaunchSpecContext(ctx, tmuxPanes[i].ID, *paneState.LaunchSpec); err != nil {
+				return fmt.Errorf("setting restored pane %d launch settings: %w", i, err)
 			}
 		}
 	}
@@ -182,380 +229,136 @@ func Restore(state *SessionState, opts RestoreOptions) (err error) {
 		}
 	}
 
-	return nil
+	if launch != nil {
+		return launch(tmuxPanes)
+	}
+	return ctx.Err()
 }
 
-// droppedLaunchableAgents reports how many saved panes WOULD launch an agent
-// but sit at a position the live pane grid cannot reach.
-//
-// The mapping is POSITIONAL: the launch loop pairs sortedPaneStates[i] with
-// panes[i] and stops at `i >= len(panes)`, so a non-launchable state (a user
-// pane, or one with no command from either source) still consumes a slot. A
-// count of launchable agents is therefore the wrong comparison — a saved
-// session of [user, cc, cc, cc] restored into 3 panes has 3 launchable agents
-// and 3 panes, yet the third cc sits at index 3 and is dropped. Only the
-// INDEX of each launchable pane answers the question.
-//
-// Non-launchable states past the cutoff are ignored: they were never going to
-// launch anything, so they must not trip a false capacity error.
-func droppedLaunchableAgents(paneStates []PaneState, cmds AgentCommands, paneCount int) int {
-	dropped := 0
-	for i, paneState := range paneStates {
-		if i < paneCount {
-			continue
-		}
-		if paneState.AgentType == string(tmux.AgentUser) || paneState.AgentType == "user" {
-			continue
-		}
-		agentCmd := paneState.Command
-		if agentCmd == "" {
-			agentCmd = getAgentCommand(paneState.AgentType, cmds)
-		}
-		if agentCmd == "" {
-			continue
-		}
-		dropped++
+// Explicit pane directories identify worktrees, so their disappearance is an
+// error. Creating an empty directory would discard the saved worktree context.
+func restorePaneDirectory(pane PaneState, sessionDir string) (string, error) {
+	if pane.WorkDir == "" {
+		return sessionDir, nil
 	}
-	return dropped
+	if _, err := tmux.SanitizePaneCommand(pane.WorkDir); err != nil {
+		return "", fmt.Errorf("invalid saved pane working directory: %w", err)
+	}
+	if !filepath.IsAbs(pane.WorkDir) {
+		return "", fmt.Errorf("saved pane working directory must be absolute: %q", pane.WorkDir)
+	}
+	info, err := os.Stat(pane.WorkDir)
+	if err != nil {
+		return "", fmt.Errorf("checking saved pane working directory %q: %w", pane.WorkDir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("saved pane working directory %q is not a directory", pane.WorkDir)
+	}
+	return pane.WorkDir, nil
 }
 
-// applyClaudeIsolation prefixes a Claude pane's launch command with its
-// per-pane credential isolation environment (GH#237, bd-4tz2d), and returns
-// non-Claude commands unchanged.
-//
-// It is applied to the RENDERED command whether that came from the saved pane
-// command or the type default: a saved command was captured before this pane
-// had an isolated config dir, so neither source carries one. Restore is the
-// most important path to cover because it recreates a whole saved swarm at
-// once — relaunching all of its Claude panes onto the shared rotating
-// credential puts every one of them back into the refresh-token race.
-func applyClaudeIsolation(cfg *config.Config, workDir, sessionName string, paneState PaneState, agentCmd string) (string, error) {
-	if agent.AgentType(paneState.AgentType).Canonical() != agent.AgentTypeClaudeCode {
-		return agentCmd, nil
+// restoreWorkingDirectory resolves the same directory for both the tmux
+// topology and agent commands. An explicit missing/unusable directory must not
+// silently move a recovery into another project, especially before --force.
+func restoreWorkingDirectory(workDir string) (string, error) {
+	if workDir == "" {
+		var err error
+		workDir, err = os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("getting home directory: %w", err)
+		}
 	}
-	claudeEnv, err := swarm.ProvisionClaudeIsolation(cfg, workDir, sessionName, paneState.Index)
+	if _, err := tmux.SanitizePaneCommand(workDir); err != nil {
+		return "", fmt.Errorf("invalid saved working directory: %w", err)
+	}
+	workDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("resolving saved working directory: %w", err)
+	}
+	info, err := os.Stat(workDir)
+	if os.IsNotExist(err) && shouldCreateDir(workDir) {
+		if err := os.MkdirAll(workDir, 0755); err != nil {
+			return "", fmt.Errorf("creating saved working directory %q: %w", workDir, err)
+		}
+		info, err = os.Stat(workDir)
+	}
+	if err != nil {
+		return "", fmt.Errorf("checking saved working directory %q: %w", workDir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("saved working directory %q is not a directory", workDir)
+	}
+	return workDir, nil
+}
+
+// buildRestoreCommand validates the final payload, including the quoted cwd.
+// Validating the executable alone would allow control bytes in a saved path to
+// become terminal input when the complete command is sent to a pane.
+func buildRestoreCommand(workDir, command string) (string, error) {
+	full, err := tmux.BuildPaneCommand(workDir, command)
 	if err != nil {
 		return "", err
 	}
-	return claudeEnv.ApplyToCommand(agentCmd), nil
-}
-
-// RestoreAgents launches the agents in the restored session.
-// This is separated from Restore to allow for customization.
-//
-// cfg carries the launch configuration and may be nil. It is required for
-// per-pane Claude credential isolation (GH#237): restore recreates a whole
-// saved swarm at once, so relaunching its Claude panes onto the shared
-// rotating credential puts every one of them back into the refresh-token race
-// the isolated config dir exists to prevent.
-func RestoreAgents(sessionName string, state *SessionState, cmds AgentCommands, cfg *config.Config) (err error) {
-	if state == nil {
-		return fmt.Errorf("session state is nil")
-	}
-	if err := ValidateAutomatedRelaunch(state); err != nil {
-		return err
-	}
-
-	correlationID := audit.NewCorrelationID()
-	auditStart := time.Now()
-	attempted := 0
-	launched := 0
-	planned := len(state.Panes)
-	_ = audit.LogEvent(sessionName, audit.EventTypeSpawn, audit.ActorSystem, "session.restore.agents", map[string]interface{}{
-		"phase":          "start",
-		"session":        sessionName,
-		"agents_planned": planned,
-		"correlation_id": correlationID,
-	}, nil)
-	defer func() {
-		payload := map[string]interface{}{
-			"phase":            "finish",
-			"session":          sessionName,
-			"agents_planned":   planned,
-			"agents_attempted": attempted,
-			"agents_launched":  launched,
-			"success":          err == nil,
-			"duration_ms":      time.Since(auditStart).Milliseconds(),
-			"correlation_id":   correlationID,
-		}
-		if err != nil {
-			payload["error"] = err.Error()
-		}
-		_ = audit.LogEvent(sessionName, audit.EventTypeSpawn, audit.ActorSystem, "session.restore.agents", payload, nil)
-	}()
-
-	panes, err := tmux.GetPanes(sessionName)
-	if err != nil {
-		return fmt.Errorf("getting panes: %w", err)
-	}
-
-	// Sort panes by WindowIndex, then Index to ensure mapping matches creation order.
-	// Copy to avoid mutating the caller's slice.
-	sortedPaneStates := make([]PaneState, len(state.Panes))
-	copy(sortedPaneStates, state.Panes)
-	sort.Slice(sortedPaneStates, func(i, j int) bool {
-		if sortedPaneStates[i].WindowIndex != sortedPaneStates[j].WindowIndex {
-			return sortedPaneStates[i].WindowIndex < sortedPaneStates[j].WindowIndex
-		}
-		return sortedPaneStates[i].Index < sortedPaneStates[j].Index
-	})
-
-	// A pane grid smaller than the saved agent list means some agents cannot be
-	// launched at all. Silently breaking out of the loop discarded them with no
-	// error, no audit event, and no effect on the return value, so the caller
-	// reported a clean restore while N agents never started — the same
-	// silently-dropped-work failure ba13c058 fixed on the swarm side. Name the
-	// arithmetic instead.
-	if dropped := droppedLaunchableAgents(sortedPaneStates, cmds, len(panes)); dropped > 0 {
-		_ = audit.LogEvent(sessionName, audit.EventTypeError, audit.ActorSystem, "session.restore.agents", map[string]interface{}{
-			"phase":             "capacity",
-			"session":           sessionName,
-			"agents_dropped":    dropped,
-			"pane_states_saved": len(sortedPaneStates),
-			"panes_available":   len(panes),
-			"correlation_id":    correlationID,
-		}, nil)
-		return fmt.Errorf(
-			"restored session %q has %d pane(s) but %d saved pane state(s); %d agent(s) would be silently dropped (topology restore likely failed)",
-			sessionName, len(panes), len(sortedPaneStates), dropped)
-	}
-
-	for i, paneState := range sortedPaneStates {
-		if i >= len(panes) {
-			break
-		}
-
-		// Skip user panes
-		if paneState.AgentType == string(tmux.AgentUser) || paneState.AgentType == "user" {
-			continue
-		}
-
-		// Prefer the pane's pre-rendered command (carries the captured model;
-		// see ntm-boi0), falling back to the type-default command. An empty
-		// result means there is nothing to launch for this pane.
-		agentCmd := paneState.Command
-		if agentCmd == "" {
-			agentCmd = getAgentCommand(paneState.AgentType, cmds)
-		}
-		if agentCmd == "" {
-			continue
-		}
-
-		// Per-pane Claude credential isolation (GH#237, bd-4tz2d).
-		isolatedCmd, isoErr := applyClaudeIsolation(cfg, state.WorkDir, sessionName, paneState, agentCmd)
-		if isoErr != nil {
-			_ = audit.LogEvent(sessionName, audit.EventTypeError, audit.ActorSystem, "agent.restore", map[string]interface{}{
-				"agent_type":     paneState.AgentType,
-				"pane_index":     paneState.Index,
-				"pane_title":     paneState.Title,
-				"error":          fmt.Sprintf("claude credential isolation: %v", isoErr),
-				"correlation_id": correlationID,
-			}, nil)
-			return fmt.Errorf("isolating credentials for claude pane %d: %w", paneState.Index, isoErr)
-		}
-		agentCmd = isolatedCmd
-
-		attempted++
-
-		// Launch agent
-		safeAgentCmd, err := tmux.SanitizePaneCommand(agentCmd)
-		if err != nil {
-			_ = audit.LogEvent(sessionName, audit.EventTypeError, audit.ActorSystem, "agent.restore", map[string]interface{}{
-				"agent_type":     paneState.AgentType,
-				"pane_index":     paneState.Index,
-				"pane_title":     paneState.Title,
-				"error":          err.Error(),
-				"correlation_id": correlationID,
-			}, nil)
-			continue
-		}
-
-		cmd, err := tmux.BuildPaneCommand(state.WorkDir, safeAgentCmd)
-		if err != nil {
-			_ = audit.LogEvent(sessionName, audit.EventTypeError, audit.ActorSystem, "agent.restore", map[string]interface{}{
-				"agent_type":     paneState.AgentType,
-				"pane_index":     paneState.Index,
-				"pane_title":     paneState.Title,
-				"error":          err.Error(),
-				"correlation_id": correlationID,
-			}, nil)
-			continue
-		}
-
-		if err := tmux.SendKeysForAgent(panes[i].ID, cmd, true, tmux.AgentType(paneState.AgentType)); err != nil {
-			_ = audit.LogEvent(sessionName, audit.EventTypeError, audit.ActorSystem, "agent.restore", map[string]interface{}{
-				"agent_type":     paneState.AgentType,
-				"pane_index":     paneState.Index,
-				"pane_title":     paneState.Title,
-				"error":          err.Error(),
-				"correlation_id": correlationID,
-			}, nil)
-			// Non-fatal - continue with other agents
-			continue
-		}
-		launched++
-		_ = audit.LogEvent(sessionName, audit.EventTypeSpawn, audit.ActorSystem, "agent.restore", map[string]interface{}{
-			"agent_type":     paneState.AgentType,
-			"pane_index":     paneState.Index,
-			"pane_title":     paneState.Title,
-			"correlation_id": correlationID,
-		}, nil)
-	}
-
-	if launched == 0 && attempted > 0 {
-		return fmt.Errorf("all %d agent launch attempts failed", attempted)
-	}
-	return nil
+	return tmux.SanitizePaneCommand(full)
 }
 
 // ResumeOptions configures session resume (topology restore + agent relaunch
 // with provider-session resume delegated to casr / native --resume).
 type ResumeOptions struct {
-	Name       string // Name to resume as (defaults to saved name)
-	Force      bool   // Force restore even if a tmux session exists
-	PreferCASR bool   // Prefer `casr` over the native --resume flag when available
+	Name       string         // Name to resume as (defaults to saved name)
+	Force      bool           // Force restore even if a tmux session exists
+	PreferCASR bool           // Prefer `casr` over the native --resume flag when available
+	Config     *config.Config // Used only for legacy settings and replay dependencies
 }
 
-// ResumeResult reports per-pane outcomes of a Resume operation.
+// ResumeResult reports per-pane outcomes of ResumeContext or RestoreWithAgents.
 type ResumeResult struct {
 	Session  string       `json:"session"`
 	Panes    []ResumePane `json:"panes"`
 	Resumed  int          `json:"resumed"`
 	Launched int          `json:"launched"`
 	Skipped  int          `json:"skipped"`
+	Failed   int          `json:"failed"`
 }
 
 // ResumePane reports how a single pane was handled during resume.
 type ResumePane struct {
-	Index     int    `json:"index"`
-	Title     string `json:"title,omitempty"`
-	AgentType string `json:"agent_type"`
-	SessionID string `json:"session_id,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Command   string `json:"command,omitempty"`
+	Index       int    `json:"index"`
+	WindowIndex int    `json:"window_index"`
+	PaneID      string `json:"pane_id,omitempty"`
+	Title       string `json:"title,omitempty"`
+	AgentType   string `json:"agent_type"`
+	SessionID   string `json:"session_id,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	Command     string `json:"command,omitempty"`
+	Error       string `json:"error,omitempty"`
 	// Action is one of: "resumed" (provider session id replayed),
-	// "launched" (fresh agent, no id), "skipped" (user/unknown pane).
+	// "launched" (fresh agent, no id), "skipped" (user/unknown pane),
+	// or "failed" (an intended agent could not be dispatched).
 	Action string `json:"action"`
 }
 
-// Resume reconstructs the tmux topology for state, then relaunches each agent
-// pane. Panes that captured a provider session id are resumed via casr / native
-// --resume; panes without an id are launched fresh. The topology recreation is
-// owned by ntm (Restore); per-pane provider-session resume is delegated to casr
-// (see internal/agentsession), keeping ntm out of provider-specific formats.
-func Resume(state *SessionState, cmds AgentCommands, opts ResumeOptions) (*ResumeResult, error) {
-	if state == nil {
-		return nil, fmt.Errorf("session state is nil")
-	}
-	if err := ValidateAutomatedRelaunch(state); err != nil {
+// ResumeContext reconstructs saved topology and resumes fresh provider bindings
+// with native commands preserving recorded settings. Legacy saves without
+// commands may use casr. Panes without a fresh binding receive their saved
+// launch command. The complete saved batch is preflighted before topology is
+// replaced, and the caller's ctx governs cancellation.
+func ResumeContext(ctx context.Context, state *SessionState, cmds AgentCommands, opts ResumeOptions) (*ResumeResult, error) {
+	launches, err := preflightSavedLaunches(ctx, state, cmds, opts.Config, &opts)
+	if err != nil {
 		return nil, err
 	}
-
 	name := opts.Name
 	if name == "" {
 		name = state.Name
 	}
-
-	// Recreate windows/panes/splits/cwd/layout (ntm-owned topology restore).
-	if err := Restore(state, RestoreOptions{Name: name, Force: opts.Force, SkipGitCheck: true}); err != nil {
-		return nil, err
-	}
-
-	panes, err := tmux.GetPanes(name)
-	if err != nil {
-		return nil, fmt.Errorf("getting panes: %w", err)
-	}
-
-	// Sort saved pane states to match Restore's creation order.
-	sorted := make([]PaneState, len(state.Panes))
-	copy(sorted, state.Panes)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].WindowIndex != sorted[j].WindowIndex {
-			return sorted[i].WindowIndex < sorted[j].WindowIndex
-		}
-		return sorted[i].Index < sorted[j].Index
+	var result *ResumeResult
+	err = restoreSession(ctx, state, RestoreOptions{Name: name, Force: opts.Force, SkipGitCheck: true}, func(panes []tmux.Pane) error {
+		var launchErr error
+		result, launchErr = dispatchSavedLaunches(ctx, name, launches, panes)
+		return launchErr
 	})
-
-	result := &ResumeResult{Session: name}
-
-	for i, ps := range sorted {
-		if i >= len(panes) {
-			break
-		}
-		rp := ResumePane{Index: ps.Index, Title: ps.Title, AgentType: ps.AgentType}
-
-		// Skip user / non-agent panes.
-		if ps.AgentType == string(tmux.AgentUser) || ps.AgentType == "user" ||
-			agentsession.ResumeProvider(ps.AgentType) == "" {
-			rp.Action = "skipped"
-			result.Skipped++
-			result.Panes = append(result.Panes, rp)
-			continue
-		}
-
-		var launchCmd string
-		if ps.HasFreshSessionBinding() {
-			provider := ps.SessionProvider
-			if provider == "" {
-				provider = agentsession.ResumeProvider(ps.AgentType)
-			}
-			launchCmd = agentsession.ResumeCommand(provider, ps.SessionID, opts.PreferCASR)
-			rp.SessionID = ps.SessionID
-			rp.Provider = provider
-		}
-
-		if launchCmd == "" {
-			// No captured id (or no resume path) -> fresh agent launch. Prefer
-			// the pane's pre-rendered command (carries the captured model; see
-			// ntm-boi0), falling back to the type-default.
-			launchCmd = ps.Command
-			if launchCmd == "" {
-				launchCmd = getAgentCommand(ps.AgentType, cmds)
-			}
-			rp.Action = "launched"
-		} else {
-			rp.Action = "resumed"
-		}
-
-		if launchCmd == "" {
-			rp.Action = "skipped"
-			result.Skipped++
-			result.Panes = append(result.Panes, rp)
-			continue
-		}
-
-		safeCmd, err := tmux.SanitizePaneCommand(launchCmd)
-		if err != nil {
-			rp.Action = "skipped"
-			result.Skipped++
-			result.Panes = append(result.Panes, rp)
-			continue
-		}
-		fullCmd, err := tmux.BuildPaneCommand(state.WorkDir, safeCmd)
-		if err != nil {
-			rp.Action = "skipped"
-			result.Skipped++
-			result.Panes = append(result.Panes, rp)
-			continue
-		}
-
-		if err := tmux.SendKeysForAgent(panes[i].ID, fullCmd, true, tmux.AgentType(ps.AgentType)); err != nil {
-			rp.Action = "skipped"
-			result.Skipped++
-			result.Panes = append(result.Panes, rp)
-			continue
-		}
-
-		rp.Command = launchCmd
-		if rp.Action == "resumed" {
-			result.Resumed++
-		} else {
-			result.Launched++
-		}
-		result.Panes = append(result.Panes, rp)
-	}
-
-	return result, nil
+	return result, err
 }
 
 // getAgentCommand returns the command for an agent type.
@@ -585,6 +388,8 @@ func getAgentCommand(agentType string, cmds AgentCommands) string {
 		return cmds.Aider
 	case tmux.AgentOpencode:
 		return cmds.Opencode
+	case tmux.AgentOmp:
+		return cmds.Omp
 	case tmux.AgentOllama:
 		return cmds.Ollama
 	default:
@@ -622,7 +427,7 @@ func restoreWindowFidelity(session string, state *SessionState, panes []PaneStat
 	}
 
 	// Map saved window indices (in creation order) -> new tmux window indices.
-	newOut, err := tmux.DefaultClient.Run("list-windows", "-t", session, "-F", "#{window_index}")
+	newOut, err := tmux.DefaultClient.Run("list-windows", "-t", tmux.TargetSession(session), "-F", "#{window_index}")
 	if err != nil {
 		_ = applyLayout(session, state.Layout)
 		return
@@ -653,14 +458,14 @@ func restoreWindowFidelity(session string, state *SessionState, panes []PaneStat
 		}
 		target := fmt.Sprintf("%s:%s", session, newIdx)
 		if w.Name != "" {
-			_ = tmux.DefaultClient.RunSilent("rename-window", "-t", target, w.Name)
+			_ = tmux.DefaultClient.RunSilent("rename-window", "-t", tmux.ExactTarget(target), w.Name)
 		}
 		layout := w.Layout
 		if layout == "" {
 			layout = state.Layout
 		}
 		if layout != "" {
-			_ = tmux.DefaultClient.RunSilent("select-layout", "-t", target, layout)
+			_ = tmux.DefaultClient.RunSilent("select-layout", "-t", tmux.ExactTarget(target), layout)
 		}
 	}
 
@@ -672,10 +477,10 @@ func restoreWindowFidelity(session string, state *SessionState, panes []PaneStat
 			continue
 		}
 		paneID := tmuxPanes[i].ID
-		_ = tmux.DefaultClient.RunSilent("select-pane", "-t", paneID)
+		_ = tmux.DefaultClient.RunSilent("select-pane", "-t", tmux.ExactTarget(paneID))
 		if w, ok := winByIdx[panes[i].WindowIndex]; ok {
 			if w.Zoomed {
-				_ = tmux.DefaultClient.RunSilent("resize-pane", "-Z", "-t", paneID)
+				_ = tmux.DefaultClient.RunSilent("resize-pane", "-Z", "-t", tmux.ExactTarget(paneID))
 			}
 			if w.Active {
 				if newIdx, ok := savedToNew[panes[i].WindowIndex]; ok {
@@ -697,7 +502,7 @@ func restoreWindowFidelity(session string, state *SessionState, panes []PaneStat
 		}
 	}
 	if activeWindowTarget != "" {
-		_ = tmux.DefaultClient.RunSilent("select-window", "-t", activeWindowTarget)
+		_ = tmux.DefaultClient.RunSilent("select-window", "-t", tmux.ExactTarget(activeWindowTarget))
 	}
 }
 
@@ -708,7 +513,7 @@ func applyLayout(session, layout string) error {
 	}
 
 	// Get first window
-	output, err := tmux.DefaultClient.Run("list-windows", "-t", session, "-F", "#{window_index}")
+	output, err := tmux.DefaultClient.Run("list-windows", "-t", tmux.TargetSession(session), "-F", "#{window_index}")
 	if err != nil {
 		return err
 	}
@@ -719,7 +524,7 @@ func applyLayout(session, layout string) error {
 			continue
 		}
 		target := fmt.Sprintf("%s:%s", session, win)
-		_ = tmux.DefaultClient.RunSilent("select-layout", "-t", target, layout)
+		_ = tmux.DefaultClient.RunSilent("select-layout", "-t", tmux.ExactTarget(target), layout)
 	}
 
 	return nil

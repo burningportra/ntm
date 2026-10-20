@@ -3,10 +3,13 @@ package robot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +70,82 @@ func TestGetIsWorkingCanceledContextReturnsTimeoutWithoutObservation(t *testing.
 	}
 	if out == nil || out.Success || out.ErrorCode != ErrCodeTimeout || !strings.Contains(strings.ToLower(out.Error), "canceled") {
 		t.Fatalf("canceled is-working output=%+v", out)
+	}
+}
+
+// Exercise the public JSON surface with two Antigravity panes sharing one
+// active window. Every invocation creates a fresh observer, matching a robot
+// polling loop: the idle verdict cannot depend on prior capture history.
+func TestPrintIsWorkingAntigravityIdleWithBusySibling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("deterministic tmux transport requires a POSIX shell")
+	}
+	const transport = `#!/bin/sh
+set -eu
+case "$1" in
+  -V) printf 'tmux 3.6a\n' ;;
+  has-session) ;;
+  list-panes) printf '%s\n' "$NTM_AGY_TEST_PANES" ;;
+  capture-pane)
+    target=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -t ]; then shift; target="$1"; break; fi
+      shift
+    done
+    case "$target" in
+      %1) printf '%s\n' "$NTM_AGY_TEST_IDLE" ;;
+      %2) printf '%s\n' "$NTM_AGY_TEST_WORKING" ;;
+      *) printf 'unexpected capture target: %s\n' "$target" >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf 'unexpected tmux command: %s\n' "$*" >&2; exit 1 ;;
+esac
+`
+	binary := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(binary, []byte(transport), 0o700); err != nil {
+		t.Fatalf("write tmux transport: %v", err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", binary)
+	t.Setenv("NTM_AGY_TEST_IDLE", "Implemented the requested change.\n──────────────────────────────────────────────────\n>\n──────────────────────────────────────────────────\n? for shortcuts")
+	t.Setenv("NTM_AGY_TEST_WORKING", "Inspecting the project.\n──────────────────────────────────────────────────\n>\n──────────────────────────────────────────────────\nesc to cancel")
+	originalFormat := GetOutputFormat()
+	SetOutputFormat(FormatJSON)
+	t.Cleanup(func() { SetOutputFormat(originalFormat) })
+
+	for range 2 {
+		activity := strconv.FormatInt(time.Now().Unix(), 10)
+		rows := make([]string, 0, 2)
+		for index := 1; index <= 2; index++ {
+			rows = append(rows, strings.Join([]string{
+				fmt.Sprintf("%%%d", index), strconv.Itoa(index), fmt.Sprintf("s__agy_%d", index),
+				"agy", "160", "40", "0", activity, strconv.Itoa(os.Getpid()), "0", "agy", "", "", "0",
+			}, tmux.FieldSeparator))
+		}
+		t.Setenv("NTM_AGY_TEST_PANES", strings.Join(rows, "\n"))
+		stdout, err := captureStdout(t, func() error {
+			return PrintIsWorking(t.Context(), IsWorkingOptions{Session: "s", LinesCaptured: 100})
+		})
+		if err != nil {
+			t.Fatalf("PrintIsWorking() error = %v; stdout = %q", err, stdout)
+		}
+		var output IsWorkingOutput
+		if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+			t.Fatalf("PrintIsWorking() did not emit one JSON document: %v; stdout = %q", err, stdout)
+		}
+		if !output.Success || output.Summary.TotalPanes != 2 || output.Summary.IdleCount != 1 || output.Summary.WorkingCount != 1 {
+			t.Fatalf("unexpected work-state summary: %+v", output)
+		}
+		idle, ok := output.Panes["1"]
+		if !ok || idle.AgentType != "agy" || !idle.IsIdle || idle.IsWorking || !idle.SafeToDispatch || idle.Recommendation != string(agent.RecommendSafeToRestart) {
+			t.Fatalf("idle agy pane in a busy window = %+v, want dispatchable idle", idle)
+		}
+		if idle.ObservationState != "idle" || idle.ObservationFreshness != "fresh" {
+			t.Fatalf("idle agy observation = %q/%q, want idle/fresh", idle.ObservationState, idle.ObservationFreshness)
+		}
+		working, ok := output.Panes["2"]
+		if !ok || !working.IsWorking || working.IsIdle || working.SafeToDispatch || working.Recommendation != string(agent.RecommendDoNotInterrupt) {
+			t.Fatalf("working agy sibling = %+v, want protected active work", working)
+		}
 	}
 }
 
@@ -503,7 +582,7 @@ func TestIsLiveBusyOverridesIdleVerdict_Codex(t *testing.T) {
   Reading src/main.rs
 
 `
-	if !IsLiveBusy(scrollback, agent.AgentTypeCodex.String()) {
+	if !IsLiveBusy(scrollback, agent.AgentTypeCodex.String(), 0) {
 		t.Fatalf("IsLiveBusy(<codex working scrollback>, %q) = false, expected true; the live-window override would not fire and SAFE_TO_RESTART would leak through", agent.AgentTypeCodex.String())
 	}
 
@@ -513,7 +592,7 @@ func TestIsLiveBusyOverridesIdleVerdict_Codex(t *testing.T) {
 
 codex>
 `
-	if IsLiveBusy(idleScrollback, agent.AgentTypeCodex.String()) {
+	if IsLiveBusy(idleScrollback, agent.AgentTypeCodex.String(), 0) {
 		t.Fatalf("IsLiveBusy(<idle codex prompt>, %q) = true, expected false; this would falsely keep idle panes out of the SAFE_TO_RESTART bucket", agent.AgentTypeCodex.String())
 	}
 }
@@ -532,7 +611,7 @@ func TestIsLiveBusy_Claude_DefersToOrderingAwareClassifier(t *testing.T) {
 		"● final summary of the work\n" +
 		"✻ Churned for 6s\n" +
 		"────────────\n❯ \n────────────\n"
-	if IsLiveBusy(staleSpinnerAboveCompletion, agent.AgentTypeClaudeCode.String()) {
+	if IsLiveBusy(staleSpinnerAboveCompletion, agent.AgentTypeClaudeCode.String(), 0) {
 		t.Fatalf("IsLiveBusy(<stale spinner above completion>, claude) = true, expected false; the position-blind CategoryThinking match would override the correct idle verdict and stall the swarm")
 	}
 
@@ -541,12 +620,12 @@ func TestIsLiveBusy_Claude_DefersToOrderingAwareClassifier(t *testing.T) {
 		"● starting next step\n" +
 		"✻ Churning… (ctrl+c to interrupt · 4s)\n" +
 		"────────────\n❯ \n"
-	if !IsLiveBusy(activeSpinner, agent.AgentTypeClaudeCode.String()) {
+	if !IsLiveBusy(activeSpinner, agent.AgentTypeClaudeCode.String(), 0) {
 		t.Fatalf("IsLiveBusy(<active claude spinner>, claude) = false, expected true; a mid-turn Claude pane must read busy")
 	}
 
 	// Alias "cc" must normalize to claude and take the same path.
-	if IsLiveBusy(staleSpinnerAboveCompletion, "cc") {
+	if IsLiveBusy(staleSpinnerAboveCompletion, "cc", 0) {
 		t.Fatalf("IsLiveBusy(<stale spinner above completion>, cc) = true, expected false; the cc alias must normalize to claude")
 	}
 }
@@ -575,7 +654,7 @@ func TestClassifyPaneWork_PiPanes(t *testing.T) {
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pane := tmux.Pane{ID: fmt.Sprintf("%%%d", i+1), Index: i + 1, Title: fmt.Sprintf("proj__pi_%d", i+1), Type: tmux.AgentPi}
-			work := classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, tt.output, "")
+			work := observedPaneWork(parser, observer.ObservePaneCapture("proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, tt.output, nil))
 			if work.Recommendation != string(tt.want) {
 				t.Fatalf("recommendation = %q, want %q (work=%+v)", work.Recommendation, tt.want, work)
 			}
@@ -637,7 +716,7 @@ func TestClassifyPaneWork_OpencodeFailingTurns(t *testing.T) {
 				output = strings.Replace(output, header, header+strings.Repeat("\n", tt.shift), 1)
 			}
 			pane := tmux.Pane{ID: fmt.Sprintf("%%%d", i+1), Index: i + 1, Title: fmt.Sprintf("proj__oc_%d", i+1), Type: tmux.AgentOpencode}
-			work := classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, output, "")
+			work := observedPaneWork(parser, observer.ObservePaneCapture("proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, output, nil))
 			if work.Recommendation != string(tt.want) {
 				t.Fatalf("recommendation = %q, want %q (work=%+v)", work.Recommendation, tt.want, work)
 			}
@@ -718,7 +797,7 @@ func TestClassifyPaneWork_PiGhostSuggestion(t *testing.T) {
 				},
 			)
 			pane := tmux.Pane{ID: fmt.Sprintf("%%%d", i+1), Index: i + 1, Title: fmt.Sprintf("proj__pi_%d", i+1), Type: tmux.AgentPi}
-			work := classifyCapturedPaneWork(observer, agent.NewParser(), "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, tt.output, "")
+			work := observedPaneWork(agent.NewParser(), observer.ObservePaneCapture("proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, tt.output, nil))
 			if work.Recommendation != string(tt.want) {
 				t.Fatalf("recommendation = %q, want %q (work=%+v)", work.Recommendation, tt.want, work)
 			}
@@ -762,10 +841,10 @@ func TestClassifyPaneWork_GenuineSpinnersStillBusy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if !IsLiveBusy(tt.output, paneAgentType(tt.pane)) {
+			if !IsLiveBusy(tt.output, paneAgentType(tt.pane), 0) {
 				t.Errorf("IsLiveBusy = false, want true")
 			}
-			work := classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: tt.pane, LastActivity: time.Now()}, tt.output, "")
+			work := observedPaneWork(parser, observer.ObservePaneCapture("proj", tmux.PaneActivity{Pane: tt.pane, LastActivity: time.Now()}, tt.output, nil))
 			if work.Recommendation != string(agent.RecommendDoNotInterrupt) || !work.IsWorking {
 				t.Fatalf("recommendation = %q, is_working = %v, want DO_NOT_INTERRUPT and working (work=%+v)", work.Recommendation, work.IsWorking, work)
 			}
@@ -804,7 +883,7 @@ func TestApplyLiveBusyOverrideRecommendationPrecedence(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if !applyLiveBusyOverride(activeSpinner, tt.state) {
+			if !applyLiveBusyOverride(activeSpinner, tt.state, 0) {
 				t.Fatal("expected live-busy override")
 			}
 			if !tt.state.IsWorking || tt.state.IsIdle || tt.state.IsInError {
@@ -820,7 +899,7 @@ func TestApplyLiveBusyOverrideRecommendationPrecedence(t *testing.T) {
 	currentErrorOutput := "· Germinating… (5m 56s)\n" +
 		"  ⎿ \u00a0Error: Exit code 1\n" +
 		"     current command failed\n❯\n"
-	if applyLiveBusyOverride(currentErrorOutput, currentError) {
+	if applyLiveBusyOverride(currentErrorOutput, currentError, 0) {
 		t.Fatal("current error after an older spinner must not be overridden")
 	}
 	if got := currentError.GetRecommendation(); got != agent.RecommendErrorState {
@@ -829,7 +908,7 @@ func TestApplyLiveBusyOverrideRecommendationPrecedence(t *testing.T) {
 
 	codexError := &agent.AgentState{Type: agent.AgentTypeCodex, IsInError: true, IsIdle: true}
 	codexOutput := "Error: current command failed\n• Working (4s · esc to interrupt)\ncodex>\n"
-	if applyLiveBusyOverride(codexOutput, codexError) {
+	if applyLiveBusyOverride(codexOutput, codexError, 0) {
 		t.Fatal("position-blind Codex working text must not override a current error")
 	}
 	if got := codexError.GetRecommendation(); got != agent.RecommendErrorState {
@@ -935,10 +1014,10 @@ func TestIsLiveBusy_WildcardPatternsDocumentTheUserPaneSkipReason(t *testing.T) 
 	shellScrollback := `$ tar -xzf data.tar.gz
 extracting archive ⠋
 `
-	if !IsLiveBusy(shellScrollback, agent.AgentTypeUser.String()) {
+	if !IsLiveBusy(shellScrollback, agent.AgentTypeUser.String(), 0) {
 		t.Fatalf("expected wildcard CategoryThinking match (braille_spinner) on shell scrollback with user hint; if this assertion changes, the GetIsWorking user-pane skip may no longer be needed")
 	}
-	if isAIAgentLiveBusy(shellScrollback, agent.AgentTypeUser.String()) {
+	if isAIAgentLiveBusy(shellScrollback, agent.AgentTypeUser.String(), 0) {
 		t.Fatal("shared live-busy guard must reject user panes even when wildcard thinking patterns match")
 	}
 }
@@ -1007,6 +1086,105 @@ func TestSelectIsWorkingPanes_SingleWindowDefaultSkipsControlPane(t *testing.T) 
 		if gotTargets[i] != w {
 			t.Fatalf("target[%d] = %q, want %q (all: %v)", i, gotTargets[i], w, gotTargets)
 		}
+	}
+}
+
+// adoptedOmpSwarmSession mirrors the live adopted frankengraphdb swarm: one
+// window, pane-base-index 1, no user pane, every pane recorded as omp by
+// `ntm adopt --omp=1-8` (@ntm_agent_type), one of them showing a title omp set
+// for itself.
+func adoptedOmpSwarmSession() []tmux.Pane {
+	panes := make([]tmux.Pane, 0, 8)
+	for i := 1; i <= 8; i++ {
+		title := fmt.Sprintf("frankengraphdb__omp_%d", i)
+		if i == 4 {
+			title = "π ⠙ Bulk Ingestion API Implementation Task"
+		}
+		panes = append(panes, tmux.Pane{ID: fmt.Sprintf("%%%d", i+2), WindowIndex: 1, Index: i, Title: title, Command: "omp", Type: tmux.AgentOmp})
+	}
+	return panes
+}
+
+// TestSelectIsWorkingPanes_AdoptedSessionWithoutUserPaneKeepsPaneOne is the
+// regression for the live report: --robot-is-working (and every surface built
+// on it: --robot-agent-health, --robot-smart-restart) silently dropped pane 1
+// of an adopted all-agent session because the lowest-index pane was assumed to
+// be the control pane.
+func TestSelectIsWorkingPanes_AdoptedSessionWithoutUserPaneKeepsPaneOne(t *testing.T) {
+	sel := selectIsWorkingPanes("frankengraphdb", adoptedOmpSwarmSession(), nil)
+	targets := selectedTargets(sel)
+	if len(sel) != 8 || targets[0] != "frankengraphdb:1.1" {
+		t.Fatalf("adopted all-agent session selected %v, want all 8 panes including 1.1", targets)
+	}
+
+	// A real user pane at the lowest index is still skipped, recorded or not.
+	withUser := append([]tmux.Pane{{ID: "%2", WindowIndex: 1, Index: 1, Title: "frankengraphdb__user", Command: "zsh", Type: tmux.AgentUser}},
+		adoptedOmpSwarmSession()...)
+	for i := 1; i < len(withUser); i++ {
+		withUser[i].Index++
+	}
+	if sel := selectIsWorkingPanes("frankengraphdb", withUser, nil); len(sel) != 8 || selectedTargets(sel)[0] != "frankengraphdb:1.2" {
+		t.Fatalf("user-pane session selected %v, want the 8 agents without pane 1", selectedTargets(sel))
+	}
+
+	if got := defaultMonitorPaneIndices(adoptedOmpSwarmSession()); len(got) != 8 || got[0] != 1 {
+		t.Fatalf("--robot-monitor default panes = %v, want 1..8", got)
+	}
+}
+
+// TestGetIsWorking_LiveAdoptedSessionIncludesPaneOne drives the real tmux path
+// (list-panes → @ntm_agent_type → default selection) on a pane-base-index 1
+// session whose panes were all recorded as agents, with no user pane.
+func TestGetIsWorking_LiveAdoptedSessionIncludesPaneOne(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	session := fmt.Sprintf("ntm-adopted-no-user-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(session, ""); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	defer tmux.KillSession(session)
+	if _, err := tmux.DefaultClient.Run("set-option", "-t", session, "pane-base-index", "1"); err != nil {
+		t.Fatalf("set pane-base-index: %v", err)
+	}
+	if _, err := tmux.DefaultClient.Run("respawn-pane", "-k", "-t", tmux.SessionPaneTarget(session)); err != nil {
+		t.Fatalf("respawn first pane under pane-base-index 1: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := tmux.DefaultClient.Run("split-window", "-d", "-t", session); err != nil {
+			t.Fatalf("split: %v", err)
+		}
+	}
+	panes, err := tmux.GetPanes(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pane := range panes {
+		if err := tmux.DefaultClient.SetPaneAgentType(pane.ID, tmux.AgentOmp); err != nil {
+			t.Fatalf("record omp on %s: %v", pane.ID, err)
+		}
+	}
+	panes, err = tmux.GetPanes(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minIdx := panes[0].Index
+	for _, pane := range panes {
+		if pane.Type != tmux.AgentOmp {
+			t.Fatalf("pane %s type = %q, want recorded omp", pane.ID, pane.Type)
+		}
+		if pane.Index < minIdx {
+			minIdx = pane.Index
+		}
+	}
+
+	out, err := GetIsWorking(t.Context(), IsWorkingOptions{Session: session, LinesCaptured: 20})
+	if err != nil || !out.Success {
+		t.Fatalf("GetIsWorking = (%+v, %v)", out, err)
+	}
+	if out.Summary.TotalPanes != len(panes) {
+		t.Fatalf("total_panes = %d (requested %v), want all %d recorded agent panes", out.Summary.TotalPanes, out.Query.PanesRequested, len(panes))
+	}
+	if _, ok := out.Panes[strconv.Itoa(minIdx)]; !ok {
+		t.Fatalf("lowest-index pane %d missing from %v", minIdx, out.Query.PanesRequested)
 	}
 }
 
@@ -1119,7 +1297,11 @@ func TestRuntimeAgentStateFollowsIsWorkingVerdict(t *testing.T) {
 			// A fresh window timestamp, as tmux reports for a window with a
 			// busy neighbor: the user shell must still not read as busy.
 			activity := tmux.PaneActivity{Pane: tt.pane, LastActivity: time.Now()}
-			work := classifyCapturedPaneWork(observer, parser, "proj", activity, tt.output, tt.captureErr)
+			var captureErr error
+			if tt.captureErr != "" {
+				captureErr = errors.New(tt.captureErr)
+			}
+			work := observedPaneWork(parser, observer.ObservePaneCapture("proj", activity, tt.output, captureErr))
 			if got := runtimeAgentState(paneAgentType(tt.pane), work); got != tt.want {
 				t.Fatalf("runtimeAgentState = %q, want %q (work=%+v)", got, tt.want, work)
 			}
@@ -1157,53 +1339,44 @@ func TestRuntimeAgentStateMapsRecommendations(t *testing.T) {
 // robot command sees every pane for the first time, and updateActivity reports
 // a first sighting as "all lines just appeared, zero seconds ago". The adapter
 // used to turn that into busy for every pane, idle agents and user shells
-// included. The state now comes from the pane's work verdict.
+// included. A first sighting now reports no output clock (#288, which fixed
+// the same bug upstream), and the adapter classifies the captured tail.
 func TestTmuxAdapterFirstSightingIsNotBusy(t *testing.T) {
-	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
-	parser := agent.NewParser()
 	adapter := NewTmuxAdapter(DefaultTmuxAdapterConfig())
 
+	tails := map[string]string{}
 	firstSighting := func(pane tmux.Pane, output string) Agent {
 		lastOutput, linesDelta := updateActivity(fmt.Sprintf("p7es6-%d-%s", time.Now().UnixNano(), pane.ID), output)
-		agent := Agent{
-			Pane:                 pane.ID,
-			PaneIdx:              pane.Index,
-			Type:                 paneAgentType(pane),
-			LastOutputTS:         lastOutput,
-			SecondsSinceOutput:   int(time.Since(lastOutput).Seconds()),
-			OutputLinesSinceLast: linesDelta,
+		if !lastOutput.IsZero() || linesDelta != 0 {
+			t.Fatalf("first sighting of %s reported output at %v (%d lines), want no output clock", pane.ID, lastOutput, linesDelta)
 		}
-		if agent.SecondsSinceOutput != 0 || agent.OutputLinesSinceLast == 0 {
-			t.Fatalf("first sighting should look like fresh output: %+v", agent)
+		tails[pane.ID] = output
+		return Agent{
+			Pane:               pane.ID,
+			PaneIdx:            pane.Index,
+			Type:               paneAgentType(pane),
+			SecondsSinceOutput: -1,
 		}
-		agent.work = classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, output, "")
-		return agent
 	}
 
 	agents := []Agent{
 		firstSighting(tmux.Pane{ID: "%10", Index: 0, Title: "host", Type: tmux.AgentUser}, userShellTestScreen),
 		firstSighting(tmux.Pane{ID: "%11", Index: 1, Title: "proj__muse_1", Type: tmux.AgentMuse}, museTestIdleScreen),
-		firstSighting(tmux.Pane{ID: "%12", Index: 2, Title: "proj__muse_2", Type: tmux.AgentMuse}, museTestWorkingScreen),
 	}
-	want := []state.AgentState{state.AgentStateUser, state.AgentStateIdle, state.AgentStateBusy}
 
-	snapshot := adapter.NormalizeSnapshot([]tmux.Session{{Name: "proj"}}, map[string][]Agent{"proj": agents})
-	if len(snapshot.Agents) != len(want) {
-		t.Fatalf("normalized %d agents, want %d", len(snapshot.Agents), len(want))
+	snapshot := adapter.NormalizeSnapshot([]tmux.Session{{Name: "proj"}}, map[string][]Agent{"proj": agents}, map[string]map[string]string{"proj": tails})
+	if len(snapshot.Agents) != len(agents) {
+		t.Fatalf("normalized %d agents, want %d", len(snapshot.Agents), len(agents))
 	}
-	for i, row := range snapshot.Agents {
-		if row.State != want[i] {
-			t.Errorf("agent %s state = %q (%s), want %q", row.Pane, row.State, row.StateReason, want[i])
+	for _, row := range snapshot.Agents {
+		if row.State == state.AgentStateBusy {
+			t.Errorf("agent %s state = busy (%s) on a first sighting of a resting screen", row.Pane, row.StateReason)
 		}
-	}
-	sess := snapshot.Sessions[0]
-	if sess.ActiveAgents != 1 || sess.IdleAgents != 1 || sess.ErrorAgents != 0 {
-		t.Errorf("session counts active=%d idle=%d error=%d, want 1/1/0", sess.ActiveAgents, sess.IdleAgents, sess.ErrorAgents)
 	}
 
 	zombie := agents[1]
 	zombie.ProcessState = "Z"
-	if got := adapter.NormalizeAgent("proj", &zombie); got.State != state.AgentStateError || got.StateReason != "process zombie" {
+	if got := adapter.NormalizeAgent("proj", &zombie, tails[zombie.Pane]); got.State != state.AgentStateError || got.StateReason != "process zombie" {
 		t.Errorf("zombie agent = %q (%s), want error (process zombie)", got.State, got.StateReason)
 	}
 }

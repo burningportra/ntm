@@ -7,20 +7,6 @@ import (
 	"time"
 )
 
-// DefaultPredictorConfig returns the default configuration for ContextPredictor.
-func DefaultPredictorConfig() PredictorConfig {
-	return PredictorConfig{
-		Window:         5 * time.Minute,  // Velocity averaging window
-		PollInterval:   30 * time.Second, // How often to sample
-		MaxSamples:     64,               // Ring buffer size
-		WarnMinutes:    15.0,             // Warn when < 15 min to exhaustion
-		WarnUsage:      0.70,             // Warn when > 70% usage
-		CompactMinutes: 8.0,              // Compact when < 8 min to exhaustion
-		CompactUsage:   0.75,             // Compact when > 75% usage
-		MinSamples:     3,                // Minimum samples for valid prediction
-	}
-}
-
 // PredictorConfig configures the ContextPredictor.
 type PredictorConfig struct {
 	Window         time.Duration // Velocity averaging window
@@ -59,6 +45,21 @@ type ContextPredictor struct {
 	head    int           // Next write position
 	count   int           // Number of valid samples
 	config  PredictorConfig
+}
+
+// DefaultPredictorConfig returns the default configuration for ContextPredictor.
+// These defaults also govern the coordinator's advisory exhaustion forecasts.
+func DefaultPredictorConfig() PredictorConfig {
+	return PredictorConfig{
+		Window:         5 * time.Minute,  // Velocity averaging window
+		PollInterval:   30 * time.Second, // How often to sample
+		MaxSamples:     64,               // Ring buffer size
+		WarnMinutes:    15.0,             // Warn when < 15 min to exhaustion
+		WarnUsage:      0.70,             // Warn when > 70% usage
+		CompactMinutes: 8.0,              // Compact when < 8 min to exhaustion
+		CompactUsage:   0.75,             // Compact when > 75% usage
+		MinSamples:     3,                // Minimum samples for valid prediction
+	}
 }
 
 // NewContextPredictor creates a new predictor with the given configuration.
@@ -104,6 +105,12 @@ func (p *ContextPredictor) AddSampleAt(tokens int64, timestamp time.Time) {
 // PredictExhaustion calculates the predicted time to context exhaustion.
 // Returns nil if insufficient data is available for prediction.
 func (p *ContextPredictor) PredictExhaustion(modelLimit int64) *Prediction {
+	return p.PredictExhaustionAt(modelLimit, time.Now())
+}
+
+// PredictExhaustionAt evaluates the same prediction at an explicit observation
+// time. Future samples cannot contribute to a historical or live forecast.
+func (p *ContextPredictor) PredictExhaustionAt(modelLimit int64, now time.Time) *Prediction {
 	if modelLimit <= 0 {
 		return nil
 	}
@@ -116,8 +123,15 @@ func (p *ContextPredictor) PredictExhaustion(modelLimit int64) *Prediction {
 	}
 
 	// Get samples within the window
-	windowStart := time.Now().Add(-p.config.Window)
+	windowStart := now.Add(-p.config.Window)
 	samples := p.getSamplesInWindow(windowStart)
+	current := samples[:0]
+	for _, sample := range samples {
+		if !sample.Timestamp.After(now) {
+			current = append(current, sample)
+		}
+	}
+	samples = current
 
 	if len(samples) < p.config.MinSamples {
 		return nil

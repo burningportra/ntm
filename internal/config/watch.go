@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/watcher"
+	"github.com/Dicklesworthstone/ntm/internal/fs/watcher"
 )
 
 // Watch starts watching the selected global config file and any project config
@@ -30,8 +30,9 @@ func Watch(cwd string, onChange func(*Config)) (func(), error) {
 				shouldReload = true
 				break
 			}
-			// Check project config (re-resolve to handle potential changes/moves, though robust enough for now)
-			// For simplicity, we just reload if ANY watched file changes, because we only add config files to the watcher.
+			// Any other event is a project-config change: only config files
+			// are added to the watcher, so reloading on any watched-file
+			// event is correct without re-resolving the project path.
 			shouldReload = true
 		}
 

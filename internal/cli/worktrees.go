@@ -25,6 +25,8 @@ directory with its own branch.`,
 	cmd.AddCommand(
 		newWorktreesListCmd(),
 		newWorktreesMergeCmd(),
+		newWorktreesMergeStatusCmd(),
+		newWorktreesMergeRecoverCmd(),
 		newWorktreesCleanCmd(),
 		newWorktreesRemoveCmd(),
 	)
@@ -82,24 +84,68 @@ func newWorktreesListCmd() *cobra.Command {
 }
 
 func newWorktreesMergeCmd() *cobra.Command {
-	var force bool
+	var dryRun bool
+	var sessionName string
+	var expectedSource, expectedTarget string
 
 	cmd := &cobra.Command{
 		Use:   "merge <agent-name>",
-		Short: "Merge an agent's worktree back to main branch",
-		Long: `Merge changes from an agent's worktree branch back to the main branch.
+		Short: "Safely integrate committed agent work into the default branch",
+		Long: `Merge committed agent work into the repository's resolved default branch.
 
-This will switch to the main branch and merge the agent's branch using
-a non-fast-forward merge to preserve the merge history.`,
+Both checkouts must be clean and the target must already have the default
+branch checked out. Conflicts, pending Git operations, and ignored-file
+overwrite risks are refused before mutation. No branch switching, stashing,
+automatic conflict resolution, or force override is performed.
+
+Use --dry-run to evaluate the real three-way merge without changing either
+checkout or index. The preview reports source/target commit IDs, conflicting
+paths, and blockers. In JSON mode inspect can_merge; a successful preview is
+an assessment, not confirmation that work was merged. Git 2.38+ is required.
+
+For an apply bound to reviewed commits, supply --expected-source and
+--expected-target using the complete IDs from the preview. Both are required.
+Without them, apply assesses the current tips. Successful integration creates
+a two-parent merge; already-merged work is a no-op. If Git or a hook fails after
+mutation starts, inspect git status before retrying; NTM never resets the work.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("expected-source") || cmd.Flags().Changed("expected-target") {
+				if dryRun {
+					return fmt.Errorf("expected commit IDs apply to a merge, not --dry-run")
+				}
+				if expectedSource == "" || expectedTarget == "" {
+					return fmt.Errorf("--expected-source and --expected-target must both contain complete preview commit IDs")
+				}
+			}
 			agentName := args[0]
-			dir, session, err := resolveWorktreeScope(cmd.Context(), "")
+			dir, session, err := resolveWorktreeScope(cmd.Context(), sessionName)
 			if err != nil {
 				return err
 			}
 
 			manager := worktrees.NewManager(dir, session)
+			if dryRun {
+				plan, err := manager.PreviewMerge(cmd.Context(), agentName)
+				if err != nil {
+					return fmt.Errorf("failed to preview merge: %w", err)
+				}
+				if IsJSONOutput() {
+					return output.PrintJSON(plan)
+				}
+				cmd.Printf("Merge preview: %s -> %s\nSource: %s\nTarget: %s\nCan merge: %t\nAlready merged: %t\n",
+					plan.SourceBranch, plan.TargetBranch, plan.SourceCommit, plan.TargetCommit, plan.CanMerge, plan.AlreadyMerged)
+				for _, blocker := range plan.Blockers {
+					cmd.Printf("  Blocker: %s\n", blocker)
+				}
+				for _, path := range plan.Conflicts {
+					cmd.Printf("  Conflict: %q\n", path)
+				}
+				for _, path := range plan.OverwriteRisks {
+					cmd.Printf("  Ignored file at risk: %q\n", path)
+				}
+				return nil
+			}
 
 			// Check if worktree exists
 			info, err := manager.GetWorktreeForAgent(cmd.Context(), agentName)
@@ -111,21 +157,31 @@ a non-fast-forward merge to preserve the merge history.`,
 				return fmt.Errorf("no worktree found for agent: %s", agentName)
 			}
 
-			if info.Error != "" && !force {
-				return fmt.Errorf("worktree has errors: %s (use --force to proceed)", info.Error)
+			if info.Error != "" {
+				return fmt.Errorf("worktree has errors: %s", info.Error)
 			}
 
 			// Perform the merge
-			if err := manager.MergeBack(cmd.Context(), agentName); err != nil {
+			if err := manager.MergeBack(cmd.Context(), agentName, worktrees.MergeOptions{
+				ExpectedSource: expectedSource, ExpectedTarget: expectedTarget,
+			}); err != nil {
 				return fmt.Errorf("failed to merge worktree: %w", err)
 			}
 
-			fmt.Printf("Successfully merged agent %s's work from branch %s\n", agentName, info.BranchName)
+			if IsJSONOutput() {
+				return output.PrintJSON(map[string]interface{}{
+					"success": true, "session": session, "agent_name": info.AgentName, "source_branch": info.BranchName,
+				})
+			}
+			cmd.Printf("Agent %s's committed work from branch %s is integrated\n", info.AgentName, info.BranchName)
 			return nil
 		},
 	}
 
-	cmd.Flags().BoolVar(&force, "force", false, "Force merge even if worktree has errors")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview the merge without changing checkout files, indexes, or branch refs")
+	cmd.Flags().StringVar(&sessionName, "session", "", "Session owning the agent worktree (defaults to current session)")
+	cmd.Flags().StringVar(&expectedSource, "expected-source", "", "Require the complete source commit ID from a reviewed merge preview")
+	cmd.Flags().StringVar(&expectedTarget, "expected-target", "", "Require the complete target commit ID from the same merge preview")
 	return cmd
 }
 
@@ -192,14 +248,19 @@ By default, cleans up the current session. Use --session to specify
 }
 
 func newWorktreesRemoveCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+
+	cmd := &cobra.Command{
 		Use:   "remove <agent-name>",
 		Short: "Remove a specific agent's worktree",
 		Long: `Remove the worktree and branch for a specific agent.
 
 This will remove the worktree directory and delete the associated branch.
 Use with caution as this will permanently delete any uncommitted changes
-in the worktree.`,
+in the worktree.
+
+Prompts for confirmation, reporting the uncommitted changes and unmerged
+commits that would be destroyed. Pass --force to skip the prompt.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			agentName := args[0]
@@ -220,6 +281,24 @@ in the worktree.`,
 				return fmt.Errorf("no worktree found for agent: %s", agentName)
 			}
 
+			// Removal runs `git worktree remove --force` and `git branch -D`, so
+			// nothing downstream will refuse on dirty or unmerged work. The sibling
+			// `worktrees clean` has always confirmed before destroying many
+			// worktrees; this destroys one just as permanently.
+			if !force {
+				// Never prompt into a JSON stream: a half-written question would
+				// corrupt the caller's output, and answering for them is worse.
+				if IsJSONOutput() {
+					return fmt.Errorf("refusing to remove worktree for agent %s without confirmation in JSON mode: re-run with --force", agentName)
+				}
+				risk, riskErr := manager.AssessRemovalRisk(cmd.Context(), agentName)
+				title := fmt.Sprintf("Remove worktree for agent '%s'?", agentName)
+				if !confirmHuhDestructive(title, describeWorktreeRemoval(info, risk, riskErr)) {
+					fmt.Println("Removal cancelled.")
+					return nil
+				}
+			}
+
 			// Remove the worktree
 			if err := manager.RemoveWorktree(cmd.Context(), agentName); err != nil {
 				return fmt.Errorf("failed to remove worktree: %w", err)
@@ -229,6 +308,46 @@ in the worktree.`,
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&force, "force", false, "Skip confirmation prompt")
+	return cmd
+}
+
+// describeWorktreeRemoval renders the confirmation body for `worktrees remove`.
+//
+// A failed assessment is reported as unknown rather than as "nothing at risk":
+// treating an inspection error as zero work is how a prompt talks an operator
+// into deleting something it never managed to look at.
+func describeWorktreeRemoval(info *worktrees.WorktreeInfo, risk worktrees.RemovalRisk, riskErr error) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Path:   %s\n", info.Path)
+	fmt.Fprintf(&b, "Branch: %s\n\n", info.BranchName)
+
+	switch {
+	case riskErr != nil:
+		fmt.Fprintf(&b, "Could not determine what would be lost: %v\n", riskErr)
+		b.WriteString("The worktree is deleted and the branch force-deleted regardless.")
+	case !risk.HasWork():
+		b.WriteString("No uncommitted changes and no unmerged commits detected.")
+	default:
+		b.WriteString("This permanently destroys:\n")
+		if risk.UncommittedFiles > 0 {
+			fmt.Fprintf(&b, "  - %s with uncommitted changes\n", countNoun(risk.UncommittedFiles, "file", "files"))
+		}
+		if risk.UnmergedCommits > 0 {
+			fmt.Fprintf(&b, "  - %s not merged into the default branch\n", countNoun(risk.UnmergedCommits, "commit", "commits"))
+		}
+	}
+
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// countNoun renders "1 file" / "3 files".
+func countNoun(n int, singular, plural string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, singular)
+	}
+	return fmt.Sprintf("%d %s", n, plural)
 }
 
 func resolveWorktreeScope(ctx context.Context, session string) (string, string, error) {
@@ -253,4 +372,79 @@ func resolveWorktreeScope(ctx context.Context, session string) (string, string, 
 		return "", "", err
 	}
 	return projectDir, session, nil
+}
+
+func newWorktreesMergeStatusCmd() *cobra.Command {
+	var sessionName string
+	cmd := &cobra.Command{
+		Use: "merge-status", Short: "Inspect the last durable merge attempt in this repository",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			dir, session, err := resolveWorktreeScope(cmd.Context(), sessionName)
+			if err != nil {
+				return err
+			}
+			record, err := worktrees.NewManager(dir, session).InspectMerge(cmd.Context())
+			if err != nil {
+				return err
+			}
+			return printWorktreesMergeRecovery(cmd, record)
+		},
+	}
+	cmd.Flags().StringVar(&sessionName, "session", "", "Resolve the merge repository from this session")
+	return cmd
+}
+
+func newWorktreesMergeRecoverCmd() *cobra.Command {
+	var sessionName string
+	var abandon bool
+	cmd := &cobra.Command{
+		Use: "merge-recover <attempt-id>", Short: "Reconcile an interrupted merge without replaying it",
+		Long: `Stop all Git writers, editing agents and orphaned hooks before recovery.
+Read the attempt ID and pinned source/target/tree with worktrees merge-status.
+
+Recovery acknowledges only an exact two-parent merge with the expected tree
+on the recorded, clean target checkout. It never runs another merge or resets,
+aborts, stashes, commits, deletes or rolls back Git state.
+
+Use --abandon only after inspecting and resolving the interrupted attempt.
+It clears the barrier only when the target is clean, has no pending Git operation
+and still identifies the original pre-merge commit. Abandonment does not prove
+that hooks had no external effects. A changed attempt ID is always refused.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, session, err := resolveWorktreeScope(cmd.Context(), sessionName)
+			if err != nil {
+				return err
+			}
+			record, err := worktrees.NewManager(dir, session).RecoverMerge(cmd.Context(), args[0], abandon)
+			if err != nil {
+				return err
+			}
+			return printWorktreesMergeRecovery(cmd, record)
+		},
+	}
+	cmd.Flags().StringVar(&sessionName, "session", "", "Resolve the merge repository from this session")
+	cmd.Flags().BoolVar(&abandon, "abandon", false, "Explicitly settle the inspected attempt only if its target remains unchanged and clean")
+	return cmd
+}
+
+func printWorktreesMergeRecovery(cmd *cobra.Command, record *worktrees.MergeRecovery) error {
+	if IsJSONOutput() {
+		return output.PrintJSON(map[string]interface{}{"recovery": record})
+	}
+	if record == nil {
+		cmd.Println("No recorded merge attempt in this repository.")
+		return nil
+	}
+	cmd.Printf("Attempt: %s\nState: %s\nSession: %s\nAgent: %s\nTarget checkout: %s\nSource: %s\nTarget before merge: %s\nPlanned tree: %s\n",
+		record.AttemptID, record.State, record.Plan.SessionID, record.Plan.AgentName,
+		record.Plan.TargetPath, record.Plan.SourceCommit, record.Plan.TargetCommit, record.Plan.MergeTree)
+	if record.Commit != "" {
+		cmd.Printf("Verified commit: %s\n", record.Commit)
+	}
+	if record.State == "prepared" {
+		cmd.Println("Outcome unknown. Inspect Git state and stop writers before merge-recover; no work will be replayed.")
+	}
+	return nil
 }

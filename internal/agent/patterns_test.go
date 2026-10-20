@@ -628,110 +628,6 @@ func TestHeaderPatterns(t *testing.T) {
 	}
 }
 
-func TestGetPatternSet(t *testing.T) {
-	tests := []struct {
-		agentType         AgentType
-		hasRateLimitPats  bool
-		hasWorkingPats    bool
-		hasIdlePats       bool
-		hasContextPattern bool
-	}{
-		{
-			agentType:         AgentTypeClaudeCode,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false, // Claude uses warnings, not explicit pattern
-		},
-		{
-			agentType:         AgentTypeCodex,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: true, // Codex has explicit context pattern
-		},
-		{
-			agentType:         AgentTypeGemini,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false,
-		},
-		{
-			agentType:         AgentTypeKimi,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false,
-		},
-		{
-			agentType:         AgentTypeMuse,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false,
-		},
-		{
-			agentType:         AgentTypeCursor,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false,
-		},
-		{
-			agentType:         AgentTypeWindsurf,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false,
-		},
-		{
-			agentType:         AgentTypeAider,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false,
-		},
-		{
-			agentType:         AgentTypeOllama,
-			hasRateLimitPats:  true,
-			hasWorkingPats:    true,
-			hasIdlePats:       true,
-			hasContextPattern: false,
-		},
-		{
-			agentType:         AgentTypeUnknown,
-			hasRateLimitPats:  false,
-			hasWorkingPats:    false,
-			hasIdlePats:       false,
-			hasContextPattern: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.agentType), func(t *testing.T) {
-			ps := GetPatternSet(tt.agentType)
-
-			if (len(ps.RateLimitPatterns) > 0) != tt.hasRateLimitPats {
-				t.Errorf("RateLimitPatterns presence = %v, want %v",
-					len(ps.RateLimitPatterns) > 0, tt.hasRateLimitPats)
-			}
-			if (len(ps.WorkingPatterns) > 0) != tt.hasWorkingPats {
-				t.Errorf("WorkingPatterns presence = %v, want %v",
-					len(ps.WorkingPatterns) > 0, tt.hasWorkingPats)
-			}
-			if (len(ps.IdlePatterns) > 0) != tt.hasIdlePats {
-				t.Errorf("IdlePatterns presence = %v, want %v",
-					len(ps.IdlePatterns) > 0, tt.hasIdlePats)
-			}
-			if (ps.ContextPattern != nil) != tt.hasContextPattern {
-				t.Errorf("ContextPattern presence = %v, want %v",
-					ps.ContextPattern != nil, tt.hasContextPattern)
-			}
-		})
-	}
-}
-
 func TestYoloModePattern(t *testing.T) {
 	tests := []struct {
 		text string
@@ -1027,8 +923,21 @@ func readinessIdleScreens(t *testing.T) map[AgentType]map[string]string {
 			"parser fixture": "Changes applied.\naider> ",
 		},
 		AgentTypeOpencode: {
-			"live fresh, 60 columns":  opencodeReadyNarrowScreen,
-			"live fresh, 100 columns": opencodeReadyWideScreen,
+			"live fresh, 60 columns":       opencodeReadyNarrowScreen,
+			"live fresh, 100 columns":      opencodeReadyWideScreen,
+			"testdata opencode_idle":       testdata("opencode_idle.txt"),
+			"source-derived hint composer": "╭──────╮\n│ Ask anything... \"fix the failing test\" │\n╰──────╯\n  /commands  @context",
+		},
+		AgentTypeOmp: {
+			"testdata omp_nerd_idle_fresh":   testdata("omp_nerd_idle_fresh.txt"),
+			"testdata omp_nerd_idle_done":    testdata("omp_nerd_idle_done.txt"),
+			"testdata omp_unicode_idle_done": testdata("omp_unicode_idle_done.txt"),
+			"testdata omp_ascii_idle_done":   testdata("omp_ascii_idle_done.txt"),
+		},
+		// Grok Build's composer and status line, as robot spawn's readiness
+		// test draws them from live grok 1.0.5 captures (GH#251 phase 2).
+		AgentTypeGrok: {
+			"spawn fixture": "╭──────╮\n│ ❯                 │\n╰──────╯\n grok-4 · always-approve",
 		},
 		AgentTypeOllama: {
 			"parser fixture": "Done.\n> ",
@@ -1038,9 +947,7 @@ func readinessIdleScreens(t *testing.T) map[AgentType]map[string]string {
 
 // readinessNoIdleScreen names the launchable agent types with no idle screen
 // in the repo or from a free stand-in, and why.
-var readinessNoIdleScreen = map[AgentType]string{
-	AgentTypeGrok: "Grok Build has no idle detection and no captured screen, and launching it needs a paid provider",
-}
+var readinessNoIdleScreen = map[AgentType]string{}
 
 // TestIsReadyOutput_EveryAgentTypeIdleScreen is the bd-1zadt regression:
 // restore, robot spawn --spawn-wait and context injection wait on
@@ -1087,6 +994,90 @@ func TestIsReadyOutput_ShellOutputNeverReady(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestOpencodeRecognizers_GH333Captures reads the opencode 1.18.32 screens
+// captured for GH #333 (testdata/opencode_*.txt) with the box reader, which
+// was measured on opencode 2.0.28 (testdata/oc_*.txt), and through the
+// parser. Once a session exists, a wide pane draws a sidebar to the right of
+// the prompt box on the box's own rows, which must not read as a draft.
+func TestOpencodeRecognizers_GH333Captures(t *testing.T) {
+	t.Parallel()
+
+	working := loadTestData(t, "opencode_working.txt")
+	const progressFooter = "⬝⬝⬝⬝■■■■  esc interrupt"
+	if !strings.Contains(working, progressFooter) {
+		t.Fatalf("opencode_working.txt does not contain %q", progressFooter)
+	}
+	// The same session once the turn ended: the footer no longer starts with
+	// the progress bar, and the sidebar's cwd stays on a box row.
+	idleSession := strings.Replace(working, progressFooter, "                       ", 1)
+
+	tests := []struct {
+		name        string
+		output      string
+		wantWorking bool
+		wantIdle    bool
+		wantPrompt  bool
+	}{
+		{name: "home screen", output: loadTestData(t, "opencode_idle.txt"), wantIdle: true, wantPrompt: true},
+		{name: "draft", output: loadTestData(t, "opencode_draft.txt"), wantPrompt: true},
+		{name: "collapsed paste", output: loadTestData(t, "opencode_paste_token.txt"), wantPrompt: true},
+		{name: "working", output: working, wantWorking: true},
+		{name: "idle session with a sidebar", output: idleSession, wantIdle: true, wantPrompt: true},
+	}
+	p := NewParser()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := OpencodeActivelyWorking(tt.output, 0); got != tt.wantWorking {
+				t.Errorf("OpencodeActivelyWorking() = %v, want %v", got, tt.wantWorking)
+			}
+			if got := OpencodeIdlePromptShowing(tt.output); got != tt.wantIdle {
+				t.Errorf("OpencodeIdlePromptShowing() = %v, want %v", got, tt.wantIdle)
+			}
+			if got := OpencodePromptShowing(tt.output); got != tt.wantPrompt {
+				t.Errorf("OpencodePromptShowing() = %v, want %v", got, tt.wantPrompt)
+			}
+			state, err := p.ParseWithHint(tt.output, AgentTypeOpencode)
+			if err != nil {
+				t.Fatalf("ParseWithHint: %v", err)
+			}
+			if state.IsWorking != tt.wantWorking || state.IsIdle != tt.wantIdle {
+				t.Errorf("ParseWithHint: IsWorking = %v, IsIdle = %v, want %v, %v", state.IsWorking, state.IsIdle, tt.wantWorking, tt.wantIdle)
+			}
+			if state.IsRateLimited || state.IsInError {
+				t.Errorf("ParseWithHint: IsRateLimited = %v, IsInError = %v, want false, false", state.IsRateLimited, state.IsInError)
+			}
+		})
+	}
+}
+
+// TestOpencodeParser_NoPromptBoxFallsBackToSubstrings pins the split between
+// the box reader and the substring patterns: with the prompt box drawn, a
+// rate-limit or error line quoted above it changes nothing, and without the
+// box the substring patterns decide.
+func TestOpencodeParser_NoPromptBoxFallsBackToSubstrings(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+	idle := loadTestData(t, "oc_idle.txt")
+
+	quoted, err := p.ParseWithHint("error: rate limit exceeded, retry later\n"+idle, AgentTypeOpencode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quoted.IsIdle || quoted.IsRateLimited || quoted.IsInError {
+		t.Errorf("transcript text above the box: IsIdle = %v, IsRateLimited = %v, IsInError = %v, want true, false, false",
+			quoted.IsIdle, quoted.IsRateLimited, quoted.IsInError)
+	}
+
+	limited, err := p.ParseWithHint("rate limit exceeded, retry later\n", AgentTypeOpencode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !limited.IsRateLimited || len(limited.LimitIndicators) == 0 {
+		t.Errorf("no box: IsRateLimited = %v, LimitIndicators = %v, want a rate limit", limited.IsRateLimited, limited.LimitIndicators)
 	}
 }
 

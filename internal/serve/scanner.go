@@ -134,14 +134,6 @@ func NewScannerStore() *ScannerStore {
 	}
 }
 
-// AddScan adds a scan record
-func (s *ScannerStore) AddScan(scan *ScanRecord) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.scans[scan.ID] = cloneScan(scan)
-	s.scanList = append(s.scanList, scan.ID)
-}
-
 // TryStartScan atomically registers a new pending/running scan only when no other
 // active scan exists. It returns the conflicting active scan when registration fails.
 func (s *ScannerStore) TryStartScan(scan *ScanRecord) (*ScanRecord, bool) {
@@ -161,14 +153,6 @@ func (s *ScannerStore) TryStartScan(scan *ScanRecord) (*ScanRecord, bool) {
 	s.scans[scan.ID] = cloneScan(scan)
 	s.scanList = append(s.scanList, scan.ID)
 	return nil, true
-}
-
-// GetScan retrieves a scan by ID
-func (s *ScannerStore) GetScan(id string) (*ScanRecord, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	scan, ok := s.scans[id]
-	return cloneScan(scan), ok
 }
 
 // UpdateScan mutates an existing scan safely using a callback
@@ -204,18 +188,6 @@ func (s *ScannerStore) GetScans(limit, offset int) []*ScanRecord {
 		}
 	}
 	return result
-}
-
-// GetRunningScan returns the currently running scan, if any
-func (s *ScannerStore) GetRunningScan() *ScanRecord {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, scan := range s.scans {
-		if scan.State == ScanStateRunning {
-			return cloneScan(scan)
-		}
-	}
-	return nil
 }
 
 // GetActiveScan returns the newest pending or running scan, if any.
@@ -349,20 +321,6 @@ func (s *ScannerStore) GetFindings(scanID string, includeDismissed bool, severit
 		end = len(filtered)
 	}
 	return filtered[offset:end]
-}
-
-// GetFindingsByScan returns all findings for a specific scan
-func (s *ScannerStore) GetFindingsByScan(scanID string) []*FindingRecord {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var result []*FindingRecord
-	for _, f := range s.findings {
-		if f.ScanID == scanID {
-			result = append(result, cloneFinding(f))
-		}
-	}
-	return result
 }
 
 // ScannerState holds the global scanner state
@@ -895,7 +853,10 @@ func (s *Server) handleCreateBeadFromFinding(w http.ResponseWriter, r *http.Requ
 
 	// Create bead via br CLI
 	labels := append([]string{"bug", "scanner"}, req.Labels...)
-	args := []string{"--title", title, "--priority", priority, "--type", "bug"}
+	// --json: br's text output ("✓ Created <id>: ...") names the ID with a
+	// project-derived prefix that cannot be recognized reliably, and an
+	// unrecognized ID left the created bead orphaned and duplicated on retry.
+	args := []string{"--title", title, "--priority", priority, "--type", "bug", "--json"}
 	if len(labels) > 0 {
 		args = append(args, "--labels", strings.Join(labels, ","))
 	}
@@ -1187,6 +1148,17 @@ func extractBeadID(output string) string {
 	}
 	if err := json.Unmarshal([]byte(output), &single); err == nil && single.ID != "" {
 		return single.ID
+	}
+
+	// Under a capacity soft limit br wraps the record:
+	// {"created":{...},"warnings":[...]}.
+	var envelope struct {
+		Created struct {
+			ID string `json:"id"`
+		} `json:"created"`
+	}
+	if err := json.Unmarshal([]byte(output), &envelope); err == nil && envelope.Created.ID != "" {
+		return envelope.Created.ID
 	}
 
 	var list []struct {

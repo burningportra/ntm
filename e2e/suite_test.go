@@ -35,6 +35,16 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// Self-heal against leaks from an earlier run that was killed mid-test. A
+	// SIGKILL (interrupted suite, OOM, host reboot) runs neither the per-test
+	// cleanup nor the isolation cleanup above, so that run's detached tmux
+	// server and its "ntm-tmux-test-*" socket root survive and accumulate. The
+	// reaper runs AFTER isolation so this process's own socket root is already
+	// in TMUX_TMPDIR and is skipped by name as well as by age.
+	if reaped := testutil.ReapStaleTmuxTestServers(staleTmuxReapAge()); reaped > 0 {
+		fmt.Fprintf(os.Stderr, "E2E: reaped %d leaked tmux test socket root(s) from an earlier interrupted run\n", reaped)
+	}
+
 	bin, err := ensureE2ENTMBin()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "E2E: failed to resolve/build ntm: %v\n", err)
@@ -77,6 +87,19 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	os.Exit(code)
+}
+
+// staleTmuxReapAge is the minimum age a leaked tmux socket root must reach
+// before the startup reaper removes it. The default is deliberately far longer
+// than any single suite so a slow but live run is never mistaken for a leak;
+// NTM_E2E_TMUX_REAP_MIN (minutes) tightens or loosens it per host.
+func staleTmuxReapAge() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("NTM_E2E_TMUX_REAP_MIN")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return testutil.DefaultStaleTmuxReapAge
 }
 
 func ensureE2ENTMBin() (string, error) {
@@ -295,11 +318,18 @@ func (s *TestSuite) Setup() error {
 func (s *TestSuite) SpawnAgent(pane int, agentType string) error {
 	s.logger.Log("[E2E-SPAWN] Spawning %s agent in pane %d", agentType, pane)
 
-	// Create new pane if needed
+	// Create new pane if needed. Splitting stays inside window 0, so the
+	// send-keys target must be the new PANE address (window 0, pane N) —
+	// "session:N" would address window N, which does not exist.
+	target := fmt.Sprintf("%s:0", s.session)
 	if pane > 0 {
-		cmd := exec.Command(tmux.BinaryPath(), "split-window", "-t", s.session, "-h")
-		if err := cmd.Run(); err != nil {
+		out, err := exec.Command(tmux.BinaryPath(), "split-window", "-t", s.session+":0", "-h", "-P", "-F", "#{pane_id}").Output()
+		if err != nil {
 			return fmt.Errorf("create pane: %w", err)
+		}
+		target = strings.TrimSpace(string(out))
+		if target == "" {
+			return fmt.Errorf("create pane: split-window returned no pane id")
 		}
 	}
 
@@ -317,7 +347,6 @@ func (s *TestSuite) SpawnAgent(pane int, agentType string) error {
 	}
 
 	// Launch agent
-	target := fmt.Sprintf("%s:%d", s.session, pane)
 	sendCmd := exec.Command(tmux.BinaryPath(), "send-keys", "-t", target, alias, "Enter")
 	if err := sendCmd.Run(); err != nil {
 		return fmt.Errorf("launch agent: %w", err)
@@ -454,12 +483,14 @@ type RestartAction struct {
 
 // RestartSummary aggregates results across all panes.
 type RestartSummary struct {
-	Restarted     int              `json:"restarted"`
-	Skipped       int              `json:"skipped"`
-	Waiting       int              `json:"waiting"`
-	Failed        int              `json:"failed"`
-	WouldRestart  int              `json:"would_restart,omitempty"`
-	PanesByAction map[string][]int `json:"panes_by_action"`
+	Restarted    int `json:"restarted"`
+	Skipped      int `json:"skipped"`
+	Waiting      int `json:"waiting"`
+	Failed       int `json:"failed"`
+	WouldRestart int `json:"would_restart,omitempty"`
+	// PanesByAction maps action -> pane ADDRESSES (e.g. "0.1"), matching
+	// robot.RestartSummary; older builds emitted bare pane indexes.
+	PanesByAction map[string][]string `json:"panes_by_action"`
 }
 
 // CallSmartRestart invokes --robot-smart-restart and parses the result.

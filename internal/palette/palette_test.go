@@ -1,7 +1,6 @@
 package palette
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -579,37 +578,27 @@ func TestBuildVisualOrderEmpty(t *testing.T) {
 	}
 }
 
-func TestSelectByNumber(t *testing.T) {
-	m := New("test-session", testCommands)
-	m.buildVisualOrder()
+// TestDigitsTypeIntoFilterNotQuickSelect: 1-9 quick-select was removed (H3,
+// bd-ws7-docs-ux-truth-tqh3l.3 — REJECTED decision). The filter input is
+// always focused in the command phase, so digits must type into the search
+// box rather than selecting items.
+func TestDigitsTypeIntoFilterNotQuickSelect(t *testing.T) {
+	for _, digit := range []rune{'1', '5', '9'} {
+		m := New("test-session", testCommands)
 
-	// Select item 1 (first item)
-	if !m.selectByNumber(1) {
-		t.Error("selectByNumber(1) should return true")
-	}
+		msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{digit}}
+		newModel, _ := m.Update(msg)
+		m = newModel.(Model)
 
-	if m.selected == nil {
-		t.Error("Expected selected to be set")
-	}
-}
-
-func TestSelectByNumberOutOfRange(t *testing.T) {
-	m := New("test-session", testCommands)
-	m.buildVisualOrder()
-
-	// Try to select item 99 (out of range)
-	if m.selectByNumber(99) {
-		t.Error("selectByNumber(99) should return false for out of range")
-	}
-}
-
-func TestSelectByNumberZero(t *testing.T) {
-	m := New("test-session", testCommands)
-	m.buildVisualOrder()
-
-	// Zero is not a valid selection (1-indexed)
-	if m.selectByNumber(0) {
-		t.Error("selectByNumber(0) should return false")
+		if m.phase != PhaseCommand {
+			t.Errorf("digit %q: expected to stay in PhaseCommand, got %v", digit, m.phase)
+		}
+		if m.selected != nil {
+			t.Errorf("digit %q: expected no selection (quick-select is rejected), got %q", digit, m.selected.Key)
+		}
+		if m.filter.Value() != string(digit) {
+			t.Errorf("digit %q: expected filter value %q, got %q", digit, string(digit), m.filter.Value())
+		}
 	}
 }
 
@@ -1161,27 +1150,27 @@ func TestFetchRecentsFromHistory(t *testing.T) {
 
 func TestKeyMapBindings(t *testing.T) {
 	// Test that key bindings are properly configured
-	if !key.Matches(tea.KeyMsg{Type: tea.KeyUp}, keys.Up) {
+	if !key.Matches(tea.KeyMsg{Type: tea.KeyUp}, commandKeys.Up) {
 		t.Error("Up key should match")
 	}
 
-	if !key.Matches(tea.KeyMsg{Type: tea.KeyDown}, keys.Down) {
+	if !key.Matches(tea.KeyMsg{Type: tea.KeyDown}, commandKeys.Down) {
 		t.Error("Down key should match")
 	}
 
-	if !key.Matches(tea.KeyMsg{Type: tea.KeyEnter}, keys.Select) {
+	if !key.Matches(tea.KeyMsg{Type: tea.KeyEnter}, commandKeys.Select) {
 		t.Error("Enter key should match Select")
 	}
 
-	if !key.Matches(tea.KeyMsg{Type: tea.KeyEsc}, keys.Back) {
+	if !key.Matches(tea.KeyMsg{Type: tea.KeyEsc}, commandKeys.Back) {
 		t.Error("Esc key should match Back")
 	}
 
-	if !key.Matches(tea.KeyMsg{Type: tea.KeyCtrlP}, keys.TogglePin) {
+	if !key.Matches(tea.KeyMsg{Type: tea.KeyCtrlP}, commandKeys.TogglePin) {
 		t.Error("Ctrl+P should match TogglePin")
 	}
 
-	if !key.Matches(tea.KeyMsg{Type: tea.KeyCtrlF}, keys.ToggleFavorite) {
+	if !key.Matches(tea.KeyMsg{Type: tea.KeyCtrlF}, commandKeys.ToggleFavorite) {
 		t.Error("Ctrl+F should match ToggleFavorite")
 	}
 }
@@ -1315,7 +1304,9 @@ func TestSendRefusesEmptyMessage(t *testing.T) {
 	}
 }
 
-func TestSendRejectsMixedGrokBatchBeforeAnyPaneMutation(t *testing.T) {
+// GH#251 phase 2: grok panes are now valid automated prompt-delivery targets,
+// so a mixed claude+grok batch is dispatched to every pane like claude/codex.
+func TestSendDeliversMixedGrokBatchToEveryPane(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 
 	m := New("mixed-grok", testCommands)
@@ -1333,21 +1324,89 @@ func TestSendRejectsMixedGrokBatchBeforeAnyPaneMutation(t *testing.T) {
 				{ID: "%2", Index: 2, Type: tmux.AgentGrok},
 			}, nil
 		},
-		func(target, _ string, _ tmux.AgentType) error {
+		func(target, prompt string, _ tmux.AgentType) error {
+			if strings.TrimSpace(prompt) == "" {
+				t.Fatalf("send() dispatched empty prompt to %s", target)
+			}
 			sentTargets = append(sentTargets, target)
 			return nil
 		},
 	)
 
 	got := model.(Model)
-	if !errors.Is(got.err, agent.ErrAutomatedPromptDeliveryNotImplemented) {
-		t.Fatalf("send() error = %v, want Grok prompt-delivery sentinel", got.err)
+	if got.err != nil {
+		t.Fatalf("send() error = %v, want mixed claude+grok batch accepted", got.err)
 	}
-	if len(sentTargets) != 0 {
-		t.Fatalf("send() mutated targets %v before mixed-batch rejection", sentTargets)
+	wantTargets := []string{"%1", "%2"}
+	if !reflect.DeepEqual(sentTargets, wantTargets) {
+		t.Fatalf("send() targets = %v, want %v (grok pane delivered like claude)", sentTargets, wantTargets)
 	}
-	if got.sent || got.sentCount != 0 {
-		t.Fatalf("send() state = sent:%v count:%d, want unsent", got.sent, got.sentCount)
+	if !got.sent || got.sentCount != 2 {
+		t.Fatalf("send() state = sent:%v count:%d, want both panes sent", got.sent, got.sentCount)
+	}
+}
+
+// TestOmpQuickTarget pins the palette's omp quick-select: key 7 targets only omp
+// panes (the documented "6 = pick agents" binding is unchanged), the target
+// rows advertise omp with its pane count and samples, and help lists the key.
+func TestOmpQuickTarget(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	m := New("omp-swarm", testCommands)
+	m.phase = PhaseTarget
+	m.selected = &testCommands[0]
+	m.paneCountsKnown = true
+	m.paneCounts = paneCounts{totalAgents: 3, claude: 1, omp: 2,
+		allSamples: []string{"omp-swarm__cc_1", "omp-swarm__omp_1", "omp-swarm__omp_2"},
+		ompSamples: []string{"omp-swarm__omp_1", "omp-swarm__omp_2"}}
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 220, Height: 50})
+	m = newModel.(Model)
+	view := stripANSI(m.View())
+	for _, want := range []string{"Oh My Pi (omp) (2)", "omp-swarm__omp_1", "7"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("target phase view missing %q:\n%s", want, view)
+		}
+	}
+	if !key.Matches(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'7'}}, targetKeys.TargetOmp) ||
+		key.Matches(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'6'}}, targetKeys.TargetOmp) {
+		t.Fatal("key 7 (and only 7) must select omp; 6 stays pick-agents")
+	}
+	pressed, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'7'}})
+	if pressed.(Model).target != TargetOmp {
+		t.Fatalf("pressing 7 in the target phase set target %v, want TargetOmp", pressed.(Model).target)
+	}
+	found := false
+	for _, e := range targetOverlayEntries() {
+		if strings.Contains(e.desc, "Oh My Pi") && e.label == "7" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("help overlay must list the omp quick-select key")
+	}
+
+	m.target = TargetOmp
+	sentTargets := []string{}
+	model, _ := m.sendWith(
+		func(string) ([]tmux.Pane, error) {
+			return []tmux.Pane{
+				{ID: "%1", Index: 1, Type: tmux.AgentClaude},
+				{ID: "%2", Index: 2, Type: tmux.AgentOmp},
+				{ID: "%3", Index: 3, Type: tmux.AgentType("oh-my-pi")},
+				{ID: "%4", Index: 4, Type: tmux.AgentUser},
+			}, nil
+		},
+		func(target, _ string, agentType tmux.AgentType) error {
+			if agentType.Canonical() != tmux.AgentOmp {
+				t.Fatalf("omp target dispatched to %s (%s)", target, agentType)
+			}
+			sentTargets = append(sentTargets, target)
+			return nil
+		},
+	)
+	got := model.(Model)
+	if got.err != nil || !reflect.DeepEqual(sentTargets, []string{"%2", "%3"}) {
+		t.Fatalf("omp quick target sent to %v (err %v), want the two omp panes", sentTargets, got.err)
 	}
 }
 
@@ -1468,7 +1527,7 @@ func TestTargetPhaseOffersSelectAgents(t *testing.T) {
 	}
 }
 
-// --- bd-eccc9: "By type…" picker on 7 ---
+// --- bd-eccc9: "By type…" picker on 8 (7 is upstream's omp quick target) ---
 
 // typePickerSession returns a session with panesOf(i) panes of the i-th type
 // in agent.AgentTypes(), a user pane and a pane of no known type, plus the
@@ -1492,9 +1551,10 @@ func typePickerSession(panesOf func(i int) int) ([]tmux.Pane, []typeTarget) {
 	return panes, want
 }
 
-// someTypesAbsent gives the i-th agent type i%3 panes, so every third type,
-// Claude Code first, has none. everyTypePresent gives each one or two.
-func someTypesAbsent(i int) int  { return i % 3 }
+// someTypesAbsent gives every even-numbered agent type, Claude Code first, no
+// panes and the odd ones one or two in turn, so the picker has fewer than 9
+// rows. everyTypePresent gives each one or two.
+func someTypesAbsent(i int) int  { return i % 2 * (i%4/2 + 1) }
 func everyTypePresent(i int) int { return i%2 + 1 }
 
 func newTypePickerModel(t *testing.T, panes []tmux.Pane) Model {
@@ -1586,12 +1646,6 @@ func TestSelectTypeSendsOnlyToTheChosenTypesPanes(t *testing.T) {
 		)
 		got := model.(Model)
 
-		if row.agentType == agent.AgentTypeGrok {
-			if !errors.Is(got.err, agent.ErrAutomatedPromptDeliveryNotImplemented) || len(sentIDs) != 0 {
-				t.Errorf("grok: err %v, sent %v; want the prompt-delivery refusal and no sends", got.err, sentIDs)
-			}
-			continue
-		}
 		if got.err != nil || !reflect.DeepEqual(sentIDs, wantIDs) || got.sentCount != len(wantIDs) {
 			t.Errorf("%s: err %v, sent %v (count %d), want %v", row.agentType, got.err, sentIDs, got.sentCount, wantIDs)
 		}
@@ -1654,7 +1708,7 @@ func TestSelectTypeWithNoAgentPanes(t *testing.T) {
 	}
 }
 
-// Key 7 is "By type…" in the target step, and its row says how many agent
+// Key 8 is "By type…" in the target step, and its row says how many agent
 // types the session has and which.
 func TestTargetPhaseOffersByType(t *testing.T) {
 	panes, want := typePickerSession(someTypesAbsent)
@@ -1676,8 +1730,14 @@ func TestTargetPhaseOffersByType(t *testing.T) {
 			t.Errorf("target phase lacks %q:\n%s", wantText, view)
 		}
 	}
-	if help := stripANSI(m.renderTargetHelpBar()); !strings.Contains(help, " 7 ") || !strings.Contains(help, "by type") {
-		t.Errorf("target help bar lacks 7 / by type: %q", help)
+	if help := stripANSI(m.renderTargetHelpBar()); !strings.Contains(help, " 8 ") || !strings.Contains(help, "by type") {
+		t.Errorf("target help bar lacks 8 / by type: %q", help)
+	}
+
+	eight := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'8'}}
+	if !key.Matches(eight, targetKeys.ByType) || key.Matches(eight, targetKeys.TargetOmp) ||
+		key.Matches(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'7'}}, targetKeys.ByType) {
+		t.Error("key 8 (and only 8) must open By type…; 7 stays the omp quick target")
 	}
 }
 

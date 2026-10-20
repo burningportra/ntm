@@ -32,6 +32,7 @@ import (
 	"crypto/sha1" //nolint:gosec // Not cryptographic; path namespace only.
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,6 +72,66 @@ func WriteIdentity(projectKey, paneID, agentName string) (string, error) {
 	}
 	path := CanonicalIdentityPath(projectKey, paneID)
 	if err := writeIdentityFile(path, trimmed+"\n"); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// BareTmuxPaneID reports whether paneID is a bare tmux pane address (%N) and
+// returns its trimmed form. This is the only shape the Agent Mail server's
+// pane-binding contract accepts (its is_trusted_tmux_pane_header allowlist);
+// composite session:window:pane labels are ntm-side provenance, not addresses.
+func BareTmuxPaneID(paneID string) (string, bool) {
+	paneID = strings.TrimSpace(paneID)
+	if len(paneID) < 2 || len(paneID) > 64 || paneID[0] != '%' {
+		return "", false
+	}
+	for _, ch := range paneID[1:] {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	return paneID, true
+}
+
+// ReadPaneIdentityReceipt reads the canonical identity file for a pane and,
+// when it holds the Agent Mail server's structured PaneIdentityRecord JSON
+// (the generation receipt its pane-binding registration writes), returns the
+// raw receipt bytes and the agent name it binds. Plain-text legacy files and
+// unreadable/malformed content return ok=false: a bare name carries no
+// generation-binding facts worth preserving.
+func ReadPaneIdentityReceipt(projectKey, paneID string) (receipt []byte, name string, ok bool) {
+	path := CanonicalIdentityPath(projectKey, paneID)
+	data, err := os.ReadFile(path) //nolint:gosec // canonical project/pane path
+	if err != nil {
+		return nil, "", false
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil, "", false
+	}
+	var record struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &record); err != nil {
+		return nil, "", false
+	}
+	record.Name = strings.TrimSpace(record.Name)
+	if record.Name == "" {
+		return nil, "", false
+	}
+	return data, record.Name, true
+}
+
+// MirrorPaneIdentityReceipt copies a server-written generation receipt into
+// another project-key namespace byte-for-byte, so worktree/symlink aliases of
+// the project resolve the same binding facts instead of a weaker plain name.
+func MirrorPaneIdentityReceipt(projectKey, paneID string, receipt []byte) (string, error) {
+	if len(receipt) == 0 {
+		return "", fmt.Errorf("cannot mirror an empty pane identity receipt")
+	}
+	path := CanonicalIdentityPath(projectKey, paneID)
+	if err := writeIdentityFile(path, string(receipt)); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -157,26 +218,6 @@ func ResolveIdentity(projectKey, paneID string) (name string, path string) {
 	}
 
 	return "", ""
-}
-
-// MigrateLegacyIdentityIfNeeded resolves the identity via the legacy paths and
-// migrates it to the canonical path if (a) a legacy file exists and (b) the
-// canonical file does not. This is a best-effort helper: errors are silently
-// swallowed because a migration failure should never break a caller.
-// Returns the resolved agent name (empty if none found).
-func MigrateLegacyIdentityIfNeeded(projectKey, paneID string) string {
-	canonical := CanonicalIdentityPath(projectKey, paneID)
-	if v, ok := readIdentityFile(canonical); ok {
-		// Canonical already exists with a valid regular identity file; nothing to do.
-		return v
-	}
-	name, found := ResolveIdentity(projectKey, paneID)
-	if found == "" || name == "" {
-		return ""
-	}
-	// Migrate into canonical (best-effort).
-	_, _ = WriteIdentity(projectKey, paneID, name)
-	return name
 }
 
 // WriteLegacyCompatIdentity writes the legacy `/tmp/agent-mail-name.<sha1>.<sanitized_pane>`
@@ -270,9 +311,19 @@ func sanitizePaneID(paneID string) string {
 	return b.String()
 }
 
-// readIdentityFile reads the identity file at path and returns the trimmed
-// contents and true, or ("", false) if the file does not exist or the content
-// is empty after trimming.
+// readIdentityFile reads the identity file at path and returns the agent
+// name and true, or ("", false) if the file does not exist or holds no usable
+// name.
+//
+// Two on-disk formats exist. Legacy writers (older ntm, this package's
+// WriteIdentity) store the bare adjective+noun name as plain text. The
+// current mcp-agent-mail reference implementation stores a structured
+// PaneIdentityRecord JSON object ({"name":"BlueLake","pane_id":"%25",...}) in
+// the SAME canonical path. Returning the raw contents of a structured file
+// made the entire JSON blob the caller's Agent Mail actor and Beads assignee
+// (PR #275 finding), so JSON content is decoded down to its "name" field, and
+// malformed JSON fails closed — a JSON document is never itself a valid agent
+// name.
 func readIdentityFile(path string) (string, bool) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -288,6 +339,19 @@ func readIdentityFile(path string) (string, bool) {
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
 		return "", false
+	}
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var record struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &record); err != nil {
+			return "", false
+		}
+		name := strings.TrimSpace(record.Name)
+		if name == "" {
+			return "", false
+		}
+		return name, true
 	}
 	return trimmed, true
 }

@@ -446,14 +446,12 @@ func TestDefaultAgentTemplates(t *testing.T) {
 	if museBare != "muse --yolo" {
 		t.Errorf("Muse bare render = %q, want %q", museBare, "muse --yolo")
 	}
-	museSysPrompt, err := GenerateAgentCommand(templates.Muse, AgentTemplateVars{
+	// Muse has no system-prompt flag, so a persona is refused loudly rather
+	// than dropped (bd-ws7-docs-ux-truth-tqh3l.5).
+	if museSysPrompt, err := GenerateAgentCommand(templates.Muse, AgentTemplateVars{
 		AgentType: "muse", Model: "muse-wonder-1.0", SystemPromptFile: "/tmp/persona.md",
-	})
-	if err != nil {
-		t.Fatalf("Muse system-prompt template failed: %v", err)
-	}
-	if museSysPrompt != "muse --yolo --model 'muse-wonder-1.0'" {
-		t.Errorf("Muse render with SystemPromptFile = %q; Muse has no system-prompt flag, so none should be emitted", museSysPrompt)
+	}); err == nil || !strings.Contains(err.Error(), "persona ignored: muse has no persona mechanism") {
+		t.Errorf("Muse render with SystemPromptFile = %q, %v; want a loud persona refusal", museSysPrompt, err)
 	}
 }
 
@@ -487,30 +485,28 @@ func TestDefaultAgentTemplates_ShellQuoting(t *testing.T) {
 		}
 	}
 
-	// checkModelOnly verifies shell-quoting of the model only — for agents where
-	// system-prompt-file injection is not supported via CLI flags (e.g. Gemini,
-	// which removed --system-instruction-file in v0.31.0).
-	checkModelOnly := func(name, tmpl string) {
-		cmd, err := GenerateAgentCommand(tmpl, vars)
-		if err != nil {
-			t.Fatalf("%s template: %v", name, err)
-		}
-		quotedModel := ShellQuote(vars.Model)
-		if !strings.Contains(cmd, quotedModel) {
-			t.Fatalf("%s template should contain quoted model %q, got: %s", name, quotedModel, cmd)
-		}
-		if strings.Contains(cmd, vars.Model) && !strings.Contains(cmd, quotedModel) {
-			t.Fatalf("%s template appears to include unquoted model: %s", name, cmd)
-		}
-	}
-
 	check("claude", templates.Claude)
 	check("codex", templates.Codex)
-	// Gemini dropped --system-instruction-file in v0.31.0; only model quoting applies.
-	checkModelOnly("gemini", templates.Gemini)
-	checkModelOnly("grok", templates.Grok)
-	// Muse has no system-prompt-file flag; only model quoting applies.
-	checkModelOnly("muse", templates.Muse)
+	// Gemini delivers the persona via the GEMINI_SYSTEM_MD env var, agy via
+	// --prompt-interactive; both must quote the file path (and the model).
+	check("gemini", templates.Gemini)
+	check("antigravity", templates.Antigravity)
+
+	// Grok and Muse have no persona mechanism: rendering with a
+	// SystemPromptFile must refuse loudly instead of silently dropping it
+	// (bd-ws7-docs-ux-truth-tqh3l.5).
+	if _, err := GenerateAgentCommand(templates.Grok, AgentTemplateVars{
+		AgentType:        "grok",
+		SystemPromptFile: vars.SystemPromptFile,
+	}); err == nil || !strings.Contains(err.Error(), "persona ignored: grok has no persona mechanism") {
+		t.Fatalf("grok template with persona: err = %v, want loud refusal", err)
+	}
+	if _, err := GenerateAgentCommand(templates.Muse, AgentTemplateVars{
+		AgentType:        "muse",
+		SystemPromptFile: vars.SystemPromptFile,
+	}); err == nil || !strings.Contains(err.Error(), "persona ignored: muse has no persona mechanism") {
+		t.Fatalf("muse template with persona: err = %v, want loud refusal", err)
+	}
 }
 
 // TestShellQuote_Branches tests both branches of ShellQuote.
@@ -670,4 +666,117 @@ func TestGenerateAgentCommandGuardsDroppedReasoningEffort(t *testing.T) {
 			t.Fatalf("unexpected error with no effort override: %v", err)
 		}
 	})
+}
+
+// Claude Code takes hooks only from settings, so ntm's PreToolUse hooks ride
+// on the launch command as --settings. The built-in template, templates that
+// `ntm config init` pinned into users' configs before ClaudeSettings existed,
+// and plain commands all end in a claude invocation and get the flag.
+func TestGenerateAgentCommandAttachesClaudeSettings(t *testing.T) {
+	const settings = `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'/usr/bin/ntm' safety claude-hook"}]}]}}`
+	quoted := ShellQuote(settings)
+
+	for name, tmpl := range map[string]string{
+		"built-in default":       DefaultAgentTemplates().Claude,
+		"pinned older default":   `{{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		"plain command":          `claude --dangerously-skip-permissions`,
+		"absolute path":          `/usr/local/bin/claude --dangerously-skip-permissions`,
+		"env assignment prefix":  `ANTHROPIC_LOG=debug claude`,
+		"redirect after command": `claude --verbose 2>>/tmp/claude.log`,
+		"after a cd":             `cd /repo && claude --dangerously-skip-permissions`,
+		"wrapper named claude":   `operator-claude --model 'operator/model'`,
+		"cc alias":               `cc`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := GenerateAgentCommand(tmpl, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+			if err != nil {
+				t.Fatalf("GenerateAgentCommand: %v", err)
+			}
+			if !strings.HasSuffix(got, " --settings "+quoted) {
+				t.Fatalf("rendered = %q, want it to end with --settings %s", got, quoted)
+			}
+			if strings.Count(got, "--settings") != 1 {
+				t.Fatalf("rendered = %q, want exactly one --settings", got)
+			}
+		})
+	}
+
+	t.Run("template that places the settings itself", func(t *testing.T) {
+		got, err := GenerateAgentCommand(`claude --settings {{shellQuote .ClaudeSettings}} | tee /tmp/log`, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+		if err != nil {
+			t.Fatalf("GenerateAgentCommand: %v", err)
+		}
+		if got != "claude --settings "+quoted+" | tee /tmp/log" {
+			t.Fatalf("rendered = %q", got)
+		}
+	})
+
+	t.Run("no settings leaves the command alone", func(t *testing.T) {
+		got, err := GenerateAgentCommand(`claude --verbose | tee /tmp/log`, AgentTemplateVars{AgentType: "cc"})
+		if err != nil || got != "claude --verbose | tee /tmp/log" {
+			t.Fatalf("rendered = %q, %v", got, err)
+		}
+	})
+
+	// Commands whose last command is not claude, or that already pass their
+	// own --settings, cannot take the hooks: they launch unchanged and the
+	// launch paths warn (never silently) with the fix.
+	for name, tmpl := range map[string]string{
+		"pipe after claude":        `claude --verbose | tee /tmp/log`,
+		"background":               `claude --verbose &`,
+		"subshell":                 `(cd /repo && claude --verbose)`,
+		"wrapper script":           `my-agent-wrapper.sh --fast`,
+		"claude only in a log arg": `my-agent --log /tmp/claude-session.log`,
+		"own settings flag":        `claude --settings /etc/claude.json`,
+		"own settings flag inline": `claude --settings=/etc/claude.json`,
+		"unbalanced quote":         `claude --system-prompt 'oops`,
+	} {
+		t.Run("leaves alone "+name, func(t *testing.T) {
+			got, err := GenerateAgentCommand(tmpl, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+			if err != nil || got != tmpl {
+				t.Fatalf("rendered = %q, %v; want the command unchanged", got, err)
+			}
+			warning := ClaudeHooksNotAppliedWarning(got, settings)
+			if !strings.Contains(warning, "{{shellQuote .ClaudeSettings}}") || !strings.Contains(warning, "claude_policy_hook") {
+				t.Fatalf("warning = %q, want both fixes named", warning)
+			}
+		})
+	}
+
+	t.Run("no warning when the hooks are carried or absent", func(t *testing.T) {
+		got, err := GenerateAgentCommand(`claude --verbose`, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := ClaudeHooksNotAppliedWarning(got, settings); w != "" {
+			t.Fatalf("warning for a command carrying the hooks: %q", w)
+		}
+		if w := ClaudeHooksNotAppliedWarning("claude --verbose | tee log", ""); w != "" {
+			t.Fatalf("warning with no hooks configured: %q", w)
+		}
+	})
+}
+
+func TestFinalShellCommand(t *testing.T) {
+	for cmd, want := range map[string]string{
+		`a && b`:                         "b",
+		`a; b c`:                         "b c",
+		`echo "x; y" && claude`:          "claude",
+		`echo 'a|b' | claude --x`:        "claude --x",
+		`x=$(cat f; echo) claude`:        "x=$(cat f; echo) claude",
+		"VAR=`date; true` claude":        "VAR=`date; true` claude",
+		`claude 2>&1 >/dev/null`:         "claude 2>&1 >/dev/null",
+		`claude &>/tmp/out`:              "claude &>/tmp/out",
+		`echo "\"quoted; still" && last`: "last",
+	} {
+		got, ok := finalShellCommand(cmd)
+		if !ok || got != want {
+			t.Errorf("finalShellCommand(%q) = %q, %v; want %q", cmd, got, ok, want)
+		}
+	}
+	for _, cmd := range []string{`claude &`, `a |`, `(claude)`, `claude 'x`, `claude "x`, `x=$(claude`} {
+		if got, ok := finalShellCommand(cmd); ok {
+			t.Errorf("finalShellCommand(%q) = %q, true; want no final command", cmd, got)
+		}
+	}
 }

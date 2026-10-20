@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/util"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // ErrActionableLabelsUnverified marks a fail-closed planning error: bv plan
@@ -30,13 +31,18 @@ var ErrActionablePlanUnverified = errors.New("actionable bv plan could not be ve
 // TriageCacheTTL is the default cache TTL for triage results
 const TriageCacheTTL = 30 * time.Second
 
+// ErrStaleWorkCoordination means a work projection no longer matches its
+// local tracker/checkout source. Callers must refresh rather than dispatch it.
+var ErrStaleWorkCoordination = worksource.ErrChanged
+
 var (
-	triageCache     *TriageResponse
-	triageCacheDir  string
-	triageCacheTime time.Time
-	triageCacheTTL  = TriageCacheTTL
-	triageCacheMu   sync.RWMutex
-	triageRunMu     sync.Mutex
+	triageCache       *TriageResponse
+	triageCacheDir    string
+	triageCacheSource worksource.Identity
+	triageCacheTime   time.Time
+	triageCacheTTL    = TriageCacheTTL
+	triageCacheMu     sync.RWMutex
+	triageRunMu       sync.Mutex
 )
 
 func acquireTriageRunLock(ctx context.Context, deadline time.Time, timeout time.Duration) (func(), error) {
@@ -68,6 +74,18 @@ func acquireTriageRunLock(ctx context.Context, deadline time.Time, timeout time.
 	}
 }
 
+// triageBudgetError reports expiry of this call's own triage budget the same
+// way as every other triage timeout ("bv timed out after ..."), instead of the
+// internal deadline context's bare "context deadline exceeded" (for example
+// while the tracker source is captured or the run lock is awaited). The cause
+// stays wrapped; the caller's own cancellation or deadline passes through.
+func triageBudgetError(parent context.Context, err error, timeout time.Duration) error {
+	if err == nil || parent.Err() != nil || !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out after") {
+		return err
+	}
+	return fmt.Errorf("bv timed out after %v: %w", timeout, err)
+}
+
 func normalizeTriageDir(dir string) (string, error) {
 	if dir == "" {
 		dir = util.ResolveProjectDir("")
@@ -91,7 +109,7 @@ func normalizeTriageDir(dir string) (string, error) {
 // GetTriage returns the complete triage analysis from bv --robot-triage.
 // Results are cached for TriageCacheTTL (default 30 seconds).
 func GetTriage(dir string) (*TriageResponse, error) {
-	return getTriageContext(context.Background(), dir, DefaultTimeout)
+	return getTriageContext(context.Background(), dir, CommandTimeout())
 }
 
 // GetTriageContext returns cached or fresh triage while honoring caller
@@ -100,7 +118,7 @@ func GetTriageContext(ctx context.Context, dir string) (*TriageResponse, error) 
 	if ctx == nil {
 		return nil, fmt.Errorf("triage context is required")
 	}
-	return getTriageContext(ctx, dir, DefaultTimeout)
+	return getTriageContext(ctx, dir, CommandTimeout())
 }
 
 // GetTriageWithTimeout returns complete triage analysis with a caller-scoped
@@ -109,7 +127,7 @@ func GetTriageWithTimeout(dir string, timeout time.Duration) (*TriageResponse, e
 	return getTriageContext(context.Background(), dir, timeout)
 }
 
-func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*TriageResponse, error) {
+func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (_ *TriageResponse, err error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("triage context is required")
 	}
@@ -121,13 +139,26 @@ func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*
 		return nil, err
 	}
 	if timeout <= 0 {
-		timeout = DefaultTimeout
+		timeout = CommandTimeout()
 	}
 	deadline := time.Now().Add(timeout)
+	parent := ctx
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	defer func() { err = triageBudgetError(parent, err, timeout) }()
+	source, err := captureTriageSource(ctx, normalizedDir)
+	if err != nil {
+		return nil, err
+	}
 
 	triageCacheMu.RLock()
-	// Return cached result if still valid and for the same directory
-	if triageCache != nil && triageCacheDir == normalizedDir && time.Since(triageCacheTime) < triageCacheTTL {
+	if triageCache != nil && triageCacheDir == normalizedDir && triageCacheSource.Bound() && !source.Bound() {
+		triageCacheMu.RUnlock()
+		return nil, fmt.Errorf("%w: previously bound tracker export is missing", ErrStaleWorkCoordination)
+	}
+	// A TTL is a performance policy, not authority to reuse different work.
+	// Check the actual tracker bytes and checkout even during a cache hit.
+	if triageCache != nil && triageCacheDir == normalizedDir && triageCacheSource == source && time.Since(triageCacheTime) < triageCacheTTL {
 		cached := triageCache
 		triageCacheMu.RUnlock()
 		return cached, nil
@@ -141,9 +172,19 @@ func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*
 	}
 	defer releaseRunLock()
 
+	// The source can change while another collector owns the runner lock.
+	source, err = captureTriageSource(ctx, normalizedDir)
+	if err != nil {
+		return nil, err
+	}
+
 	// Double-check cache after acquiring run lock
 	triageCacheMu.RLock()
-	if triageCache != nil && triageCacheDir == normalizedDir && time.Since(triageCacheTime) < triageCacheTTL {
+	if triageCache != nil && triageCacheDir == normalizedDir && triageCacheSource.Bound() && !source.Bound() {
+		triageCacheMu.RUnlock()
+		return nil, fmt.Errorf("%w: previously bound tracker export is missing", ErrStaleWorkCoordination)
+	}
+	if triageCache != nil && triageCacheDir == normalizedDir && triageCacheSource == source && time.Since(triageCacheTime) < triageCacheTTL {
 		cached := triageCache
 		triageCacheMu.RUnlock()
 		return cached, nil
@@ -164,37 +205,19 @@ func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*
 		return nil, fmt.Errorf("parsing triage: %w", err)
 	}
 
-	// Update cache
-	triageCacheMu.Lock()
-	triageCache = &resp
-	triageCacheDir = normalizedDir
-	triageCacheTime = time.Now()
-	triageCacheMu.Unlock()
-
-	return &resp, nil
-}
-
-// GetTriageNoCache returns fresh triage data, bypassing the cache
-func GetTriageNoCache(dir string) (*TriageResponse, error) {
-	normalizedDir, err := normalizeTriageDir(dir)
+	current, err := captureTriageSource(ctx, normalizedDir)
 	if err != nil {
 		return nil, err
 	}
-
-	output, err := run(normalizedDir, "--robot-triage")
-	if err != nil {
+	if err := source.Verify(current); err != nil {
 		return nil, err
 	}
 
-	var resp TriageResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing triage: %w", err)
-	}
-
-	// Also update cache with fresh data
+	// Publish only results observed entirely within one source revision.
 	triageCacheMu.Lock()
 	triageCache = &resp
 	triageCacheDir = normalizedDir
+	triageCacheSource = source
 	triageCacheTime = time.Now()
 	triageCacheMu.Unlock()
 
@@ -202,19 +225,13 @@ func GetTriageNoCache(dir string) (*TriageResponse, error) {
 }
 
 // InvalidateTriageCache clears the triage cache.
-// Call this when beads data changes (e.g., after bd sync).
+// Call this when beads data changes (e.g., after br sync --flush-only).
 func InvalidateTriageCache() {
 	triageCacheMu.Lock()
 	triageCache = nil
 	triageCacheDir = ""
+	triageCacheSource = worksource.Identity{}
 	triageCacheTTL = TriageCacheTTL // Reset to default
-	triageCacheMu.Unlock()
-}
-
-// SetTriageCacheTTL allows configuring the cache TTL
-func SetTriageCacheTTL(ttl time.Duration) {
-	triageCacheMu.Lock()
-	triageCacheTTL = ttl
 	triageCacheMu.Unlock()
 }
 
@@ -227,28 +244,11 @@ func GetTriageQuickRef(dir string) (*TriageQuickRef, error) {
 	return &triage.Triage.QuickRef, nil
 }
 
-// GetTriageTopPicks returns the top N picks from triage
-func GetTriageTopPicks(dir string, n int) ([]TriageTopPick, error) {
-	if n < 0 {
-		return nil, fmt.Errorf("triage top-picks limit must not be negative: %d", n)
-	}
-	triage, err := GetTriage(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	picks := triage.Triage.QuickRef.TopPicks
-	if len(picks) > n {
-		picks = picks[:n]
-	}
-	return picks, nil
-}
-
-// GetActionableRecommendations returns recommendations sourced from the FULL
+// getActionableRecommendationsFromToolsContext collects the FULL
 // dependency-aware actionable set (bv --robot-plan), ranked by triage scoring.
 //
 // bv --robot-triage is hardcoded to ≤10 recommendations (see beads_viewer
-// triage.TopN), so GetTriageRecommendations can never surface more than 10
+// triage.TopN), so triage-derived recommendations can never surface more than 10
 // candidates no matter what n is requested. On large or heavily-gated backlogs
 // whose top-ranked rows are epics/gated/blocked, that ceiling silently starves
 // the assigner: it reports the queue drained while dozens of beads below the
@@ -268,15 +268,20 @@ func GetTriageTopPicks(dir string, n int) ([]TriageTopPick, error) {
 // unavailable, malformed, structurally incomplete, or contains an assignable
 // item whose labels cannot be verified, the call fails closed rather than
 // authorizing raw triage candidates.
-func GetActionableRecommendations(dir string, n int) ([]TriageRecommendation, error) {
-	return GetActionableRecommendationsContext(context.Background(), dir, n)
-}
-
-// GetActionableRecommendationsContext returns the full actionable set while
-// honoring caller cancellation across triage, plan, and label enrichment.
-func GetActionableRecommendationsContext(ctx context.Context, dir string, n int) ([]TriageRecommendation, error) {
+//
+// It honors caller cancellation across triage, plan, and label enrichment.
+func getActionableRecommendationsFromToolsContext(ctx context.Context, dir string, n int) ([]TriageRecommendation, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("actionable recommendations context is required")
+	}
+	resolvedDir, err := normalizeTriageDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	dir = resolvedDir
+	source, err := captureTriageSource(ctx, dir)
+	if err != nil {
+		return nil, err
 	}
 	triage, err := GetTriageContext(ctx, dir)
 	if err != nil {
@@ -326,10 +331,51 @@ func GetActionableRecommendationsContext(ctx context.Context, dir string, n int)
 	if labelsErr != nil {
 		return nil, classifyActionableLabelsError(ctx, labelsErr)
 	}
+
+	// bv --robot-plan is a ranked snapshot; Beads owns lifecycle state. A plan
+	// row that has vanished from both open-only label surfaces is either stale
+	// (closed/blocked/in_progress/deferred since the snapshot — satisfied or
+	// ineligible, skip it) or genuinely unaccounted for (fail closed). Resolve
+	// the distinction once against the complete tracker surface; the normal
+	// all-verified path never pays for the extra br call.
+	var missingFromOpen []string
 	for _, item := range planItems {
 		if _, verified := labelsByID[item.ID]; !verified {
-			return nil, fmt.Errorf("%w: open actionable plan item %q was absent from both br ready and br list --status open", ErrActionableLabelsUnverified, item.ID)
+			missingFromOpen = append(missingFromOpen, item.ID)
 		}
+	}
+	if len(missingFromOpen) > 0 {
+		statusesByID, statusErr := allBeadStatusesContext(ctx, dir)
+		if statusErr != nil {
+			return nil, classifyActionableLabelsError(ctx, statusErr)
+		}
+		stale := make(map[string]struct{}, len(missingFromOpen))
+		for _, id := range missingFromOpen {
+			status, tracked := statusesByID[id]
+			switch {
+			case !tracked:
+				return nil, fmt.Errorf("%w: actionable plan item %q was absent from br ready, br list --status open, and br list --all", ErrActionableLabelsUnverified, id)
+			case status == "open":
+				// Live-open yet invisible on both open surfaces: the label
+				// sources are inconsistent, not merely behind the plan. Keep
+				// failing closed rather than dispatch unverifiable work.
+				return nil, fmt.Errorf("%w: plan item %q is still open in br list --all but was absent from both br ready and br list --status open", ErrActionableLabelsUnverified, id)
+			default:
+				stale[id] = struct{}{}
+			}
+		}
+		filtered := planItems[:0]
+		for _, item := range planItems {
+			if _, drop := stale[item.ID]; drop {
+				delete(planByID, item.ID)
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		planItems = filtered
+	}
+
+	for _, item := range planItems {
 		// Type evidence follows the same coverage invariant as labels: without
 		// a verified issue type the classifier cannot prove a plan item is not
 		// a container (epic), so assignment must stop rather than dispatch it.
@@ -378,6 +424,14 @@ func GetActionableRecommendationsContext(ctx context.Context, dir string, n int)
 			Labels:      append([]string(nil), labelsByID[item.ID]...),
 			UnblocksIDs: append([]string(nil), item.Unblocks...),
 		})
+	}
+
+	current, err := captureTriageSource(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := source.Verify(current); err != nil {
+		return nil, err
 	}
 
 	if n > 0 && len(recs) > n {
@@ -482,55 +536,36 @@ func readyBeadLabelsContext(ctx context.Context, dir string) (map[string][]strin
 	return labels, issueTypes, nil
 }
 
-// GetTriageRecommendations returns the top N recommendations
-func GetTriageRecommendations(dir string, n int) ([]TriageRecommendation, error) {
-	if n < 0 {
-		return nil, fmt.Errorf("triage recommendations limit must not be negative: %d", n)
-	}
-	triage, err := GetTriage(dir)
+// allBeadStatusesContext reads Beads' complete lifecycle surface (br list
+// --all) as an id→status map. It backs the stale-plan-row resolution above
+// and is only invoked when a plan item has already vanished from both
+// open-only label sources, so the common path stays at two br calls.
+func allBeadStatusesContext(ctx context.Context, dir string) (map[string]string, error) {
+	args := []string{"list", "--json", "--all", "--limit", "100000"}
+	output, err := RunBdContext(ctx, dir, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read bead lifecycle (br %s): %w", strings.Join(args, " "), err)
 	}
-
-	recs := triage.Triage.Recommendations
-	if len(recs) > n {
-		recs = recs[:n]
-	}
-	return recs, nil
-}
-
-// GetQuickWins returns quick win recommendations (low effort, high impact)
-func GetQuickWins(dir string, n int) ([]TriageRecommendation, error) {
-	if n < 0 {
-		return nil, fmt.Errorf("quick-wins limit must not be negative: %d", n)
-	}
-	triage, err := GetTriage(dir)
+	items, err := UnmarshalBdList[struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}](output)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse bead lifecycle (br %s): %w", strings.Join(args, " "), err)
 	}
-
-	wins := triage.Triage.QuickWins
-	if len(wins) > n {
-		wins = wins[:n]
+	statuses := make(map[string]string, len(items))
+	for _, item := range items {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(item.Status))
+		if status == "" {
+			return nil, fmt.Errorf("parse bead lifecycle (br %s): bead %q has a blank status", strings.Join(args, " "), id)
+		}
+		statuses[id] = status
 	}
-	return wins, nil
-}
-
-// GetBlockersToClear returns blockers that should be cleared first
-func GetBlockersToClear(dir string, n int) ([]BlockerToClear, error) {
-	if n < 0 {
-		return nil, fmt.Errorf("blockers-to-clear limit must not be negative: %d", n)
-	}
-	triage, err := GetTriage(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	blockers := triage.Triage.BlockersToClear
-	if len(blockers) > n {
-		blockers = blockers[:n]
-	}
-	return blockers, nil
+	return statuses, nil
 }
 
 // GetNextRecommendation returns the single top recommendation.
@@ -548,30 +583,19 @@ func GetNextRecommendation(dir string) (*TriageRecommendation, error) {
 	return &triage.Triage.Recommendations[0], nil
 }
 
-// GetProjectHealth returns the project health metrics from triage
-func GetProjectHealth(dir string) (*ProjectHealth, error) {
-	triage, err := GetTriage(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	return triage.Triage.ProjectHealth, nil
-}
-
-// GetTriageDataHash returns the data hash for cache validation
-func GetTriageDataHash(dir string) (string, error) {
-	triage, err := GetTriage(dir)
-	if err != nil {
-		return "", err
-	}
-	return triage.DataHash, nil
-}
-
 // IsCacheValid checks if the cache is still valid
 func IsCacheValid() bool {
 	triageCacheMu.RLock()
-	defer triageCacheMu.RUnlock()
-	return triageCache != nil && time.Since(triageCacheTime) < triageCacheTTL
+	valid := triageCache != nil && time.Since(triageCacheTime) < triageCacheTTL
+	dir, source := triageCacheDir, triageCacheSource
+	triageCacheMu.RUnlock()
+	if !valid {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	current, err := captureTriageSource(ctx, dir)
+	return err == nil && source.Verify(current) == nil
 }
 
 // GetCacheAge returns how long the cache has been in place
@@ -582,4 +606,18 @@ func GetCacheAge() time.Duration {
 		return 0
 	}
 	return time.Since(triageCacheTime)
+}
+
+// captureTriageSource fails closed on an unreadable existing export. Missing
+// JSONL exports keep the historical DB-only TTL behavior, without claiming a
+// source binding. No caller's cancellation is reclassified as source drift.
+func captureTriageSource(ctx context.Context, dir string) (worksource.Identity, error) {
+	source, err := worksource.Capture(ctx, dir)
+	if err == nil {
+		return source, nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return worksource.Identity{}, err
+	}
+	return worksource.Identity{}, fmt.Errorf("%w: cannot verify work source: %w", ErrStaleWorkCoordination, err)
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -51,6 +52,22 @@ func IsAlive(pid int) bool {
 		return false
 	}
 
+	// Windows: os.Process.Signal only implements os.Kill — any other signal
+	// (including the POSIX signal-0 probe below) returns EWINDOWS, so the
+	// fallback path would report every live process as dead. That silently
+	// broke every Windows consumer of IsAlive (e.g. cm daemon PID-file
+	// discovery, which would always skip a live daemon). gopsutil implements
+	// existence via the process snapshot API, and Windows has no zombie
+	// state to filter.
+	if runtime.GOOS == "windows" {
+		proc, err := gopsutil.NewProcess(int32(pid))
+		if err != nil {
+			return false
+		}
+		running, err := proc.IsRunning()
+		return err == nil && running
+	}
+
 	// Fast path: inspect /proc state directly on Linux. Zombie and dead
 	// processes still have a /proc entry until reaped, but they are not alive.
 	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid)); err == nil {
@@ -66,6 +83,12 @@ func IsAlive(pid int) bool {
 			break
 		}
 		return true
+	}
+
+	// Native snapshot (darwin): one sysctl lookup answers both existence and
+	// zombie state, replacing the kill(0)+`ps` probe below (bd-4479y).
+	if alive, ok := nativeIsAlive(pid); ok {
+		return alive
 	}
 
 	// Fallback: signal 0 check (works on all POSIX systems).
@@ -108,6 +131,12 @@ func IsAlive(pid int) bool {
 func HasChildAlive(shellPID int) bool {
 	if shellPID <= 0 {
 		return false
+	}
+	// Native single-syscall path (darwin): the portable fallback below costs
+	// one pgrep plus one ps per child, which robot status pays once per pane,
+	// serially (bd-4479y).
+	if alive, ok := nativeHasChildAlive(shellPID); ok {
+		return alive
 	}
 	for _, child := range getChildPIDs(shellPID) {
 		if IsAlive(child) {
@@ -174,6 +203,16 @@ func getChildPIDs(parentPID int) []int {
 					add(pid)
 				}
 			}
+		}
+	}
+
+	// Native snapshot (darwin): one sysctl call replaces the pgrep spawn.
+	if len(pids) == 0 {
+		if native, ok := nativeChildPIDs(parentPID); ok {
+			for _, pid := range native {
+				add(pid)
+			}
+			return pids
 		}
 	}
 
@@ -263,6 +302,19 @@ func GetChildPIDs(parentPID int, limit int) []int {
 	if data, err := os.ReadFile(taskPath); err == nil {
 		return collect(strings.Fields(string(data)))
 	}
+	if native, ok := nativeChildPIDs(parentPID); ok {
+		var out []int
+		for _, pid := range native {
+			if pid <= 0 {
+				continue
+			}
+			out = append(out, pid)
+			if len(out) >= limit {
+				break
+			}
+		}
+		return out
+	}
 	cmd := exec.Command("pgrep", "-P", strconv.Itoa(parentPID))
 	if out, err := cmd.Output(); err == nil {
 		return collect(strings.Fields(string(out)))
@@ -290,6 +342,40 @@ var processStateNames = map[string]string{
 // It tries /proc/<pid>/status on Linux and falls back to ps on macOS/Linux.
 // Returns the single-character state code (R, S, D, Z, T, etc.),
 // a human-readable name, and any error.
+// TerminalForeground reports which process group currently owns the
+// controlling terminal of pid (tpgid) and pid's own process group (pgrp),
+// read from /proc/<pid>/stat. A shell whose pgrp equals tpgid is itself in
+// the foreground (idle, or running a builtin / same-group rc children); a job
+// it launched with job control owns the terminal under a different group.
+// ok is false when the fields cannot be read (non-Linux, process gone).
+func TerminalForeground(pid int) (tpgid, pgrp int, ok bool) {
+	if pid <= 0 {
+		return 0, 0, false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, 0, false
+	}
+	// "pid (comm) state ppid pgrp session tty_nr tpgid ..." — comm may contain
+	// spaces and parentheses, so split after the LAST ')'.
+	text := string(data)
+	end := strings.LastIndex(text, ")")
+	if end < 0 || end+2 > len(text) {
+		return 0, 0, false
+	}
+	fields := strings.Fields(text[end+2:])
+	// fields[0]=state fields[1]=ppid fields[2]=pgrp fields[3]=session fields[4]=tty_nr fields[5]=tpgid
+	if len(fields) < 6 {
+		return 0, 0, false
+	}
+	pg, err1 := strconv.Atoi(fields[2])
+	tp, err2 := strconv.Atoi(fields[5])
+	if err1 != nil || err2 != nil || pg <= 0 {
+		return 0, 0, false
+	}
+	return tp, pg, true
+}
+
 func GetProcessState(pid int) (string, string, error) {
 	if pid <= 0 {
 		return "", "", fmt.Errorf("invalid pid: %d", pid)
@@ -310,6 +396,19 @@ func GetProcessState(pid int) (string, string, error) {
 				}
 			}
 		}
+	}
+
+	// Native snapshot (darwin): one sysctl lookup replaces the ps spawn,
+	// which robot status pays once per pane, serially (bd-4479y).
+	if state, ok := nativeProcessState(pid); ok {
+		name := processStateNames[state]
+		if name == "" && state == "I" {
+			name = "idle"
+		}
+		if name == "" {
+			name = "unknown"
+		}
+		return state, name, nil
 	}
 
 	// Fallback to ps (macOS and Linux)

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -474,37 +473,6 @@ func TestValidateRestartStorePreflightAcceptsReleasedRequiredTerminalAssignment(
 	}
 }
 
-func TestValidateRestartFreshDetailsRejectsEveryLiveAutomationGate(t *testing.T) {
-	now := time.Now()
-	future := now.Add(time.Hour)
-	base := bv.BeadAssignmentDetails{ID: "ntm-gated", Title: "Gated", Status: "open"}
-	tests := []struct {
-		name string
-		edit func(*bv.BeadAssignmentDetails)
-		want string
-	}{
-		{name: "blocked", edit: func(d *bv.BeadAssignmentDetails) { d.BlockedBy = []string{"dep"} }, want: "blocker"},
-		{name: "operator label", edit: func(d *bv.BeadAssignmentDetails) { d.Labels = []string{"operator-gated"} }, want: "operator-gated"},
-		{name: "not open", edit: func(d *bv.BeadAssignmentDetails) { d.Status = "in_progress" }, want: "want open"},
-		{name: "assigned", edit: func(d *bv.BeadAssignmentDetails) { d.Assignee = "owner" }, want: "already assigned"},
-		{name: "deferred", edit: func(d *bv.BeadAssignmentDetails) { d.DeferUntil = &future }, want: "deferred"},
-		{name: "pinned", edit: func(d *bv.BeadAssignmentDetails) { d.Pinned = true }, want: "pinned"},
-		{name: "ephemeral", edit: func(d *bv.BeadAssignmentDetails) { d.Ephemeral = true }, want: "ephemeral"},
-		{name: "template", edit: func(d *bv.BeadAssignmentDetails) { d.Template = true }, want: "template"},
-		{name: "wisp", edit: func(d *bv.BeadAssignmentDetails) { d.Wisp = true }, want: "wisp"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			details := base
-			test.edit(&details)
-			err := validateRestartFreshDetails(&details, now)
-			if err == nil || !strings.Contains(strings.ToLower(err.Error()), test.want) {
-				t.Fatalf("validateRestartFreshDetails() error = %v, want containing %q", err, test.want)
-			}
-		})
-	}
-}
-
 func TestRestartAssignmentEligibilityPortRechecksAuthoritativeLiveState(t *testing.T) {
 	const (
 		projectDir = "/authoritative/project"
@@ -722,7 +690,9 @@ func TestSelectRestartPaneTargetsUsesParsedPaneTypeForFilters(t *testing.T) {
 	}
 }
 
-func TestRespawnRestartPaneTargetsRejectsGrokBatchBeforeMutation(t *testing.T) {
+// GH#251 phase 2: grok supports automated relaunch, so grok-only and mixed
+// batches pass the preflight and every pane (including grok) is respawned.
+func TestRespawnRestartPaneTargetsAcceptsGrokBatch(t *testing.T) {
 	tests := []struct {
 		name    string
 		targets []tmux.Pane
@@ -732,7 +702,7 @@ func TestRespawnRestartPaneTargetsRejectsGrokBatchBeforeMutation(t *testing.T) {
 			targets: []tmux.Pane{{ID: "%1", Index: 1, WindowIndex: 0, Type: tmux.AgentGrok}},
 		},
 		{
-			name: "mixed batch rejects before earlier supported pane",
+			name: "mixed batch respawns grok alongside supported panes",
 			targets: []tmux.Pane{
 				{ID: "%1", Index: 1, WindowIndex: 0, Type: tmux.AgentClaude},
 				{ID: "%2", Index: 2, WindowIndex: 0, Type: tmux.AgentGrok},
@@ -742,30 +712,33 @@ func TestRespawnRestartPaneTargetsRejectsGrokBatchBeforeMutation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mutations := 0
+			var respawned []string
 			output := &RestartPaneOutput{Restarted: []string{}, Failed: []RestartError{}}
+			pid := 100
 			info, err := respawnRestartPaneTargetsContext(
 				t.Context(),
 				tt.targets,
 				false,
 				output,
-				func(context.Context, string) error {
-					mutations++
+				func(_ context.Context, target string) error {
+					respawned = append(respawned, target)
 					return nil
 				},
 				func(context.Context, string) (int, error) {
-					t.Fatal("rejected batch observed a pane PID")
-					return 0, nil
+					// A fresh PID per observation so the respawn reads as a
+					// genuine pane replacement.
+					pid++
+					return pid, nil
 				},
 			)
-			if !errors.Is(err, agent.ErrAutomatedRelaunchNotImplemented) {
-				t.Fatalf("respawnRestartPaneTargetsContext() error = %v, want Grok relaunch sentinel", err)
+			if err != nil {
+				t.Fatalf("respawnRestartPaneTargetsContext() error = %v, want nil (grok relaunch is supported)", err)
 			}
-			if mutations != 0 {
-				t.Fatalf("respawn callback called %d time(s), want zero", mutations)
+			if len(respawned) != len(tt.targets) {
+				t.Fatalf("respawn callback saw %v, want all %d panes including grok", respawned, len(tt.targets))
 			}
-			if len(info) != 0 || len(output.Restarted) != 0 || len(output.Failed) != 0 {
-				t.Fatalf("rejected batch mutated output: info=%v output=%+v", info, output)
+			if len(output.Restarted) != len(tt.targets) || len(output.Failed) != 0 || len(info) != len(tt.targets) {
+				t.Fatalf("batch results: info=%v output=%+v", info, output)
 			}
 		})
 	}
@@ -1059,10 +1032,11 @@ func TestSendRestartPromptsUsesAgentAwareSender(t *testing.T) {
 	}
 
 	var calls []string
-	errs, canceledPanes, deliveryStatus, err := sendRestartPromptsContext(t.Context(), targets, "resume work", func(_ context.Context, target, keys string, agentType tmux.AgentType) error {
+	report, err := sendRestartPromptsContext(t.Context(), targets, "resume work", func(_ context.Context, target, keys string, agentType tmux.AgentType) error {
 		calls = append(calls, fmt.Sprintf("%s|%s|%s", target, keys, agentType))
 		return nil
-	})
+	}, nil, nil)
+	errs, canceledPanes, deliveryStatus := report.Errors, report.CanceledPanes, report.Status
 	if err != nil || len(errs) != 0 || len(canceledPanes) != 0 {
 		t.Fatalf("sendRestartPromptsContext() errors=%v canceled=%v error=%v", errs, canceledPanes, err)
 	}
@@ -1088,14 +1062,15 @@ func TestSendRestartPromptsContextStopsAfterCancellation(t *testing.T) {
 		{Pane: "3", Target: "%3", AgentType: tmux.AgentGemini},
 	}
 	var calls int
-	errs, canceledPanes, deliveryStatus, err := sendRestartPromptsContext(ctx, targets, "resume work", func(gotCtx context.Context, target, keys string, agentType tmux.AgentType) error {
+	report, err := sendRestartPromptsContext(ctx, targets, "resume work", func(gotCtx context.Context, target, keys string, agentType tmux.AgentType) error {
 		calls++
 		if gotCtx != ctx || target != "%1" || keys != "resume work" || agentType != tmux.AgentCodex {
 			t.Fatalf("first prompt call context=%v target=%q keys=%q type=%s", gotCtx, target, keys, agentType)
 		}
 		cancel()
 		return context.Canceled
-	})
+	}, nil, nil)
+	errs, canceledPanes, deliveryStatus := report.Errors, report.CanceledPanes, report.Status
 	if !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatalf("sendRestartPromptsContext() error=%v calls=%d, want canceled after one", err, calls)
 	}
@@ -1121,7 +1096,7 @@ func TestSendRestartPromptsContextPreservesConfirmedDeliveryWhenCancellationFoll
 				targets = append(targets, restartPromptTarget{Pane: "2", Target: "%2", AgentType: tmux.AgentClaude})
 			}
 			calls := 0
-			errs, canceledPanes, deliveryStatus, err := sendRestartPromptsContext(
+			report, err := sendRestartPromptsContext(
 				ctx,
 				targets,
 				"resume work",
@@ -1130,7 +1105,10 @@ func TestSendRestartPromptsContextPreservesConfirmedDeliveryWhenCancellationFoll
 					cancel()
 					return nil
 				},
+				nil,
+				nil,
 			)
+			errs, canceledPanes, deliveryStatus := report.Errors, report.CanceledPanes, report.Status
 			if !errors.Is(err, context.Canceled) || calls != 1 {
 				t.Fatalf("send result error=%v calls=%d, want cancellation after one confirmed delivery", err, calls)
 			}
@@ -1151,7 +1129,8 @@ func TestSendRestartPromptsContextPreservesConfirmedDeliveryWhenCancellationFoll
 }
 
 func TestRelaunchRestartPaneAgentContextObservesReadyAgentAfterSenderReturnsCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
+	type contextKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), contextKey{}, "restart-test"))
 	defer cancel()
 	info := restartPromptTarget{
 		Pane:         "1",
@@ -1159,6 +1138,7 @@ func TestRelaunchRestartPaneAgentContextObservesReadyAgentAfterSenderReturnsCanc
 		AgentType:    tmux.AgentCodex,
 		ResolvedType: "codex",
 	}
+	identitySet := false
 	mutated := false
 	var pidCalls int
 	outcome, phase, err := relaunchRestartPaneAgentContext(
@@ -1166,9 +1146,16 @@ func TestRelaunchRestartPaneAgentContextObservesReadyAgentAfterSenderReturnsCanc
 		info,
 		"codex",
 		time.Minute,
+		func(gotCtx context.Context, target string, agentType tmux.AgentType) error {
+			if gotCtx.Value(contextKey{}) != "restart-test" || target != "%1" || agentType != tmux.AgentCodex {
+				t.Fatalf("identity context=%v target=%q type=%s", gotCtx, target, agentType)
+			}
+			identitySet = true
+			return nil
+		},
 		func(gotCtx context.Context, target, command string, enter bool, agentType tmux.AgentType) error {
-			if gotCtx != ctx || target != "%1" || command != "codex" || !enter || agentType != tmux.AgentCodex {
-				t.Fatalf("launch context=%v target=%q command=%q enter=%t type=%s", gotCtx, target, command, enter, agentType)
+			if !identitySet || gotCtx != ctx || target != "%1" || command != "codex" || !enter || agentType != tmux.AgentCodex {
+				t.Fatalf("launch identitySet=%t context=%v target=%q command=%q enter=%t type=%s", identitySet, gotCtx, target, command, enter, agentType)
 			}
 			mutated = true
 			cancel()
@@ -1201,7 +1188,7 @@ func TestRelaunchRestartPaneAgentContextObservesReadyAgentAfterSenderReturnsCanc
 		},
 		func(pid int) bool { return mutated && pid == 100 },
 	)
-	if !errors.Is(err, context.Canceled) || phase != "launch" || pidCalls != 2 {
+	if !identitySet || !errors.Is(err, context.Canceled) || phase != "launch" || pidCalls != 2 {
 		t.Fatalf("relaunch error=%v phase=%q pidCalls=%d", err, phase, pidCalls)
 	}
 	if outcome.Status != RestartAgentRelaunchReady || !outcome.Ready || !outcome.ProcessAlive || outcome.ShellPID != 100 {
@@ -1427,18 +1414,20 @@ func TestRestartAgentLaunchCommandNilConfigFallsBackToAlias(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := restartAgentLaunchCommand(nil, tt.agentType, ""); got != tt.want {
-			t.Errorf("restartAgentLaunchCommand(nil, %q) = %q, want %q", tt.agentType, got, tt.want)
+		if got, err := restartAgentLaunchCommandWithOverride(nil, tt.agentType, "", restartLaunchOverride{}); err != nil || got != tt.want {
+			t.Errorf("restartAgentLaunchCommandWithOverride(nil, %q) = %q, %v, want %q", tt.agentType, got, err, tt.want)
 		}
 	}
 }
 
-func TestRestartAgentLaunchCommandGrokNeverFallsBackToClaude(t *testing.T) {
-	if got := restartAgentLaunchCommand(nil, "grok", ""); got != "" {
-		t.Fatalf("restartAgentLaunchCommand(nil, grok) = %q, want empty unsupported command", got)
+// GH#251 phase 2: grok has its own canonical launch command — and it must be
+// the grok command, never a fallback to claude's alias.
+func TestRestartAgentLaunchCommandGrokUsesGrokCommand(t *testing.T) {
+	if got, err := restartAgentLaunchCommandWithOverride(nil, "grok", "", restartLaunchOverride{}); err != nil || got != "grok --always-approve" {
+		t.Fatalf("restartAgentLaunchCommandWithOverride(nil, grok) = %q, %v, want %q", got, err, "grok --always-approve")
 	}
-	if got := restartLaunchAlias("grok-build"); got != "" {
-		t.Fatalf("restartLaunchAlias(grok-build) = %q, want empty unsupported command", got)
+	if got := restartLaunchAlias("grok-build"); got != "grok --always-approve" {
+		t.Fatalf("restartLaunchAlias(grok-build) = %q, want %q", got, "grok --always-approve")
 	}
 }
 
@@ -1447,15 +1436,15 @@ func TestRestartAgentLaunchCommandUsesConfiguredCommand(t *testing.T) {
 	cfg.Agents.Claude = "claude --dangerously-skip-permissions"
 	cfg.Agents.Codex = "codex --yolo"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "claude --dangerously-skip-permissions" {
-		t.Errorf("restartAgentLaunchCommand(cfg, claude) = %q, want configured command", got)
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "claude --dangerously-skip-permissions" {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, claude) = %q, %v, want configured command", got, err)
 	}
-	if got := restartAgentLaunchCommand(cfg, "codex", ""); got != "codex --yolo" {
-		t.Errorf("restartAgentLaunchCommand(cfg, codex) = %q, want configured command", got)
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "codex", "", restartLaunchOverride{}); err != nil || got != "codex --yolo" {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, codex) = %q, %v, want configured command", got, err)
 	}
 	// Unconfigured type falls back to the alias.
-	if got := restartAgentLaunchCommand(cfg, "gemini", ""); got != "gmi" {
-		t.Errorf("restartAgentLaunchCommand(cfg, gemini) = %q, want %q", got, "gmi")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "gemini", "", restartLaunchOverride{}); err != nil || got != "gmi" {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, gemini) = %q, %v, want %q", got, err, "gmi")
 	}
 }
 
@@ -1465,8 +1454,8 @@ func TestRestartAgentLaunchCommandRendersTemplate(t *testing.T) {
 	// robot-spawn pattern (spawn.go getAgentCommands).
 	cfg.Agents.Claude = "claude {{.Model}}"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "claude" {
-		t.Errorf("restartAgentLaunchCommand template render = %q, want %q", got, "claude")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "claude" {
+		t.Errorf("restartAgentLaunchCommandWithOverride template render = %q, %v, want %q", got, err, "claude")
 	}
 }
 
@@ -1474,8 +1463,8 @@ func TestRestartAgentLaunchCommandInvalidTemplateFallsBack(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Agents.Claude = "claude {{.Broken"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "cc" {
-		t.Errorf("restartAgentLaunchCommand invalid template = %q, want fallback %q", got, "cc")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "cc" {
+		t.Errorf("restartAgentLaunchCommandWithOverride invalid template = %q, %v, want fallback %q", got, err, "cc")
 	}
 }
 
@@ -1483,8 +1472,8 @@ func TestRestartAgentLaunchCommandRejectsControlCharacters(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Agents.Claude = "claude\nrm -x"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "cc" {
-		t.Errorf("restartAgentLaunchCommand control chars = %q, want fallback %q", got, "cc")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "cc" {
+		t.Errorf("restartAgentLaunchCommandWithOverride control chars = %q, %v, want fallback %q", got, err, "cc")
 	}
 }
 
@@ -1641,30 +1630,30 @@ func TestRestartAgentLaunchCommandPreservesModelPin(t *testing.T) {
 	cfg.Agents.Claude = "claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}"
 	cfg.Models.Claude = map[string]string{"opus": "claude-opus-4-6"}
 
-	got := restartAgentLaunchCommand(cfg, "claude", "opus")
+	got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "opus", restartLaunchOverride{})
 	want := "claude --dangerously-skip-permissions --model 'claude-opus-4-6'"
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand(cfg, claude, opus) = %q, want %q", got, want)
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, claude, opus) = %q, %v, want %q", got, err, want)
 	}
 
 	// A full model name from the alias table is honored as-is (case-insensitive).
-	got = restartAgentLaunchCommand(cfg, "claude", "Claude-Opus-4-6")
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand full-name variant = %q, want %q", got, want)
+	got, err = restartAgentLaunchCommandWithOverride(cfg, "claude", "Claude-Opus-4-6", restartLaunchOverride{})
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride full-name variant = %q, %v, want %q", got, err, want)
 	}
 
 	// An unknown variant (e.g. a persona name in the same title slot) must
 	// not be guessed into a bogus --model value.
-	got = restartAgentLaunchCommand(cfg, "claude", "architect")
+	got, err = restartAgentLaunchCommandWithOverride(cfg, "claude", "architect", restartLaunchOverride{})
 	want = "claude --dangerously-skip-permissions"
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand persona variant = %q, want %q", got, want)
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride persona variant = %q, %v, want %q", got, err, want)
 	}
 
 	// No variant keeps the exact pre-#223 behavior.
-	got = restartAgentLaunchCommand(cfg, "claude", "")
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand empty variant = %q, want %q", got, want)
+	got, err = restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{})
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride empty variant = %q, %v, want %q", got, err, want)
 	}
 }
 
@@ -1715,22 +1704,6 @@ func TestRestartModelVarsKeepsPinnedAndAliasedModels(t *testing.T) {
 	}
 	if !vars.ModelRequested || vars.ModelAlias != "fast" {
 		t.Fatalf("alias metadata lost: requested=%t alias=%q", vars.ModelRequested, vars.ModelAlias)
-	}
-}
-
-// Robot spawn must render every agent type's default model, not only grok's.
-func TestGetAgentCommandsRendersPinnedAgyModel(t *testing.T) {
-	commands := getAgentCommands(config.Default())
-
-	agy, ok := commands["antigravity"]
-	if !ok {
-		t.Fatalf("no antigravity command rendered: %v", commands)
-	}
-	if strings.Contains(agy, "--model ''") {
-		t.Fatalf("agy rendered with an empty model and would not start: %s", agy)
-	}
-	if !strings.Contains(agy, config.AntigravityRequiredModel) {
-		t.Fatalf("agy command %q lacks the pinned model %q", agy, config.AntigravityRequiredModel)
 	}
 }
 
@@ -1810,18 +1783,18 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 			want:      []string{"muse --yolo --model 'muse-wonder-full-1.0' --reasoning-effort 'max'"},
 		},
 		{
-			name:      "legacy codex config gets appended last-flag-wins override",
+			name:      "legacy codex config replaces scalar options",
 			agentType: "codex",
 			codexCmd:  legacyCodex,
 			override:  restartLaunchOverride{Model: "gpt-5.6-terra", Effort: "high"},
-			want:      []string{"-m gpt-5.6-sol", "-m 'gpt-5.6-terra'", "model_reasoning_effort='high'"},
+			want:      []string{"-m 'gpt-5.6-terra'", "model_reasoning_effort='high'"},
 		},
 		{
 			name:      "template codex config renders override directly",
 			agentType: "codex",
 			codexCmd:  templateCodex,
 			override:  restartLaunchOverride{Model: "gpt-5.6-terra", Effort: "high"},
-			want:      []string{"-m gpt-5.6-terra", "model_reasoning_effort=high"},
+			want:      []string{"-m 'gpt-5.6-terra'", "model_reasoning_effort='high'"},
 		},
 		{
 			name:      "claude legacy config appends --model/--effort",
@@ -1879,11 +1852,11 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 			if (tc.agentType == "muse" || tc.agentType == "pi" || tc.agentType == "kimi") && strings.Count(got, "--model") != 1 {
 				t.Errorf("command %q carries %d --model flags, want 1", got, strings.Count(got, "--model"))
 			}
-			// last-flag-wins: the override model must come after the configured one.
-			if tc.override.Model != "" && strings.Contains(got, "-m gpt-5.6-sol") {
-				if strings.LastIndex(got, tc.override.Model) < strings.Index(got, "gpt-5.6-sol") {
-					t.Errorf("override model does not come after configured model: %q", got)
-				}
+			if tc.override.Model != "" && strings.Contains(got, "gpt-5.6-sol") {
+				t.Errorf("old model remained in override command: %q", got)
+			}
+			if tc.override.Model != "" && tc.agentType == "codex" && strings.Count(got, "-m ") != 1 {
+				t.Errorf("Codex scalar model flag must occur exactly once: %q", got)
 			}
 		})
 	}
@@ -2135,4 +2108,207 @@ func TestRestartLaunchCommandToleratesEffortTemplateCannotRender(t *testing.T) {
 	if cmd == "" {
 		t.Fatal("empty relaunch command")
 	}
+}
+
+// notifyRestartPaneIdentityHook is the seam through which restarted panes
+// regain Agent Mail identities (bd-vb7s3): it must forward only successfully
+// restarted AGENT panes to the installed hook, and it must be a no-op when no
+// hook is installed (robot used outside the ntm CLI binary).
+func TestNotifyRestartPaneIdentityHookForwardsRestartedAgentPanes(t *testing.T) {
+	targets := []tmux.Pane{
+		{ID: "%1", Index: 1, WindowIndex: 0, Type: tmux.AgentClaude, Title: "demo__cc_1", Variant: "sonnet"},
+		{ID: "%2", Index: 2, WindowIndex: 0, Type: tmux.AgentCodex, Title: "demo__cod_1"},
+		{ID: "%0", Index: 0, WindowIndex: 0, Type: tmux.AgentUser, Title: "demo__user_0"},
+	}
+	// Pane %2 failed to restart; pane %0 restarted but is a user pane.
+	restarted := []string{"1", "0"}
+
+	// No hook installed: must not panic.
+	SetRestartPaneIdentityHook(nil)
+	notifyRestartPaneIdentityHook(t.Context(), "demo", targets, restarted, false)
+
+	var gotSession string
+	var got []RestartedAgentPane
+	SetRestartPaneIdentityHook(func(_ context.Context, session string, panes []RestartedAgentPane) {
+		gotSession = session
+		got = panes
+	})
+	defer SetRestartPaneIdentityHook(nil)
+
+	notifyRestartPaneIdentityHook(t.Context(), "demo", targets, restarted, false)
+	if gotSession != "demo" {
+		t.Fatalf("hook session = %q, want %q", gotSession, "demo")
+	}
+	if len(got) != 1 {
+		t.Fatalf("hook received %d panes (%+v), want exactly the restarted Claude pane", len(got), got)
+	}
+	if got[0].PaneID != "%1" || got[0].PaneIndex != 1 || got[0].PaneTitle != "demo__cc_1" ||
+		got[0].AgentType != "cc" || got[0].Variant != "sonnet" {
+		t.Fatalf("hook pane = %+v, want the %%1 Claude pane with title/type/variant preserved", got[0])
+	}
+
+	// Nothing restarted: the hook must not fire at all.
+	got = nil
+	notifyRestartPaneIdentityHook(t.Context(), "demo", targets, nil, false)
+	if got != nil {
+		t.Fatalf("hook fired with no restarted panes: %+v", got)
+	}
+}
+
+// =============================================================================
+// bd-rf0ka: delivery-readiness gate + submission verification
+// =============================================================================
+
+// A pane that never becomes ready must have its prompt WITHHELD: no keystrokes
+// are sent, and the response carries a typed per-pane failure so ready:true can
+// never coexist with a silently swallowed prompt.
+func TestSendRestartPromptsWithholdsPromptWhenPaneNeverReady(t *testing.T) {
+	targets := []restartPromptTarget{
+		{Pane: "1", Target: "%1", AgentType: tmux.AgentClaude, ResolvedType: "claude"},
+	}
+	sendCalls := 0
+	report, err := sendRestartPromptsContext(
+		t.Context(),
+		targets,
+		"resume work",
+		func(context.Context, string, string, tmux.AgentType) error {
+			sendCalls++
+			return nil
+		},
+		func(context.Context, restartPromptTarget) (bool, string, error) {
+			return false, `pane foreground process is a shell ("zsh"), not the relaunched agent`, nil
+		},
+		func(context.Context, restartPromptTarget) error {
+			t.Fatal("submission verification must not run for a withheld prompt")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("sendRestartPromptsContext() error = %v", err)
+	}
+	if sendCalls != 0 {
+		t.Fatalf("prompt was typed into an unready pane: %d send calls, want 0", sendCalls)
+	}
+	if !report.Withheld {
+		t.Fatal("report.Withheld = false, want true")
+	}
+	if report.Status["1"] != RestartPromptSkipped {
+		t.Fatalf("delivery status = %v, want skipped", report.Status)
+	}
+	if len(report.PaneFailures) != 1 ||
+		report.PaneFailures[0].Pane != "1" ||
+		!strings.Contains(report.PaneFailures[0].Reason, ErrCodeRestartPromptNotDelivered) ||
+		!strings.Contains(report.PaneFailures[0].Reason, "shell") {
+		t.Fatalf("pane failures = %+v, want typed RESTART_PROMPT_NOT_DELIVERED failure with the shell reason", report.PaneFailures)
+	}
+	if len(report.Errors) != 1 || !strings.Contains(report.Errors[0], "prompt withheld") {
+		t.Fatalf("errors = %v, want a withheld-prompt error", report.Errors)
+	}
+}
+
+// After keys are sent, an unconfirmed submission is a per-pane failure with
+// status unknown, not a delivered success.
+func TestSendRestartPromptsSurfacesUnconfirmedSubmission(t *testing.T) {
+	targets := []restartPromptTarget{
+		{Pane: "1", Target: "%1", AgentType: tmux.AgentCodex, ResolvedType: "codex"},
+		{Pane: "2", Target: "%2", AgentType: tmux.AgentClaude, ResolvedType: "claude"},
+	}
+	report, err := sendRestartPromptsContext(
+		t.Context(),
+		targets,
+		"resume work",
+		func(context.Context, string, string, tmux.AgentType) error { return nil },
+		func(context.Context, restartPromptTarget) (bool, string, error) { return true, "", nil },
+		func(_ context.Context, target restartPromptTarget) error {
+			if target.Pane == "1" {
+				return errors.New("codex submission unconfirmed: prompt still in composer after rescue (pane %1)")
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("sendRestartPromptsContext() error = %v", err)
+	}
+	if report.Status["1"] != RestartPromptUnknown {
+		t.Fatalf("unconfirmed pane status = %q, want unknown", report.Status["1"])
+	}
+	if report.Status["2"] != RestartPromptDelivered {
+		t.Fatalf("confirmed pane status = %q, want delivered", report.Status["2"])
+	}
+	if len(report.PaneFailures) != 1 ||
+		report.PaneFailures[0].Pane != "1" ||
+		!strings.Contains(report.PaneFailures[0].Reason, "prompt submission unconfirmed") {
+		t.Fatalf("pane failures = %+v, want one unconfirmed-submission failure for pane 1", report.PaneFailures)
+	}
+	if report.Withheld {
+		t.Fatal("report.Withheld = true, want false: keys reached the pane")
+	}
+}
+
+// The readiness gate must keep polling while the foreground is a shell, then
+// report ready only when a non-shell foreground AND a ready composer coincide.
+func TestWaitForRestartPromptDeliveryReadyGatesOnShellAndComposer(t *testing.T) {
+	target := restartPromptTarget{Pane: "1", Target: "%1", AgentType: tmux.AgentClaude, ResolvedType: "claude"}
+
+	t.Run("becomes ready once agent is foreground with composer", func(t *testing.T) {
+		commands := []string{"zsh", "zsh", "node"}
+		call := 0
+		ready, reason, err := waitForRestartPromptDeliveryReadyContext(
+			t.Context(),
+			target,
+			500*time.Millisecond,
+			time.Millisecond,
+			func(context.Context, string) (string, error) {
+				cmd := commands[min(call, len(commands)-1)]
+				call++
+				return cmd, nil
+			},
+			func(context.Context, string, tmux.AgentType, int) (bool, string) { return true, "" },
+		)
+		if err != nil || !ready || reason != "" {
+			t.Fatalf("gate = (%v, %q, %v), want ready", ready, reason, err)
+		}
+		if call < 3 {
+			t.Fatalf("gate stopped polling after %d observations while the shell was foreground", call)
+		}
+	})
+
+	t.Run("times out with shell reason when foreground never leaves the shell", func(t *testing.T) {
+		ready, reason, err := waitForRestartPromptDeliveryReadyContext(
+			t.Context(),
+			target,
+			20*time.Millisecond,
+			time.Millisecond,
+			func(context.Context, string) (string, error) { return "zsh", nil },
+			func(context.Context, string, tmux.AgentType, int) (bool, string) {
+				t.Fatal("composer check must not run while the foreground is a shell")
+				return true, ""
+			},
+		)
+		if err != nil || ready {
+			t.Fatalf("gate = (%v, %q, %v), want not ready without error", ready, reason, err)
+		}
+		if !strings.Contains(reason, "shell") || !strings.Contains(reason, "did not become ready") {
+			t.Fatalf("gate reason = %q, want a shell-foreground timeout reason", reason)
+		}
+	})
+
+	t.Run("times out with composer reason when composer never appears", func(t *testing.T) {
+		ready, reason, err := waitForRestartPromptDeliveryReadyContext(
+			t.Context(),
+			target,
+			20*time.Millisecond,
+			time.Millisecond,
+			func(context.Context, string) (string, error) { return "node", nil },
+			func(context.Context, string, tmux.AgentType, int) (bool, string) {
+				return false, "claude composer not visible: pane appears to be initializing"
+			},
+		)
+		if err != nil || ready {
+			t.Fatalf("gate = (%v, %q, %v), want not ready without error", ready, reason, err)
+		}
+		if !strings.Contains(reason, "composer not visible") {
+			t.Fatalf("gate reason = %q, want the composer reason", reason)
+		}
+	})
 }

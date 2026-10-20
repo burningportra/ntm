@@ -32,8 +32,10 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
 	"github.com/Dicklesworthstone/ntm/internal/health"
 	"github.com/Dicklesworthstone/ntm/internal/history"
+	"github.com/Dicklesworthstone/ntm/internal/integrations/caut"
 	"github.com/Dicklesworthstone/ntm/internal/integrations/rano"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/scanner"
 	sessionPkg "github.com/Dicklesworthstone/ntm/internal/session"
@@ -53,32 +55,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/watcher"
 	"github.com/Dicklesworthstone/ntm/internal/workflow"
 )
-
-// compactionRecoveryConfigToRuntime converts the `[context_rotation.recovery]`
-// TOML surface into the runtime `status.RecoveryConfig` that the recovery
-// engine consumes. Zero / empty fields fall through to the engine's hardcoded
-// defaults, so a partial TOML override behaves the same as a full default
-// config except for the fields the user actually set. The `Enabled` flag is
-// honoured by skipping recovery entirely when false; that semantic lives in
-// the dashboard call site rather than the engine because the engine has no
-// notion of "configured but disabled".
-func compactionRecoveryConfigToRuntime(cfg *config.CompactionRecoveryConfig) status.RecoveryConfig {
-	rc := status.DefaultRecoveryConfig()
-	if cfg == nil {
-		return rc
-	}
-	if cfg.CooldownSeconds > 0 {
-		rc.Cooldown = time.Duration(cfg.CooldownSeconds) * time.Second
-	}
-	if cfg.MaxRecoveriesPerPane > 0 {
-		rc.MaxRecoveries = cfg.MaxRecoveriesPerPane
-	}
-	if cfg.Prompt != "" {
-		rc.Prompt = cfg.Prompt
-	}
-	rc.IncludeBeadContext = cfg.IncludeBeadContext
-	return rc
-}
 
 func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	prevWidth := m.width
@@ -134,6 +110,14 @@ func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	}
 	m.ensembleModes.SetSize(modesW, modesH)
 
+	// The spawn wizard's forms ask for the window size on Init and lay out
+	// against it, so the overlay must see resizes as well as the new bounds.
+	var wizardCmd tea.Cmd
+	if m.spawnWizard != nil {
+		m.spawnWizard.SetSize(width, height)
+		wizardCmd = m.forwardToSpawnWizard(msg)
+	}
+
 	m.resizePanelsForLayout()
 
 	if dashboardDebugEnabled(m) {
@@ -165,7 +149,7 @@ func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	// window, or shrinking then growing - are not guaranteed to be erased,
 	// leaving stale glyphs ("scrambled" UI). tea.ClearScreen issues a hard
 	// EraseEntireScreen before the next render, guaranteeing a clean repaint.
-	return *m, tea.ClearScreen
+	return *m, tea.Batch(tea.ClearScreen, wizardCmd)
 }
 
 func (m Model) subscribeToConfig() tea.Cmd {
@@ -176,6 +160,48 @@ func (m Model) subscribeToConfig() tea.Cmd {
 		cfg := <-m.configSub
 		return ConfigReloadMsg{Config: cfg}
 	}
+}
+
+// applyConfig makes cfg the dashboard's effective configuration: the values
+// background fetches consult (rano polling and its interval, Agent Mail,
+// model names, compaction recovery) plus theme, icons and help verbosity.
+// It runs for the initial load before the program starts and again on every
+// ConfigReloadMsg from the file watcher. Until the initial call existed,
+// m.cfg stayed nil - and every "enabled unless configured" default applied -
+// until the user edited a config file while the dashboard was open (#317).
+func (m *Model) applyConfig(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	m.cfg = cfg
+	m.helpVerbosity = normalizedHelpVerbosity(cfg.HelpVerbosity)
+	// Update theme: the configured name becomes the process-wide fallback so
+	// panels built later agree with it; an explicit NTM_THEME still wins.
+	theme.SetConfigured(cfg.Theme)
+	m.theme = theme.Current()
+	// Reload icons (if dependent on config in future, pass cfg)
+	m.icons = icons.Current()
+
+	// Follow integrations.rano.poll_interval_ms (default 1000ms).
+	if cfg.Integrations.Rano.PollIntervalMs > 0 {
+		m.ranoNetworkRefreshInterval = time.Duration(cfg.Integrations.Rano.PollIntervalMs) * time.Millisecond
+	}
+
+	// Re-initialize an existing renderer with the new theme colors. Before
+	// the deferred startup init has produced one there is nothing to
+	// rebuild; that init reads m.theme when it runs, so it picks the
+	// configured theme up on its own.
+	if m.renderer != nil {
+		_, detailWidth := layout.SplitProportions(m.width)
+		contentWidth := detailWidth - 4
+		if contentWidth < 20 {
+			contentWidth = 20
+		}
+		m.initRenderer(contentWidth)
+	}
+
+	// If help verbosity changed, ensure focused panel remains valid.
+	m.cycleFocus(0)
 }
 
 func (m Model) tick() tea.Cmd {
@@ -461,7 +487,12 @@ func (m *Model) fetchScanStatusWithContext(ctx context.Context) tea.Cmd {
 	}
 }
 
-// fetchRanoNetworkStats fetches per-agent network activity from rano (best-effort).
+// ranoNetworkWindow is how far back the network panel counts recorded connections.
+const ranoNetworkWindow = 5 * time.Minute
+
+// fetchRanoNetworkStats reads per-agent connection activity from rano's
+// observer database (best-effort). A missing database or failed export is
+// surfaced as the panel's error, never shown as zero traffic.
 func (m *Model) fetchRanoNetworkStats() tea.Cmd {
 	gen := m.nextGen(refreshRanoNetwork)
 	cfg := m.cfg
@@ -470,15 +501,18 @@ func (m *Model) fetchRanoNetworkStats() tea.Cmd {
 	return func() tea.Msg {
 		data := panels.RanoNetworkPanelData{
 			Loaded: true,
+			Window: ranoNetworkWindow,
 		}
 
 		enabled := true
 		pollInterval := 1 * time.Second
+		database := config.DefaultRanoConfig().SQLitePath
 		if cfg != nil {
 			enabled = cfg.Integrations.Rano.Enabled
 			if cfg.Integrations.Rano.PollIntervalMs > 0 {
 				pollInterval = time.Duration(cfg.Integrations.Rano.PollIntervalMs) * time.Millisecond
 			}
+			database = cfg.Integrations.Rano.SQLitePath
 		}
 		data.Enabled = enabled
 		data.PollInterval = pollInterval
@@ -491,6 +525,7 @@ func (m *Model) fetchRanoNetworkStats() tea.Cmd {
 		defer cancel()
 
 		adapter := tools.NewRanoAdapter()
+		adapter.SetDatabase(database)
 		availability, err := adapter.GetAvailability(ctx)
 		if err != nil {
 			data.Error = err
@@ -498,7 +533,7 @@ func (m *Model) fetchRanoNetworkStats() tea.Cmd {
 		}
 
 		if availability != nil {
-			data.Available = availability.Available && availability.Compatible && availability.HasCapability && availability.CanReadProc
+			data.Available = availability.Available && availability.Compatible && availability.Operational && availability.CanReadProc
 			if availability.Version.Raw != "" {
 				data.Version = availability.Version.String()
 			}
@@ -515,70 +550,55 @@ func (m *Model) fetchRanoNetworkStats() tea.Cmd {
 			return RanoNetworkUpdateMsg{Data: data, Gen: gen}
 		}
 
-		allStats, err := adapter.GetAllProcessStats(ctx)
+		allStats, err := adapter.GetAllProcessStatsWithWindow(ctx, ranoNetworkWindow.String())
 		if err != nil {
 			data.Error = err
 			return RanoNetworkUpdateMsg{Data: data, Gen: gen}
 		}
 
-		byPane := make(map[string]*panels.RanoNetworkRow)
-		for i := range allStats {
-			st := allStats[i]
-
-			identity := pidMap.GetPaneForPID(st.PID)
-			if identity == nil {
-				continue
-			}
-			label := identity.PaneTitle
-			if label == "" {
-				label = identity.String()
-			}
-
-			row := byPane[label]
-			if row == nil {
-				row = &panels.RanoNetworkRow{
-					Label:     label,
-					AgentType: string(identity.AgentType),
-				}
-				byPane[label] = row
-			}
-
-			row.RequestCount += st.RequestCount
-			row.BytesOut += st.BytesOut
-			row.BytesIn += st.BytesIn
-
-			if ts := parseRanoTimestamp(st.LastRequest); !ts.IsZero() && ts.After(row.LastRequest) {
-				row.LastRequest = ts
-			}
-		}
-
-		for _, row := range byPane {
-			data.Rows = append(data.Rows, *row)
-			data.TotalRequests += row.RequestCount
-			data.TotalBytesOut += row.BytesOut
-			data.TotalBytesIn += row.BytesIn
-		}
-
-		// Stable ordering by label (the panel will still prioritize recency in View).
-		sort.Slice(data.Rows, func(i, j int) bool {
-			return data.Rows[i].Label < data.Rows[j].Label
+		panes, total := robot.AggregateRanoStats(allStats, pidMap.GetPaneForPID, func(identity *rano.PaneIdentity) bool {
+			return identity.AgentType != "" && identity.AgentType != tmux.AgentUser && identity.AgentType != tmux.AgentUnknown
 		})
+		data.Rows = ranoNetworkRows(panes)
+		data.TotalConnections = total.ConnectionCount
 
 		return RanoNetworkUpdateMsg{Data: data, Gen: gen}
 	}
 }
 
-func parseRanoTimestamp(s string) time.Time {
-	if strings.TrimSpace(s) == "" {
-		return time.Time{}
+// ranoNetworkRows converts robot pane aggregates into panel rows, ordered by
+// label then pane identity (the panel still prioritizes recency in View).
+func ranoNetworkRows(panes map[string]robot.RanoPaneStats) []panels.RanoNetworkRow {
+	keys := make([]string, 0, len(panes))
+	for key := range panes {
+		keys = append(keys, key)
 	}
-	if ts, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return ts
+	sort.Strings(keys)
+	rows := make([]panels.RanoNetworkRow, 0, len(panes))
+	for _, key := range keys {
+		pane := panes[key]
+		label := pane.PaneTitle
+		if label == "" {
+			label = key
+		}
+		row := panels.RanoNetworkRow{
+			Label:       label,
+			AgentType:   pane.AgentType,
+			Connections: pane.ConnectionCount,
+		}
+		if at, err := time.Parse(time.RFC3339Nano, pane.LastConnection); err == nil {
+			row.LastConnection = at
+		}
+		if len(pane.Providers) > 0 {
+			row.Providers = make(map[string]int, len(pane.Providers))
+			for provider, agg := range pane.Providers {
+				row.Providers[provider] = agg.Connections
+			}
+		}
+		rows = append(rows, row)
 	}
-	if ts, err := time.Parse(time.RFC3339, s); err == nil {
-		return ts
-	}
-	return time.Time{}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Label < rows[j].Label })
+	return rows
 }
 
 // fetchRCHStatus fetches the current RCH status.
@@ -692,21 +712,23 @@ func (m *Model) fetchPendingRotations() tea.Cmd {
 }
 
 // newAgentMailClient builds the dashboard's Agent Mail client from the
-// [agent_mail] config, or returns nil when there is no project or the
+// [agent_mail] config (AGENT_MAIL_URL/TOKEN still override url/token, see
+// agentmail.ConfigOptions), or returns nil when there is no project or the
 // integration is disabled: the dashboard's Agent Mail panels and conflict
 // actions are automatic integration.
 func (m *Model) newAgentMailClient(projectKey string) *agentmail.Client {
 	if projectKey == "" {
 		return nil
 	}
-	settings := config.Default().AgentMail
+	var opts []agentmail.Option
+	opts = append(opts, agentmail.WithProjectKey(projectKey))
 	if m.cfg != nil {
-		settings = m.cfg.AgentMail
+		if !m.cfg.AgentMail.Enabled {
+			return nil
+		}
+		opts = append(opts, agentmail.ConfigOptions(m.cfg.AgentMail.URL, m.cfg.AgentMail.Token)...)
 	}
-	if !settings.Enabled {
-		return nil
-	}
-	return settings.NewClient(projectKey)
+	return agentmail.NewClient(opts...)
 }
 
 func resolveAgentMailProjectKey(sessionName, projectDir string) string {
@@ -1110,62 +1132,19 @@ type RotationConfirmResultMsg struct {
 // executeRotationConfirmAction executes a rotation confirmation action.
 func (m Model) executeRotationConfirmAction(agentID string, action ctxmon.ConfirmAction) tea.Cmd {
 	return func() tea.Msg {
-		// Get the pending rotation
-		pending, err := ctxmon.GetPendingRotationByID(agentID)
-		if err != nil {
-			return RotationConfirmResultMsg{
-				AgentID: agentID,
-				Action:  action,
-				Success: false,
-				Err:     err,
-			}
-		}
-		if pending == nil {
-			return RotationConfirmResultMsg{
-				AgentID: agentID,
-				Action:  action,
-				Success: false,
-				Message: fmt.Sprintf("No pending rotation found for agent %s", agentID),
-			}
-		}
-
-		var resultMsg string
-		switch action {
-		case ctxmon.ConfirmRotate:
-			// Remove pending and mark for rotation on next check
-			if err := ctxmon.RemovePendingRotation(agentID); err != nil {
-				return RotationConfirmResultMsg{AgentID: agentID, Action: action, Success: false, Err: err}
-			}
-			resultMsg = fmt.Sprintf("Rotation confirmed for %s", agentID)
-
-		case ctxmon.ConfirmCompact:
-			// Remove pending and mark for compaction
-			if err := ctxmon.RemovePendingRotation(agentID); err != nil {
-				return RotationConfirmResultMsg{AgentID: agentID, Action: action, Success: false, Err: err}
-			}
-			resultMsg = fmt.Sprintf("Compaction requested for %s", agentID)
-
-		case ctxmon.ConfirmIgnore:
-			// Simply remove the pending rotation
-			if err := ctxmon.RemovePendingRotation(agentID); err != nil {
-				return RotationConfirmResultMsg{AgentID: agentID, Action: action, Success: false, Err: err}
-			}
-			resultMsg = fmt.Sprintf("Rotation cancelled for %s", agentID)
-
-		case ctxmon.ConfirmPostpone:
-			// Extend the timeout by 30 minutes
-			pending.TimeoutAt = pending.TimeoutAt.Add(30 * time.Minute)
-			if err := ctxmon.AddPendingRotation(pending); err != nil {
-				return RotationConfirmResultMsg{AgentID: agentID, Action: action, Success: false, Err: err}
-			}
-			resultMsg = fmt.Sprintf("Rotation postponed 30 minutes for %s", agentID)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		result := ctxmon.ConfirmPendingRotationContext(ctx, agentID, action, 30, false, m.cfg)
+		message := result.Error
+		if result.Success {
+			message = fmt.Sprintf("%s completed for %s", action, agentID)
 		}
 
 		return RotationConfirmResultMsg{
 			AgentID: agentID,
 			Action:  action,
-			Success: true,
-			Message: resultMsg,
+			Success: result.Success,
+			Message: message,
 		}
 	}
 }
@@ -1227,6 +1206,26 @@ func (m Model) sidebarInteractivePanels() []sidebarPanelRef {
 		refs = append(refs, sidebarPanelRef{
 			id:    m.cassPanel.Config().ID,
 			panel: m.cassPanel,
+		})
+	}
+	// C6-wire panels join focus cycling only while toggled visible.
+	// [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+	if m.showQuotaPanel && m.quotaPanel != nil {
+		refs = append(refs, sidebarPanelRef{
+			id:    m.quotaPanel.Config().ID,
+			panel: m.quotaPanel,
+		})
+	}
+	if m.showRateLimitPanel && m.rateLimitPanel != nil {
+		refs = append(refs, sidebarPanelRef{
+			id:    m.rateLimitPanel.Config().ID,
+			panel: m.rateLimitPanel,
+		})
+	}
+	if m.showAccountsPanel && m.accountsPanel != nil {
+		refs = append(refs, sidebarPanelRef{
+			id:    m.accountsPanel.Config().ID,
+			panel: m.accountsPanel,
 		})
 	}
 	if m.timelinePanel != nil {
@@ -1384,6 +1383,98 @@ func (m Model) fetchWorkflowState() tea.Cmd {
 		state, err := store.Load(session)
 		return WorkflowStateMsg{State: state, Err: err}
 	}
+}
+
+// C6-wire panel data fetchers. [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+// Package-level indirection follows the dashboardRunAddAgents pattern so tests
+// can substitute deterministic fixtures without touching tmux/caut/caam.
+
+// dashboardQuotaRefreshTimeout bounds the caut read a quota-panel refresh may
+// trigger; the fetch runs off the UI loop.
+const dashboardQuotaRefreshTimeout = 25 * time.Second
+
+var dashboardFetchQuotaData = func() panels.QuotaData {
+	poller := caut.GetGlobalPoller()
+	ctx, cancel := context.WithTimeout(context.Background(), dashboardQuotaRefreshTimeout)
+	defer cancel()
+	poller.RefreshIfStale(ctx, caut.MaxAge)
+	cache := poller.GetCache()
+	if cache == nil {
+		return panels.QuotaData{Available: false}
+	}
+	quotaStatus := cache.GetStatus()
+	usages := cache.GetAllUsage()
+	_, err := cache.GetLastError()
+	return panels.QuotaData{
+		Status:    quotaStatus,
+		Usages:    usages,
+		Available: quotaStatus != nil || len(usages) > 0,
+		Error:     err,
+	}
+}
+
+var dashboardFetchOAuthHealth = func(session string) ([]robot.AgentOAuthHealth, error) {
+	out, err := robot.GetHealthOAuth(session)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return nil, nil
+	}
+	if !out.Success {
+		return nil, fmt.Errorf("oauth health unavailable: %s", out.Error)
+	}
+	return out.Agents, nil
+}
+
+var dashboardFetchAccountsStatus = func(ctx context.Context) (*tools.CAAMStatus, error) {
+	return tools.NewCAAMAdapter().GetStatus(ctx)
+}
+
+// fetchQuotaStatus reads caut usage data from the global poller cache.
+func (m Model) fetchQuotaStatus() tea.Cmd {
+	return func() tea.Msg {
+		return QuotaStatusMsg{Data: dashboardFetchQuotaData()}
+	}
+}
+
+// fetchOAuthHealth collects per-agent OAuth/rate-limit health for the session.
+func (m Model) fetchOAuthHealth() tea.Cmd {
+	session := m.session
+	return func() tea.Msg {
+		agents, err := dashboardFetchOAuthHealth(session)
+		return OAuthHealthMsg{Agents: agents, Err: err}
+	}
+}
+
+// fetchAccountsStatus queries CAAM for account/rotation status.
+func (m Model) fetchAccountsStatus() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		caamStatus, err := dashboardFetchAccountsStatus(ctx)
+		if err != nil {
+			return AccountsStatusMsg{Data: panels.AccountsData{Available: false, Error: err}}
+		}
+		return AccountsStatusMsg{Data: panels.AccountsData{
+			Status:    caamStatus,
+			Available: caamStatus != nil && caamStatus.Available,
+		}}
+	}
+}
+
+// accountsToggleShortcutAvailable reports whether the global 'a' accounts
+// toggle may fire; it yields to the history panel, which claims 'a' for its
+// agent filter when focused.
+func (m Model) accountsToggleShortcutAvailable() bool {
+	if m.focusedPanel == PanelHistory {
+		return false
+	}
+	if m.focusedPanel == PanelSidebar && m.historyPanel != nil &&
+		m.sidebarActivePanelID() == m.historyPanel.Config().ID {
+		return false
+	}
+	return true
 }
 
 func (m *Model) requestSessionFetch(cancelInFlight bool) tea.Cmd {
@@ -1848,8 +1939,11 @@ func (m Model) fetchHealthCmd() tea.Cmd {
 			return HealthUpdateMsg{Health: nil, Err: err}
 		}
 
-		// Get health tracker for uptime/restart data
-		tracker := robot.GetHealthTracker(session)
+		// Restarts and uptime come from the readers --robot-metrics and
+		// ntm health use: the session monitor's restart records and the
+		// pane shell's start time.
+		now := time.Now()
+		restarts := robot.RecentAgentRestarts(session, time.Hour, now)
 
 		// Build health info map
 		healthMap := make(map[string]PaneHealthInfo)
@@ -1863,9 +1957,10 @@ func (m Model) fetchHealthCmd() tea.Cmd {
 				info.Issues = append(info.Issues, issue.Message)
 			}
 
-			// Get uptime and restart count from tracker
-			info.Uptime = int(tracker.GetUptime(agent.PaneID).Seconds())
-			info.RestartCount = tracker.GetRestartsInWindow(agent.PaneID)
+			if startedAt, ok := robot.PaneStartedAt(agent.ShellPID); ok {
+				info.Uptime = int(now.Sub(startedAt).Seconds())
+			}
+			info.RestartCount = restarts[agent.PaneID]
 
 			healthMap[agent.PaneID] = info
 		}
@@ -2140,8 +2235,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case panels.ConflictActionResultMsg:
 		// Handle conflict action result
 		if msg.Err != nil {
-			// Log error but don't block
+			// Log error but don't block. It must ALSO surface in the UI: with
+			// the default policy (automation.force_release=approval) the
+			// Force action is refused for everyone (bd-2y2on), and a refusal
+			// visible only in a log file makes the keybinding look broken.
 			log.Printf("[Dashboard] Conflict action error: %v", msg.Err)
+			if m.toasts != nil {
+				m.toasts.Push(components.Toast{
+					ID:      "conflict-action-" + msg.Conflict.Path,
+					Message: fmt.Sprintf("Conflict action %s failed: %v", msg.Action, msg.Err),
+					Level:   components.ToastError,
+				})
+			}
 		}
 		// Remove the conflict from the panel if action was successful or dismissed
 		if msg.Err == nil {
@@ -2332,6 +2437,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fetchingWorkflow = true
 			cmds = append(cmds, m.fetchWorkflowState())
 		}
+		// C6-wire panels refresh only while visible, at their configured
+		// cadence. On error, slow panels (quota 30s, accounts) retry faster
+		// (5s) so recovery is visible; ratelimit already polls at 5s, so it
+		// instead backs off to 2x to avoid hammering a failing source.
+		// [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+		if m.showQuotaPanel && m.quotaPanel != nil && !m.fetchingQuota {
+			interval := m.quotaPanel.Config().RefreshInterval
+			if m.quotaPanel.HasError() {
+				interval = 5 * time.Second
+			}
+			if now.Sub(m.lastQuotaFetch) >= interval {
+				m.fetchingQuota = true
+				cmds = append(cmds, m.fetchQuotaStatus())
+			}
+		}
+		if m.showRateLimitPanel && m.rateLimitPanel != nil && !m.fetchingOAuthHealth {
+			interval := m.rateLimitPanel.Config().RefreshInterval
+			if m.rateLimitPanel.HasError() {
+				interval = 2 * interval
+			}
+			if now.Sub(m.lastOAuthFetch) >= interval {
+				m.fetchingOAuthHealth = true
+				cmds = append(cmds, m.fetchOAuthHealth())
+			}
+		}
+		if m.showAccountsPanel && m.accountsPanel != nil && !m.fetchingAccounts {
+			interval := m.accountsPanel.Config().RefreshInterval
+			if m.accountsPanel.HasError() {
+				interval = 5 * time.Second
+			}
+			if now.Sub(m.lastAccountsFetch) >= interval {
+				m.fetchingAccounts = true
+				cmds = append(cmds, m.fetchAccountsStatus())
+			}
+		}
 
 		cmds = append(cmds, m.tick())
 		return m, tea.Batch(cmds...)
@@ -2343,6 +2483,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.workflowError = msg.Err
 		if m.workflowPanel != nil {
 			m.workflowPanel.SetData(panels.WorkflowPanelData{State: msg.State}, msg.Err)
+		}
+		return m, nil
+
+	// C6-wire panel data arrivals. [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+	case QuotaStatusMsg:
+		m.fetchingQuota = false
+		m.lastQuotaFetch = time.Now()
+		if m.quotaPanel != nil {
+			m.quotaPanel.SetData(msg.Data)
+		}
+		return m, nil
+
+	case OAuthHealthMsg:
+		m.fetchingOAuthHealth = false
+		m.lastOAuthFetch = time.Now()
+		if m.rateLimitPanel != nil {
+			m.rateLimitPanel.SetData(msg.Agents, msg.Err)
+		}
+		return m, nil
+
+	case AccountsStatusMsg:
+		m.fetchingAccounts = false
+		m.lastAccountsFetch = time.Now()
+		if m.accountsPanel != nil {
+			m.accountsPanel.SetData(msg.Data)
 		}
 		return m, nil
 
@@ -2478,10 +2643,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				modelName := ""
 				switch data.AgentType {
 				case string(tmux.AgentClaude):
-					if m.cfg != nil {
+					if m.cfg != nil && m.cfg.Models.DefaultClaude != "" {
 						modelName = m.cfg.Models.DefaultClaude
 					} else {
-						modelName = "claude-sonnet-4-6"
+						modelName = config.ClaudeEstimationModel
 					}
 				case string(tmux.AgentCodex):
 					if m.cfg != nil {
@@ -2608,22 +2773,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				// Compaction check — gated by [context_rotation.recovery] enabled
-				// per issue #113. Pre-config-load (m.cfg == nil) we run with
-				// defaults (recovery enabled). Once the first ConfigReloadMsg
-				// lands, m.cfg.ContextRotation.Recovery.Enabled is the source
-				// of truth; users who set it to false get neither compaction
-				// detection nor recovery prompts on this pane.
+				// Compaction display — gated by [context_rotation.recovery]
+				// enabled per issue #113 (m.cfg == nil before the first
+				// ConfigReloadMsg runs with the default, enabled). The
+				// dashboard only shows the banner; the session monitor owns
+				// the recovery prompt (bd-xa7ry), so any number of open
+				// dashboards never adds a sender.
 				var event *status.CompactionEvent
-				var recoverySent bool
 				if data.Observation.Current.Freshness == status.FreshnessFresh && (m.cfg == nil || m.cfg.ContextRotation.Recovery.Enabled) {
-					event, recoverySent, _ = m.compaction.CheckAndRecover(data.Output, statusAgentType, m.session, data.PaneIndex)
+					event = m.compaction.Check(data.Output, statusAgentType, paneKey)
 				}
 
 				if event != nil {
 					now := time.Now()
 					ps.LastCompaction = &now
-					ps.RecoverySent = recoverySent
 					ps.State = "compacted"
 				}
 
@@ -2847,39 +3010,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ConfigReloadMsg:
 		if msg.Config != nil {
-			m.cfg = msg.Config
-			m.helpVerbosity = normalizedHelpVerbosity(msg.Config.HelpVerbosity)
-			// Update theme
-			m.theme = theme.FromName(msg.Config.Theme)
-			// Reload icons (if dependent on config in future, pass cfg)
-			m.icons = icons.Current()
-
-			// Follow integrations.rano.poll_interval_ms (default 1000ms).
-			if msg.Config.Integrations.Rano.PollIntervalMs > 0 {
-				m.ranoNetworkRefreshInterval = time.Duration(msg.Config.Integrations.Rano.PollIntervalMs) * time.Millisecond
-			}
-
-			// Issue #113: rebuild the compaction-recovery integration from
-			// `[context_rotation.recovery]` so user TOML actually reaches
-			// the runtime. Until this wired up, the dashboard would silently
-			// use NewCompactionRecoveryIntegrationDefault() regardless of
-			// what the config file said. Defaults still kick in when fields
-			// are zero — see compactionRecoveryConfigToRuntime — so this is
-			// a pure additive bridge.
-			m.compaction = status.NewCompactionRecoveryIntegration(
-				compactionRecoveryConfigToRuntime(&msg.Config.ContextRotation.Recovery),
-			)
-
-			// Re-initialize renderer with new theme colors
-			_, detailWidth := layout.SplitProportions(m.width)
-			contentWidth := detailWidth - 4
-			if contentWidth < 20 {
-				contentWidth = 20
-			}
-			m.initRenderer(contentWidth)
-
-			// If help verbosity changed, ensure focused panel remains valid.
-			m.cycleFocus(0)
+			m.applyConfig(msg.Config)
 		}
 		return m, m.subscribeToConfig()
 
@@ -3399,6 +3530,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// C6-wire panel toggles: quota ('$'), oauth/rate status ('o'),
+		// accounts ('a'). [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+		if key.Matches(msg, dashKeys.QuotaToggle) {
+			m.showQuotaPanel = !m.showQuotaPanel
+			if m.showQuotaPanel && !m.fetchingQuota {
+				m.fetchingQuota = true
+				return m, m.fetchQuotaStatus()
+			}
+			return m, nil
+		}
+		if key.Matches(msg, dashKeys.RateLimitToggle) {
+			m.showRateLimitPanel = !m.showRateLimitPanel
+			if m.showRateLimitPanel && !m.fetchingOAuthHealth {
+				m.fetchingOAuthHealth = true
+				return m, m.fetchOAuthHealth()
+			}
+			return m, nil
+		}
+		if key.Matches(msg, dashKeys.AccountsToggle) && m.accountsToggleShortcutAvailable() {
+			m.showAccountsPanel = !m.showAccountsPanel
+			if m.showAccountsPanel && !m.fetchingAccounts {
+				m.fetchingAccounts = true
+				return m, m.fetchAccountsStatus()
+			}
+			return m, nil
+		}
+
 		// [tui-upgrade: bd-uz09d] Open spawn wizard with ctrl+w.
 		if key.Matches(msg, dashKeys.SpawnWizard) {
 			m.showSpawnWizard = true
@@ -3655,10 +3813,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	}
 
+	// The spawn wizard's huh forms complete through their own internal
+	// messages (next-field, next-group, field refreshes), which the forms
+	// return as commands rather than receiving as key presses. Key input is
+	// routed to the overlay in the tea.KeyMsg branch above; every other
+	// message the switch did not consume must still reach the open wizard or
+	// the form never advances (#318).
+	if cmd := m.forwardToSpawnWizard(msg); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+
 	if len(cmds) > 0 {
 		return m, tea.Batch(cmds...)
 	}
 	return m, nil
+}
+
+// forwardToSpawnWizard delivers a non-key message to the open spawn wizard
+// and returns the command it produced. Key presses are handled by the
+// dedicated tea.KeyMsg branch in Update and are never forwarded twice; with
+// no wizard open the message is ignored. The wizard's own completion message
+// closes the overlay before Update reaches this point, so a finished form is
+// never fed its own SpawnWizardDoneMsg and cannot re-trigger the spawn.
+func (m *Model) forwardToSpawnWizard(msg tea.Msg) tea.Cmd {
+	if !m.showSpawnWizard || m.spawnWizard == nil {
+		return nil
+	}
+	if _, isKey := msg.(tea.KeyMsg); isKey {
+		return nil
+	}
+	updated, cmd := m.spawnWizard.Update(msg)
+	if wizard, ok := updated.(*panels.SpawnWizard); ok {
+		m.spawnWizard = wizard
+	}
+	return cmd
 }
 
 func (m *Model) selectByNumber(n int) tea.Cmd {
@@ -4186,11 +4374,7 @@ func (m Model) renderPaneGrid() string {
 		// Compaction indicator
 		if hasPaneStatus && ps.LastCompaction != nil {
 			cardContent.WriteString("\n")
-			indicator := "⚠ compacted"
-			if ps.RecoverySent {
-				indicator = "↻ recovering"
-			}
-			cardContent.WriteString(cachedStyledText(indicator, t.Warning, true, false))
+			cardContent.WriteString(cachedStyledText("⚠ compacted", t.Warning, true, false))
 		}
 
 		// Create card box
@@ -4665,7 +4849,7 @@ func (m *Model) resolveCostModelForPane(pane tmux.Pane) string {
 		if m.cfg != nil && m.cfg.Models.DefaultClaude != "" {
 			return m.cfg.Models.DefaultClaude
 		}
-		return "claude-sonnet-4-6"
+		return config.ClaudeEstimationModel
 	case tmux.AgentCodex:
 		if m.cfg != nil && m.cfg.Models.DefaultCodex != "" {
 			return m.cfg.Models.DefaultCodex
@@ -4676,6 +4860,13 @@ func (m *Model) resolveCostModelForPane(pane tmux.Pane) string {
 			return m.cfg.Models.DefaultGemini
 		}
 		return "gemini-2.0-flash"
+	case tmux.AgentOmp:
+		// omp chooses its own model when none is configured, so there is no
+		// safe hardcoded pricing fallback.
+		if m.cfg != nil {
+			return m.cfg.Models.DefaultOmp
+		}
+		return ""
 	default:
 		return ""
 	}
@@ -4717,7 +4908,7 @@ func (m *Model) refreshCostPanel(now time.Time) {
 		inputTokens := m.costInputTokens[p.ID]
 		outputTokens := m.costOutputTokens[p.ID]
 
-		pricing := cost.GetModelPricing(modelName)
+		pricing, pricingMatch := cost.GetModelPricingInfo(modelName)
 		costUSD := (float64(inputTokens)/1000.0)*pricing.InputPer1K + (float64(outputTokens)/1000.0)*pricing.OutputPer1K
 		total += costUSD
 
@@ -4738,6 +4929,7 @@ func (m *Model) refreshCostPanel(now time.Time) {
 			OutputTokens: outputTokens,
 			CostUSD:      costUSD,
 			Trend:        trend,
+			PricingMatch: pricingMatch,
 		})
 	}
 
@@ -4788,66 +4980,7 @@ func (m *Model) recordTimelineStatus(pane tmux.Pane, st status.AgentStatus) bool
 	if m.timelinePanel == nil || m.session == "" {
 		return false
 	}
-
-	agentType := timelineAgentType(pane, st.AgentType)
-	if agentType == tmux.AgentUnknown || agentType == tmux.AgentUser {
-		return false
-	}
-
-	agentID := timelineAgentID(pane, st.AgentType, st.PaneID)
-	if agentID == "" {
-		return false
-	}
-
-	nextState := timelineStateFromStatus(st)
-	tracker := state.GetGlobalTimelineTracker()
-	currentState := tracker.GetCurrentState(agentID)
-	if currentState == nextState {
-		return false
-	}
-
-	event := state.AgentEvent{
-		AgentID:   agentID,
-		AgentType: state.AgentType(agentType),
-		SessionID: m.session,
-		State:     nextState,
-		Timestamp: st.UpdatedAt,
-	}
-	recorded := tracker.RecordEvent(event)
-
-	if currentState == "" {
-		tracker.AddMarker(state.TimelineMarker{
-			AgentID:   agentID,
-			SessionID: m.session,
-			Type:      state.MarkerStart,
-			Timestamp: recorded.Timestamp,
-		})
-	}
-
-	if currentState == state.TimelineWorking && nextState == state.TimelineIdle {
-		tracker.AddMarker(state.TimelineMarker{
-			AgentID:   agentID,
-			SessionID: m.session,
-			Type:      state.MarkerCompletion,
-			Timestamp: recorded.Timestamp,
-		})
-	}
-
-	if nextState == state.TimelineError {
-		errMsg := ""
-		if st.ErrorType != "" {
-			errMsg = st.ErrorType.String()
-		}
-		tracker.AddMarker(state.TimelineMarker{
-			AgentID:   agentID,
-			SessionID: m.session,
-			Type:      state.MarkerError,
-			Timestamp: recorded.Timestamp,
-			Message:   errMsg,
-		})
-	}
-
-	return true
+	return state.GetGlobalTimelineTracker().RecordAgentStatus(m.session, pane, st)
 }
 
 func (m *Model) refreshTimelinePanel() {
@@ -4864,55 +4997,6 @@ func (m *Model) refreshTimelinePanel() {
 		Stats:   tracker.Stats(),
 	}
 	m.timelinePanel.SetData(data, nil)
-}
-
-func timelineStateFromStatus(st status.AgentStatus) state.TimelineState {
-	switch st.State {
-	case status.StateWorking:
-		return state.TimelineWorking
-	case status.StateError:
-		return state.TimelineError
-	case status.StateIdle:
-		return state.TimelineIdle
-	default:
-		return state.TimelineIdle
-	}
-}
-
-func timelineAgentID(pane tmux.Pane, fallbackType, fallbackID string) string {
-	if pane.NTMIndex > 0 && pane.Type != tmux.AgentUnknown && pane.Type != tmux.AgentUser {
-		return fmt.Sprintf("%s_%d", pane.Type, pane.NTMIndex)
-	}
-
-	if pane.Title != "" {
-		if suffix := tmux.PaneTitleSuffix(pane.Title); suffix != "" {
-			return suffix
-		}
-		return pane.Title
-	}
-
-	if fallbackType == "" {
-		return fallbackID
-	}
-	suffix := strings.TrimPrefix(fallbackID, "%")
-	if suffix == "" {
-		suffix = "0"
-	}
-	return fmt.Sprintf("%s_%s", fallbackType, suffix)
-}
-
-func timelineAgentType(pane tmux.Pane, fallbackType string) tmux.AgentType {
-	if pane.Type != tmux.AgentUnknown && pane.Type != tmux.AgentUser && pane.Type != "" {
-		return pane.Type
-	}
-	if fallbackType == "" {
-		return tmux.AgentUnknown
-	}
-	t := tmux.AgentType(fallbackType)
-	if t.IsValid() && t != tmux.AgentUser {
-		return t
-	}
-	return tmux.AgentUnknown
 }
 
 func (m *Model) scheduleRefreshes(now time.Time) []tea.Cmd {
@@ -5022,15 +5106,6 @@ func (m *Model) scheduleRefreshes(now time.Time) []tea.Cmd {
 	}
 
 	return cmds
-}
-
-func (m *Model) scheduleSpawnRefresh(now time.Time) tea.Cmd {
-	if refreshDue(m.lastSpawnFetch, m.spawnRefreshInterval) && !m.fetchingSpawn {
-		m.fetchingSpawn = true
-		m.lastSpawnFetch = now
-		return m.fetchSpawnStateCmd()
-	}
-	return nil
 }
 
 func rchStatusActive(status *tools.RCHStatus) bool {
@@ -5207,6 +5282,51 @@ func (m Model) renderSidebar(width, height int) string {
 			}
 			m.workflowPanel.SetSize(width, panelHeight)
 			lines = append(lines, m.workflowPanel.View(), "")
+		}
+	}
+
+	// C6-wire panels: quota, ratelimit, accounts render in the sidebar while
+	// toggled visible. [reality-bridge: bd-ws2-wire-or-delete-ykmcz.6]
+	if m.showQuotaPanel && m.quotaPanel != nil && height > 0 {
+		used := lipgloss.Height(strings.Join(lines, "\n"))
+		panelHeight := height - used - 1
+		if panelHeight >= m.quotaPanel.Config().MinHeight {
+			if panelHeight > 12 {
+				panelHeight = 12
+			}
+			if activeSidebarID == m.quotaPanel.Config().ID {
+				m.quotaPanel.Focus()
+			}
+			m.quotaPanel.SetSize(width, panelHeight)
+			lines = append(lines, m.quotaPanel.View(), "")
+		}
+	}
+	if m.showRateLimitPanel && m.rateLimitPanel != nil && height > 0 {
+		used := lipgloss.Height(strings.Join(lines, "\n"))
+		panelHeight := height - used - 1
+		if panelHeight >= m.rateLimitPanel.Config().MinHeight {
+			if panelHeight > 12 {
+				panelHeight = 12
+			}
+			if activeSidebarID == m.rateLimitPanel.Config().ID {
+				m.rateLimitPanel.Focus()
+			}
+			m.rateLimitPanel.SetSize(width, panelHeight)
+			lines = append(lines, m.rateLimitPanel.View(), "")
+		}
+	}
+	if m.showAccountsPanel && m.accountsPanel != nil && height > 0 {
+		used := lipgloss.Height(strings.Join(lines, "\n"))
+		panelHeight := height - used - 1
+		if panelHeight >= m.accountsPanel.Config().MinHeight {
+			if panelHeight > 12 {
+				panelHeight = 12
+			}
+			if activeSidebarID == m.accountsPanel.Config().ID {
+				m.accountsPanel.Focus()
+			}
+			m.accountsPanel.SetSize(width, panelHeight)
+			lines = append(lines, m.accountsPanel.View(), "")
 		}
 	}
 
@@ -5533,33 +5653,8 @@ func (m Model) renderConflictsPanel(width, height int) string {
 	return m.conflictsPanel.View()
 }
 
-func (m Model) renderSpawnPanel(width, height int) string {
-	m.spawnPanel.SetSize(width, height)
-	return m.spawnPanel.View()
-}
-
-func (m Model) renderMetricsPanel(width, height int) string {
-	m.metricsPanel.SetSize(width, height)
-	if m.focusedPanel == PanelMetrics {
-		m.metricsPanel.Focus()
-	} else {
-		m.metricsPanel.Blur()
-	}
-	return m.metricsPanel.View()
-}
-
 func hasMetricsData(data panels.MetricsData) bool {
 	return data.Coverage != nil || data.Redundancy != nil || data.Velocity != nil || data.Conflicts != nil
-}
-
-func (m Model) renderHistoryPanel(width, height int) string {
-	m.historyPanel.SetSize(width, height)
-	if m.focusedPanel == PanelHistory {
-		m.historyPanel.Focus()
-	} else {
-		m.historyPanel.Blur()
-	}
-	return m.historyPanel.View()
 }
 
 // renderPaneList renders a compact list of panes with status indicators.
@@ -5663,12 +5758,6 @@ func (m Model) computeContextRanks() map[string]int {
 		ranks[pr.key] = currentRank
 	}
 	return ranks
-}
-
-// spinnerDot returns a one-cell dot spinner frame based on the animation tick.
-func spinnerDot(tick int) string {
-	frames := []string{".", "·", "•", "·"}
-	return frames[tick%len(frames)]
 }
 
 // dashboardPaneIdentity returns the display identity for a pane and, when its
@@ -5870,9 +5959,6 @@ func (m Model) renderPaneDetail(width int) string {
 		lines = append(lines, "")
 		warnStyle := lipgloss.NewStyle().Foreground(t.Peach).Bold(true)
 		lines = append(lines, warnStyle.Render("  ⚠ Context compaction detected"))
-		if ps.RecoverySent {
-			lines = append(lines, lipgloss.NewStyle().Foreground(t.Green).Render("    ↻ Recovery prompt sent"))
-		}
 	}
 
 	// Command (if running)
@@ -6079,6 +6165,19 @@ func (m *Model) handleConflictAction(conflict watcher.FileConflict, action watch
 		return nil
 
 	case watcher.ConflictActionForce:
+		// bd-2y2on: honor automation.force_release here too — the dashboard
+		// must not be a bypass around the CLI approval gate
+		// (internal/cli/force_release_gate.go). Only an explicit "auto"
+		// policy permits unattended force-release; "never" and "approval"
+		// (the default) fail closed with a pointer at the gated workflow.
+		pol, perr := policy.LoadOrDefault()
+		if perr != nil {
+			return fmt.Errorf("cannot load policy for force-release gate: %w", perr)
+		}
+		if fr := pol.ForceReleasePolicy(); fr != "auto" {
+			return fmt.Errorf("force-release blocked by policy (automation.force_release=%s); use `ntm locks force-release` for the approval workflow", fr)
+		}
+
 		// Force action: force-release the reservation via Agent Mail
 		if len(conflict.HolderReservationIDs) == 0 {
 			return fmt.Errorf("no reservation IDs available for force-release")

@@ -2,7 +2,6 @@ package agents
 
 import (
 	"testing"
-	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/models"
@@ -334,40 +333,6 @@ func TestRecommendAgent(t *testing.T) {
 	}
 }
 
-func TestRecordCompletion(t *testing.T) {
-	pm := NewProfileMatcher()
-
-	// Get initial stats
-	initialStats := pm.GetPerformanceStats()
-	initialTasks := initialStats[AgentTypeClaude].TasksCompleted
-	initialRate := initialStats[AgentTypeClaude].SuccessRate
-
-	// Record a successful completion
-	pm.RecordCompletion(AgentTypeClaude, true, 5*time.Minute)
-
-	// Check updated stats
-	newStats := pm.GetPerformanceStats()
-	if newStats[AgentTypeClaude].TasksCompleted != initialTasks+1 {
-		t.Errorf("tasks completed should increase by 1, got %d", newStats[AgentTypeClaude].TasksCompleted)
-	}
-	if newStats[AgentTypeClaude].SuccessRate < initialRate {
-		t.Error("success rate should not decrease after successful completion")
-	}
-	if newStats[AgentTypeClaude].AvgCompletionTime == 0 {
-		t.Error("avg completion time should be set")
-	}
-	if newStats[AgentTypeClaude].LastUpdated.IsZero() {
-		t.Error("last updated should be set")
-	}
-
-	// Record a failed completion
-	pm.RecordCompletion(AgentTypeClaude, false, 10*time.Minute)
-	afterFailStats := pm.GetPerformanceStats()
-	if afterFailStats[AgentTypeClaude].SuccessRate >= newStats[AgentTypeClaude].SuccessRate {
-		t.Error("success rate should decrease after failed completion")
-	}
-}
-
 func TestNormalizeAgentType(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -397,6 +362,7 @@ func TestNormalizeAgentType(t *testing.T) {
 		{"muse", "muse"},
 		{"muse-code", "muse"},
 		{"muse_code", "muse"},
+		{"musecode", "muse"},
 		{"meta-muse", "muse"},
 		{"muse-wonder-1.0", "muse"},
 		{"muse-wonder-full-1.0", "muse"},
@@ -442,34 +408,6 @@ func TestMatchGlobPattern(t *testing.T) {
 			result := matchGlobPattern(tt.path, tt.pattern)
 			if result != tt.want {
 				t.Errorf("matchGlobPattern(%q, %q) = %v, want %v", tt.path, tt.pattern, result, tt.want)
-			}
-		})
-	}
-}
-
-func TestParseAgentType(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected AgentType
-	}{
-		{"claude", AgentTypeClaude},
-		{"cc", AgentTypeClaude},
-		{" claude_code ", AgentTypeClaude},
-		{"codex", AgentTypeCodex},
-		{"openai-codex", AgentTypeCodex},
-		{"gemini", AgentTypeGemini},
-		{"google_gemini", AgentTypeGemini},
-		{"muse", AgentTypeMuse},
-		{"musecode", AgentTypeMuse},
-		{"muse-spark-1.3", AgentTypeMuse},
-		{"ws", AgentType("windsurf")},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := ParseAgentType(tt.input)
-			if result != tt.expected {
-				t.Errorf("ParseAgentType(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
 	}

@@ -22,6 +22,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -462,9 +464,48 @@ func TestRESTBeadsCreateAndUpdate(t *testing.T) {
 	srv, _ := testRESTServer(t, t.TempDir())
 	client := newHTTPClient(t, logger, srv)
 
+	// Isolation (bd-w4fbk): the beads endpoints resolve the br workspace from
+	// the server's project dir, which defaults to the process cwd — the real
+	// repo. Point the server at a throwaway initialized br workspace so this
+	// test can never write to the repo's .beads DB, and prove it stayed
+	// untouched afterward.
+	beadsDir := t.TempDir()
+	initCmd := exec.Command("br", "init")
+	initCmd.Dir = beadsDir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Skipf("br init failed in temp workspace: %v (%s)", err, out)
+	}
+	if cfgResp := client.patch("/api/v1/config", map[string]interface{}{"project_dir": beadsDir}); cfgResp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to point server at isolated beads workspace: status %d", cfgResp.StatusCode)
+	}
+	// The leak probe is the test's own marker title rather than a raw row
+	// count: an external writer (e.g. a br auto-commit watcher flushing the
+	// repo workspace mid-test) may legitimately change the row count, but
+	// only THIS test can plant its marker bead in the repo JSONL. The marker
+	// carries a per-run nonce so (a) a leak from one historical or concurrent
+	// run can never permanently disarm the guard via the pre-existing-marker
+	// skip, and (b) concurrent CI runs sharing a checkout cannot misattribute
+	// each other's leaks.
+	const leakMarkerBase = "REST Integration Test Bead"
+	leakMarker := fmt.Sprintf("%s %d-%d", leakMarkerBase, os.Getpid(), time.Now().UnixNano())
+	if repoBeadsContainsMarker(t, leakMarkerBase) {
+		// A PRIOR run's marker in the repo JSONL is evidence of a real past
+		// leak. Surface it loudly, but keep this run's guard armed: the
+		// nonce keeps this run's verdict independent of historical dirt.
+		t.Logf("WARNING: repo beads JSONL already contains %q — a previous run leaked; this run still verifies isolation with unique marker %q", leakMarkerBase, leakMarker)
+	}
+	if repoBeadsContainsMarker(t, leakMarker) {
+		t.Skipf("repo beads JSONL already contains marker %q; cannot prove isolation", leakMarker)
+	}
+	defer func() {
+		if repoBeadsContainsMarker(t, leakMarker) {
+			t.Errorf("ISOLATION LEAK: marker bead %q appeared in the repo beads JSONL", leakMarker)
+		}
+	}()
+
 	// Create a test bead
 	createReq := map[string]interface{}{
-		"title":       "REST Integration Test Bead",
+		"title":       leakMarker,
 		"description": "Created via REST API integration test",
 		"type":        "task",
 		"priority":    "P2",
@@ -919,4 +960,22 @@ func TestRESTFullSessionFlow(t *testing.T) {
 	}
 
 	logger.Log("Full REST session flow completed")
+}
+
+// repoBeadsContainsMarker reports whether the repository's own beads JSONL
+// contains the given marker string, so the isolation guard in
+// TestRESTBeadsCreateAndUpdate can prove no test bead leaked into the real
+// workspace (bd-w4fbk) without false-failing when a concurrent external
+// writer (e.g. a br auto-commit watcher) changes unrelated rows mid-test.
+func repoBeadsContainsMarker(t *testing.T, marker string) bool {
+	t.Helper()
+	root, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		t.Skipf("cannot locate repo root: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(root)), ".beads", "issues.jsonl"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), marker)
 }

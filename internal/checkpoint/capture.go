@@ -45,6 +45,9 @@ func (c *Capturer) Create(sessionName, name string, opts ...CheckpointOption) (*
 	for _, opt := range opts {
 		opt(&options)
 	}
+	if options.captureUntracked && !options.captureGit {
+		return nil, fmt.Errorf("including untracked files requires git capture")
+	}
 
 	// Check privacy mode before creating checkpoint
 	if err := privacy.GetDefaultManager().CanPersist(sessionName, privacy.OpCheckpoint); err != nil {
@@ -59,10 +62,13 @@ func (c *Capturer) Create(sessionName, name string, opts ...CheckpointOption) (*
 	// Generate checkpoint ID
 	checkpointID := GenerateID(name)
 
-	// Get working directory from session
-	workingDir, err := getSessionDir(sessionName)
-	if err != nil {
+	// Get working directory from session. An unresolvable directory is
+	// recorded on the checkpoint instead of silently degrading to clean
+	// defaults (ntm#310).
+	workingDir, workingDirErr := getSessionDir(sessionName)
+	if workingDirErr != nil {
 		workingDir = ""
+		slog.Warn("failed to resolve session working directory; git state will not be captured", "session", sessionName, "error", workingDirErr)
 	}
 
 	// Capture session state
@@ -81,7 +87,11 @@ func (c *Capturer) Create(sessionName, name string, opts ...CheckpointOption) (*
 		WorkingDir:  workingDir,
 		CreatedAt:   time.Now(),
 		Session:     sessionState,
+		Git:         gitStateNotCaptured(options.captureGit, workingDirErr),
 		PaneCount:   len(sessionState.Panes),
+	}
+	if workingDirErr != nil {
+		cp.WorkingDirError = workingDirErr.Error()
 	}
 
 	// Save checkpoint first so directory exists
@@ -101,11 +111,13 @@ func (c *Capturer) Create(sessionName, name string, opts ...CheckpointOption) (*
 		slog.Warn("failed to capture some scrollback", "error", err)
 	}
 
-	// Capture git state if enabled and in a git repo
+	// Capture git state if enabled and the working directory resolved. A
+	// failed capture is recorded as such rather than left looking clean.
 	if options.captureGit && workingDir != "" {
-		gitState, err := c.captureGitState(workingDir, sessionName, checkpointID)
+		gitState, err := c.captureGitState(workingDir, sessionName, checkpointID, options.captureUntracked)
 		if err != nil {
 			slog.Warn("failed to capture git state", "error", err)
+			cp.Git = GitState{SkipReason: GitSkipCaptureFailed, SkipDetail: err.Error()}
 		} else {
 			cp.Git = gitState
 		}
@@ -135,6 +147,11 @@ func (c *Capturer) Create(sessionName, name string, opts ...CheckpointOption) (*
 	if err := c.storage.Save(cp); err != nil {
 		return nil, fmt.Errorf("saving final checkpoint: %w", err)
 	}
+	if options.captureUntracked && !cp.Git.Captured {
+		// Preserve the useful session checkpoint, but do not report success
+		// for an explicitly requested code snapshot that could not be made.
+		return cp, fmt.Errorf("checkpoint %s saved without requested git files: %s", cp.ID, DescribeGitUnavailable(cp))
+	}
 
 	return cp, nil
 }
@@ -151,6 +168,24 @@ func (c *Capturer) captureSessionState(sessionName string) (SessionState, error)
 
 	for i, p := range panes {
 		state := FromTmuxPane(p)
+		// A pane-local launch record survives wrapper execs and foreground
+		// command changes. Absence is legitimate for older/external panes;
+		// a present but unreadable record must not silently become a lossy
+		// checkpoint that appears to preserve the agent's configuration.
+		if agentType := tmux.ParsePaneAgentTypeOption(string(p.Type)); agentType != tmux.AgentUnknown && agentType != tmux.AgentUser {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			launchSpec, err := tmux.ReadPaneLaunchSpecContext(ctx, p.ID)
+			cancel()
+			if err != nil {
+				return SessionState{}, fmt.Errorf("reading pane %s launch specification: %w", p.ID, err)
+			}
+			if launchSpec != nil {
+				if err := launchSpec.Validate(agentType); err != nil {
+					return SessionState{}, fmt.Errorf("pane %s launch specification: %w", p.ID, err)
+				}
+				state.LaunchSpec = launchSpec
+			}
+		}
 		if p.Active {
 			activeIndex = i
 		}
@@ -193,14 +228,28 @@ func (c *Capturer) captureSessionState(sessionName string) (SessionState, error)
 	}, nil
 }
 
+// gitStateNotCaptured describes why git capture did not run before it was
+// attempted: disabled by option, or no working directory to run it in.
+func gitStateNotCaptured(captureEnabled bool, workingDirErr error) GitState {
+	if !captureEnabled {
+		return GitState{SkipReason: GitSkipDisabled}
+	}
+	if workingDirErr != nil {
+		return GitState{SkipReason: GitSkipWorkingDirUnavailable, SkipDetail: workingDirErr.Error()}
+	}
+	return GitState{}
+}
+
 // captureGitState captures the git repository state.
-func (c *Capturer) captureGitState(workingDir, sessionName, checkpointID string) (GitState, error) {
+func (c *Capturer) captureGitState(workingDir, sessionName, checkpointID string, includeUntracked bool) (GitState, error) {
 	state := GitState{}
 
 	// Check if it's a git repository
 	if !isGitRepo(workingDir) {
+		state.SkipReason = GitSkipNotRepository
 		return state, nil
 	}
+	state.Captured = true
 
 	// Get current branch
 	branch, err := gitCommand(workingDir, "rev-parse", "--abbrev-ref", "HEAD")
@@ -217,7 +266,7 @@ func (c *Capturer) captureGitState(workingDir, sessionName, checkpointID string)
 	state.Commit = strings.TrimSpace(commit)
 
 	// Get status counts
-	status, err := gitCommand(workingDir, "status", "--porcelain")
+	status, err := gitCommand(workingDir, "status", "--porcelain=v1", "--untracked-files=all")
 	if err != nil {
 		return state, fmt.Errorf("getting git status: %w", err)
 	}
@@ -234,40 +283,64 @@ func (c *Capturer) captureGitState(workingDir, sessionName, checkpointID string)
 		}
 	}
 
-	// Capture uncommitted changes as patch
-	if state.IsDirty {
-		// Warn about untracked files if any
-		if state.UntrackedCount > 0 {
-			slog.Warn("untracked files will not be captured in git patch", "count", state.UntrackedCount)
-		}
+	if state.UntrackedCount > 0 && !includeUntracked {
+		slog.Warn("untracked files will not be captured in git patch; use --include-untracked to preserve them", "count", state.UntrackedCount)
+	}
 
-		// Get diff of tracked changes (both staged and unstaged)
-		patch, err := gitCommand(workingDir, "diff", "HEAD")
-		if err != nil {
-			return state, fmt.Errorf("getting git diff: %w", err)
+	// Pin the base to the recorded commit. Capture even after a clean status
+	// observation: another agent can have written files since that query.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	snapshot, err := captureWorkingTreePatch(ctx, workingDir, state.Commit, gitPatchCaptureOptions{
+		IncludeUntracked: includeUntracked,
+		MaxBytes:         MaxGitOutputBytes,
+	})
+	if err != nil {
+		return state, fmt.Errorf("capturing git patch: %w", err)
+	}
+	if snapshot.Patch != "" {
+		// Write only a complete snapshot. Output-limit, read and selection
+		// failures above must not publish a plausible-looking partial patch.
+		if err := c.storage.SaveGitPatch(sessionName, checkpointID, snapshot.Patch); err != nil {
+			return state, fmt.Errorf("saving git patch: %w", err)
 		}
-		if patch != "" {
-			if err := c.storage.SaveGitPatch(sessionName, checkpointID, patch); err == nil {
-				state.PatchFile = GitPatchFile
-			}
-		}
+		state.PatchFile = GitPatchFile
+		state.IsDirty = true
+	}
+	state.UntrackedCaptured = snapshot.UntrackedCaptured
+	if includeUntracked {
+		state.UntrackedCount = snapshot.UntrackedCaptured
 	}
 
 	return state, nil
 }
 
-// getSessionDir gets the working directory for a session.
+// getSessionDir gets the working directory of the session's active pane.
+//
+// The target must be the pane-qualified exact form (`=name:`): `display-message
+// -p -t =name` exits 0 with empty output on tmux 3.4/3.6a, which used to be
+// recorded as an empty working_dir with Git capture silently skipped (ntm#310).
+// An empty answer is an error here so callers cannot mistake it for a path.
 func getSessionDir(sessionName string) (string, error) {
-	return tmux.DefaultClient.Run("display-message", "-p", "-t", sessionName, "#{pane_current_path}")
+	out, err := tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.SessionPaneTarget(sessionName), "#{pane_current_path}")
+	if err != nil {
+		return "", err
+	}
+	dir := strings.TrimSpace(out)
+	if dir == "" {
+		return "", fmt.Errorf("tmux reported no current path for the active pane of session %s", sessionName)
+	}
+	return dir, nil
 }
 
-// getSessionLayout gets the tmux layout string for a session.
+// getSessionLayout gets the tmux layout string for the session's current
+// window (pane-qualified exact target; see getSessionDir).
 func getSessionLayout(sessionName string) (string, error) {
-	return tmux.DefaultClient.Run("display-message", "-p", "-t", sessionName, "#{window_layout}")
+	return tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.SessionPaneTarget(sessionName), "#{window_layout}")
 }
 
 func getSessionWindowLayouts(sessionName string) ([]WindowLayoutState, error) {
-	out, err := tmux.DefaultClient.Run("list-windows", "-t", sessionName, "-F", "#{window_index}\t#{window_layout}")
+	out, err := tmux.DefaultClient.Run("list-windows", "-t", tmux.TargetSession(sessionName), "-F", "#{window_index}\t#{window_layout}")
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +376,19 @@ func canUseLegacyLayoutFallback(panes []PaneState) bool {
 }
 
 func getSessionActivePaneID(sessionName string) (string, error) {
-	return tmux.DefaultClient.Run("display-message", "-p", "-t", sessionName, "#{pane_id}")
+	// `-t =name` resolves for most commands, but `display-message -p` on tmux
+	// 3.6 answers it with exit 0 and EMPTY output, which silently left the
+	// pane_active fallback (the last window's active pane) in charge. The
+	// `=name:` form resolves to the session's current window and its pane.
+	paneID, err := tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.SessionPaneTarget(sessionName), "#{pane_id}")
+	if err != nil {
+		return "", err
+	}
+	paneID = strings.TrimSpace(paneID)
+	if paneID == "" {
+		return "", fmt.Errorf("tmux reported no selected pane for session %s", sessionName)
+	}
+	return paneID, nil
 }
 
 // isGitRepo checks if a directory is a git repository.
@@ -331,6 +416,7 @@ func gitCommand(dir string, args ...string) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", allArgs...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	return runGitCommand(cmd, ctx, args...)
 }
 
@@ -476,11 +562,6 @@ func matchWildcard(s, pattern string) bool {
 // GetLatest returns the most recent checkpoint for a session.
 func (c *Capturer) GetLatest(sessionName string) (*Checkpoint, error) {
 	return c.storage.GetLatest(sessionName)
-}
-
-// List returns all checkpoints for a session.
-func (c *Capturer) List(sessionName string) ([]*Checkpoint, error) {
-	return c.storage.List(sessionName)
 }
 
 // GetByIndex returns the Nth most recent checkpoint (1-indexed, 1 = latest).

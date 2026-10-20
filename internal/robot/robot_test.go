@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -23,14 +25,16 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/cass"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/privacy"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
-	"github.com/Dicklesworthstone/ntm/internal/tracker"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
@@ -153,13 +157,74 @@ func skipSlowRobotShortIntegrationTest(t *testing.T, reason string) {
 	}
 }
 
+// hermeticGlobalConfig points config.DefaultPath at a minimal valid temp
+// global config for the duration of the test, so code paths that load the
+// global config (LoadAssignmentPolicy, alerts/spawn config resolution) never
+// read the developer's real ~/.config/ntm/config.toml. That file may
+// legitimately carry keys that hard-fail the strict loader since the v1.29.0
+// deprecated-key flip (bd-6otuk / bd-ad54k) — same hermeticity precedent as
+// isolateSessionAgentStorage in internal/cli.
+func hermeticGlobalConfig(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte("projects_base = \""+dir+"\"\n"), 0o644); err != nil {
+		t.Fatalf("write hermetic global config: %v", err)
+	}
+	t.Setenv("NTM_CONFIG", path)
+}
+
+// errNoTestWorkSource is what the snapshot and status work read returns in
+// this package unless a test installs its own: tests run inside a repository
+// whose real tracker they must never read.
+var errNoTestWorkSource = errors.New("test: no work source installed")
+
+// stubRobotWork replaces the verified work read for one test.
+func stubRobotWork(t *testing.T, collect func(ctx context.Context, store *state.Store, cfg adapters.WorkCoordinationAdapterConfig, refresh bool) (*adapters.WorkSection, error)) {
+	t.Helper()
+	previous := collectRobotWork
+	collectRobotWork = collect
+	t.Cleanup(func() { collectRobotWork = previous })
+}
+
+// developerDataHome is XDG_DATA_HOME as the test binary inherited it, before
+// TestMain isolates it; read-only tests of installed tools that keep their
+// data there (cass) restore it.
+var developerDataHome string
+
 func TestMain(m *testing.M) {
 	cleanupTmux, err := testutil.IsolateTmuxTestProcess()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "isolate robot tmux tests: %v\n", err)
 		os.Exit(1)
 	}
+	collectRobotWork = func(context.Context, *state.Store, adapters.WorkCoordinationAdapterConfig, bool) (*adapters.WorkSection, error) {
+		return nil, errNoTestWorkSource
+	}
+	// Robot sends record prompt history (and spawns write manifests) under
+	// XDG_DATA_HOME; never let the package's real-tmux sends append to the
+	// developer's own history. Tests that inspect it set their own.
+	developerDataHome = os.Getenv("XDG_DATA_HOME")
+	dataHome, err := os.MkdirTemp("", "ntm-robot-test-data-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create robot test data home: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("XDG_DATA_HOME", dataHome); err != nil {
+		fmt.Fprintf(os.Stderr, "isolate robot test data home: %v\n", err)
+		os.Exit(1)
+	}
+	// Robot spawn provisions Agent Mail identities under the default config
+	// ([agent_mail] enabled + auto_register). Point every test that does not
+	// install its own stub at a refusing local port, so no test registers
+	// agents with a developer's real Agent Mail server (or one named by the
+	// ambient AGENT_MAIL_URL). Tests that need a server use t.Setenv.
+	if err := os.Setenv("AGENT_MAIL_URL", "http://127.0.0.1:1/mcp/"); err != nil {
+		fmt.Fprintf(os.Stderr, "isolate robot Agent Mail endpoint: %v\n", err)
+		os.Exit(1)
+	}
 	code := m.Run()
+	_ = os.RemoveAll(dataHome)
 	if err := cleanupTmux(); err != nil {
 		fmt.Fprintf(os.Stderr, "clean up isolated robot tmux: %v\n", err)
 		code = 1
@@ -301,7 +366,10 @@ func TestGetMail_DropsStaleSessionAgentFromDifferentProject(t *testing.T) {
 	}
 }
 
-func TestGetMail_DegradesOnAgentMailListAgentsError(t *testing.T) {
+// TestGetMail_FailsOnAgentMailListAgentsError: a server that is up but cannot
+// list the project's agents fails the call. Success with agents: [] would tell
+// the orchestrator the project has no agents.
+func TestGetMail_FailsOnAgentMailListAgentsError(t *testing.T) {
 	origDir, _ := os.Getwd()
 	t.Cleanup(func() {
 		if err := os.Chdir(origDir); err != nil {
@@ -318,6 +386,13 @@ func TestGetMail_DegradesOnAgentMailListAgentsError(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 
 		var req struct {
@@ -378,8 +453,11 @@ func TestGetMail_DegradesOnAgentMailListAgentsError(t *testing.T) {
 	if output == nil {
 		t.Fatal("expected output")
 	}
-	if !output.Success {
-		t.Fatalf("Success = false, warnings=%v", output.Warnings)
+	if output.Success || output.ErrorCode != ErrCodeInternalError {
+		t.Fatalf("Success = %v ErrorCode = %q, want a failed INTERNAL_ERROR response", output.Success, output.ErrorCode)
+	}
+	if !strings.Contains(output.Error, "list_agents failed") || !strings.Contains(output.Error, "database disk image is malformed") {
+		t.Fatalf("Error = %q, want the list_agents failure and the server's message", output.Error)
 	}
 	if !output.Available {
 		t.Fatal("expected Agent Mail to be marked available")
@@ -387,11 +465,55 @@ func TestGetMail_DegradesOnAgentMailListAgentsError(t *testing.T) {
 	if output.ProjectKey != projectDir {
 		t.Fatalf("ProjectKey = %q, want %q", output.ProjectKey, projectDir)
 	}
-	if len(output.Warnings) == 0 {
-		t.Fatal("expected warnings when list_agents fails")
+	if output.Agents == nil || len(output.Agents) != 0 {
+		t.Fatalf("Agents = %#v, want the required array present and empty", output.Agents)
 	}
-	if !strings.Contains(output.Warnings[0], "list_agents failed") {
-		t.Fatalf("warning = %q, want list_agents failure", output.Warnings[0])
+}
+
+// TestGetMail_RejectedTokenIsPermissionDenied: a server that refuses ntm's
+// bearer token fails the call with PERMISSION_DENIED and a token hint, rather
+// than reporting a reachable server with no agents.
+func TestGetMail_RejectedTokenIsPermissionDenied(t *testing.T) {
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() {
+		if err := os.Chdir(origDir); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+	projectDir := tempDirCanonical(t)
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer right-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		t.Errorf("request with the right token reached the server; the test sends a wrong one")
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+	t.Setenv("AGENT_MAIL_TOKEN", "wrong-token")
+
+	output, err := GetMail(MailOptions{})
+	if err != nil {
+		t.Fatalf("GetMail error: %v", err)
+	}
+	if output.Success || output.ErrorCode != ErrCodePermissionDenied {
+		t.Fatalf("Success = %v ErrorCode = %q Error = %q, want PERMISSION_DENIED", output.Success, output.ErrorCode, output.Error)
+	}
+	// --robot-mail looks the project up instead of registering it (bd-5g66p),
+	// so the first call the server refuses is the agent listing.
+	if !strings.Contains(output.Error, "list_agents failed") || !strings.Contains(output.Hint, "token") {
+		t.Fatalf("Error = %q Hint = %q, want the list_agents failure and a token hint", output.Error, output.Hint)
+	}
+	if output.Agents == nil || len(output.Agents) != 0 {
+		t.Fatalf("Agents = %#v, want the required array present and empty", output.Agents)
 	}
 }
 
@@ -448,45 +570,6 @@ func TestSplitLines(t *testing.T) {
 				if got[i] != tc.expected[i] {
 					t.Errorf("splitLines(%q)[%d] = %q, want %q", tc.input, i, got[i], tc.expected[i])
 				}
-			}
-		})
-	}
-}
-
-func TestDetectState(t *testing.T) {
-	// Note: detectState behavior changed during refactoring.
-	// The new implementation delegates to status.DetectIdleFromOutput and status.DetectErrorInOutput.
-	// Key differences:
-	// - Empty output returns "idle" for user panes (empty agentType) or "active" otherwise
-	// - Idle detection requires proper agentType for agent-specific prompts
-	// - The "unknown" state no longer exists - it's now "active" by default
-	// - Pane titles must be in proper format: "{session}__{type}_{index}" for agent type detection
-	tests := []struct {
-		name     string
-		lines    []string
-		title    string
-		expected string
-	}{
-		{"empty", []string{}, "", "idle"},                                              // Empty + user type = idle
-		{"all empty lines", []string{"", "", ""}, "", "idle"},                          // Empty content + user type = idle
-		{"claude idle", []string{"some output", "claude>"}, "myproject__cc_1", "idle"}, // With proper title format
-		{"codex idle", []string{"output", "codex>"}, "myproject__cod_1", "idle"},       // With proper title format
-		{"gemini idle", []string{"Gemini>"}, "myproject__gmi_1", "idle"},               // With proper title format
-		{"bash prompt", []string{"$ "}, "", "idle"},
-		{"zsh prompt", []string{"% "}, "", "idle"},
-		{"python prompt", []string{">>> "}, "", "idle"}, // Python REPL prompt is ready for input
-		{"rate limit error", []string{"Error: rate limit exceeded"}, "", "error"},
-		{"429 error", []string{"HTTP 429 too many requests"}, "", "error"},
-		{"panic error", []string{"panic: runtime error"}, "", "error"},
-		{"fatal error", []string{"fatal: not a git repository"}, "", "error"},
-		{"active with output", []string{"Running tests", "Building package"}, "", "active"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := detectState(tc.lines, tc.title)
-			if got != tc.expected {
-				t.Errorf("detectState(%v, %q) = %q, want %q", tc.lines, tc.title, got, tc.expected)
 			}
 		})
 	}
@@ -585,6 +668,149 @@ func TestGetMSShow_EmptyID(t *testing.T) {
 	}
 	if output.ErrorCode != ErrCodeInvalidFlag {
 		t.Fatalf("expected %s, got %s", ErrCodeInvalidFlag, output.ErrorCode)
+	}
+}
+
+// TestRobotMSSearchAndShowReadInstalledMS indexes one skill into an isolated
+// ms root and drives --robot-ms-search / --robot-ms-show through the real ms.
+func TestRobotMSSearchAndShowReadInstalledMS(t *testing.T) {
+	if _, err := exec.LookPath("ms"); err != nil {
+		t.Skip("ms not installed")
+	}
+	root := t.TempDir()
+	skillDir := filepath.Join(root, "skills", "commit-workflow")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	skill := "---\nname: commit-workflow\n---\n\n# Commit Workflow\n\n" +
+		"Stage related changes together and write a commit message that explains why.\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", root)
+	t.Setenv("MS_ROOT", filepath.Join(root, ".ms"))
+	t.Setenv("MS_CONFIG", filepath.Join(root, ".ms", "config.toml"))
+	for _, args := range [][]string{{"--robot", "init"}, {"--robot", "index"}} {
+		cmd := exec.Command("ms", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("ms %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+
+	search, err := GetMSSearch("commit")
+	if err != nil {
+		t.Fatalf("GetMSSearch returned error: %v", err)
+	}
+	if !search.Success || search.Count != 1 || len(search.Skills) != 1 || search.Skills[0].ID != "commit-workflow" {
+		t.Fatalf("GetMSSearch = success:%t count:%d skills:%+v err:%q", search.Success, search.Count, search.Skills, search.Error)
+	}
+
+	show, err := GetMSShow("commit-workflow")
+	if err != nil {
+		t.Fatalf("GetMSShow returned error: %v", err)
+	}
+	var shown struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if !show.Success || json.Unmarshal(show.Skill, &shown) != nil || shown.ID != "commit-workflow" || shown.Status != "" {
+		t.Fatalf("GetMSShow = success:%t skill:%s err:%q, want the bare skill object", show.Success, show.Skill, show.Error)
+	}
+
+	missing, err := GetMSShow("no-such-skill")
+	if err != nil {
+		t.Fatalf("GetMSShow returned error: %v", err)
+	}
+	if missing.Success || missing.ErrorCode != "NOT_FOUND" {
+		t.Fatalf("GetMSShow(missing) = success:%t code:%q err:%q, want NOT_FOUND", missing.Success, missing.ErrorCode, missing.Error)
+	}
+}
+
+// TestRobotCASSInsightsMatchesInstalledCass compares --robot-cass-insights with
+// the installed cass's own aggregation over the same window.
+func TestRobotCASSInsightsMatchesInstalledCass(t *testing.T) {
+	if _, err := exec.LookPath("cass"); err != nil {
+		t.Skip("cass not installed")
+	}
+	// Both runs read the developer's real index, not TestMain's empty data home.
+	t.Setenv("XDG_DATA_HOME", developerDataHome)
+	raw, err := exec.Command("cass", "search", "*", "--json", "--limit", "0", "--since", "30d", "--aggregate", "agent,workspace").Output()
+	var direct struct {
+		Aggregations struct {
+			Agent struct {
+				Buckets []cass.AggregationBucket `json:"buckets"`
+			} `json:"agent"`
+		} `json:"aggregations"`
+	}
+	if err != nil || json.Unmarshal(raw, &direct) != nil {
+		t.Fatalf("cass search --aggregate: %v", err)
+	}
+
+	out, err := GetCASSInsights("30d")
+	if err != nil || !out.Success || out.Period != "30d" {
+		t.Fatalf("GetCASSInsights = %+v, %v", out, err)
+	}
+	if len(out.Agents) != len(direct.Aggregations.Agent.Buckets) {
+		t.Fatalf("agents = %+v, cass says %+v", out.Agents, direct.Aggregations.Agent.Buckets)
+	}
+	for i, b := range direct.Aggregations.Agent.Buckets {
+		if out.Agents[i] != b {
+			t.Fatalf("agents[%d] = %+v, cass says %+v", i, out.Agents[i], b)
+		}
+	}
+}
+
+// TestRobotJFPReadsInstalledJFP drives the --robot-jfp-* surfaces through the
+// installed jfp with an isolated home, where jfp serves its bundled registry.
+func TestRobotJFPReadsInstalledJFP(t *testing.T) {
+	if _, err := exec.LookPath("jfp"); err != nil {
+		t.Skip("jfp not installed")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Chdir(t.TempDir()) // jfp export writes into the working directory
+
+	arrayLen := func(raw json.RawMessage) int {
+		t.Helper()
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			t.Fatalf("expected a JSON array, got %s: %v", raw, err)
+		}
+		return len(items)
+	}
+
+	list, err := GetJFPList(JFPListOptions{})
+	if err != nil || !list.Success || list.Count == 0 || list.Count != arrayLen(list.Prompts) {
+		t.Fatalf("GetJFPList = success:%t count:%d err:%q (%v)", list.Success, list.Count, list.Error, err)
+	}
+
+	search, err := GetJFPSearch("commit")
+	if err != nil || !search.Success || search.Count == 0 || search.Count != arrayLen(search.Results) {
+		t.Fatalf("GetJFPSearch = success:%t count:%d err:%q (%v)", search.Success, search.Count, search.Error, err)
+	}
+
+	suggest, err := GetJFPSuggest("write documentation")
+	if err != nil || !suggest.Success {
+		t.Fatalf("GetJFPSuggest = success:%t err:%q (%v)", suggest.Success, suggest.Error, err)
+	}
+	arrayLen(suggest.Suggestions)
+
+	skillExport, err := GetJFPExport("idea-wizard", "skill")
+	if err != nil || skillExport.Success || skillExport.ErrorCode != ErrCodeNotImplemented {
+		t.Fatalf("GetJFPExport(skill) = success:%t code:%q err:%q, want NOT_IMPLEMENTED", skillExport.Success, skillExport.ErrorCode, skillExport.Error)
+	}
+	mdExport, err := GetJFPExport("idea-wizard", "")
+	if err != nil || !mdExport.Success {
+		t.Fatalf("GetJFPExport(md) = success:%t err:%q (%v)", mdExport.Success, mdExport.Error, err)
+	}
+
+	// Refresh may fail offline, but never as the retired `jfp update`.
+	update, err := GetJFPUpdate()
+	if err != nil || strings.Contains(update.Error, "jsm") {
+		t.Fatalf("GetJFPUpdate = success:%t err:%q (%v), want jfp refresh", update.Success, update.Error, err)
 	}
 }
 
@@ -731,7 +957,13 @@ func TestSendOutputMarshal(t *testing.T) {
 // ====================
 
 func TestPrintVersion(t *testing.T) {
-	// Set version info
+	// Set version info, restoring the package globals afterwards so the
+	// override cannot leak into order-dependent tests (the token-corpus
+	// staleness ratchet embeds the version in capabilities envelopes).
+	prevVersion, prevCommit, prevDate, prevBuiltBy := Version, Commit, Date, BuiltBy
+	t.Cleanup(func() {
+		Version, Commit, Date, BuiltBy = prevVersion, prevCommit, prevDate, prevBuiltBy
+	})
 	Version = "1.2.3"
 	Commit = "abc123"
 	Date = "2025-01-01"
@@ -1074,10 +1306,10 @@ func TestPrintHelp_UsesCurrentSharedModifierDescriptions(t *testing.T) {
 
 	for _, want := range []string{
 		"--since=VALUE   Time filter for commands that support it (history, diff, and summary accept duration or RFC3339; snapshot requires RFC3339; mail-check uses YYYY-MM-DD)",
-		"--type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, gemini, pi, kimi, muse, cursor, windsurf, aider, opencode, ollama)",
+		"--type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, omp, gemini, pi, kimi, muse, cursor, windsurf, aider, opencode, ollama)",
 		"--timeout=VALUE Shared timeout for wait/ack/interrupt and spawn --spawn-wait",
 		"--strategy=NAME Strategy override for assign, route, and spawn --spawn-assign-work",
-		"--msg=TEXT      Shared message payload for send, ack echo detection, and interrupt retasks",
+		"--msg=TEXT      Shared message payload for send, ack echo detection, interrupt retasks, and route affinity",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("help output missing %q:\n%s", want, output)
@@ -1194,124 +1426,9 @@ func TestPrintPlan(t *testing.T) {
 	}
 }
 
-func TestPrintStatus(t *testing.T) {
-	skipSlowRobotShortIntegrationTest(t, "PrintStatus probes live runtime state and is too expensive for go test -short")
-
-	output, err := captureStdout(t, PrintStatus)
-	if err != nil {
-		t.Fatalf("PrintStatus failed: %v", err)
-	}
-
-	var result StatusOutput
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, output)
-	}
-
-	// Verify structure
-	if result.GeneratedAt.IsZero() {
-		t.Error("GeneratedAt is zero")
-	}
-
-	if result.SafetyProfile == "" {
-		t.Error("SafetyProfile is empty")
-	} else {
-		valid := map[string]bool{
-			config.SafetyProfileStandard: true,
-			config.SafetyProfileSafe:     true,
-			config.SafetyProfileParanoid: true,
-		}
-		if !valid[result.SafetyProfile] {
-			t.Errorf("SafetyProfile = %q, want one of standard|safe|paranoid", result.SafetyProfile)
-		}
-	}
-	if result.SchemaVersion != statusSchemaVersion {
-		t.Errorf("SchemaVersion = %q, want %q", result.SchemaVersion, statusSchemaVersion)
-	}
-	if result.SchemaID != defaultRobotSchemaID("status") {
-		t.Errorf("SchemaID = %q, want %q", result.SchemaID, defaultRobotSchemaID("status"))
-	}
-
-	// System info should be populated
-	if result.System.GoVersion == "" {
-		t.Error("System.GoVersion is empty")
-	}
-	if result.System.OS == "" {
-		t.Error("System.OS is empty")
-	}
-
-	// Sessions should be an array (empty or not)
-	if result.Sessions == nil {
-		t.Error("Sessions is nil (should be empty array)")
-	}
-}
-
-func TestPrintSessions(t *testing.T) {
-	output, err := captureStdout(t, PrintSessions)
-	if err != nil {
-		t.Fatalf("PrintSessions failed: %v", err)
-	}
-
-	var result []SessionInfo
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, output)
-	}
-
-	// Result should be an array (may be empty if no tmux sessions)
-	// Just verify it's valid JSON array
-	if result == nil {
-		t.Error("Result is nil (should be empty array)")
-	}
-}
-
 // ====================
 // Test with Real Tmux
 // ====================
-
-func TestPrintStatusWithSession(t *testing.T) {
-	skipSlowRobotShortIntegrationTest(t, "PrintStatusWithSession uses real tmux integration and belongs in longer runs")
-	testutil.RequireTmuxThrottled(t)
-
-	// Create a test session
-	sessionName := "ntm_test_status_" + time.Now().Format("150405")
-	if err := tmux.CreateSession(sessionName, ""); err != nil {
-		t.Fatalf("Failed to create test session: %v", err)
-	}
-	defer tmux.KillSession(sessionName)
-
-	output, err := captureStdout(t, PrintStatus)
-	if err != nil {
-		t.Fatalf("PrintStatus failed: %v", err)
-	}
-
-	var result StatusOutput
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Fatalf("Failed to parse JSON: %v", err)
-	}
-
-	// Should have at least one session
-	if len(result.Sessions) == 0 {
-		t.Error("Expected at least one session")
-	}
-
-	// Find our test session
-	found := false
-	for _, sess := range result.Sessions {
-		if sess.Name == sessionName {
-			found = true
-			if sess.AgentCount < 0 {
-				t.Error("AgentCount should not be negative")
-			}
-		}
-	}
-	if !found {
-		t.Errorf("Test session %s not found in output", sessionName)
-	}
-
-	// Summary should count sessions
-	if result.Summary.TotalSessions == 0 {
-		t.Error("TotalSessions should be at least 1")
-	}
-}
 
 func TestPrintTailNonexistentSession(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
@@ -1662,89 +1779,6 @@ func TestPrintTailWithPaneFilter(t *testing.T) {
 // Test PrintSnapshot
 // ====================
 
-func TestPrintSnapshot(t *testing.T) {
-	skipSlowRobotShortIntegrationTest(t, "PrintSnapshot collects live system state and is too slow for go test -short")
-
-	oldFeed := PeekAttentionFeed()
-	feed := NewAttentionFeed(AttentionFeedConfig{
-		JournalSize:       8,
-		RetentionPeriod:   30 * time.Minute,
-		HeartbeatInterval: 0,
-	})
-	SetAttentionFeed(feed)
-	t.Cleanup(func() {
-		feed.Stop()
-		SetAttentionFeed(oldFeed)
-	})
-
-	output, err := captureStdout(t, func() error { return PrintSnapshot(config.Default()) })
-	if err != nil {
-		t.Fatalf("PrintSnapshot failed: %v", err)
-	}
-
-	var result SnapshotOutput
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, output)
-	}
-
-	// Timestamp should be set
-	if result.Timestamp == "" {
-		t.Error("Timestamp is empty")
-	}
-
-	if result.SafetyProfile != config.SafetyProfileStandard {
-		t.Errorf("SafetyProfile = %q, want %q", result.SafetyProfile, config.SafetyProfileStandard)
-	}
-	if result.AttentionContractVersion != AttentionContractVersion {
-		t.Errorf("AttentionContractVersion = %q, want %q", result.AttentionContractVersion, AttentionContractVersion)
-	}
-	if result.LatestCursor != 0 {
-		t.Errorf("LatestCursor = %d, want 0 for empty journal", result.LatestCursor)
-	}
-	// Empty journal has no events to replay
-	if result.ReplayWindow.Supported {
-		t.Error("ReplayWindow.Supported = true, want false for empty journal")
-	}
-	if result.ReplayWindow.Reason != "no events in feed yet" {
-		t.Errorf("ReplayWindow.Reason = %q, want %q", result.ReplayWindow.Reason, "no events in feed yet")
-	}
-	if result.ReplayWindow.EventCount != 0 {
-		t.Errorf("ReplayWindow.EventCount = %d, want 0 for empty journal", result.ReplayWindow.EventCount)
-	}
-	if result.ReplayWindow.OldestCursor != 0 {
-		t.Errorf("ReplayWindow.OldestCursor = %d, want 0 for empty journal", result.ReplayWindow.OldestCursor)
-	}
-	if result.ReplayWindow.LatestCursor != 0 {
-		t.Errorf("ReplayWindow.LatestCursor = %d, want 0 for empty journal", result.ReplayWindow.LatestCursor)
-	}
-	if result.ReplayWindow.RetentionPeriod != (30 * time.Minute).String() {
-		t.Errorf("ReplayWindow.RetentionPeriod = %q, want %q", result.ReplayWindow.RetentionPeriod, (30 * time.Minute).String())
-	}
-	if result.ReplayWindow.ResyncCommand != "ntm --robot-snapshot" {
-		t.Errorf("ReplayWindow.ResyncCommand = %q, want %q", result.ReplayWindow.ResyncCommand, "ntm --robot-snapshot")
-	}
-	t.Logf("empty snapshot cursor handoff oldest=%d latest=%d resync=%q",
-		result.ReplayWindow.OldestCursor,
-		result.ReplayWindow.LatestCursor,
-		result.ReplayWindow.ResyncCommand,
-	)
-
-	// Sessions should be an array
-	if result.Sessions == nil {
-		t.Error("Sessions is nil (should be empty array)")
-	}
-
-	// Alerts should be an array
-	if result.Alerts == nil {
-		t.Error("Alerts is nil (should be empty array)")
-	}
-
-	// Swarm should be omitted when swarm is disabled
-	if result.Swarm != nil {
-		t.Errorf("expected Swarm to be nil when swarm is disabled, got %+v", result.Swarm)
-	}
-}
-
 func TestGetSnapshotIncludesReplayWindowMetadata(t *testing.T) {
 	oldFeed := PeekAttentionFeed()
 	feed := NewAttentionFeed(AttentionFeedConfig{
@@ -1805,174 +1839,6 @@ func TestGetSnapshotIncludesReplayWindowMetadata(t *testing.T) {
 	}
 	if result.ReplayWindow.LatestTimestamp == "" {
 		t.Error("ReplayWindow.LatestTimestamp should be populated")
-	}
-}
-
-func TestRecordStateChangePublishesToAttentionFeed(t *testing.T) {
-	oldFeed := PeekAttentionFeed()
-	feed := NewAttentionFeed(AttentionFeedConfig{
-		JournalSize:       8,
-		RetentionPeriod:   time.Hour,
-		HeartbeatInterval: 0,
-	})
-	SetAttentionFeed(feed)
-	t.Cleanup(func() {
-		feed.Stop()
-		SetAttentionFeed(oldFeed)
-	})
-
-	RecordStateChange(tracker.ChangeAgentState, "myproject", "0.2", map[string]interface{}{
-		"state": "error",
-	})
-
-	events, newest, err := feed.Replay(0, 10)
-	if err != nil {
-		t.Fatalf("Replay failed: %v", err)
-	}
-	if newest != 1 {
-		t.Errorf("newest cursor = %d, want 1", newest)
-	}
-	if len(events) != 1 {
-		t.Fatalf("got %d events, want 1", len(events))
-	}
-	if events[0].Type != EventTypeAgentStateChange {
-		t.Errorf("event.Type = %q, want %q", events[0].Type, EventTypeAgentStateChange)
-	}
-	if events[0].Severity != SeverityError {
-		t.Errorf("event.Severity = %q, want %q", events[0].Severity, SeverityError)
-	}
-}
-
-func TestPrintSnapshotIncludesSwarmWhenActive(t *testing.T) {
-	skipSlowRobotShortIntegrationTest(t, "PrintSnapshotIncludesSwarmWhenActive exercises live tmux and swarm discovery")
-	testutil.RequireTmuxThrottled(t)
-
-	// Set up attention feed for tests - earlier tests may leave globalFeed nil
-	oldFeed := PeekAttentionFeed()
-	feed := NewAttentionFeed(AttentionFeedConfig{
-		JournalSize:       8,
-		RetentionPeriod:   30 * time.Minute,
-		HeartbeatInterval: 0,
-	})
-	SetAttentionFeed(feed)
-	t.Cleanup(func() {
-		feed.Stop()
-		SetAttentionFeed(oldFeed)
-	})
-
-	sessionName := "cc_agents_" + time.Now().Format("150405")
-	if err := tmux.CreateSession(sessionName, ""); err != nil {
-		t.Fatalf("Failed to create test session: %v", err)
-	}
-	defer tmux.KillSession(sessionName)
-
-	panes, err := tmux.GetPanes(sessionName)
-	if err != nil || len(panes) == 0 {
-		t.Fatalf("Failed to get panes: %v", err)
-	}
-
-	// Ensure the pane title matches NTM convention so type detection sees it as an agent.
-	_ = tmux.SetPaneTitle(panes[0].ID, tmux.FormatPaneName(sessionName, "cc", 1, ""))
-
-	cfg := config.Default()
-	cfg.Swarm.Enabled = true
-	// Use a non-existent scan dir so the snapshot plan is still populated but fast.
-	cfg.Swarm.DefaultScanDir = "/does/not/exist"
-
-	output, err := captureStdout(t, func() error { return PrintSnapshot(cfg) })
-	if err != nil {
-		t.Fatalf("PrintSnapshot failed: %v", err)
-	}
-
-	var result SnapshotOutput
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Fatalf("Failed to parse JSON: %v", err)
-	}
-
-	if result.Swarm == nil {
-		t.Fatal("expected Swarm to be present when swarm is enabled and swarm sessions exist")
-	}
-	if !result.Swarm.Active {
-		t.Error("expected Swarm.Active to be true")
-	}
-	if result.Swarm.Plan.ScanDir != cfg.Swarm.DefaultScanDir {
-		t.Errorf("expected Swarm.Plan.ScanDir = %q, got %q", cfg.Swarm.DefaultScanDir, result.Swarm.Plan.ScanDir)
-	}
-	if result.Swarm.Sessions == nil {
-		t.Error("expected Swarm.Sessions to be a JSON array")
-	}
-	if result.Swarm.RecentEvents == nil {
-		t.Error("expected Swarm.RecentEvents to be a JSON array")
-	}
-
-	found := false
-	for _, sess := range result.Swarm.Sessions {
-		if sess.Name == sessionName {
-			found = true
-			if sess.AgentType != "cc" {
-				t.Errorf("expected swarm session agent_type cc, got %q", sess.AgentType)
-			}
-			if sess.PaneCount < 1 {
-				t.Errorf("expected swarm session pane_count >= 1, got %d", sess.PaneCount)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("expected swarm session %q to appear in snapshot", sessionName)
-	}
-}
-
-func TestPrintSnapshotWithSession(t *testing.T) {
-	skipSlowRobotShortIntegrationTest(t, "PrintSnapshotWithSession uses real tmux integration and belongs in longer runs")
-	testutil.RequireTmuxThrottled(t)
-
-	// Set up attention feed for tests - earlier tests may leave globalFeed nil
-	oldFeed := PeekAttentionFeed()
-	feed := NewAttentionFeed(AttentionFeedConfig{
-		JournalSize:       8,
-		RetentionPeriod:   30 * time.Minute,
-		HeartbeatInterval: 0,
-	})
-	SetAttentionFeed(feed)
-	t.Cleanup(func() {
-		feed.Stop()
-		SetAttentionFeed(oldFeed)
-	})
-
-	sessionName := "ntm_test_snapshot_" + time.Now().Format("150405")
-	if err := tmux.CreateSession(sessionName, ""); err != nil {
-		t.Fatalf("Failed to create test session: %v", err)
-	}
-	defer tmux.KillSession(sessionName)
-
-	output, err := captureStdout(t, func() error { return PrintSnapshot(config.Default()) })
-	if err != nil {
-		t.Fatalf("PrintSnapshot failed: %v", err)
-	}
-
-	var result SnapshotOutput
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Fatalf("Failed to parse JSON: %v", err)
-	}
-
-	// Should have at least one session
-	if len(result.Sessions) == 0 {
-		t.Error("Expected at least one session")
-	}
-
-	// Find our session
-	found := false
-	for _, sess := range result.Sessions {
-		if sess.Name == sessionName {
-			found = true
-			// Should have agents
-			if len(sess.Agents) == 0 {
-				t.Error("Expected at least one agent/pane")
-			}
-		}
-	}
-	if !found {
-		t.Errorf("Test session %s not found", sessionName)
 	}
 }
 
@@ -2072,6 +1938,22 @@ func TestModelNameForPane(t *testing.T) {
 			cfg:  &config.Config{},
 			want: "muse-spark-1.2",
 		},
+		{
+			// ntm#334: the launch model is delegated to Claude Code, but
+			// context/cost estimates keep a Claude-family model.
+			name: "claude delegated default estimates as claude family",
+			pane: tmux.Pane{Type: tmux.AgentClaude},
+			cfg:  &config.Config{Models: config.DefaultModels()},
+			want: config.ClaudeEstimationModel,
+		},
+		{
+			name: "claude configured default wins",
+			pane: tmux.Pane{Type: tmux.AgentClaude},
+			cfg: &config.Config{
+				Models: config.ModelsConfig{DefaultClaude: "claude-pinned"},
+			},
+			want: "claude-pinned",
+		},
 	}
 
 	for _, tt := range tests {
@@ -2094,8 +1976,8 @@ func TestMuseRobotDeliveryMappings(t *testing.T) {
 		if got := paneAgentType(pane); got != "muse" {
 			t.Errorf("paneAgentType(%+v) = %q, want muse", pane, got)
 		}
-		if got := ackPaneTMUXAgentType(pane); got != tmux.AgentMuse {
-			t.Errorf("ackPaneTMUXAgentType(%+v) = %q, want muse", pane, got)
+		if got := ackPaneAgentType(pane); got != "muse" {
+			t.Errorf("ackPaneAgentType(%+v) = %q, want muse", pane, got)
 		}
 		plan, err := robotDispatchProtocolPlanner{}.PlanDelivery(context.Background(), dispatchsvc.Target{Pane: pane, AgentType: pane.Type}, true)
 		if err != nil {
@@ -2551,18 +2433,6 @@ func TestSendOptionsDelay(t *testing.T) {
 // Test edge cases
 // ====================
 
-func TestDetectStateEdgeCases(t *testing.T) {
-	// Test with lines that have trailing whitespace
-	lines := []string{"  ", "   claude>   "}
-	state := detectState(lines, "")
-	// The implementation looks for HasSuffix after TrimSpace, so this should match
-	// Actually let me check the real implementation behavior
-	if state != "idle" && state != "active" {
-		// Either is acceptable depending on implementation
-		t.Logf("State with whitespace: %s", state)
-	}
-}
-
 func TestPrintSendEmptySession(t *testing.T) {
 	output, err := captureStdout(t, func() error {
 		return PrintSend(SendOptions{
@@ -2989,6 +2859,13 @@ func TestStatusOutputWithGraphMetrics(t *testing.T) {
 
 func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 	tmpDir := t.TempDir()
+	// Live host alerts (under 1 GB free disk raises a critical one) must not
+	// decide the status this test derives from projected source health.
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[alerts]\nenabled = false\n"), 0o644); err != nil {
+		t.Fatalf("write hermetic config: %v", err)
+	}
+	t.Setenv("NTM_CONFIG", configPath)
 	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("Open store: %v", err)
@@ -3003,11 +2880,9 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 		SetProjectionStore(oldStore)
 		_ = store.Close()
 	})
-	oldListLive := listProjectionLiveSessions
-	listProjectionLiveSessions = func() ([]tmux.Session, error) {
+	withProjectionLiveSessions(t, func() ([]tmux.Session, error) {
 		return []tmux.Session{{Name: "alpha", Attached: true}}, nil
-	}
-	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
+	})
 
 	now := time.Now().UTC()
 	staleAfter := now.Add(time.Hour)
@@ -3112,6 +2987,13 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 		t.Fatalf("UpsertSourceHealth: %v", err)
 	}
 
+	// Sessions, mail and handoff come from the projection; work counts come
+	// only from the verified observation, which here disagrees with the
+	// seeded RuntimeWork rows (1 ready, 1 in progress) on purpose (GH #283).
+	stubRobotWork(t, func(context.Context, *state.Store, adapters.WorkCoordinationAdapterConfig, bool) (*adapters.WorkSection, error) {
+		return &adapters.WorkSection{Available: true, Summary: &adapters.WorkSummary{Ready: 0, InProgress: 2}}, nil
+	})
+
 	result, err := GetStatusWithOptions(PaginationOptions{})
 	if err != nil {
 		t.Fatalf("GetStatusWithOptions: %v", err)
@@ -3123,11 +3005,11 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 	if result.SchemaID != defaultRobotSchemaID("status") {
 		t.Fatalf("SchemaID = %q, want %q", result.SchemaID, defaultRobotSchemaID("status"))
 	}
-	if result.Summary.ReadyWork != 1 {
-		t.Fatalf("Summary.ReadyWork = %d, want 1", result.Summary.ReadyWork)
+	if result.Summary.ReadyWork != 0 {
+		t.Fatalf("Summary.ReadyWork = %d, want 0 from the verified observation, not the row", result.Summary.ReadyWork)
 	}
-	if result.Summary.InProgress != 1 {
-		t.Fatalf("Summary.InProgress = %d, want 1", result.Summary.InProgress)
+	if result.Summary.InProgress != 2 {
+		t.Fatalf("Summary.InProgress = %d, want 2 from the verified observation", result.Summary.InProgress)
 	}
 	if result.Summary.MailUnread != 3 {
 		t.Fatalf("Summary.MailUnread = %d, want 3", result.Summary.MailUnread)
@@ -3165,6 +3047,7 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 }
 
 func TestGetStatusWithOptionsRespectsDisabledAlertsConfig(t *testing.T) {
+	hermeticGlobalConfig(t)
 	oldStore := currentProjectionStore()
 	SetProjectionStore(nil)
 	t.Cleanup(func() {
@@ -3172,8 +3055,8 @@ func TestGetStatusWithOptionsRespectsDisabledAlertsConfig(t *testing.T) {
 	})
 
 	tracker := alerts.GetGlobalTracker()
-	tracker.Clear()
-	t.Cleanup(tracker.Clear)
+	clearAlertTracker(tracker)
+	t.Cleanup(func() { clearAlertTracker(tracker) })
 	t.Cleanup(func() {
 		alerts.SetGlobalTrackerConfig(alerts.DefaultConfig())
 	})
@@ -3213,9 +3096,10 @@ func TestGetStatusWithOptionsRespectsDisabledAlertsConfig(t *testing.T) {
 }
 
 func TestGetDashboardRespectsDisabledAlertsConfig(t *testing.T) {
+	hermeticGlobalConfig(t)
 	tracker := alerts.GetGlobalTracker()
-	tracker.Clear()
-	t.Cleanup(tracker.Clear)
+	clearAlertTracker(tracker)
+	t.Cleanup(func() { clearAlertTracker(tracker) })
 	t.Cleanup(func() {
 		alerts.SetGlobalTrackerConfig(alerts.DefaultConfig())
 	})
@@ -3320,7 +3204,7 @@ func TestDashboardCountsUserPanesAndEveryAgentType(t *testing.T) {
 		"| Kimi | 1 |",
 		"| Opencode | 1 |",
 		"| Other Agents | 1 |",
-		"| mixed | yes | 9 | 2 | 1 | 1 | 0 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 1 |",
+		"| mixed | yes | 9 | 2 | 1 | 1 | 0 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 |",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("dashboard markdown missing %q:\n%s", want, rendered)
@@ -3329,9 +3213,10 @@ func TestDashboardCountsUserPanesAndEveryAgentType(t *testing.T) {
 }
 
 func TestGetAlertsDetailedRespectsDisabledAlertsConfig(t *testing.T) {
+	hermeticGlobalConfig(t)
 	tracker := alerts.GetGlobalTracker()
-	tracker.Clear()
-	t.Cleanup(tracker.Clear)
+	clearAlertTracker(tracker)
+	t.Cleanup(func() { clearAlertTracker(tracker) })
 	t.Cleanup(func() {
 		alerts.SetGlobalTrackerConfig(alerts.DefaultConfig())
 	})
@@ -3713,71 +3598,21 @@ func TestBuildProjectionAgentMailPaneMapUsesRuntimeProjection(t *testing.T) {
 	}
 }
 
-func TestSnapshotBeadsSummaryFromRuntime(t *testing.T) {
+func TestBeadsSummaryFromWork(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
-	if err != nil {
-		t.Fatalf("Open store: %v", err)
-	}
-	if err := store.Migrate(); err != nil {
-		t.Fatalf("Migrate store: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
-
-	now := time.Now().UTC()
-	claimedAt := now.Add(-10 * time.Minute)
-	staleAfter := now.Add(time.Hour)
-	for _, item := range []state.RuntimeWork{
-		{
-			BeadID:         "bd-ready",
-			Title:          "Ready bead",
-			Status:         "open",
-			Priority:       1,
-			BlockedByCount: 0,
-			CollectedAt:    now,
-			StaleAfter:     staleAfter,
-		},
-		{
-			BeadID:         "bd-blocked",
-			Title:          "Blocked bead",
-			Status:         "open",
-			Priority:       2,
-			BlockedByCount: 2,
-			CollectedAt:    now,
-			StaleAfter:     staleAfter,
-		},
-		{
-			BeadID:      "bd-active",
-			Title:       "Active bead",
-			Status:      "in_progress",
-			Priority:    1,
-			Assignee:    "BlueLake",
-			ClaimedAt:   &claimedAt,
-			CollectedAt: now,
-			StaleAfter:  staleAfter,
-		},
-		{
-			BeadID:      "bd-closed",
-			Title:       "Closed bead",
-			Status:      "closed",
-			Priority:    3,
-			CollectedAt: now,
-			StaleAfter:  staleAfter,
-		},
-	} {
-		item := item
-		item.ProjectDir = tmpDir
-		if err := store.UpsertRuntimeWork(&item); err != nil {
-			t.Fatalf("UpsertRuntimeWork(%s): %v", item.BeadID, err)
-		}
+	claimedAt := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	work := &adapters.WorkSection{
+		Available: true,
+		Ready:     []adapters.WorkItem{{ID: "bd-ready", Title: "Ready bead", Priority: 1}},
+		Blocked:   []adapters.WorkItem{{ID: "bd-blocked", Title: "Blocked bead", Priority: 2}},
+		InProgress: []adapters.WorkItem{{
+			ID: "bd-active", Title: "Active bead", Priority: 1, Assignee: "BlueLake",
+			UpdatedAt: claimedAt.Format(time.RFC3339),
+		}},
+		Summary: &adapters.WorkSummary{Total: 4, Open: 2, Ready: 1, Blocked: 1, InProgress: 1, Closed: 1},
 	}
 
-	summary, err := snapshotBeadsSummaryFromRuntime(store, tmpDir, 5)
-	if err != nil {
-		t.Fatalf("snapshotBeadsSummaryFromRuntime: %v", err)
-	}
+	summary := beadsSummaryFromWork(work, tmpDir, 5)
 	if !summary.Available || summary.Project != tmpDir {
 		t.Fatalf("Summary availability/project = %+v", summary)
 	}
@@ -3792,6 +3627,12 @@ func TestSnapshotBeadsSummaryFromRuntime(t *testing.T) {
 	}
 	if !summary.InProgressList[0].UpdatedAt.Equal(claimedAt) {
 		t.Fatalf("InProgressList UpdatedAt = %v, want %v", summary.InProgressList[0].UpdatedAt, claimedAt)
+	}
+
+	// Unverified work is an unavailable summary with its reason, never counts.
+	unverified := beadsSummaryFromWork(&adapters.WorkSection{Available: false, Reason: "STALE_WORK_COORDINATION: tracker changed"}, tmpDir, 5)
+	if unverified.Available || unverified.Ready != 0 || len(unverified.ReadyPreview) != 0 || unverified.Reason != "STALE_WORK_COORDINATION: tracker changed" {
+		t.Fatalf("unverified summary = %+v, want unavailable with the work's reason and no ready beads", unverified)
 	}
 }
 
@@ -3902,63 +3743,344 @@ func TestSnapshotCoordinationFromRuntime(t *testing.T) {
 	}
 }
 
-func TestSnapshotWorkFromRuntime(t *testing.T) {
+// The inspect view still renders one bead from its RuntimeWork row.
+func TestSnapshotWorkItemFromRuntime(t *testing.T) {
 	now := time.Now().UTC()
 	claimed := now.Add(-5 * time.Minute)
-	section := snapshotWorkFromRuntime([]state.RuntimeWork{
-		{
-			BeadID:          "bd-ready",
-			Title:           "Ready bead",
-			TitleDisclosure: `{"disclosure_state":"visible"}`,
-			Status:          "open",
-			Priority:        1,
-			BeadType:        "task",
-			Labels:          `["robot-redesign","snapshot"]`,
-			UnblocksCount:   2,
-			Score:           func() *float64 { value := 7.5; return &value }(),
-			CollectedAt:     now,
-			StaleAfter:      now.Add(time.Hour),
-		},
-		{
-			BeadID:         "bd-blocked",
-			Title:          "Blocked bead",
-			Status:         "open",
-			Priority:       2,
-			BlockedByCount: 1,
-			CollectedAt:    now,
-			StaleAfter:     now.Add(time.Hour),
-		},
-		{
-			BeadID:      "bd-active",
-			Title:       "Active bead",
-			Status:      "in_progress",
-			Assignee:    "BlueLake",
-			ClaimedAt:   &claimed,
-			CollectedAt: now,
-			StaleAfter:  now.Add(time.Hour),
-		},
-	}, 5)
+	item := snapshotWorkItemFromRuntime(state.RuntimeWork{
+		BeadID:          "bd-ready",
+		Title:           "Ready bead",
+		TitleDisclosure: `{"disclosure_state":"visible"}`,
+		Status:          "open",
+		Priority:        1,
+		BeadType:        "task",
+		Labels:          `["robot-redesign","snapshot"]`,
+		UnblocksCount:   2,
+		Assignee:        "BlueLake",
+		ClaimedAt:       &claimed,
+		Score:           func() *float64 { value := 7.5; return &value }(),
+		CollectedAt:     now,
+		StaleAfter:      now.Add(time.Hour),
+	})
 
-	if section == nil || !section.Available || section.Summary == nil {
-		t.Fatalf("Work section = %+v, want available summary", section)
+	if item.ID != "bd-ready" || item.Title != "Ready bead" || item.Priority != 1 || item.Type != "task" || item.Assignee != "BlueLake" {
+		t.Fatalf("item = %+v", item)
 	}
-	if section.Summary.Total != 3 || section.Summary.Ready != 1 || section.Summary.Blocked != 1 || section.Summary.InProgress != 1 {
-		t.Fatalf("Work summary = %+v", section.Summary)
+	if item.TitleDisclosure == nil || item.TitleDisclosure.DisclosureState != "visible" {
+		t.Fatalf("title disclosure = %+v", item.TitleDisclosure)
 	}
-	if len(section.Ready) != 1 || section.Ready[0].ID != "bd-ready" {
-		t.Fatalf("Ready items = %+v", section.Ready)
+	if len(item.Labels) != 2 || item.Unblocks != 2 || item.Score == nil || *item.Score != 7.5 {
+		t.Fatalf("item detail = %+v", item)
 	}
-	if len(section.Blocked) != 1 || section.Blocked[0].ID != "bd-blocked" {
-		t.Fatalf("Blocked items = %+v", section.Blocked)
+	if item.UpdatedAt != claimed.UTC().Format(time.RFC3339) {
+		t.Fatalf("UpdatedAt = %q, want the claim time", item.UpdatedAt)
 	}
-	if len(section.InProgress) != 1 || section.InProgress[0].ID != "bd-active" || section.InProgress[0].Assignee != "BlueLake" {
-		t.Fatalf("InProgress items = %+v", section.InProgress)
+}
+
+// The projection refresh that precedes every robot command publishes the
+// work it verified, so the snapshot's verified read restores that observation
+// instead of running br and bv a second time. Agent Mail is down here: the
+// read must still succeed, with reservation evidence reported unavailable.
+func TestRefreshPublishesVerifiedWorkForTheNextRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tool fixtures require /bin/sh")
 	}
-	if section.Ready[0].TitleDisclosure == nil || section.Ready[0].TitleDisclosure.DisclosureState != "visible" {
-		t.Fatalf("Ready title disclosure = %+v", section.Ready[0].TitleDisclosure)
+	project, bin := t.TempDir(), t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if len(section.Ready[0].Labels) != 2 || section.Ready[0].Unblocks != 2 || section.Ready[0].Score == nil || *section.Ready[0].Score != 7.5 {
-		t.Fatalf("Ready item detail = %+v", section.Ready[0])
+	if err := os.WriteFile(filepath.Join(project, ".beads", "issues.jsonl"), []byte("{\"id\":\"a\",\"status\":\"open\"}\n{\"id\":\"b\",\"status\":\"open\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := filepath.Join(bin, "calls")
+	br := `#!/bin/sh
+echo br >> "` + calls + `"
+case "$*" in
+ *stats*) printf '%s\n' '{"summary":{"total_issues":2,"open_issues":2,"in_progress_issues":0,"blocked_issues":0,"ready_issues":2,"closed_issues":0}}' ;;
+ *ready*) printf '%s\n' '[{"id":"a","title":"Task A","priority":2},{"id":"b","title":"Task B","priority":2}]' ;;
+ *) printf '%s\n' '[]' ;;
+esac
+`
+	bvScript := "#!/bin/sh\necho bv >> \"" + calls + "\"\nprintf '%s\\n' '{\"triage\":{\"recommendations\":[]}}'\n"
+	for name, script := range map[string]string{"br": br, "bv": bvScript} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("NTM_CONFIG", filepath.Join(t.TempDir(), "config.toml"))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AGENT_MAIL_URL", "http://127.0.0.1:1/mcp/")
+	t.Setenv("AGENT_MAIL_TOKEN", "")
+	bv.InvalidateTriageCache()
+	t.Cleanup(bv.InvalidateTriageCache)
+	countCalls := func() int {
+		data, _ := os.ReadFile(calls)
+		return strings.Count(string(data), "\n")
+	}
+
+	store := newProjectionTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := RefreshNormalizedProjection(ctx, store, project, "", 0); err != nil {
+		t.Fatalf("RefreshNormalizedProjection: %v", err)
+	}
+	refreshCalls := countCalls()
+	if refreshCalls == 0 {
+		t.Fatal("refresh never ran the tracker tools")
+	}
+
+	work, err := adapters.CollectDurableWork(ctx, store, adapters.DefaultWorkCoordinationAdapterConfig(project), false)
+	if err != nil || work == nil || !work.Available || work.Verification == nil || !work.Verification.FromCache {
+		t.Fatalf("read after refresh = %+v, %v; want the published observation from cache", work, err)
+	}
+	if work.Summary == nil || work.Summary.Ready != 2 {
+		t.Fatalf("summary = %+v, want both open beads ready", work.Summary)
+	}
+	if got := countCalls(); got != refreshCalls {
+		t.Fatalf("tracker tools ran %d more time(s) after the refresh; the read must restore, not recollect", got-refreshCalls)
+	}
+}
+
+// GH #338: an exact process binding attributes a transcript even where panes
+// of one agent type share a directory. The (type, cwd) fallback serves only a
+// pane alone in its directory, never one whose neighbour may own the newest
+// transcript there.
+func TestResolvePaneTranscriptsPrefersExactBindingAndKeepsAmbiguityRule(t *testing.T) {
+	prevProcess, prevCwd, prevPath := transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath
+	t.Cleanup(func() {
+		transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath = prevProcess, prevCwd, prevPath
+	})
+	cwds := map[string]string{"%1": "/shared", "%2": "/shared", "%3": "/alone", "%4": "/pair", "%5": "/pair"}
+	paneCurrentPath = func(id string) (string, bool) { cwd, ok := cwds[id]; return cwd, ok }
+	bound := map[int]*ntmctx.TranscriptUsage{101: {Tokens: 101}, 104: {Tokens: 104}}
+	transcriptUsageForProcess = func(_ string, pid int) (*ntmctx.TranscriptUsage, bool) { usage, ok := bound[pid]; return usage, ok }
+	transcriptUsageForCwd = func(string, string) (*ntmctx.TranscriptUsage, bool) {
+		return &ntmctx.TranscriptUsage{Tokens: 999}, true
+	}
+
+	got := ResolvePaneTranscripts([]tmux.Pane{
+		{ID: "%1", PID: 101, Type: tmux.AgentClaude}, // bound, shares /shared
+		{ID: "%2", PID: 102, Type: tmux.AgentClaude}, // unbound, shares /shared
+		{ID: "%3", PID: 103, Type: tmux.AgentClaude}, // unbound, alone in /alone
+		{ID: "%4", PID: 104, Type: tmux.AgentClaude}, // bound, /pair
+		{ID: "%5", PID: 105, Type: tmux.AgentClaude}, // unbound, /pair with a bound neighbour
+	})
+	tokensOf := func(id string) int {
+		if usage := got[id]; usage != nil {
+			return usage.Tokens
+		}
+		return 0
+	}
+	for id, want := range map[string]int{"%1": 101, "%2": 0, "%3": 999, "%4": 104, "%5": 0} {
+		if have := tokensOf(id); have != want {
+			t.Errorf("pane %s transcript tokens = %d, want %d", id, have, want)
+		}
+	}
+}
+
+// TestAlertConfigSuppliesTranscriptContextUsage: alerts.context_warning_threshold
+// had no consumer (bd-r0j1n). The alert config every surface uses must carry
+// a usage source that turns each pane's attributed transcript into a percent
+// of its context window, so the generator can warn.
+func TestAlertConfigSuppliesTranscriptContextUsage(t *testing.T) {
+	prevProcess, prevCwd, prevPath := transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath
+	t.Cleanup(func() {
+		transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath = prevProcess, prevCwd, prevPath
+	})
+	paneCurrentPath = func(string) (string, bool) { return "", false }
+	registryWindow := getContextLimit("claude-opus-4")
+	if registryWindow <= 0 {
+		t.Fatalf("model registry has no window for claude-opus-4")
+	}
+	bound := map[int]*ntmctx.TranscriptUsage{
+		201: {Tokens: 180000, ContextWindow: 200000},              // 90% of its own window
+		202: {Tokens: 50000, ContextWindow: 200000},               // 25%
+		203: {Tokens: 900000, ContextWindow: 200000},              // over the window: capped
+		204: {Tokens: registryWindow / 2, Model: "claude-opus-4"}, // registry window
+	}
+	transcriptUsageForProcess = func(_ string, pid int) (*ntmctx.TranscriptUsage, bool) {
+		usage, ok := bound[pid]
+		return usage, ok
+	}
+	transcriptUsageForCwd = func(string, string) (*ntmctx.TranscriptUsage, bool) { return nil, false }
+
+	cfg := config.Default()
+	cfg.Alerts.ContextWarningThreshold = 80
+	alertCfg := AlertConfigForProject(cfg, t.TempDir())
+	if alertCfg.PaneContextUsage == nil || alertCfg.ContextWarningThreshold != 80 {
+		t.Fatalf("alert config lacks the context usage source or threshold: %+v", alertCfg)
+	}
+
+	got := alertCfg.PaneContextUsage("proj", []tmux.Pane{
+		{ID: "%1", PID: 201, Type: tmux.AgentClaude, Title: "proj__cc_1"},
+		{ID: "%2", PID: 202, Type: tmux.AgentClaude, Title: "proj__cc_2"},
+		{ID: "%3", PID: 203, Type: tmux.AgentClaude, Title: "proj__cc_3"},
+		{ID: "%4", PID: 204, Type: tmux.AgentClaude, Title: "proj__cc_4"},
+		{ID: "%5", PID: 205, Type: tmux.AgentClaude, Title: "proj__cc_5"}, // no transcript
+	})
+	want := map[string]float64{"%1": 90, "%2": 25, "%3": 100, "%4": 50}
+	if len(got) != len(want) {
+		t.Fatalf("usage = %v, want %v (a pane without a transcript must be absent)", got, want)
+	}
+	for pane, pct := range want {
+		if math.Abs(got[pane]-pct) > 0.01 {
+			t.Errorf("pane %s usage = %.2f%%, want %.2f%%", pane, got[pane], pct)
+		}
+	}
+}
+
+// GH #283 field case (a), end to end: br reports bead c blocked, but triage
+// does not list it, so its blocker IDs are unknown. The old row path stored it
+// as an open row with no blockers and counted it ready. Through the real
+// refresh and the real verified read, the snapshot counts only a and b.
+func TestSnapshotNeverCountsAnUntriagedBlockedBeadAsReady(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tool fixtures require /bin/sh")
+	}
+	project, bin := t.TempDir(), t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	jsonl := "{\"id\":\"a\",\"status\":\"open\"}\n{\"id\":\"b\",\"status\":\"open\"}\n" +
+		"{\"id\":\"c\",\"status\":\"open\",\"dependencies\":[{\"depends_on_id\":\"a\",\"type\":\"blocks\"}]}\n"
+	if err := os.WriteFile(filepath.Join(project, ".beads", "issues.jsonl"), []byte(jsonl), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	br := `#!/bin/sh
+case "$*" in
+ *stats*) printf '%s\n' '{"summary":{"total_issues":3,"open_issues":3,"in_progress_issues":0,"blocked_issues":1,"ready_issues":2,"closed_issues":0}}' ;;
+ *blocked*) printf '%s\n' '[{"id":"c","title":"Task C","priority":1}]' ;;
+ *ready*) printf '%s\n' '[{"id":"a","title":"Task A","priority":2},{"id":"b","title":"Task B","priority":2}]' ;;
+ *) printf '%s\n' '[]' ;;
+esac
+`
+	for name, script := range map[string]string{"br": br, "bv": "#!/bin/sh\nprintf '%s\\n' '{\"triage\":{\"recommendations\":[]}}'\n"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("NTM_CONFIG", filepath.Join(t.TempDir(), "config.toml"))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AGENT_MAIL_URL", "http://127.0.0.1:1/mcp/")
+	t.Setenv("AGENT_MAIL_TOKEN", "")
+	bv.InvalidateTriageCache()
+	t.Cleanup(bv.InvalidateTriageCache)
+	stubRobotWork(t, adapters.CollectDurableWork)
+
+	store := newProjectionTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := RefreshNormalizedProjection(ctx, store, project, "", 0); err != nil {
+		t.Fatalf("RefreshNormalizedProjection: %v", err)
+	}
+	output, err := buildProjectionBackedSnapshot(store, config.Default(), PaginationOptions{}, newSnapshotOutput(config.Default()), nil, project)
+	if err != nil {
+		t.Fatalf("buildProjectionBackedSnapshot: %v", err)
+	}
+	snapshotFinalize(output, PaginationOptions{})
+
+	if output.Work == nil || !output.Work.Available {
+		t.Fatalf("work = %+v, want the verified observation", output.Work)
+	}
+	for _, item := range output.Work.Ready {
+		if item.ID == "c" {
+			t.Fatalf("blocked bead c served as ready: %+v", output.Work.Ready)
+		}
+	}
+	if output.Summary.ReadyWork != 2 || output.BeadsSummary == nil || output.BeadsSummary.Ready != 2 {
+		t.Fatalf("ready_work = %d, beads_summary = %+v; want 2 (a and b), never c", output.Summary.ReadyWork, output.BeadsSummary)
+	}
+}
+
+// GH #283 field case (b): RuntimeWork rows are fresh by age alone. Rows that
+// still advertise a ready bead must not reach the snapshot, its beads summary
+// or its ready_work count once the verified read cannot vouch for them.
+func TestSnapshotNeverServesUnverifiedRuntimeWorkRows(t *testing.T) {
+	store := newProjectionTestStore(t)
+	now := time.Now().UTC()
+	if err := store.UpsertRuntimeWork(&state.RuntimeWork{
+		BeadID: "bd-gone", Title: "Closed since the row was written", Status: "open",
+		CollectedAt: now, StaleAfter: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeWork: %v", err)
+	}
+	stubRobotWork(t, func(context.Context, *state.Store, adapters.WorkCoordinationAdapterConfig, bool) (*adapters.WorkSection, error) {
+		return nil, &worksource.StaleError{Reason: "tracker changed during source capture"}
+	})
+
+	output, err := buildProjectionBackedSnapshot(store, config.Default(), PaginationOptions{}, newSnapshotOutput(config.Default()), nil, t.TempDir())
+	if err != nil {
+		t.Fatalf("buildProjectionBackedSnapshot: %v", err)
+	}
+	snapshotFinalize(output, PaginationOptions{})
+	if output.Work == nil || output.Work.Available || len(output.Work.Ready) != 0 || output.Work.Reason == "" {
+		t.Fatalf("work = %+v, want unavailable with a reason and no ready rows", output.Work)
+	}
+	if output.BeadsSummary == nil || output.BeadsSummary.Available || len(output.BeadsSummary.ReadyPreview) != 0 {
+		t.Fatalf("beads summary = %+v, want unavailable with no ready preview", output.BeadsSummary)
+	}
+	if output.Summary.ReadyWork != 0 {
+		t.Fatalf("summary.ready_work = %d, want 0: the only ready row is unverified", output.Summary.ReadyWork)
+	}
+}
+
+// A cached observation the tracker has moved past is stale, not unusable: one
+// new verified observation replaces it.
+func TestVerifiedRobotWorkRecollectsOnceWhenTheSourceMovedOn(t *testing.T) {
+	store := newProjectionTestStore(t)
+	var refreshes []bool
+	stubRobotWork(t, func(_ context.Context, _ *state.Store, _ adapters.WorkCoordinationAdapterConfig, refresh bool) (*adapters.WorkSection, error) {
+		refreshes = append(refreshes, refresh)
+		if !refresh {
+			return nil, &worksource.StaleError{Reason: "cached work source no longer matches"}
+		}
+		return &adapters.WorkSection{Available: true, Ready: []adapters.WorkItem{{ID: "bd-1"}}, Summary: &adapters.WorkSummary{Ready: 1}}, nil
+	})
+
+	work := verifiedRobotWork(store, t.TempDir(), 5)
+	if fmt.Sprint(refreshes) != "[false true]" {
+		t.Fatalf("reads = %v, want a cached read then one refresh", refreshes)
+	}
+	if !work.Available || len(work.Ready) != 1 || work.Summary.Ready != 1 {
+		t.Fatalf("work = %+v, want the recollected observation", work)
+	}
+}
+
+// Anything other than a moved-on source is not retried: it is reported.
+func TestVerifiedRobotWorkReportsOtherFailuresWithoutRetrying(t *testing.T) {
+	store := newProjectionTestStore(t)
+	calls := 0
+	stubRobotWork(t, func(context.Context, *state.Store, adapters.WorkCoordinationAdapterConfig, bool) (*adapters.WorkSection, error) {
+		calls++
+		return nil, errors.New("br stats failed: database is locked")
+	})
+
+	work := verifiedRobotWork(store, t.TempDir(), 5)
+	if calls != 1 || work.Available || work.Reason != "br stats failed: database is locked" {
+		t.Fatalf("calls = %d work = %+v, want one read reported unavailable with its reason", calls, work)
+	}
+	if work.Ready == nil || work.Blocked == nil || work.InProgress == nil || work.Summary == nil {
+		t.Fatalf("work = %+v, want every critical array present", work)
+	}
+}
+
+// GH #283 field case (a): a blocked bead triage did not list arrives without
+// blocker IDs. Its row must still read back as blocked, not ready.
+func TestRuntimeWorkRowsKeepBlockedBeadsBlocked(t *testing.T) {
+	now := time.Now().UTC()
+	rows := buildRuntimeWorkRows(t.TempDir(), &adapters.WorkSection{
+		Ready:   []adapters.WorkItem{{ID: "bd-ready"}},
+		Blocked: []adapters.WorkItem{{ID: "bd-blocked-untriaged"}, {ID: "bd-blocked", BlockedBy: []string{"a", "b"}}},
+	}, now, now.Add(time.Hour))
+
+	if got := rows["bd-ready"].BlockedByCount; got != 0 {
+		t.Errorf("ready row BlockedByCount = %d, want 0", got)
+	}
+	if got := rows["bd-blocked-untriaged"].BlockedByCount; got < 1 {
+		t.Errorf("untriaged blocked row BlockedByCount = %d, want at least 1", got)
+	}
+	if got := rows["bd-blocked"].BlockedByCount; got != 2 {
+		t.Errorf("blocked row BlockedByCount = %d, want its 2 known blockers", got)
 	}
 }
 
@@ -4189,141 +4311,6 @@ func TestTerseStateStringNoSession(t *testing.T) {
 	}
 }
 
-func TestParseTerse(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected TerseState
-	}{
-		{
-			name:  "full state with alerts and attention",
-			input: "S:myproject|A:2/3|W:1|I:1|E:0|C:45%|B:R10/I2/B5|M:3|^:2a,4i|!:1c,2w",
-			expected: TerseState{
-				Session:           "myproject",
-				ActiveAgents:      2,
-				TotalAgents:       3,
-				WorkingAgents:     1,
-				IdleAgents:        1,
-				ErrorAgents:       0,
-				ContextPct:        45,
-				ReadyBeads:        10,
-				BlockedBeads:      5,
-				InProgressBead:    2,
-				UnreadMail:        3,
-				AttentionAction:   2,
-				AttentionInterest: 4,
-				CriticalAlerts:    1,
-				WarningAlerts:     2,
-			},
-		},
-		{
-			name:  "no session zero alerts zero attention",
-			input: "S:-|A:0/0|W:0|I:0|E:0|C:0%|B:R15/I3/B8|M:0|^:0|!:0",
-			expected: TerseState{
-				Session:           "-",
-				ActiveAgents:      0,
-				TotalAgents:       0,
-				WorkingAgents:     0,
-				IdleAgents:        0,
-				ErrorAgents:       0,
-				ContextPct:        0,
-				ReadyBeads:        15,
-				BlockedBeads:      8,
-				InProgressBead:    3,
-				UnreadMail:        0,
-				AttentionAction:   0,
-				AttentionInterest: 0,
-				CriticalAlerts:    0,
-				WarningAlerts:     0,
-			},
-		},
-		{
-			name:  "only critical alerts only action attention",
-			input: "S:proj|A:5/8|W:3|I:2|E:0|C:78%|B:R100/I50/B20|M:10|^:3a|!:5c",
-			expected: TerseState{
-				Session:           "proj",
-				ActiveAgents:      5,
-				TotalAgents:       8,
-				WorkingAgents:     3,
-				IdleAgents:        2,
-				ErrorAgents:       0,
-				ContextPct:        78,
-				ReadyBeads:        100,
-				BlockedBeads:      20,
-				InProgressBead:    50,
-				UnreadMail:        10,
-				AttentionAction:   3,
-				AttentionInterest: 0,
-				CriticalAlerts:    5,
-				WarningAlerts:     0,
-			},
-		},
-		{
-			name:  "only interesting attention",
-			input: "S:test|A:1/1|W:1|I:0|E:0|C:50%|B:R5/I1/B2|M:0|^:7i|!:0",
-			expected: TerseState{
-				Session:           "test",
-				ActiveAgents:      1,
-				TotalAgents:       1,
-				WorkingAgents:     1,
-				IdleAgents:        0,
-				ErrorAgents:       0,
-				ContextPct:        50,
-				ReadyBeads:        5,
-				BlockedBeads:      2,
-				InProgressBead:    1,
-				UnreadMail:        0,
-				AttentionAction:   0,
-				AttentionInterest: 7,
-				CriticalAlerts:    0,
-				WarningAlerts:     0,
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			result, err := ParseTerse(tc.input)
-			if err != nil {
-				t.Fatalf("ParseTerse(%q) failed: %v", tc.input, err)
-			}
-			if *result != tc.expected {
-				t.Errorf("ParseTerse(%q) = %+v, want %+v", tc.input, *result, tc.expected)
-			}
-		})
-	}
-}
-
-func TestTerseStateRoundTrip(t *testing.T) {
-	original := TerseState{
-		Session:           "test",
-		ActiveAgents:      5,
-		TotalAgents:       8,
-		WorkingAgents:     3,
-		IdleAgents:        2,
-		ErrorAgents:       0,
-		ContextPct:        78,
-		ReadyBeads:        20,
-		BlockedBeads:      10,
-		InProgressBead:    5,
-		UnreadMail:        2,
-		AttentionAction:   3,
-		AttentionInterest: 5,
-		CriticalAlerts:    1,
-		WarningAlerts:     2,
-	}
-
-	str := original.String()
-	parsed, err := ParseTerse(str)
-	if err != nil {
-		t.Fatalf("ParseTerse failed: %v", err)
-	}
-
-	if *parsed != original {
-		t.Errorf("Round trip failed: original=%+v, parsed=%+v", original, *parsed)
-	}
-}
-
 func TestTerseStateMarshal(t *testing.T) {
 	state := TerseState{
 		Session:           "myproject",
@@ -4404,57 +4391,6 @@ func TestTerseStateAttentionStates(t *testing.T) {
 	}
 }
 
-// TestTerseStateAttentionRoundTrip verifies attention fields survive round-trip.
-func TestTerseStateAttentionRoundTrip(t *testing.T) {
-	tests := []struct {
-		name         string
-		attnAction   int
-		attnInterest int
-	}{
-		{"quiet", 0, 0},
-		{"action_only", 5, 0},
-		{"interesting_only", 0, 10},
-		{"both", 3, 7},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			original := TerseState{
-				Session:           "attn-test",
-				ActiveAgents:      2,
-				TotalAgents:       3,
-				WorkingAgents:     1,
-				IdleAgents:        1,
-				ContextPct:        50,
-				ReadyBeads:        5,
-				InProgressBead:    1,
-				BlockedBeads:      2,
-				UnreadMail:        0,
-				AttentionAction:   tc.attnAction,
-				AttentionInterest: tc.attnInterest,
-				CriticalAlerts:    0,
-				WarningAlerts:     0,
-			}
-
-			str := original.String()
-			parsed, err := ParseTerse(str)
-			if err != nil {
-				t.Fatalf("ParseTerse failed: %v", err)
-			}
-
-			if parsed.AttentionAction != tc.attnAction {
-				t.Errorf("AttentionAction: got %d, want %d", parsed.AttentionAction, tc.attnAction)
-			}
-			if parsed.AttentionInterest != tc.attnInterest {
-				t.Errorf("AttentionInterest: got %d, want %d", parsed.AttentionInterest, tc.attnInterest)
-			}
-			if *parsed != original {
-				t.Errorf("Round trip failed: original=%+v, parsed=%+v", original, *parsed)
-			}
-		})
-	}
-}
-
 // ====================
 // Test Context Functions
 // ====================
@@ -4485,6 +4421,48 @@ func TestGetUsageLevel(t *testing.T) {
 				t.Errorf("getUsageLevel(%.1f) = %q, want %q", tc.pct, got, tc.expected)
 			}
 		})
+	}
+}
+
+// Reading the recorded launch model (GH #333) must not shrink a pane's
+// context budget: agy records its pinned display name, which the model
+// registry does not know, so budgeting against it fell to the 128K default
+// instead of gemini's 1M window. Unknown recorded models keep the family
+// limit of the title heuristic; known ones use their own.
+func TestContextPaneLimitKeepsFamilyLimitForUnknownLaunchModel(t *testing.T) {
+	agy := tmux.Pane{ID: "%1", Title: "flywheel__agy_1"}
+	if got, want := contextPaneLimit("Gemini 4 Argon (High)", agy, "antigravity"), getContextLimit("gemini"); got != want {
+		t.Fatalf("agy pane limit = %d, want gemini family limit %d", got, want)
+	}
+	cc := tmux.Pane{ID: "%2", Title: "flywheel__cc_1"}
+	if got, want := contextPaneLimit("opus[1m]", cc, "claude"), getContextLimit("sonnet"); got != want {
+		t.Fatalf("unregistered claude alias limit = %d, want claude family limit %d", got, want)
+	}
+	if got, want := contextPaneLimit("gpt-5.3-codex", tmux.Pane{ID: "%3"}, "codex"), getContextLimit("gpt-5.3-codex"); got != want {
+		t.Fatalf("known recorded model limit = %d, want its registry limit %d", got, want)
+	}
+}
+
+// GH #333: an `--oc=1:MODEL` pane reported model "unknown" in
+// --robot-context because only title substrings were consulted. The recorded
+// launch model now wins; panes without one keep the title heuristic.
+func TestContextPaneModelPrefersRecordedLaunchModel(t *testing.T) {
+	orig := paneLaunchModel
+	t.Cleanup(func() { paneLaunchModel = orig })
+	launched := map[string]string{"%1": "opencode/space-bunny-free"}
+	paneLaunchModel = func(paneID string) string { return launched[paneID] }
+
+	oc := tmux.Pane{ID: "%1", Title: "flywheel__oc_1_opencode/space-bunny-free"}
+	if got := contextPaneModel(oc, "oc"); got != "opencode/space-bunny-free" {
+		t.Fatalf("oc pane model = %q, want the launch model", got)
+	}
+	legacy := tmux.Pane{ID: "%2", Title: "flywheel__cc_1 opus"}
+	if got := contextPaneModel(legacy, "claude"); got != "opus" {
+		t.Fatalf("pane without launch record model = %q, want title heuristic opus", got)
+	}
+	unrecorded := tmux.Pane{ID: "%3", Title: "flywheel__oc_2"}
+	if got := contextPaneModel(unrecorded, "oc"); got != "unknown" {
+		t.Fatalf("oc pane delegating its model = %q, want unknown", got)
 	}
 }
 
@@ -4624,6 +4602,7 @@ func TestContextOutputJSON(t *testing.T) {
 		Agents: []AgentContextInfo{
 			{
 				Pane:            "0",
+				PaneID:          "%41",
 				PaneIdx:         0,
 				AgentType:       "claude",
 				Model:           "sonnet",
@@ -4661,6 +4640,9 @@ func TestContextOutputJSON(t *testing.T) {
 	}
 	if result.Agents[0].Model != "sonnet" {
 		t.Errorf("Model mismatch: got %q, want %q", result.Agents[0].Model, "sonnet")
+	}
+	if result.Agents[0].PaneID != "%41" || !strings.Contains(string(data), `"pane_id":"%41"`) {
+		t.Errorf("context JSON lost physical pane identity: %s", data)
 	}
 }
 
@@ -4726,75 +4708,76 @@ func TestParsePriority(t *testing.T) {
 }
 
 func TestCalculateConfidence(t *testing.T) {
+	// Simple strategy confidence is the raw capability score with no strategy
+	// adjustments; every other strategy routes through internal/assign.
 	tests := []struct {
 		name      string
 		agentType string
 		bead      bv.BeadPreview
-		strategy  string
 		minConf   float64
 		maxConf   float64
 	}{
 		// Claude strengths (using assign.DefaultCapabilities)
-		{"claude analysis", "claude", bv.BeadPreview{Title: "Analyze codebase"}, "balanced", 0.85, 0.95},
-		{"claude refactor", "claude", bv.BeadPreview{Title: "Refactor module"}, "balanced", 0.90, 1.00},
-		{"claude generic", "claude", bv.BeadPreview{Title: "Some task"}, "balanced", 0.75, 0.85}, // TaskTask = 0.80
+		{"claude analysis", "claude", bv.BeadPreview{Title: "Analyze codebase"}, 0.85, 0.95},
+		{"claude refactor", "claude", bv.BeadPreview{Title: "Refactor module"}, 0.90, 1.00},
+		{"claude generic", "claude", bv.BeadPreview{Title: "Some task"}, 0.75, 0.85}, // TaskTask = 0.80
 
 		// Codex strengths
-		{"codex feature", "codex", bv.BeadPreview{Title: "Implement feature"}, "balanced", 0.85, 0.95},
-		{"codex bug", "codex", bv.BeadPreview{Title: "Fix bug"}, "balanced", 0.85, 0.95}, // TaskBug = 0.90
+		{"codex feature", "codex", bv.BeadPreview{Title: "Implement feature"}, 0.85, 0.95},
+		{"codex bug", "codex", bv.BeadPreview{Title: "Fix bug"}, 0.85, 0.95}, // TaskBug = 0.90
 
 		// Gemini strengths
-		{"gemini docs", "gemini", bv.BeadPreview{Title: "Update documentation"}, "balanced", 0.85, 0.95},
+		{"gemini docs", "gemini", bv.BeadPreview{Title: "Update documentation"}, 0.85, 0.95},
 
-		// Strategy adjustments
-		{"speed boost", "claude", bv.BeadPreview{Title: "Some task"}, "speed", 0.80, 0.90},                   // (0.80 + 0.9) / 2 = 0.85
-		{"dependency P1", "claude", bv.BeadPreview{Title: "Task", Priority: "P1"}, "dependency", 0.85, 0.95}, // 0.80 + 0.1 = 0.90
-		{"dependency P0", "claude", bv.BeadPreview{Title: "Task", Priority: "P0"}, "dependency", 0.85, 0.95},
+		// Priority never adjusts simple confidence.
+		{"P1 no boost", "claude", bv.BeadPreview{Title: "Task", Priority: "P1"}, 0.75, 0.85},
+		{"P0 no boost", "claude", bv.BeadPreview{Title: "Task", Priority: "P0"}, 0.75, 0.85},
 
 		// Unknown agent returns 0.5 default from capability matrix
-		{"unknown agent", "unknown", bv.BeadPreview{Title: "Task"}, "balanced", 0.45, 0.55},
+		{"unknown agent", "unknown", bv.BeadPreview{Title: "Task"}, 0.45, 0.55},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := calculateConfidence(tc.agentType, tc.bead, tc.strategy)
+			got := calculateConfidence(tc.agentType, tc.bead)
 			if got < tc.minConf || got > tc.maxConf {
-				t.Errorf("calculateConfidence(%q, %q, %q) = %.2f, want in range [%.2f, %.2f]",
-					tc.agentType, tc.bead.Title, tc.strategy, got, tc.minConf, tc.maxConf)
+				t.Errorf("calculateConfidence(%q, %q) = %.2f, want in range [%.2f, %.2f]",
+					tc.agentType, tc.bead.Title, got, tc.minConf, tc.maxConf)
 			}
 		})
 	}
 }
 
 func TestGenerateReasoning(t *testing.T) {
+	// Simple strategy reasoning names the sequential pairing and never
+	// mentions planner strategies.
 	tests := []struct {
 		name        string
 		agentType   string
 		bead        bv.BeadPreview
-		strategy    string
 		mustContain []string
 	}{
-		{"claude refactor balanced", "claude", bv.BeadPreview{Title: "Refactor code"}, "balanced",
-			[]string{"excels at refactor", "balanced"}},
-		{"codex feature speed", "codex", bv.BeadPreview{Title: "Add feature"}, "speed",
-			[]string{"excels at feature", "speed"}},
-		{"gemini docs quality", "gemini", bv.BeadPreview{Title: "Write documentation"}, "quality",
-			[]string{"excels at documentation", "quality"}},
-		{"P0 critical", "claude", bv.BeadPreview{Title: "Fix", Priority: "P0"}, "dependency",
+		{"claude refactor", "claude", bv.BeadPreview{Title: "Refactor code"},
+			[]string{"excels at refactor", "simple sequential pairing"}},
+		{"codex feature", "codex", bv.BeadPreview{Title: "Add feature"},
+			[]string{"excels at feature", "simple sequential pairing"}},
+		{"gemini docs", "gemini", bv.BeadPreview{Title: "Write documentation"},
+			[]string{"excels at documentation", "simple sequential pairing"}},
+		{"P0 critical", "claude", bv.BeadPreview{Title: "Fix", Priority: "P0"},
 			[]string{"critical priority"}},
-		{"P1 high", "claude", bv.BeadPreview{Title: "Fix", Priority: "P1"}, "dependency",
+		{"P1 high", "claude", bv.BeadPreview{Title: "Fix", Priority: "P1"},
 			[]string{"high priority"}},
-		{"generic task", "unknown", bv.BeadPreview{Title: "Do stuff"}, "balanced",
-			[]string{"balanced"}},
+		{"generic task", "unknown", bv.BeadPreview{Title: "Do stuff"},
+			[]string{"simple sequential pairing"}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := generateReasoning(tc.agentType, tc.bead, tc.strategy)
+			got := generateReasoning(tc.agentType, tc.bead)
 			for _, substr := range tc.mustContain {
 				if !strings.Contains(strings.ToLower(got), strings.ToLower(substr)) {
-					t.Errorf("generateReasoning(%q, %q, %q) = %q, should contain %q",
-						tc.agentType, tc.bead.Title, tc.strategy, got, substr)
+					t.Errorf("generateReasoning(%q, %q) = %q, should contain %q",
+						tc.agentType, tc.bead.Title, got, substr)
 				}
 			}
 		})
@@ -6052,9 +6035,11 @@ func TestUpdateActivityLinesDelta(t *testing.T) {
 
 	paneID := "%1"
 
-	_, delta := updateActivity(paneID, "a\nb\n")
-	if delta != 2 {
-		t.Fatalf("initial delta = %d, want 2", delta)
+	// First observation in a process has no baseline to diff against, so it
+	// must report no activity (#288).
+	ts, delta := updateActivity(paneID, "a\nb\n")
+	if delta != 0 || !ts.IsZero() {
+		t.Fatalf("initial observation = (%v, %d), want (zero, 0)", ts, delta)
 	}
 
 	_, delta = updateActivity(paneID, "a\nb\n")
@@ -6094,6 +6079,13 @@ func TestReadOnlyAgentMailSurfacesDoNotRegisterProject(t *testing.T) {
 		tools []string
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req struct {
 			ID     interface{}     `json:"id"`
 			Method string          `json:"method"`
@@ -6163,10 +6155,21 @@ func TestReadOnlyAgentMailSurfacesDoNotRegisterProject(t *testing.T) {
 func TestRobotAgentMailClientFollowsConfig(t *testing.T) {
 	projectDir := t.TempDir()
 	var (
-		mu    sync.Mutex
-		auths []string
+		mu       sync.Mutex
+		auths    []string
+		requests int
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		mu.Lock()
 		auths = append(auths, r.Header.Get("Authorization"))
 		mu.Unlock()
@@ -6196,6 +6199,7 @@ func TestRobotAgentMailClientFollowsConfig(t *testing.T) {
 		}
 		mu.Lock()
 		auths = nil
+		requests = 0
 		mu.Unlock()
 	}
 
@@ -6226,8 +6230,8 @@ func TestRobotAgentMailClientFollowsConfig(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(auths) != 0 {
-		t.Fatalf("server saw %d requests with Agent Mail disabled, want 0", len(auths))
+	if requests != 0 {
+		t.Fatalf("server saw %d requests with Agent Mail disabled, want 0", requests)
 	}
 }
 
@@ -6333,6 +6337,13 @@ func TestFetchAgentMailDataIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 	var inboxMarkRead atomic.Value
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 
 		var req struct {
@@ -6451,6 +6462,13 @@ func newSlowInboxMailServer(t *testing.T, names []string, delay time.Duration) (
 	var peeked atomic.Int64
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -6558,6 +6576,13 @@ func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *t
 	var inboxMarkRead atomic.Value
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 
 		var req struct {
@@ -7147,7 +7172,7 @@ func TestRefreshNormalizedProjectionBoundsSlowSources(t *testing.T) {
 		t.Fatalf("GetAllSourceHealth: %v", err)
 	}
 	for _, row := range rows {
-		if row.SourceName != "work" {
+		if row.SourceName != "work_coordination" {
 			continue
 		}
 		if row.Healthy || !strings.Contains(row.LastError, "deadline") {
@@ -7173,12 +7198,10 @@ func TestProjectionBackedSessionsRequireEveryLiveSession(t *testing.T) {
 		t.Fatalf("UpsertRuntimeSession: %v", err)
 	}
 
-	oldListLive := listProjectionLiveSessions
-	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
 	live := []tmux.Session{{Name: "alpha"}, {Name: "beta"}}
-	listProjectionLiveSessions = func() ([]tmux.Session, error) { return live, nil }
+	withProjectionLiveSessions(t, func() ([]tmux.Session, error) { return live, nil })
 
-	if output, err := buildProjectionBackedStatus(store, config.Default(), t.TempDir(), PaginationOptions{}); err == nil {
+	if output, err := buildProjectionBackedStatus(store, config.Default(), PaginationOptions{}); err == nil {
 		t.Fatalf("status answered from a projection missing live session beta: %+v", output.Sessions)
 	}
 	if sessions, err := buildProjectionBackedSnapshotSessions(store, live); err == nil {
@@ -7221,13 +7244,13 @@ case "$cmd" in
 esac
 `
 
-// bd-9k16u: --robot-status and --robot-snapshot count the projection's work
-// rows, and those rows disagreed with br ready twice over. Blockers reached
-// them only through bv triage, which seldom recommends a blocked bead, so the
-// beads from br blocked were saved as open with no blockers and counted as
-// ready; and the ready rows stopped at ten, below br ready's own 20, so no
-// count above ten was possible. On this project ready_work said 12 where br
-// ready said 25.
+// bd-9k16u: the work source disagreed with br ready twice over. Blockers
+// reached it only through bv triage, which seldom recommends a blocked bead, so
+// the beads from br blocked were saved as open with no blockers and counted as
+// ready; and the ready count stopped at the listed items. On this project
+// ready_work said 12 where br ready said 25. Status and snapshot now count
+// verified work (GH #283); the work section and the projection rows it saves
+// must still agree with br.
 func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 	projectDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(projectDir, ".beads"), 0o755); err != nil {
@@ -7244,50 +7267,35 @@ func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	batch, err := adapters.NewWorkAdapter(adapters.DefaultWorkCoordinationAdapterConfig(projectDir)).Collect(ctx)
+	batch, err := adapters.NewWorkCoordinationAdapter(adapters.DefaultWorkCoordinationAdapterConfig(projectDir)).Collect(ctx)
 	if err != nil {
 		t.Fatalf("collect work: %v", err)
 	}
 	const brReady = 25
 
-	store := newTestAttentionStore(t)
-	now := time.Now().UTC()
-	for _, row := range buildRuntimeWorkRows(projectDir, batch.Work, now, now.Add(time.Hour)) {
-		if err := store.UpsertRuntimeWork(row); err != nil {
-			t.Fatalf("UpsertRuntimeWork(%s): %v", row.BeadID, err)
-		}
+	work := batch.Work
+	if work == nil || !work.Available || work.Summary == nil {
+		t.Fatalf("work = %+v, want br's work", work)
 	}
-	oldListLive := listProjectionLiveSessions
-	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
-	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
-
-	status, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
-	if err != nil {
-		t.Fatalf("buildProjectionBackedStatus: %v", err)
-	}
-	if status.Summary.ReadyWork != brReady || status.Summary.InProgress != 1 {
-		t.Fatalf("status ready_work = %d, in_progress = %d; want %d and 1 as br reports", status.Summary.ReadyWork, status.Summary.InProgress, brReady)
-	}
-
-	rows, err := store.ListRuntimeWork(projectDir)
-	if err != nil {
-		t.Fatalf("ListRuntimeWork: %v", err)
-	}
-	work := snapshotWorkFromRuntime(rows, 0)
-	if work.Summary.Ready != brReady || work.Summary.Blocked != 2 || len(work.Ready) != brReady {
-		t.Fatalf("snapshot work summary = %+v with %d ready items; want %d ready and two blocked", work.Summary, len(work.Ready), brReady)
+	if work.Summary.Ready != brReady || work.Summary.InProgress != 1 || work.Summary.Blocked != 2 || len(work.Blocked) != 2 {
+		t.Fatalf("work summary = %+v with %d blocked items; want %d ready, 1 in progress and two blocked as br reports", work.Summary, len(work.Blocked), brReady)
 	}
 	for _, item := range work.Ready {
 		if !strings.HasPrefix(item.ID, "bd-r") {
 			t.Fatalf("ready items = %+v, want only br ready's beads", work.Ready)
 		}
 	}
-	beads, err := snapshotBeadsSummaryFromRuntime(store, projectDir, 0)
-	if err != nil {
-		t.Fatalf("snapshotBeadsSummaryFromRuntime: %v", err)
+
+	store := newTestAttentionStore(t)
+	now := time.Now().UTC()
+	for _, row := range buildRuntimeWorkRows(projectDir, work, now, now.Add(time.Hour)) {
+		if err := store.UpsertRuntimeWork(row); err != nil {
+			t.Fatalf("UpsertRuntimeWork(%s): %v", row.BeadID, err)
+		}
 	}
-	if beads.Ready != brReady || beads.Blocked != 2 {
-		t.Fatalf("snapshot beads summary ready = %d, blocked = %d; want %d and 2", beads.Ready, beads.Blocked, brReady)
+	rows, err := store.ListRuntimeWork(projectDir)
+	if err != nil {
+		t.Fatalf("ListRuntimeWork: %v", err)
 	}
 	for _, row := range rows {
 		if want := map[string]int{"bd-b1": 1, "bd-b2": 2}[row.BeadID]; row.BlockedByCount != want {
@@ -7308,81 +7316,58 @@ func installFakeWorkTools(t *testing.T, br string) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-// collectWorkSignals runs the work source the way a refresh does, under budget.
-func collectWorkSignals(t *testing.T, projectDir string, budget time.Duration) *adapters.AggregatedSignals {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
-	aggregator := adapters.NewSignalAggregator(0)
-	aggregator.RegisterAdapter(adapters.NewWorkAdapter(adapters.DefaultWorkCoordinationAdapterConfig(projectDir)))
-	signals, err := aggregator.Collect(ctx)
-	if err != nil {
-		t.Fatalf("collect work signals: %v", err)
+// readyWorkSignals is a refresh's collection with the given beads ready.
+func readyWorkSignals(ids ...string) *adapters.AggregatedSignals {
+	work := adapters.NewWorkSection()
+	work.Available = true
+	for _, id := range ids {
+		work.Ready = append(work.Ready, adapters.WorkItem{ID: id, Title: id})
 	}
-	return signals
+	return &adapters.AggregatedSignals{CollectedAt: time.Now().UTC(), Work: work}
 }
 
 // A work source that misses its refresh budget reports nothing, which means
-// "unknown", not "no work". The refresh deleted every work row on such a tick,
-// so status read ready_work 0 / in_progress 0 until br answered in time again
-// (bd-o3oq3).
+// "unknown", not "no work". The refresh deleted every work row on such a tick
+// (bd-o3oq3). The rows now stay as the last good collection, marked stale.
+// Status and snapshot no longer count these rows (GH #283), but the TUI
+// parity surfaces still read them.
 func TestWorkSourceMissKeepsLastGoodWorkRows(t *testing.T) {
 	projectDir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(projectDir, ".beads"), 0o755); err != nil {
-		t.Fatalf("mkdir .beads: %v", err)
-	}
 	store := newTestAttentionStore(t)
-	oldListLive := listProjectionLiveSessions
-	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
-	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
-
-	status := func() StatusSummary {
+	rows := func() []state.RuntimeWork {
 		t.Helper()
-		output, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
+		rows, err := store.ListRuntimeWork(projectDir)
 		if err != nil {
-			t.Fatalf("buildProjectionBackedStatus: %v", err)
+			t.Fatalf("ListRuntimeWork: %v", err)
 		}
-		return output.Summary
+		return rows
 	}
 
-	installFakeWorkTools(t, fakeBRBlockedScript)
-	if err := persistNormalizedProjection(store, projectDir, collectWorkSignals(t, projectDir, 10*time.Second), nil, time.Hour); err != nil {
+	if err := persistNormalizedProjection(store, projectDir, readyWorkSignals("bd-1", "bd-2"), nil, time.Hour); err != nil {
 		t.Fatalf("persist good collection: %v", err)
 	}
 
-	installFakeWorkTools(t, "#!/bin/sh\nexec sleep 1\n")
-	missed := collectWorkSignals(t, projectDir, 300*time.Millisecond)
-	if missed.Work != nil && missed.Work.Available {
-		t.Fatalf("slow br answered within the budget: %+v", missed.Work)
-	}
+	missed := &adapters.AggregatedSignals{CollectedAt: time.Now().UTC(), Work: &adapters.WorkSection{Available: false, Reason: "context deadline exceeded"}}
 	if err := persistNormalizedProjection(store, projectDir, missed, nil, time.Hour); err != nil {
 		t.Fatalf("persist missed collection: %v", err)
 	}
-
-	if got := status(); got.ReadyWork != 25 || got.InProgress != 1 || !got.WorkStale {
-		t.Fatalf("after a missed work collection status ready_work = %d, in_progress = %d, work_stale = %v; want the last good 25 and 1, marked stale", got.ReadyWork, got.InProgress, got.WorkStale)
+	afterMiss := rows()
+	if len(afterMiss) != 2 {
+		t.Fatalf("work rows after a missed collection = %+v, want the last good two", afterMiss)
 	}
-	rows, err := store.ListRuntimeWork(projectDir)
-	if err != nil {
-		t.Fatalf("ListRuntimeWork: %v", err)
-	}
-	if work := snapshotWorkFromRuntime(rows, 0); work.Summary.Ready != 25 || work.Summary.InProgress != 1 || !work.Stale {
-		t.Fatalf("snapshot work after a miss = %+v, stale = %v; want the last good 25 ready and 1 in progress, marked stale", work.Summary, work.Stale)
-	}
-	beads, err := snapshotBeadsSummaryFromRuntime(store, projectDir, 0)
-	if err != nil {
-		t.Fatalf("snapshotBeadsSummaryFromRuntime: %v", err)
-	}
-	if beads.Ready != 25 || beads.InProgress != 1 || !beads.Stale {
-		t.Fatalf("snapshot beads summary after a miss: ready = %d, in_progress = %d, stale = %v; want 25, 1, stale", beads.Ready, beads.InProgress, beads.Stale)
+	for _, row := range afterMiss {
+		if row.IsFresh() {
+			t.Fatalf("work row %s is fresh after a missed collection, want it marked stale", row.BeadID)
+		}
 	}
 
-	installFakeWorkTools(t, fakeBRBlockedScript)
-	if err := persistNormalizedProjection(store, projectDir, collectWorkSignals(t, projectDir, 10*time.Second), nil, time.Hour); err != nil {
+	if err := persistNormalizedProjection(store, projectDir, readyWorkSignals("bd-1", "bd-2"), nil, time.Hour); err != nil {
 		t.Fatalf("persist recovered collection: %v", err)
 	}
-	if got := status(); got.ReadyWork != 25 || got.InProgress != 1 || got.WorkStale {
-		t.Fatalf("after br answered again status ready_work = %d, in_progress = %d, work_stale = %v; want 25 and 1, fresh", got.ReadyWork, got.InProgress, got.WorkStale)
+	for _, row := range rows() {
+		if !row.IsFresh() {
+			t.Fatalf("work row %s is stale after br answered again, want it fresh", row.BeadID)
+		}
 	}
 }
 
@@ -7390,34 +7375,20 @@ func TestWorkSourceMissKeepsLastGoodWorkRows(t *testing.T) {
 // neither replace nor be counted in another project's work rows (bd-o3oq3).
 func TestWorkRowsAreScopedByProject(t *testing.T) {
 	store := newTestAttentionStore(t)
-	oldListLive := listProjectionLiveSessions
-	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
-	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
-	// Status counts alerts with bv and br, so keep them off the real repo.
-	installFakeWorkTools(t, fakeBRBlockedScript)
-
-	readyWork := func(ids ...string) *adapters.AggregatedSignals {
-		work := adapters.NewWorkSection()
-		work.Available = true
-		for _, id := range ids {
-			work.Ready = append(work.Ready, adapters.WorkItem{ID: id, Title: id})
-		}
-		return &adapters.AggregatedSignals{CollectedAt: time.Now().UTC(), Work: work}
-	}
-	if err := persistNormalizedProjection(store, "/proj/a", readyWork("bd-1", "bd-2"), nil, time.Hour); err != nil {
+	if err := persistNormalizedProjection(store, "/proj/a", readyWorkSignals("bd-1", "bd-2"), nil, time.Hour); err != nil {
 		t.Fatalf("persist project a: %v", err)
 	}
-	if err := persistNormalizedProjection(store, "/proj/b", readyWork("bd-1"), nil, time.Hour); err != nil {
+	if err := persistNormalizedProjection(store, "/proj/b", readyWorkSignals("bd-1"), nil, time.Hour); err != nil {
 		t.Fatalf("persist project b: %v", err)
 	}
 
 	for projectDir, want := range map[string]int{"/proj/a": 2, "/proj/b": 1} {
-		output, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
+		rows, err := store.ListRuntimeWork(projectDir)
 		if err != nil {
-			t.Fatalf("buildProjectionBackedStatus(%s): %v", projectDir, err)
+			t.Fatalf("ListRuntimeWork(%s): %v", projectDir, err)
 		}
-		if output.Summary.ReadyWork != want {
-			t.Fatalf("%s ready_work = %d, want %d", projectDir, output.Summary.ReadyWork, want)
+		if len(rows) != want {
+			t.Fatalf("%s work rows = %+v, want %d", projectDir, rows, want)
 		}
 	}
 }
@@ -7430,19 +7401,23 @@ func TestCoordinationRowsAreScopedByProject(t *testing.T) {
 	oldStore := currentProjectionStore()
 	SetProjectionStore(store)
 	t.Cleanup(func() { SetProjectionStore(oldStore) })
-	oldListLive := listProjectionLiveSessions
-	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
-	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
-	// Status counts alerts with bv and br, so keep them off the real repo.
+	withProjectionLiveSessions(t, func() ([]tmux.Session, error) { return nil, nil })
+	// Status counts alerts and reads work with bv and br, so keep them off
+	// the real repo.
 	installFakeWorkTools(t, fakeBRBlockedScript)
 
-	// Inspect reads the project of the working directory.
-	t.Chdir(t.TempDir())
-	projectA, err := resolveNormalizedProjectDir("")
-	if err != nil {
-		t.Fatalf("resolveNormalizedProjectDir: %v", err)
+	// Status and inspect read the project of the working directory.
+	projectIn := func(dir string) string {
+		t.Helper()
+		t.Chdir(dir)
+		project, err := resolveNormalizedProjectDir("")
+		if err != nil {
+			t.Fatalf("resolveNormalizedProjectDir: %v", err)
+		}
+		return project
 	}
-	projectB := t.TempDir()
+	projectB := projectIn(t.TempDir())
+	projectA := projectIn(t.TempDir())
 
 	unreadMail := func(unread map[string]int) *adapters.AggregatedSignals {
 		coordination := adapters.NewCoordinationSection()
@@ -7462,7 +7437,8 @@ func TestCoordinationRowsAreScopedByProject(t *testing.T) {
 	}
 
 	for projectDir, want := range map[string]int{projectA: 5, projectB: 7} {
-		output, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
+		t.Chdir(projectDir)
+		output, err := buildProjectionBackedStatus(store, config.Default(), PaginationOptions{})
 		if err != nil {
 			t.Fatalf("buildProjectionBackedStatus(%s): %v", projectDir, err)
 		}
@@ -7476,6 +7452,7 @@ func TestCoordinationRowsAreScopedByProject(t *testing.T) {
 		}
 	}
 
+	t.Chdir(projectA)
 	inspect, err := GetInspectCoordination(InspectCoordinationOptions{AgentName: "BlueLake"})
 	if err != nil {
 		t.Fatalf("GetInspectCoordination: %v", err)
@@ -7494,17 +7471,17 @@ func TestStatusAndSnapshotWarnWhenProjectionRefreshIsOff(t *testing.T) {
 	oldStore := currentProjectionStore()
 	SetProjectionStore(store)
 	t.Cleanup(func() { SetProjectionStore(oldStore) })
-	oldListLive := listProjectionLiveSessions
-	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
-	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
-	// Status counts alerts with bv and br, so keep them off the real repo.
+	withProjectionLiveSessions(t, func() ([]tmux.Session, error) { return nil, nil })
+	// Status counts alerts and reads work with bv and br, so keep them off
+	// the real repo.
 	installFakeWorkTools(t, fakeBRBlockedScript)
+	t.Chdir(t.TempDir())
 
 	reason := "explicitly selected config /cfg/missing.toml does not exist"
 	want := "runtime projection refresh is off: " + reason
 	SetProjectionRefreshOff(reason)
 
-	status, err := buildProjectionBackedStatus(store, config.Default(), t.TempDir(), PaginationOptions{})
+	status, err := buildProjectionBackedStatus(store, config.Default(), PaginationOptions{})
 	if err != nil {
 		t.Fatalf("buildProjectionBackedStatus: %v", err)
 	}
@@ -7526,7 +7503,7 @@ func TestStatusAndSnapshotWarnWhenProjectionRefreshIsOff(t *testing.T) {
 	}
 
 	SetProjectionRefresh(func() {})
-	status, err = buildProjectionBackedStatus(store, config.Default(), t.TempDir(), PaginationOptions{})
+	status, err = buildProjectionBackedStatus(store, config.Default(), PaginationOptions{})
 	if err != nil {
 		t.Fatalf("buildProjectionBackedStatus after refresh registered: %v", err)
 	}
@@ -7568,5 +7545,138 @@ func TestSnapshotMailReusesTheRefreshInboxPeeks(t *testing.T) {
 	}
 	if summary == nil || summary.AgentsNotRead != 0 || summary.TotalUnread != len(names) {
 		t.Fatalf("snapshot mail = %+v, want every agent's one unread message", summary)
+	}
+}
+
+func TestAgentTypeStringPassesThroughRegisteredPlugins(t *testing.T) {
+	// "pix" is a fictional plugin agent; omp, which this test used to borrow,
+	// is a built-in type now.
+	if got := agentTypeString(tmux.AgentType("pix")); got != "unknown" {
+		t.Fatalf("unregistered type = %q, want unknown", got)
+	}
+	if err := agent.RegisterPlugin("pix", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := agentTypeString(tmux.AgentType("PIX")); got != "pix" {
+		t.Fatalf("registered plugin type = %q, want pix", got)
+	}
+	if got := paneAgentType(tmux.Pane{Type: tmux.AgentType("pix"), Title: "repro__pix_1"}); got != "pix" {
+		t.Fatalf("paneAgentType = %q, want pix", got)
+	}
+}
+
+func TestAgentTypeStringBuiltinOmp(t *testing.T) {
+	if got := agentTypeString(tmux.AgentOmp); got != "omp" {
+		t.Fatalf("agentTypeString(omp) = %q, want omp without any plugin registration", got)
+	}
+	if got := paneAgentType(tmux.Pane{Type: tmux.AgentType("oh-my-pi"), Title: "repro__omp_1"}); got != "omp" {
+		t.Fatalf("paneAgentType = %q, want omp", got)
+	}
+	if got := paneAgentType(tmux.Pane{Title: "repro__omp_3"}); got != "omp" {
+		t.Fatalf("title-only omp pane = %q, want omp", got)
+	}
+	if got := ResolveAgentType("OH_MY_PI"); got != "omp" {
+		t.Fatalf("ResolveAgentType = %q, want omp", got)
+	}
+}
+
+// TestOmpRobotStateDialogsAndContext drives the robot surfaces that classify
+// an omp pane from real omp v18.2.3 captures: tail state, tmux adapter state,
+// the dialog classifier (paste limbo, selector overlay), the dialog key
+// adaptation, and the status-bar context gauge.
+func TestOmpRobotStateDialogsAndContext(t *testing.T) {
+	idle := readAgentFixture(t, "omp_nerd_idle_done.txt")
+	working := readAgentFixture(t, "omp_nerd_working.txt")
+	toolWorking := readAgentFixture(t, "omp_nerd_tool_working.txt")
+	steering := readAgentFixture(t, "omp_unicode_steering.txt")
+	asciiWorking := readAgentFixture(t, "omp_ascii_working.txt")
+	paste := readAgentFixture(t, "omp_nerd_paste_token.txt")
+	selector := readAgentFixture(t, "omp_nerd_model_selector.txt")
+
+	subagents := readAgentFixture(t, "omp_nerd_working_subagents.txt")
+	todo := readAgentFixture(t, "omp_nerd_working_todo.txt")
+	for name, capture := range map[string]string{"working": working, "tool": toolWorking, "steering": steering, "ascii": asciiWorking, "subagents": subagents, "todo": todo} {
+		if got := determineState(capture, "omp"); got == "idle" {
+			t.Errorf("determineState(%s) = idle, want a busy state", name)
+		}
+	}
+	if got := determineState(idle, "oh-my-pi"); got != "idle" {
+		t.Errorf("determineState(idle) = %q, want idle", got)
+	}
+
+	a := NewTmuxAdapter(DefaultTmuxAdapterConfig())
+	if got := a.classifyAgentState(&Agent{Type: "omp", Pane: "%41", PID: 10}, idle); got != state.AgentStateIdle {
+		t.Errorf("adapter idle omp = %q, want idle", got)
+	}
+	if got := a.classifyAgentState(&Agent{Type: "omp", Pane: "%42", PID: 10}, working); got != state.AgentStateBusy {
+		t.Errorf("adapter working omp = %q, want busy", got)
+	}
+
+	if got := classifyDialog(paste, "omp"); got.Class != DialogPasteLimbo || !strings.Contains(got.Evidence, "#1") {
+		t.Errorf("paste token dialog = %+v, want paste_limbo with the #1 token", got)
+	}
+	if got := classifyDialog(selector, "omp"); got.Class != DialogUnknown || !strings.Contains(got.Evidence, "Esc close") {
+		t.Errorf("selector overlay dialog = %+v, want unknown with the Esc close footer", got)
+	}
+	for name, capture := range map[string]string{"idle": idle, "working": working, "steering": steering} {
+		if got := classifyDialog(capture, "omp"); got.Class != DialogNone {
+			t.Errorf("classifyDialog(%s) = %+v, want none", name, got)
+		}
+	}
+	limbo := DialogState{Class: DialogPasteLimbo}
+	if got := adaptDialogKeysForAgent([]string{"Escape"}, limbo, "omp"); len(got) != 1 || got[0] != "C-c" {
+		t.Errorf("omp paste-limbo dismiss keys = %v, want [C-c]", got)
+	}
+	if got := adaptDialogKeysForAgent([]string{"Escape"}, limbo, "codex"); len(got) != 1 || got[0] != "Escape" {
+		t.Errorf("codex paste-limbo dismiss keys = %v, want [Escape]", got)
+	}
+
+	// Provider error (live OpenRouter server_error frame): an error in the
+	// projection and in --robot-is-working, retryable, never idle.
+	providerErr := readAgentFixture(t, "omp_nerd_provider_error.txt")
+	if got := a.classifyAgentState(&Agent{Type: "omp", Pane: "%43", PID: 10}, providerErr); got != state.AgentStateError {
+		t.Errorf("adapter provider-error omp = %q, want error", got)
+	}
+	if reason := a.classifyStateReason(&Agent{Type: "omp", Pane: "%43"}, state.AgentStateError, providerErr); !strings.Contains(reason, "server_error: ERROR") || !strings.Contains(reason, "retryable") {
+		t.Errorf("provider-error reason = %q", reason)
+	}
+	ws := PaneWorkStatus{IsIdle: true, Recommendation: string(agent.RecommendSafeToRestart)}
+	if !applyProviderErrorOverride(&ws, agent.AgentTypeOmp, providerErr) || ws.IsIdle ||
+		ws.Recommendation != string(agent.RecommendErrorState) || ws.IndicatorBasis != "provider_error" ||
+		!strings.Contains(ws.RecommendationReason, "continue prompt") {
+		t.Errorf("provider-error work status = %+v", ws)
+	}
+	idleWS := PaneWorkStatus{IsIdle: true}
+	if applyProviderErrorOverride(&idleWS, agent.AgentTypeOmp, idle) || !idleWS.IsIdle {
+		t.Error("an idle omp pane after a completed turn must not be flagged as a provider error")
+	}
+	if determineState(providerErr, "omp") == "idle" {
+		t.Error("determineState must not report a failed omp turn as idle")
+	}
+	// Live swarm false negative: "F5 to Retry" between the error block and the
+	// composer read as plain idle in --robot-is-working.
+	providerErrF5 := readAgentFixture(t, "omp_nerd_provider_error_f5.txt")
+	wsF5 := PaneWorkStatus{IsIdle: true, Recommendation: string(agent.RecommendSafeToRestart)}
+	if !applyProviderErrorOverride(&wsF5, agent.AgentTypeOmp, providerErrF5) || wsF5.IsIdle ||
+		wsF5.Recommendation != string(agent.RecommendErrorState) || !strings.Contains(wsF5.RecommendationReason, "press F5") {
+		t.Errorf("F5 provider-error work status = %+v", wsF5)
+	}
+	if got := a.classifyAgentState(&Agent{Type: "omp", Pane: "%44", PID: 10}, providerErrF5); got != state.AgentStateError {
+		t.Errorf("adapter F5 provider-error omp = %q, want error", got)
+	}
+	if got := determineState(providerErrF5, "omp"); got != "error" {
+		t.Errorf("determineState(F5 provider error) = %q, want error", got)
+	}
+
+	at := time.Now()
+	gauge, ok := ompStatusBarUsage("omp", idle, at)
+	if !ok || gauge.ContextWindow != 262000 || gauge.Tokens != 18340 {
+		t.Errorf("omp gauge = (%+v, %v), want 7%% of 262000", gauge, ok)
+	}
+	if _, ok := ompStatusBarUsage("claude", idle, at); ok {
+		t.Error("the omp gauge must never be read for another agent type")
+	}
+	if _, ok := ompStatusBarUsage("omp", selector, at); ok {
+		t.Error("a selector overlay hides the composer; no gauge reading expected")
 	}
 }

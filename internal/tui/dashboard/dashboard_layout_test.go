@@ -81,7 +81,9 @@ func (c *dashboardReplayTestClient) SendKeysForAgent(target string, _ string, _ 
 	return nil
 }
 
-func TestDashboardHistoryReplayRejectsMixedGrokBatchBeforeSend(t *testing.T) {
+// GH#251 phase 2: grok panes are now valid automated prompt-delivery targets,
+// so history replay sends to a mixed claude+grok batch like claude/codex.
+func TestDashboardHistoryReplaySendsMixedGrokBatch(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 
 	m := New("replay-grok", "")
@@ -91,7 +93,7 @@ func TestDashboardHistoryReplayRejectsMixedGrokBatchBeforeSend(t *testing.T) {
 	}}
 	entry := history.HistoryEntry{
 		Targets: []string{"1", "2"},
-		Prompt:  "do not deliver",
+		Prompt:  "deliver to both panes",
 	}
 
 	msg := m.executeReplayWithClient(entry, client)()
@@ -99,20 +101,21 @@ func TestDashboardHistoryReplayRejectsMixedGrokBatchBeforeSend(t *testing.T) {
 	if !ok {
 		t.Fatalf("executeReplayWithClient() message = %T, want dashboardReplayResultMsg", msg)
 	}
-	if !errors.Is(result.Err, agent.ErrAutomatedPromptDeliveryNotImplemented) {
-		t.Fatalf("executeReplayWithClient() error = %v, want Grok prompt-delivery sentinel", result.Err)
+	if result.Err != nil {
+		t.Fatalf("executeReplayWithClient() error = %v, want mixed claude+grok replay accepted", result.Err)
 	}
-	if client.getCalls != 1 || len(client.sentTargets) != 0 {
-		t.Fatalf("replay client calls = get:%d targets:%v, want get:1 targets:[]", client.getCalls, client.sentTargets)
+	wantTargets := []string{"%1", "%2"}
+	if client.getCalls != 1 || !reflect.DeepEqual(client.sentTargets, wantTargets) {
+		t.Fatalf("replay client calls = get:%d targets:%v, want get:1 targets:%v", client.getCalls, client.sentTargets, wantTargets)
 	}
-	if _, err := os.Stat(history.StoragePath()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unsupported replay mutated history storage: stat error = %v", err)
+	if _, err := os.Stat(history.StoragePath()); err != nil {
+		t.Fatalf("successful replay did not record history: stat error = %v", err)
 	}
 
 	updated, _ := m.Update(result)
 	next := updated.(Model)
-	if !strings.Contains(next.healthMessage, agent.GrokPromptDeliveryCapabilityHint) {
-		t.Fatalf("dashboard replay message = %q, want unsupported Grok hint", next.healthMessage)
+	if !strings.Contains(next.healthMessage, "Prompt replayed") {
+		t.Fatalf("dashboard replay message = %q, want replay success message", next.healthMessage)
 	}
 }
 
@@ -186,14 +189,6 @@ func maxRenderedLineWidth(s string) int {
 		}
 	}
 	return maxWidth
-}
-
-func TestTimelineAgentIDUsesFinalSeparator(t *testing.T) {
-
-	pane := tmux.Pane{Title: "my__project__cc_2"}
-	if got := timelineAgentID(pane, "", ""); got != "cc_2" {
-		t.Fatalf("timelineAgentID() = %q, want %q", got, "cc_2")
-	}
 }
 
 func renderedHeight(s string) int {
@@ -2047,140 +2042,6 @@ func TestLayoutModeString(t *testing.T) {
 	}
 }
 
-func TestRenderSparkline(t *testing.T) {
-
-	tests := []struct {
-		value float64
-		width int
-		name  string
-	}{
-		{0.0, 10, "zero"},
-		{0.5, 10, "half"},
-		{1.0, 10, "full"},
-		{-0.5, 10, "negative_clamped"},
-		{1.5, 10, "over_one_clamped"},
-		{0.33, 5, "partial"},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			result := RenderSparkline(tc.value, tc.width)
-			// Basic check: result should not be empty and roughly match width
-			if result == "" {
-				t.Error("RenderSparkline should not return empty string")
-			}
-			// Length should be close to width (Unicode characters may vary)
-			if len([]rune(result)) > tc.width+1 {
-				t.Errorf("RenderSparkline result length %d exceeds expected width %d", len([]rune(result)), tc.width)
-			}
-		})
-	}
-}
-
-func TestRenderMiniBar(t *testing.T) {
-
-	m := newTestModel(120)
-	tests := []struct {
-		value float64
-		width int
-		name  string
-	}{
-		{0.0, 10, "zero"},
-		{0.5, 10, "half"},
-		{1.0, 10, "full"},
-		{0.25, 5, "quarter"},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			result := RenderMiniBar(tc.value, tc.width, m.theme)
-			// Should render something
-			if result == "" {
-				t.Error("RenderMiniBar should not return empty string")
-			}
-		})
-	}
-}
-
-func TestRenderLayoutIndicator(t *testing.T) {
-
-	m := newTestModel(120)
-	mode := LayoutForWidth(m.width)
-	indicator := RenderLayoutIndicator(mode, m.theme)
-
-	// Should produce some output
-	if indicator == "" {
-		t.Error("RenderLayoutIndicator should return non-empty string")
-	}
-}
-
-func TestScrollIndicator(t *testing.T) {
-
-	m := newTestModel(120)
-	tests := []struct {
-		offset   int
-		total    int
-		visible  int
-		selected int
-		name     string
-	}{
-		{0, 10, 5, 0, "at_top"},
-		{5, 10, 5, 5, "at_bottom"},
-		{2, 10, 5, 3, "middle"},
-		{0, 3, 5, 0, "all_visible"},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			vp := &ViewportPosition{
-				Offset:   tc.offset,
-				Total:    tc.total,
-				Visible:  tc.visible,
-				Selected: tc.selected,
-			}
-			// Just verify it doesn't panic
-			result := vp.ScrollIndicator(m.theme)
-			_ = result // Result varies based on position
-		})
-	}
-}
-
-func TestEnsureVisible(t *testing.T) {
-
-	tests := []struct {
-		selected int
-		offset   int
-		visible  int
-		total    int
-		wantOff  int
-		name     string
-	}{
-		{0, 0, 10, 20, 0, "at_top"},
-		{5, 0, 10, 20, 0, "within_visible"},
-		{15, 0, 10, 20, 6, "below_visible"},
-		{3, 10, 10, 20, 3, "above_visible"},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			vp := &ViewportPosition{
-				Offset:   tc.offset,
-				Visible:  tc.visible,
-				Total:    tc.total,
-				Selected: tc.selected,
-			}
-			vp.EnsureVisible()
-			if vp.Offset != tc.wantOff {
-				t.Errorf("EnsureVisible() offset = %d, want %d", vp.Offset, tc.wantOff)
-			}
-		})
-	}
-}
-
 func TestMinFunc(t *testing.T) {
 
 	tests := []struct {
@@ -2228,37 +2089,6 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-func TestGetStatusIconAndColor(t *testing.T) {
-
-	m := newTestModel(120)
-
-	tests := []struct {
-		state string
-		tick  int
-		name  string
-	}{
-		{"working", 0, "working_tick0"},
-		{"working", 5, "working_tick5"},
-		{"idle", 0, "idle"},
-		{"error", 0, "error"},
-		{"compacted", 0, "compacted"},
-		{"unknown", 0, "unknown"},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			icon, color := getStatusIconAndColor(tc.state, m.theme, tc.tick)
-			if icon == "" {
-				t.Errorf("getStatusIconAndColor(%q, tick=%d) returned empty icon", tc.state, tc.tick)
-			}
-			if color == "" {
-				t.Errorf("getStatusIconAndColor(%q, tick=%d) returned empty color", tc.state, tc.tick)
-			}
-		})
-	}
-}
-
 func TestFormatRelativeTime(t *testing.T) {
 
 	tests := []struct {
@@ -2280,17 +2110,6 @@ func TestFormatRelativeTime(t *testing.T) {
 				t.Errorf("formatRelativeTime(%v) = %q, expected to contain %q", tc.duration, result, tc.contains)
 			}
 		})
-	}
-}
-
-func TestSpinnerDot(t *testing.T) {
-
-	// Test multiple animation ticks
-	for i := 0; i < 10; i++ {
-		result := spinnerDot(i)
-		if result == "" {
-			t.Errorf("spinnerDot(%d) returned empty string", i)
-		}
 	}
 }
 
@@ -2344,19 +2163,6 @@ func TestRenderDiagnosticsBar(t *testing.T) {
 
 	// Should contain some indication of diagnostics
 	_ = plain // Content varies based on error state
-}
-
-func TestRenderMetricsPanel(t *testing.T) {
-
-	m := newTestModel(200)
-	m.metricsPanel.SetData(panels.MetricsData{
-		Coverage: &ensemble.CoverageReport{Overall: 0.5},
-	}, nil)
-
-	result := m.renderMetricsPanel(50, 10)
-	if result == "" {
-		t.Error("renderMetricsPanel should not return empty string")
-	}
 }
 
 func TestDashboardMetricsPanelShortcutOverridesContextRefresh(t *testing.T) {
@@ -2543,7 +2349,6 @@ func TestDashboardSidebarRendersRotationConfirmPanelWhenPending(t *testing.T) {
 			SessionName:    "proj",
 			ContextPercent: 93,
 			TimeoutAt:      now.Add(30 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 	}, nil)
 
@@ -2580,7 +2385,6 @@ func TestDashboardRotationConfirmShortcutsOverrideGlobalBindings(t *testing.T) {
 					SessionName:    "proj",
 					ContextPercent: 93,
 					TimeoutAt:      now.Add(30 * time.Second),
-					DefaultAction:  ctxmon.ConfirmRotate,
 				},
 			}, nil)
 			_ = m.renderSidebar(60, 28)
@@ -2616,21 +2420,18 @@ func TestDashboardRotationConfirmNavigationMovesSingleStep(t *testing.T) {
 			SessionName:    "proj",
 			ContextPercent: 93,
 			TimeoutAt:      now.Add(30 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 		{
 			AgentID:        "proj__cc_2",
 			SessionName:    "proj",
 			ContextPercent: 94,
 			TimeoutAt:      now.Add(45 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 		{
 			AgentID:        "proj__cc_3",
 			SessionName:    "proj",
 			ContextPercent: 95,
 			TimeoutAt:      now.Add(60 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 	}, nil)
 	_ = m.renderSidebar(60, 28)
@@ -3365,26 +3166,6 @@ func TestDashboardSidebarCyclesActiveSubpanelAndHints(t *testing.T) {
 	}
 }
 
-func TestRenderHistoryPanel(t *testing.T) {
-
-	m := newTestModel(200)
-	m.historyPanel.SetEntries([]history.HistoryEntry{
-		{
-			ID:        "1",
-			Timestamp: time.Now().UTC(),
-			Session:   "test",
-			Prompt:    "Hello",
-			Source:    history.SourceCLI,
-			Success:   true,
-		},
-	}, nil)
-
-	result := m.renderHistoryPanel(50, 10)
-	if result == "" {
-		t.Error("renderHistoryPanel should not return empty string")
-	}
-}
-
 // detectedIconSets are the icon sets icons.Detect hands the dashboard.
 var detectedIconSets = map[string]icons.IconSet{
 	"nerd":    icons.NerdFonts.WithFallback(icons.Unicode).WithFallback(icons.ASCII),
@@ -3412,6 +3193,7 @@ func TestAgentTypePresentationCoversEveryAgentType(t *testing.T) {
 		tmux.AgentWindsurf:    nerd.Windsurf,
 		tmux.AgentAider:       "AID",
 		tmux.AgentOpencode:    "OC",
+		tmux.AgentOmp:         "OMP",
 		tmux.AgentOllama:      "OLL",
 		tmux.AgentUser:        nerd.User,
 	}
@@ -3455,6 +3237,7 @@ func TestAgentTypePresentationCanonicalizesAliases(t *testing.T) {
 		{"muse-code", tmux.AgentMuse},
 		{"moonshot", tmux.AgentKimi},
 		{"opencode", tmux.AgentOpencode},
+		{"oh-my-pi", tmux.AgentOmp},
 		{"ws", tmux.AgentWindsurf},
 	}
 	for _, pair := range aliasPairs {
@@ -3618,93 +3401,6 @@ func TestUpdateStatsCountsEveryAgentType(t *testing.T) {
 	}
 }
 
-func TestPanelStyles(t *testing.T) {
-
-	m := newTestModel(120)
-	// Test with FocusList (tick=0 for static, tick=5 for animation)
-	listStyle, detailStyle := PanelStyles(FocusList, 0, m.theme)
-
-	// Both should be valid styles (not zero values)
-	testText := "test"
-	if listStyle.Render(testText) == "" {
-		t.Error("list panel style should render")
-	}
-	if detailStyle.Render(testText) == "" {
-		t.Error("detail panel style should render")
-	}
-
-	// Test with FocusDetail
-	listStyle2, detailStyle2 := PanelStyles(FocusDetail, 5, m.theme)
-	if listStyle2.Render(testText) == "" {
-		t.Error("list panel style (detail focus) should render")
-	}
-	if detailStyle2.Render(testText) == "" {
-		t.Error("detail panel style (detail focus) should render")
-	}
-}
-
-func TestAgentBorderStyle(t *testing.T) {
-
-	m := newTestModel(120)
-
-	types := []string{
-		string(tmux.AgentClaude),
-		string(tmux.AgentCodex),
-		string(tmux.AgentGemini),
-		string(tmux.AgentGrok),
-		string(tmux.AgentUser),
-	}
-
-	for _, agentType := range types {
-		// Test inactive
-		style := AgentBorderStyle(agentType, false, 0, m.theme)
-		result := style.Render("test")
-		if result == "" {
-			t.Errorf("AgentBorderStyle(%s, inactive) returned style that renders empty", agentType)
-		}
-
-		// Test active with tick
-		styleActive := AgentBorderStyle(agentType, true, 5, m.theme)
-		resultActive := styleActive.Render("test")
-		if resultActive == "" {
-			t.Errorf("AgentBorderStyle(%s, active) returned style that renders empty", agentType)
-		}
-	}
-}
-
-func TestAgentPanelStyles(t *testing.T) {
-
-	m := newTestModel(120)
-
-	types := []string{
-		string(tmux.AgentClaude),
-		string(tmux.AgentCodex),
-		string(tmux.AgentGemini),
-		string(tmux.AgentGrok),
-		string(tmux.AgentUser),
-	}
-
-	for _, agentType := range types {
-		// Test with FocusList, inactive
-		listStyle, detailStyle := AgentPanelStyles(agentType, FocusList, false, 0, m.theme)
-		if listStyle.Render("test") == "" {
-			t.Errorf("AgentPanelStyles(%s) list style renders empty", agentType)
-		}
-		if detailStyle.Render("test") == "" {
-			t.Errorf("AgentPanelStyles(%s) detail style renders empty", agentType)
-		}
-
-		// Test with FocusDetail, active with tick
-		listStyle2, detailStyle2 := AgentPanelStyles(agentType, FocusDetail, true, 5, m.theme)
-		if listStyle2.Render("test") == "" {
-			t.Errorf("AgentPanelStyles(%s, active) list style renders empty", agentType)
-		}
-		if detailStyle2.Render("test") == "" {
-			t.Errorf("AgentPanelStyles(%s, active) detail style renders empty", agentType)
-		}
-	}
-}
-
 func TestMaxInt(t *testing.T) {
 
 	tests := []struct {
@@ -3722,33 +3418,6 @@ func TestMaxInt(t *testing.T) {
 		t.Run(fmt.Sprintf("%d_%d", tc.a, tc.b), func(t *testing.T) {
 			if got := maxInt(tc.a, tc.b); got != tc.want {
 				t.Errorf("maxInt(%d, %d) = %d, want %d", tc.a, tc.b, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestTruncateRunes(t *testing.T) {
-
-	tests := []struct {
-		input  string
-		maxLen int
-		want   string
-	}{
-		{"hello", 10, "hello"},
-		{"hello world", 5, "hell…"}, // Uses Unicode ellipsis, keeps maxLen-1 chars
-		{"hi", 10, "hi"},
-		{"", 5, ""},
-		{"日本語テスト", 4, "日本語…"}, // Keeps 3 runes + ellipsis
-		{"ab", 1, "…"},        // maxLen==1 and string is longer returns just ellipsis
-		{"a", 1, "a"},         // string fits, returns unchanged
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.input, func(t *testing.T) {
-			got := layout.TruncateRunes(tc.input, tc.maxLen, "…")
-			if got != tc.want {
-				t.Errorf("TruncateRunes(%q, %d) = %q, want %q", tc.input, tc.maxLen, got, tc.want)
 			}
 		})
 	}

@@ -262,7 +262,7 @@ ERROR
 ├─ CURSOR_* ─────────────────────────────────────────────┐
 │   └─ Resync: ntm --robot-snapshot                      │
 ├─ ENTITY_NOT_FOUND ─────────────────────────────────────┤
-│   └─ List: ntm --robot-status or --robot-bead-list     │
+│   └─ List: ntm --robot-status or --robot-beads-list    │
 ├─ ENTITY_STALE ─────────────────────────────────────────┤
 │   └─ Use last-known OR Refresh: same command           │
 ├─ ENTITY_BUSY ──────────────────────────────────────────┤
@@ -345,31 +345,38 @@ Errors include retry guidance:
 
 ### 5.3 Request Correlation
 
-For non-idempotent commands, include request ID:
+For non-idempotent commands (`--robot-send`, `--robot-interrupt`), include a
+durable operation ID (`--op-id`; the REST endpoints take the same ID as the
+`Idempotency-Key` header):
 
 ```bash
-ntm --robot-send --target="..." --msg="..." --request-id="req_123"
+ntm --robot-send=myproject --msg="Fix auth" --op-id="deploy-42"
+ntm --robot-interrupt=myproject --msg="Stop and fix the build" --op-id="retask-42"
 ```
 
-Response confirms request ID:
+The response includes the recorded operation:
 ```json
 {
   "success": true,
-  "request_id": "req_123",
-  "idempotency_key": "idem_abc",
-  "duplicate": false
+  "operation": {
+    "operation_id": "deploy-42",
+    "kind": "send",
+    "status": "completed",
+    "payload_sha256": "...",
+    "payload_bytes": 8
+  }
 }
 ```
 
-Duplicate detection:
-```json
-{
-  "success": true,
-  "request_id": "req_123",
-  "idempotency_key": "idem_abc",
-  "duplicate": true,
-  "original_response": { ... }
-}
+An identical retry replays the recorded outcome (`"replayed": true` in
+`operation`) without sending, or interrupting, again; reusing the same
+`--op-id` with a different command — or for a different actuation in the same
+session — is rejected with `IDEMPOTENCY_CONFLICT`. Query the durable receipt
+later with (it reports `outcome` for sends and `interrupt_outcome` for
+interrupts):
+
+```bash
+ntm --robot-send-receipt=deploy-42
 ```
 
 ---
@@ -388,7 +395,7 @@ When a summary surface identifies something interesting, it includes drill-down 
       "type": "error",
       "message": "Agent crashed",
       "drill_down": {
-        "command": "ntm --robot-diagnose=myproject --panes=2",
+        "command": "ntm --robot-diagnose=myproject --diagnose-pane=2",
         "returns": "Full diagnostic with root cause analysis"
       }
     }

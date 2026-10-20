@@ -3,13 +3,22 @@
 > This document captures the complete design, rationale, and implementation plan for
 > NTM's next-generation orchestration capabilities. It serves as the authoritative
 > reference for the feature set and should be updated as implementation proceeds.
+>
+> The "authoritative" claim is enforced, not asserted: every fenced `ntm` example
+> in this file is executed against the real command tree by the WS0-G3
+> docs-conformance gate (`tests/docs_conformance_test.go`) with a zero skip
+> budget for this file. Each feature section also carries a status marker —
+> **Shipped**, **Partial**, or **Planned** — for the semantics the parse gate
+> cannot check.
 
-**Document Version**: 2.1 (2026-07-18)
+**Document Version**: 2.3 (2026-10-07)
 
 ## Revision History
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.3 | 2026-10-07 | Documented the session coordinator runtime: the session monitor hosts the coordinator, always maintains assignment leases, applies persisted toggles live, yields to foreground coordinators, and `conflict_notify` is now opt-in |
+| 2.2 | 2026-08-17 | Reality sweep: corrected every stale API example to shipped syntax (activity/wait/route/send/diff/CASS/spawn), fixed `[alerts]`/`[cass]` config keys and the session-health JSON shape to match the code, added per-section status markers, and put the file under the G3 docs-conformance gate with zero skip waivers |
 | 2.1 | 2026-07-18 | Documented atomic assignment, fail-closed operator-label enrichment, persistent coordinator toggles, and the canonical resilience configuration |
 | 2.0 | 2025-12-30 | Major revision: Added state transition hysteresis, enhanced wait command with error handling, Agent Mail integration for alerts, configurable scoring weights, sticky routing, parallel step execution, conditional logic, loop constructs, output parsing, pipeline notifications |
 | 1.0 | 2025-12-30 | Initial design document |
@@ -75,6 +84,8 @@ Current NTM                          Future NTM
 ---
 
 ## Feature 1: Agent Activity Detection
+
+**Status: Shipped** — `ntm activity`, `ntm wait`, `--robot-activity`, and `--robot-wait` are live.
 
 ### Problem Statement
 
@@ -160,8 +171,12 @@ RETURN UNKNOWN, confidence=0.50
 
 **Robot Mode:**
 ```bash
-ntm --robot-activity=SESSION [--activity-panes=1,2] [--activity-type=claude]
+ntm --robot-activity=myproject
+ntm --robot-activity=myproject --activity-type=claude
 ```
+
+There is no pane filter for `--robot-activity`; it reports every agent pane in
+the session (`--activity-type` narrows by agent type).
 
 ```json
 {
@@ -170,25 +185,26 @@ ntm --robot-activity=SESSION [--activity-panes=1,2] [--activity-type=claude]
   "session": "myproject",
   "agents": [
     {
-      "pane": "myproject__cc_1",
+      "pane": "1",
       "pane_idx": 1,
       "agent_type": "claude",
       "state": "GENERATING",
       "confidence": 0.92,
-      "velocity_cps": 45.2,
-      "last_output_at": "2025-01-15T10:30:00Z",
+      "velocity": 45.2,
       "state_since": "2025-01-15T10:29:30Z",
-      "state_duration_seconds": 30,
-      "detected_patterns": ["thinking_indicator"]
+      "pane_pid": 12345,
+      "capture_collected_at": "2025-01-15T10:30:00Z",
+      "capture_provenance": "live",
+      "observation_state": "generating",
+      "observation_freshness": "fresh",
+      "observation_confidence": 0.9,
+      "safe_to_dispatch": false,
+      "output_sequence": {"epoch": "ea378164557d3868", "sequence": 42}
     }
   ],
   "summary": {
-    "generating": 1,
-    "waiting": 2,
-    "thinking": 0,
-    "error": 0,
-    "stalled": 0,
-    "unknown": 0
+    "total_agents": 1,
+    "by_state": {"GENERATING": 1}
   },
   "_agent_hints": {
     "available_agents": ["myproject__cc_2", "myproject__cod_1"],
@@ -220,13 +236,13 @@ Summary: 1 generating, 2 waiting, 1 error
 ntm wait myproject --until=idle --timeout=5m
 
 # Wait for any agent to become available
-ntm wait myproject --until=any-idle --timeout=2m
+ntm wait myproject --until=idle --any --timeout=2m
 
 # Wait for specific pane
 ntm wait myproject --pane=1 --until=idle --timeout=3m
 
 # Robot mode
-ntm --robot-wait=SESSION --wait-until=idle --wait-timeout=5m
+ntm --robot-wait=myproject --wait-until=idle --timeout=5m
 ```
 
 ### Implementation Considerations
@@ -252,6 +268,8 @@ Activity detection enables:
 ---
 
 ## Feature 2: Agent Health & Resilience
+
+**Status: Shipped** — `ntm health`, `--robot-health[=SESSION]`, `[resilience]` auto-restart, and rate-limit backoff are live.
 
 ### Problem Statement
 
@@ -357,11 +375,18 @@ detect = true                # Detect rate limits
 notify = true                # Send notification on rate limit
 
 [alerts]
-enabled = true
-desktop_notify = true       # notify-send / osascript
-webhook_url = ""            # POST to this URL on state change
-alert_on = ["unhealthy", "rate_limited", "restart"]
+enabled = true                    # Top-level toggle for the alert system
+agent_stuck_minutes = 5           # Minutes without output before alerting
+disk_low_threshold_gb = 5.0       # Minimum free disk space (GB)
+mail_backlog_threshold = 10       # Unread messages before alerting
+bead_stale_hours = 24             # Hours before an in-progress bead is stale
+context_warning_threshold = 75.0  # Context usage % that triggers a warning
+resolved_prune_minutes = 60       # How long to keep resolved alerts
 ```
+
+Crash/restart/rate-limit notifications are controlled by `[resilience]`
+(`notify_on_crash`, `notify_on_max_restarts`, `[resilience.rate_limit] notify`),
+not by `[alerts]`.
 
 ### API Design
 
@@ -373,44 +398,48 @@ ntm --robot-health=SESSION
 ```json
 {
   "success": true,
+  "timestamp": "2025-01-15T10:30:00Z",
   "session": "myproject",
   "checked_at": "2025-01-15T10:30:00Z",
   "agents": [
     {
-      "pane": "myproject__cc_1",
+      "pane": 1,
+      "pane_target": "%1",
+      "agent_type": "claude",
       "health": "healthy",
-      "uptime_seconds": 8100,
-      "restarts_total": 0,
-      "restarts_this_hour": 0,
-      "last_error": null,
+      "idle_since_seconds": 12,
+      "restarts": 0,
       "rate_limit_count": 0,
-      "backoff_remaining_seconds": 0
+      "backoff_remaining": 0,
+      "confidence": 0.9
     },
     {
-      "pane": "myproject__cod_1",
+      "pane": 2,
+      "pane_target": "%2",
+      "agent_type": "codex",
       "health": "degraded",
-      "uptime_seconds": 2700,
-      "restarts_total": 2,
-      "restarts_this_hour": 2,
-      "last_error": {
-        "type": "rate_limit",
-        "at": "2025-01-15T10:25:00Z",
-        "message": "Rate limit exceeded, retrying in 60s"
-      },
+      "idle_since_seconds": 340,
+      "restarts": 2,
+      "last_error": "rate limit exceeded, retrying in 60s",
       "rate_limit_count": 3,
-      "backoff_remaining_seconds": 45
+      "backoff_remaining": 45,
+      "confidence": 0.8
     }
   ],
   "summary": {
+    "total": 2,
     "healthy": 1,
     "degraded": 1,
     "unhealthy": 0,
     "rate_limited": 0,
-    "total_restarts_24h": 2,
-    "agents_in_backoff": 1
+    "blocked": 0
   }
 }
 ```
+
+(`health` is one of `healthy`, `degraded`, `unhealthy`, `rate_limited`;
+`blocked` counts panes parked on an interactive gate screen awaiting a human
+keystroke.)
 
 **Human CLI:**
 ```
@@ -441,6 +470,8 @@ $ ntm health myproject --verbose
 ---
 
 ## Feature 3: Smart Work Distribution
+
+**Status: Shipped** — `ntm send --smart/--route`, `--robot-route`, and `--robot-assign` are live. Shipped strategies go beyond this design: least-loaded, first-available, round-robin, round-robin-available, random, sticky, explicit, affinity.
 
 ### Problem Statement
 
@@ -488,28 +519,47 @@ Rotate through agents regardless of state. Predictable distribution.
 **4. random**
 Random selection among available agents. Simple load distribution.
 
+**5. affinity**
+Pick the agent holding live Agent Mail file reservations on the files the
+prompt names (the highest fraction of named files covered; score breaks
+ties). Falls back to least-loaded — reported as `fallback_used` — when no
+available agent holds any. Needs `[agent_mail] enabled = true` and the
+session's agent registry (written when ntm registers panes with Agent Mail).
+Choosing this strategy is its own opt-in; `[routing] affinity_enabled`
+separately adds the same signal as a score bonus under every strategy.
+
+Whenever reservations are loaded (either opt-in), a recommendation whose
+pick would edit files another agent reserves carries
+`recommendation.reservation_warning` (`message`, `paths`, `holders`,
+`selected_has_reserved`) plus an `_agent_hints` suggestion, and
+`ntm send --smart` prints the warning on stderr. It is omitted when the
+selected agent is the only holder.
+
 ### API Design
 
 **Get Routing Recommendation:**
 ```bash
-ntm --robot-route=SESSION --type=claude --strategy=least-loaded
+ntm --robot-route=myproject --type=claude --strategy=least-loaded
 ```
 
 ```json
 {
   "success": true,
+  "session": "myproject",
+  "strategy": "least-loaded",
   "recommendation": {
-    "pane": "myproject__cc_2",
-    "pane_idx": 2,
+    "pane_id": "%12",
+    "pane_index": 2,
     "agent_type": "claude",
     "score": 77,
-    "reason": "highest_score_available"
+    "reason": "highest_score_available",
+    "context_usage": 28,
+    "state": "WAITING"
   },
-  "strategy": "least-loaded",
   "candidates": [
-    {"pane": "myproject__cc_1", "score": 26, "context_pct": 72, "state": "GENERATING"},
-    {"pane": "myproject__cc_2", "score": 77, "context_pct": 28, "state": "WAITING"},
-    {"pane": "myproject__cc_3", "score": 67, "context_pct": 45, "state": "WAITING"}
+    {"pane_id": "%11", "pane_index": 1, "agent_type": "claude", "score": 26, "context_usage": 72, "state": "GENERATING"},
+    {"pane_id": "%12", "pane_index": 2, "agent_type": "claude", "score": 77, "context_usage": 28, "state": "WAITING"},
+    {"pane_id": "%13", "pane_index": 3, "agent_type": "claude", "score": 67, "context_usage": 45, "state": "WAITING"}
   ]
 }
 ```
@@ -522,35 +572,52 @@ ntm send myproject --cc "Fix the bug"
 # New way: send to best available Claude agent
 ntm send myproject --cc --smart "Fix the bug"
 
-# Or with explicit strategy
+# Or with explicit strategy (--route implies --smart)
 ntm send myproject --cc --route=least-loaded "Fix the bug"
+
+# Prefer the agent already holding the files the prompt names
+ntm send myproject --route=affinity "Fix internal/auth/session.go"
 ```
+
+An explicit `--pane`/`--panes` wins over routing. `--all`, `--skip-first`,
+`--project`, `--batch`, and `--distribute` are rejected alongside
+`--smart`/`--route`: each would otherwise silently ignore or contradict the
+single-agent routing decision.
 
 **Robot Mode Send with Routing:**
+
+`--robot-send` does not route by itself; robot callers compose routing from the
+two shipped primitives — query `--robot-route` for a recommendation, then send
+to the recommended pane:
+
 ```bash
-ntm --robot-send=SESSION --msg="Fix bug" --type=claude --route=least-loaded
+ntm --robot-route=myproject --type=claude --strategy=least-loaded
+ntm --robot-send=myproject --msg="Fix bug" --pane=%12
+
+# Affinity ranks by the files the message names, so pass the message
+ntm --robot-route=myproject --strategy=affinity --msg="Fix internal/auth/session.go"
 ```
 
-Response includes routing info:
-```json
-{
-  "success": true,
-  "routed_to": "myproject__cc_2",
-  "routing_score": 77,
-  "routing_reason": "highest_score_available",
-  ...
-}
-```
+`--robot-send` rejects the route-only modifiers (`--strategy`, `--last-agent`,
+`--route-*`) with `INVALID_FLAG` instead of ignoring them and delivering to
+every matching pane.
+
+(Human CLI callers get the same composition in one step via
+`ntm send --smart`.)
 
 ### Integration with Health
 
-Skip unhealthy and rate-limited agents:
-- `health == unhealthy` → score = -100 (excluded)
-- `health == rate_limited` → score = -50 (excluded unless only option)
+Skip unhealthy and rate-limited agents (hard exclusions, not score penalties):
+- `health == unhealthy` → excluded when `exclude_if_error_state` is on (default: true)
+- `rate_limited` → excluded when `exclude_if_rate_limited` is on (default: true); there is no "unless only option" fallback
+
+(Implemented in `AgentScorer.checkExclusion`, internal/robot/routing.go.)
 
 ---
 
 ## Feature 4: Output Synthesis
+
+**Status: Shipped** — `ntm conflicts`, `ntm diff`, `ntm changes`, and `--robot-diff` are live.
 
 ### Problem Statement
 
@@ -633,13 +700,16 @@ Clean Modifications:
   src/user.go
   tests/auth_test.go
 
-$ ntm diff myproject --panes=1,2 --last=50
-# Shows side-by-side output comparison
+$ ntm diff myproject cc_1 cod_1
+# Shows side-by-side output comparison (--unified for unified diff,
+# --code-only to compare extracted code blocks)
 ```
 
 ---
 
 ## Feature 5: CASS Auto-Injection
+
+**Status: Shipped** — `ntm send --with-cass/--no-cass`, `--robot-send --with-cass/--no-cass`, `ntm cass preview`, and the `[cass.context]` config are live. Assignment prompts are enriched through the same pipeline: `ntm assign` (and `ntm coordinator assign`) and `--robot-bulk-assign` take `--with-cass/--no-cass/--with-memory`, and the coordinator's auto-assign follows `[cass.context] enabled` and `[memory] send_injection` (see [Assignment-time injection](#assignment-time-injection)).
 
 ### Problem Statement
 
@@ -683,13 +753,18 @@ Injected prompt:
 
 ```toml
 [cass]
-auto_inject = true          # Enable by default
-inject_limit = 3            # Max items to inject
+enabled = true              # Top-level switch for all CASS features
+binary_path = ""            # Path to cass binary (auto-detect from PATH if empty)
+timeout = 30                # Timeout for CASS operations (seconds)
+
+[cass.context]
+enabled = true              # Auto-inject context (send-time default; override per send with --with-cass/--no-cass)
+max_sessions = 3            # Max past sessions to include
 min_relevance = 0.7         # Minimum similarity score
-max_inject_tokens = 500     # Token budget for injection
+max_tokens = 500            # Token budget for injection
 skip_if_context_above = 60  # Skip if agent > 60% context usage
 prefer_same_project = true  # Prefer history from same project
-max_age_days = 30           # Only consider recent history
+lookback_days = 30          # Only consider recent history
 ```
 
 ### API Integration
@@ -725,9 +800,41 @@ ntm cass preview "Implement rate limiting"
 }
 ```
 
+### Assignment-time injection
+
+Every surface that hands an agent its work enriches the assignment prompt
+before the agent starts, so each task begins with the lessons from past
+sessions that solved similar problems:
+
+| Surface | Control |
+|---------|---------|
+| `ntm assign` (`--auto`, `--pane`, `--watch`, `--retry`, `--reassign`), `ntm coordinator assign` | `--with-cass` / `--no-cass` / `--with-memory` |
+| `ntm --robot-bulk-assign` | `--with-cass` / `--no-cass` / `--with-memory` |
+| Session coordinator auto-assign (`ntm coordinator run`, session monitor) | config only |
+
+Precedence matches send: `--no-cass` > `--with-cass` > `[cass] enabled &&
+[cass.context] enabled`; `--with-memory` or `[memory] enabled &&
+send_injection` turns on CM rules. The CASS query is built from the bead's
+title, labels, and description (credentials redacted) rather than the
+template boilerplate, and the CM workspace is the bead's project.
+
+The prompt is enriched once, **before** the durable assignment intent is
+recorded: the assignment ledger hashes and persists the enriched prompt
+(`pending_prompt` / `prompt_sent`), plus `base_intent_sha256`, the checksum of
+the prompt before enrichment. Retries and recovery (`ntm assign --retry` of a
+pending claim, a same-intent `ntm assign --pane` re-run, a
+`--robot-bulk-assign` re-run of the same template intent, and the
+coordinator's pending recovery) replay the recorded prompt exactly and never
+query cass or cm again. cass or cm being missing, disabled, or failing never
+blocks an assignment; each assignment record in the JSON output carries the
+same `cass_injection` / `memory_injection` objects as send, including the
+skip reason on the degraded path.
+
 ---
 
 ## Feature 6: Workflow Pipelines
+
+**Status: Shipped** — `ntm pipeline run/status/list/cancel/resume` and the `--robot-pipeline-*` surfaces are live.
 
 ### Problem Statement
 
@@ -1037,6 +1144,8 @@ ntm --robot-pipeline-cancel=run-abc123
 
 ## Feature 7: Thundering Herd Prevention
 
+**Status: Shipped** — `ntm spawn --stagger/--stagger-mode/--stagger-delay`, `ntm spawn --assign`, the `NTM_SPAWN_*` env vars (`ntm spawn`), `--robot-spawn --spawn-assign-work`, `--robot-spawn --spawn-prompt/--spawn-prompt-file`, `--robot-spawn --spawn-stagger-mode/--spawn-stagger-delay`, and the `[spawn]` config table (`stagger_mode`, `stagger_delay`) are shipped. Both surfaces resolve stagger through one planner (`robot.ResolveSpawnStagger`).
+
 ### Problem Statement
 
 When multiple agents spawn simultaneously and self-select work via `bv --robot-triage` or `br ready`, they race to claim the same beads:
@@ -1058,10 +1167,10 @@ Introduce configurable delay between agents starting their work selection:
 
 ```bash
 # Spawn 3 agents with 90s stagger between prompts
-ntm spawn myproject --cc 3 --stagger
+ntm spawn myproject --cc=3 --stagger
 
 # Custom stagger duration
-ntm spawn myproject --cc 3 --stagger=2m
+ntm spawn myproject --cc=3 --stagger=2m
 ```
 
 Timing:
@@ -1111,7 +1220,7 @@ Instead of agents self-selecting, ntm can assign work:
 
 ```bash
 # ntm picks work and assigns to each agent
-ntm spawn myproject --cc 3 --assign-work
+ntm spawn myproject --cc=3 --assign
 ```
 
 Flow:
@@ -1151,8 +1260,10 @@ ntm coordinator disable conflict-negotiate
 
 The writer preserves unrelated keys, comments, file modes, and symlink targets;
 serializes concurrent writers; and validates the complete strict NTM schema
-before atomic replacement. A running coordinator daemon reads configuration at
-startup and must be restarted to apply a toggle.
+before atomic replacement. The coordinator each session monitor hosts (see
+below) re-reads the selected config every 15 seconds and applies a toggle
+without a restart. A foreground `ntm coordinator run` reads configuration at
+startup and must be restarted to apply one.
 
 Persistence supports both a `[coordinator]` table and root dotted assignments
 such as `coordinator.auto_assign = false`. It deliberately refuses a
@@ -1160,44 +1271,149 @@ whole-section inline assignment such as
 `coordinator = { auto_assign = false }` without mutating the file, because that
 form cannot be updated surgically while preserving the operator's source.
 
+### Session Coordinator Runtime
+
+**Status: Shipped** — the session monitor `ntm spawn` starts hosts the
+coordinator; `ntm coordinator status` reports it.
+
+Every session monitor runs the session coordinator, so a toggle persisted with
+`ntm coordinator enable` acts on spawned sessions without a separate
+`ntm coordinator run`:
+
+```bash
+ntm coordinator enable auto-assign
+ntm coordinator status myproject
+ntm coordinator status myproject --json
+```
+
+- **Assignment maintenance always runs.** It renews the exact file
+  reservations of delivered, still-owned assignments before their one-hour
+  leases lapse, and releases an assignment's reservations and Beads claim once
+  its bead is closed (or its pane is gone). Reservations taken by a one-shot
+  `ntm assign` are therefore kept alive and cleaned up without
+  `ntm assign --watch`. With no feature enabled the monitor runs only this
+  maintenance, every 30 seconds, and does nothing while the session's
+  assignment ledger has no active assignments. Maintenance reads the saved
+  coordinator identity; it never registers one, sends mail, or admits work.
+- **Every other action is opt-in.** `auto-assign`, `digest`,
+  `conflict-notify`, `conflict-negotiate`, `mail-nudge`, the
+  `[rotation] usage_percent_threshold` trigger and
+  `[integrations.caam] auto_failover` all default off. Enabling any of them
+  switches the monitor to the full coordinator loop that
+  `ntm coordinator run` runs. `conflict_notify` is off by default because
+  notification mails every holder of overlapping reservations in the project,
+  including other sessions' agents, at high importance and again for each
+  persisting pair after its cooldown. The monitor never hosts
+  `conflict-notify`, even when it is set: releases up to v1.36.1 defaulted it
+  to true and `ntm config init` wrote that default into config files, so a
+  persisted `true` is not a reliable opt-in, and every session would mail each
+  conflicting pair. Conflict notification runs only under
+  `ntm coordinator run`, as before. Enabled auto-assignment whose assignment
+  safety policy does not load stays disabled, and the status reports why.
+- **No double coordination.** A foreground `ntm coordinator run` (including
+  `--once`) or an `ntm assign --watch` that maintains reservations claims the
+  session: the monitor stops its coordinator within about a second, stays paused
+  while any claim is held, and resumes after the last one ends. The claim waits
+  at most one minute for the monitor to stop. `coordinator run --json` reports
+  `monitor_yielded: true` when it paused the monitor. Ownership uses `flock`
+  locks next to the monitor's control files, so a crashed process never wedges
+  the other side.
+- **Status.** `ntm coordinator status` shows a Runtime section, and its JSON
+  carries `runtime`: `host` (`session-monitor` or `none`), `state`
+  (`running`, `yielded`, or `not_running`), `mode` (`maintenance` or `full`),
+  the enabled `features`, the monitor's `config_path`,
+  `last_maintenance_at`, `maintenance_error`, and `error`. Stopping the session
+  (`ntm kill`) stops the coordinator before the monitor releases its lease.
+
+Account-rotation monitors (`ntm swarm` CAAM rotation) run only their CAAM
+checker and do not host the coordinator.
+
 ### API Design
 
 ```bash
 # Stagger flags
-ntm spawn myproject --cc 3 --stagger          # default 90s
-ntm spawn myproject --cc 3 --stagger=2m       # custom
-ntm spawn myproject --cc 3 --stagger=0        # disabled
+ntm spawn myproject --cc=3 --stagger            # default 90s
+ntm spawn myproject --cc=3 --stagger=2m         # custom
+ntm spawn myproject --cc=5 --stagger-mode=smart # adaptive rate-limit avoidance
+ntm spawn myproject --cc=4 --stagger-mode=fixed --stagger-delay=20s
 
 # Assignment mode
-ntm spawn myproject --cc 3 --assign-work
-ntm spawn myproject --cc 3 --assign-work --assign-strategy=diverse
+ntm spawn myproject --cc=3 --assign
+ntm spawn myproject --cc=3 --assign --strategy=dependency
 
-# Robot mode
-ntm --robot-spawn=myproject --spawn-cc=3 --spawn-stagger=90s
+# Robot mode: initial prompt + the same stagger modes
+ntm --robot-spawn=myproject --spawn-cc=3 --spawn-prompt='Read AGENTS.md, then pick ready work' \
+    --spawn-stagger-mode=fixed --spawn-stagger-delay=90s
+ntm --robot-spawn=myproject --spawn-cc=5 --spawn-prompt-file=boot.md --spawn-stagger-mode=smart
+ntm --robot-spawn=myproject --spawn-cc=3 --spawn-assign-work --strategy=diverse \
+    --spawn-stagger-mode=fixed --spawn-stagger-delay=30s
 ```
 
-Response includes schedule:
+`--spawn-prompt` (or `--spawn-prompt-file`, `-` for stdin) is delivered to
+every spawned agent only after the readiness wait — it implies `--spawn-wait` —
+and goes through the same canonical dispatch port as robot send and spawn work
+assignment (final-message redaction, per-agent delivery protocol, and a
+dispatch-time re-observation that refuses any pane that is not freshly idle;
+never raw send-keys). With `--spawn-assign-work` the initial prompt prefixes
+each agent's work prompt, so both arrive in one atomic, paced delivery — a
+second back-to-back dispatch would be refused by the idle gate once the first
+prompt is running. Grok Build panes take spawn prompts like any other agent
+(readiness and composer-gated delivery shipped in phase 2, GH#251).
+
+Pacing is identical on both surfaces: the agent at delivery position `i`
+(0-based, launch order) receives its prompt `i × interval` after the first.
+`fixed` uses `--stagger-delay` / `--spawn-stagger-delay`; `smart` uses the
+learned delay of the strictest provider in the batch from the project's
+`.ntm/rate_limits.json` (anthropic, then openai, then google, then omp's own
+bucket); `none` delivers back to back. `ntm spawn --stagger[=DURATION]`
+remains the legacy fixed interval when no mode is chosen. In assignment mode
+each agent's whole claim-and-dispatch waits for its slot, so no bead claim is
+held across a stagger wait.
+
+`ntm spawn` reports each pane's `prompt_delay_ms` and, when pacing is active,
+`stagger: {enabled, mode, interval_ms}`. `--robot-spawn` reports a `stagger`
+plan whenever it delivers prompts (including `--dry-run`, which previews the
+delays without delivering):
+
 ```json
-{
-  "success": true,
-  "stagger": {
-    "enabled": true,
-    "duration_seconds": 90,
-    "schedule": [
-      {"pane": "proj__cc_1", "prompt_at": "2025-01-15T10:00:00Z"},
-      {"pane": "proj__cc_2", "prompt_at": "2025-01-15T10:01:30Z"}
-    ]
-  }
-}
+"stagger": {
+  "mode": "fixed", "interval_ms": 90000,
+  "schedule": [
+    {"pane": "0.1", "agent_type": "claude", "order": 1, "delay_ms": 0,      "scheduled_at": "2026-10-07T12:00:00Z"},
+    {"pane": "0.2", "agent_type": "claude", "order": 2, "delay_ms": 90000,  "scheduled_at": "2026-10-07T12:01:30Z"},
+    {"pane": "0.3", "agent_type": "claude", "order": 3, "delay_ms": 180000, "scheduled_at": "2026-10-07T12:03:00Z"}
+  ]
+},
+"prompt_deliveries": [
+  {"pane": "0.1", "agent_type": "claude", "order": 1, "prompt_sent": true, "delivered_at": "2026-10-07T12:00:00Z"}
+]
 ```
+
+`prompt_deliveries[]` holds one `--spawn-prompt` outcome per agent; any failed
+delivery makes the envelope fail with `PROMPT_SEND_FAILED` while every
+launched pane keeps running. In assignment mode the outcome is on
+`assignments[]` (`prompt_sent`, `delivered_at`). Smart mode adds `provider`,
+and a `warning` when the rate-limit history is unreadable (the provider's
+built-in delay is used). An unsupported mode or a delay outside 0–5m fails
+with `INVALID_FLAG` before any session is touched.
 
 ### Configuration
 
+The `[spawn]` table supplies defaults for both `ntm spawn` and
+`--robot-spawn`. A flag always wins; `[spawn]` applies only when the flag is
+not given (an explicit `ntm spawn --stagger` also counts as choosing the
+mode):
+
 ```toml
 [spawn]
-default_stagger = "90s"           # used when --stagger has no value
-auto_stagger_threshold = 2        # auto-enable stagger when >= N agents
+stagger_mode = "fixed"   # none (default), fixed, or smart
+stagger_delay = "90s"    # fixed-mode interval between agents, 0-5m (default 30s)
 ```
+
+An invalid value is reported against its key (`[spawn] stagger_mode must be
+one of none, fixed, or smart`) and by `ntm config validate`. The bare
+`--stagger` default stays 90s. Spawn *rate* pacing (concurrent spawn limits per
+provider) is configured separately via `[spawn_pacing]`.
 
 ---
 

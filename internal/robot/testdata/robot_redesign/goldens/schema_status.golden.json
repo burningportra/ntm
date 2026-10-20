@@ -945,12 +945,40 @@
             "description": "Agents by type",
             "type": "object"
           },
+          "aider_count": {
+            "description": "Aider count",
+            "type": "integer"
+          },
           "alerts_active": {
             "description": "Alerts active",
             "type": "integer"
           },
+          "antigravity_count": {
+            "description": "Antigravity count",
+            "type": "integer"
+          },
           "attached_count": {
             "description": "Attached count",
+            "type": "integer"
+          },
+          "claude_count": {
+            "description": "Claude count",
+            "type": "integer"
+          },
+          "codex_count": {
+            "description": "Codex count",
+            "type": "integer"
+          },
+          "cursor_count": {
+            "description": "Cursor count",
+            "type": "integer"
+          },
+          "gemini_count": {
+            "description": "Gemini count",
+            "type": "integer"
+          },
+          "grok_count": {
+            "description": "Grok count",
             "type": "integer"
           },
           "health_score": {
@@ -965,12 +993,36 @@
             "description": "In progress",
             "type": "integer"
           },
+          "kimi_count": {
+            "description": "Kimi count",
+            "type": "integer"
+          },
           "mail_unread": {
             "description": "Mail unread",
             "type": "integer"
           },
           "mail_urgent": {
             "description": "Mail urgent",
+            "type": "integer"
+          },
+          "muse_count": {
+            "description": "Muse count",
+            "type": "integer"
+          },
+          "ollama_count": {
+            "description": "Ollama count",
+            "type": "integer"
+          },
+          "omp_count": {
+            "description": "Omp count",
+            "type": "integer"
+          },
+          "opencode_count": {
+            "description": "Opencode count",
+            "type": "integer"
+          },
+          "pi_count": {
+            "description": "Pi count",
             "type": "integer"
           },
           "ready_work": {
@@ -985,15 +1037,29 @@
             "description": "Total sessions",
             "type": "integer"
           },
-          "work_stale": {
-            "description": "Work stale",
-            "type": "boolean"
+          "windsurf_count": {
+            "description": "Windsurf count",
+            "type": "integer"
           }
         },
         "required": [
           "total_sessions",
           "total_agents",
           "attached_count",
+          "claude_count",
+          "codex_count",
+          "gemini_count",
+          "pi_count",
+          "kimi_count",
+          "muse_count",
+          "antigravity_count",
+          "grok_count",
+          "cursor_count",
+          "windsurf_count",
+          "aider_count",
+          "opencode_count",
+          "omp_count",
+          "ollama_count",
           "agents_by_state",
           "agents_by_type",
           "ready_work",

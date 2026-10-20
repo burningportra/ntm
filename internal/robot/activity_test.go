@@ -24,67 +24,6 @@ func TestNewVelocityTracker(t *testing.T) {
 	}
 }
 
-func TestNewVelocityTrackerWithSize(t *testing.T) {
-	// Test with valid size
-	tracker := NewVelocityTrackerWithSize("test-pane", 5)
-	if tracker.MaxSamples != 5 {
-		t.Errorf("expected MaxSamples 5, got %d", tracker.MaxSamples)
-	}
-
-	// Test with zero size (should default)
-	tracker = NewVelocityTrackerWithSize("test-pane", 0)
-	if tracker.MaxSamples != DefaultMaxSamples {
-		t.Errorf("expected default MaxSamples %d, got %d", DefaultMaxSamples, tracker.MaxSamples)
-	}
-
-	// Test with negative size (should default)
-	tracker = NewVelocityTrackerWithSize("test-pane", -5)
-	if tracker.MaxSamples != DefaultMaxSamples {
-		t.Errorf("expected default MaxSamples %d, got %d", DefaultMaxSamples, tracker.MaxSamples)
-	}
-}
-
-func TestVelocityTracker_AddSample(t *testing.T) {
-	tracker := NewVelocityTrackerWithSize("test", 3)
-
-	// Add samples directly for testing
-	samples := []VelocitySample{
-		{Timestamp: time.Now(), CharsAdded: 10, Velocity: 5.0},
-		{Timestamp: time.Now(), CharsAdded: 20, Velocity: 10.0},
-		{Timestamp: time.Now(), CharsAdded: 30, Velocity: 15.0},
-	}
-
-	for _, s := range samples {
-		tracker.mu.Lock()
-		tracker.addSampleLocked(s)
-		tracker.mu.Unlock()
-	}
-
-	if len(tracker.Samples) != 3 {
-		t.Errorf("expected 3 samples, got %d", len(tracker.Samples))
-	}
-
-	// Add one more to test circular buffer behavior
-	newSample := VelocitySample{Timestamp: time.Now(), CharsAdded: 40, Velocity: 20.0}
-	tracker.mu.Lock()
-	tracker.addSampleLocked(newSample)
-	tracker.mu.Unlock()
-
-	if len(tracker.Samples) != 3 {
-		t.Errorf("expected 3 samples after overflow, got %d", len(tracker.Samples))
-	}
-
-	// First sample should now be the second original
-	if tracker.Samples[0].Velocity != 10.0 {
-		t.Errorf("expected first sample velocity 10.0, got %f", tracker.Samples[0].Velocity)
-	}
-
-	// Last sample should be the new one
-	if tracker.Samples[2].Velocity != 20.0 {
-		t.Errorf("expected last sample velocity 20.0, got %f", tracker.Samples[2].Velocity)
-	}
-}
-
 func TestVelocityTracker_CurrentVelocity(t *testing.T) {
 	tracker := NewVelocityTracker("test")
 
@@ -157,23 +96,6 @@ func TestVelocityTracker_RecentVelocity(t *testing.T) {
 	// Recent larger than samples should use all
 	if v := tracker.RecentVelocity(100); v != expected {
 		t.Errorf("expected %f for n=100, got %f", expected, v)
-	}
-}
-
-func TestVelocityTracker_SampleCount(t *testing.T) {
-	tracker := NewVelocityTrackerWithSize("test", 5)
-
-	if c := tracker.SampleCount(); c != 0 {
-		t.Errorf("expected 0 samples, got %d", c)
-	}
-
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 1.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 2.0})
-	tracker.mu.Unlock()
-
-	if c := tracker.SampleCount(); c != 2 {
-		t.Errorf("expected 2 samples, got %d", c)
 	}
 }
 
@@ -369,134 +291,6 @@ func TestVelocityTracker_UpdateWithOutput_ANSI(t *testing.T) {
 	// Should only count visible characters added (6 for " world")
 	if sample.CharsAdded != 6 {
 		t.Errorf("expected 6 visible chars added (ANSI stripped), got %d", sample.CharsAdded)
-	}
-}
-
-func TestVelocityManager_GetOrCreate(t *testing.T) {
-	vm := NewVelocityManager()
-
-	// First call should create
-	tracker1 := vm.GetOrCreate("pane1")
-	if tracker1 == nil {
-		t.Fatal("expected tracker, got nil")
-	}
-	if tracker1.PaneID != "pane1" {
-		t.Errorf("expected pane1, got %s", tracker1.PaneID)
-	}
-
-	// Second call should return same tracker
-	tracker2 := vm.GetOrCreate("pane1")
-	if tracker1 != tracker2 {
-		t.Error("expected same tracker instance")
-	}
-
-	// Different pane should create new tracker
-	tracker3 := vm.GetOrCreate("pane2")
-	if tracker3 == tracker1 {
-		t.Error("expected different tracker for different pane")
-	}
-}
-
-func TestVelocityManager_Get(t *testing.T) {
-	vm := NewVelocityManager()
-
-	// Non-existent should return nil
-	if tracker := vm.Get("nonexistent"); tracker != nil {
-		t.Error("expected nil for non-existent pane")
-	}
-
-	// Create and get
-	vm.GetOrCreate("pane1")
-	if tracker := vm.Get("pane1"); tracker == nil {
-		t.Error("expected tracker, got nil")
-	}
-}
-
-func TestVelocityManager_Remove(t *testing.T) {
-	vm := NewVelocityManager()
-
-	vm.GetOrCreate("pane1")
-	vm.GetOrCreate("pane2")
-
-	if vm.TrackerCount() != 2 {
-		t.Errorf("expected 2 trackers, got %d", vm.TrackerCount())
-	}
-
-	vm.Remove("pane1")
-
-	if vm.TrackerCount() != 1 {
-		t.Errorf("expected 1 tracker after remove, got %d", vm.TrackerCount())
-	}
-
-	if vm.Get("pane1") != nil {
-		t.Error("expected nil after remove")
-	}
-
-	if vm.Get("pane2") == nil {
-		t.Error("expected pane2 to still exist")
-	}
-}
-
-func TestVelocityManager_GetAllVelocities(t *testing.T) {
-	vm := NewVelocityManager()
-
-	tracker1 := vm.GetOrCreate("pane1")
-	tracker2 := vm.GetOrCreate("pane2")
-
-	// Add samples with known velocities
-	tracker1.mu.Lock()
-	tracker1.addSampleLocked(VelocitySample{Velocity: 5.0})
-	tracker1.mu.Unlock()
-
-	tracker2.mu.Lock()
-	tracker2.addSampleLocked(VelocitySample{Velocity: 10.0})
-	tracker2.mu.Unlock()
-
-	velocities := vm.GetAllVelocities()
-
-	if len(velocities) != 2 {
-		t.Errorf("expected 2 velocities, got %d", len(velocities))
-	}
-
-	if velocities["pane1"] != 5.0 {
-		t.Errorf("expected pane1 velocity 5.0, got %f", velocities["pane1"])
-	}
-
-	if velocities["pane2"] != 10.0 {
-		t.Errorf("expected pane2 velocity 10.0, got %f", velocities["pane2"])
-	}
-}
-
-func TestVelocityManager_Clear(t *testing.T) {
-	vm := NewVelocityManager()
-
-	vm.GetOrCreate("pane1")
-	vm.GetOrCreate("pane2")
-	vm.GetOrCreate("pane3")
-
-	vm.Clear()
-
-	if vm.TrackerCount() != 0 {
-		t.Errorf("expected 0 trackers after clear, got %d", vm.TrackerCount())
-	}
-}
-
-func TestVelocityManager_TrackerCount(t *testing.T) {
-	vm := NewVelocityManager()
-
-	if vm.TrackerCount() != 0 {
-		t.Errorf("expected 0, got %d", vm.TrackerCount())
-	}
-
-	vm.GetOrCreate("pane1")
-	if vm.TrackerCount() != 1 {
-		t.Errorf("expected 1, got %d", vm.TrackerCount())
-	}
-
-	vm.GetOrCreate("pane2")
-	vm.GetOrCreate("pane3")
-	if vm.TrackerCount() != 3 {
-		t.Errorf("expected 3, got %d", vm.TrackerCount())
 	}
 }
 
@@ -832,7 +626,7 @@ func TestFilterThinkingToLive_KeepsCurrentBullets(t *testing.T) {
 // CategoryThinking live-window filter: when the live tail contains an idle
 // prompt and the error pattern only appears in the older scrollback,
 // classifyState should land on WAITING.
-func TestFilterErrorToLiveWhenIdle_DropsHistoricalErrorAboveLivePrompt(t *testing.T) {
+func TestFilterErrorToLiveWithCurrentSignal_DropsHistoricalErrorAboveLivePrompt(t *testing.T) {
 	// "failed" 40 lines above an idle codex chevron.
 	var b strings.Builder
 	b.WriteString("Error: failed to upload chunk 17 with: connection reset\n")
@@ -885,10 +679,10 @@ func TestFilterErrorToLiveWhenIdle_DropsHistoricalErrorAboveLivePrompt(t *testin
 	}
 
 	// The filter should drop the stale error match entirely.
-	filtered := filterErrorToLiveWhenIdle(full, live)
+	filtered := filterErrorToLiveWithCurrentSignal(full, live)
 	for _, m := range filtered {
 		if m.Category == CategoryError && m.Pattern == "failed_text" {
-			t.Fatalf("filterErrorToLiveWhenIdle failed to drop stale failed_text: %+v", filtered)
+			t.Fatalf("filterErrorToLiveWithCurrentSignal failed to drop stale failed_text: %+v", filtered)
 		}
 	}
 
@@ -906,7 +700,7 @@ func TestFilterErrorToLiveWhenIdle_DropsHistoricalErrorAboveLivePrompt(t *testin
 // when the failure is currently visible in the live tail (e.g. a fresh API
 // error that just landed alongside the chevron), the filter must NOT drop
 // it. The pane is genuinely in trouble and should classify as ERROR.
-func TestFilterErrorToLiveWhenIdle_KeepsFreshErrorInLiveTail(t *testing.T) {
+func TestFilterErrorToLiveWithCurrentSignal_KeepsFreshErrorInLiveTail(t *testing.T) {
 	content := "" +
 		"  Read connection.rs\n" +
 		"  Edited connection.rs\n" +
@@ -935,7 +729,7 @@ func TestFilterErrorToLiveWhenIdle_KeepsFreshErrorInLiveTail(t *testing.T) {
 		t.Fatalf("test premise broken: liveError=%v liveIdle=%v live=%+v", sawLiveError, sawLiveIdle, live)
 	}
 
-	filtered := filterErrorToLiveWhenIdle(full, live)
+	filtered := filterErrorToLiveWithCurrentSignal(full, live)
 	sawError := false
 	for _, m := range filtered {
 		if m.Category == CategoryError && m.Pattern == "failed_text" {
@@ -944,7 +738,7 @@ func TestFilterErrorToLiveWhenIdle_KeepsFreshErrorInLiveTail(t *testing.T) {
 		}
 	}
 	if !sawError {
-		t.Fatalf("filterErrorToLiveWhenIdle dropped a fresh in-live-tail failed_text: %+v", filtered)
+		t.Fatalf("filterErrorToLiveWithCurrentSignal dropped a fresh in-live-tail failed_text: %+v", filtered)
 	}
 
 	sc := NewStateClassifier("test", nil)
@@ -960,7 +754,7 @@ func TestFilterErrorToLiveWhenIdle_KeepsFreshErrorInLiveTail(t *testing.T) {
 // match) with an error somewhere in the buffer should keep ERROR priority,
 // since "no live prompt + historical error" is not the false-positive shape
 // the issue describes — it could just be a stalled error mid-output.
-func TestFilterErrorToLiveWhenIdle_NoIdlePromptKeepsHistoricalError(t *testing.T) {
+func TestFilterErrorToLiveWithCurrentSignal_NoIdlePromptKeepsHistoricalError(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("Error: failed to acquire lock on resource\n")
 	for i := 0; i < 30; i++ {
@@ -984,7 +778,7 @@ func TestFilterErrorToLiveWhenIdle_NoIdlePromptKeepsHistoricalError(t *testing.T
 
 	// With no idle prompt in the live tail the filter must be a no-op
 	// and the historical error must survive.
-	filtered := filterErrorToLiveWhenIdle(full, live)
+	filtered := filterErrorToLiveWithCurrentSignal(full, live)
 	sawError := false
 	for _, m := range filtered {
 		if m.Category == CategoryError && m.Pattern == "failed_text" {
@@ -993,7 +787,72 @@ func TestFilterErrorToLiveWhenIdle_NoIdlePromptKeepsHistoricalError(t *testing.T
 		}
 	}
 	if !sawError {
-		t.Fatalf("filterErrorToLiveWhenIdle wrongly dropped historical error with no live idle prompt; got %+v", filtered)
+		t.Fatalf("filterErrorToLiveWithCurrentSignal wrongly dropped historical error with no live idle prompt; got %+v", filtered)
+	}
+}
+
+func TestFilterErrorToLiveWithCurrentSignal_GenericThinkingKeepsHistoricalError(t *testing.T) {
+	full := []PatternMatch{
+		{Pattern: "failed_text", Category: CategoryError},
+		{Pattern: "processing_text", Category: CategoryThinking},
+	}
+	live := []PatternMatch{{Pattern: "processing_text", Category: CategoryThinking}}
+
+	filtered := filterErrorToLiveWithCurrentSignal(full, live)
+	for _, match := range filtered {
+		if match.Pattern == "failed_text" && match.Category == CategoryError {
+			return
+		}
+	}
+	t.Fatalf("generic thinking text discarded an ambiguous historical error: %+v", filtered)
+}
+
+func TestFilterErrorToLiveWithCurrentSignal_AuthoritativeWorkDropsHistoricalError(t *testing.T) {
+	full := []PatternMatch{
+		{Pattern: "failed_text", Category: CategoryError},
+		{Pattern: "agy_esc_cancel", Category: CategoryThinking},
+	}
+	live := []PatternMatch{{Pattern: "agy_esc_cancel", Category: CategoryThinking}}
+
+	filtered := filterErrorToLiveWithCurrentSignal(full, live)
+	for _, match := range filtered {
+		if match.Pattern == "failed_text" && match.Category == CategoryError {
+			t.Fatalf("authoritative live-work marker did not discard stale error: %+v", filtered)
+		}
+	}
+}
+
+func TestStateClassifier_AntigravityLiveFrames(t *testing.T) {
+	idleOutput := `Antigravity
+
+  >
+
+  ? for shortcuts
+  Gemini 4 Argon (High)`
+	idleClassifier := NewStateClassifier("agy-idle", &ClassifierConfig{AgentType: "agy"})
+	idle, err := idleClassifier.ClassifyWithOutput(idleOutput)
+	if err != nil {
+		t.Fatalf("classify idle Antigravity frame: %v", err)
+	}
+	if idle.State != StateWaiting {
+		t.Fatalf("idle Antigravity state = %s, want %s; patterns=%v", idle.State, StateWaiting, idle.DetectedPatterns)
+	}
+
+	var workingOutput strings.Builder
+	workingOutput.WriteString("Error: failed to run an earlier tool\n")
+	for i := 0; i < 20; i++ {
+		workingOutput.WriteString("historical output outside the live window\n")
+	}
+	workingOutput.WriteString("⠹ Analyzing repository\n")
+	workingOutput.WriteString("esc to cancel\n")
+	workingOutput.WriteString("Gemini 4 Argon (High)\n")
+	workingClassifier := NewStateClassifier("agy-working", &ClassifierConfig{AgentType: "agy"})
+	working, err := workingClassifier.ClassifyWithOutput(workingOutput.String())
+	if err != nil {
+		t.Fatalf("classify working Antigravity frame: %v", err)
+	}
+	if working.State != StateThinking {
+		t.Fatalf("working Antigravity state = %s, want %s; patterns=%v", working.State, StateThinking, working.DetectedPatterns)
 	}
 }
 
@@ -1062,7 +921,7 @@ func TestActivity_RateLimitedFlagFollowsLiveWindow(t *testing.T) {
 
 	// Post-filter (what activity.go actually feeds the flag now): the
 	// stale rate_limit_text is dropped, so the flag must read false.
-	filtered := filterErrorToLiveWhenIdle(full, live)
+	filtered := filterErrorToLiveWithCurrentSignal(full, live)
 	if isRateLimitPatternMatch(filtered) {
 		t.Fatalf("isRateLimitPatternMatch(filtered) returned true; rate_limit_text leaked through filter on a recovered pane: %+v", filtered)
 	}
@@ -1912,149 +1771,6 @@ func TestPatternCategoryConstants(t *testing.T) {
 	}
 }
 
-func TestVelocityTrackerCircularBufferEdgeCases(t *testing.T) {
-
-	// Test with size 1 - single element buffer
-	tracker := NewVelocityTrackerWithSize("test", 1)
-
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 1.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 2.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 3.0})
-	tracker.mu.Unlock()
-
-	if len(tracker.Samples) != 1 {
-		t.Errorf("expected 1 sample, got %d", len(tracker.Samples))
-	}
-	if tracker.Samples[0].Velocity != 3.0 {
-		t.Errorf("expected last velocity 3.0, got %f", tracker.Samples[0].Velocity)
-	}
-}
-
-func TestVelocityTrackerExactMaxSamples(t *testing.T) {
-
-	tracker := NewVelocityTrackerWithSize("test", 3)
-
-	// Add exactly MaxSamples samples
-	for i := 1; i <= 3; i++ {
-		tracker.mu.Lock()
-		tracker.addSampleLocked(VelocitySample{Velocity: float64(i)})
-		tracker.mu.Unlock()
-	}
-
-	if len(tracker.Samples) != 3 {
-		t.Errorf("expected 3 samples, got %d", len(tracker.Samples))
-	}
-
-	// Verify order: 1.0, 2.0, 3.0
-	for i, s := range tracker.Samples {
-		expected := float64(i + 1)
-		if s.Velocity != expected {
-			t.Errorf("sample %d: expected velocity %f, got %f", i, expected, s.Velocity)
-		}
-	}
-}
-
-func TestVelocityTrackerRecentVelocityEdgeCases(t *testing.T) {
-
-	tracker := NewVelocityTrackerWithSize("test", 10)
-
-	// Test with exactly n=1
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 10.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 20.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 30.0})
-	tracker.mu.Unlock()
-
-	// Recent 1 should be just the last sample
-	if v := tracker.RecentVelocity(1); v != 30.0 {
-		t.Errorf("RecentVelocity(1) = %f, want 30.0", v)
-	}
-
-	// Test with negative n (should use all)
-	if v := tracker.RecentVelocity(-1); v != 20.0 {
-		t.Errorf("RecentVelocity(-1) = %f, want 20.0 (average of all)", v)
-	}
-}
-
-func TestLastOutputAgeLocked_AllSamplesNoOutput(t *testing.T) {
-
-	tracker := NewVelocityTrackerWithSize("test", 5)
-
-	// Set LastCaptureAt but add samples with no output
-	oldTime := time.Now().Add(-10 * time.Second)
-	tracker.mu.Lock()
-	tracker.LastCaptureAt = time.Now()
-	tracker.Samples = []VelocitySample{
-		{Timestamp: oldTime.Add(-5 * time.Second), CharsAdded: 0, Velocity: 0},
-		{Timestamp: oldTime, CharsAdded: 0, Velocity: 0},
-	}
-	tracker.mu.Unlock()
-
-	// Should return time since oldest sample
-	age := tracker.LastOutputAge()
-	if age < 14*time.Second || age > 16*time.Second {
-		t.Errorf("expected ~15s age (since oldest sample), got %v", age)
-	}
-}
-
-func TestLastOutputAgeLocked_MixedSamples(t *testing.T) {
-
-	tracker := NewVelocityTrackerWithSize("test", 5)
-
-	// Mix of samples with and without output
-	now := time.Now()
-	tracker.mu.Lock()
-	tracker.LastCaptureAt = now
-	tracker.Samples = []VelocitySample{
-		{Timestamp: now.Add(-10 * time.Second), CharsAdded: 50, Velocity: 5.0}, // Has output
-		{Timestamp: now.Add(-5 * time.Second), CharsAdded: 0, Velocity: 0},     // No output
-		{Timestamp: now.Add(-2 * time.Second), CharsAdded: 0, Velocity: 0},     // No output
-	}
-	tracker.lastOutputAt = now.Add(-10 * time.Second)
-	tracker.mu.Unlock()
-
-	// Should find the sample with output (10s ago)
-	age := tracker.LastOutputAge()
-	if age < 9*time.Second || age > 11*time.Second {
-		t.Errorf("expected ~10s age (sample with output), got %v", age)
-	}
-}
-
-func TestVelocityTracker_LastOutputAgeSurvivesSampleEviction(t *testing.T) {
-	tracker := NewVelocityTrackerWithSize("test", 2)
-
-	if _, err := tracker.UpdateWithOutput("baseline"); err != nil {
-		t.Fatalf("establish baseline: %v", err)
-	}
-	if _, err := tracker.UpdateWithOutput("baseline with output"); err != nil {
-		t.Fatalf("record output: %v", err)
-	}
-
-	tracker.mu.Lock()
-	lastOutputAt := time.Now().Add(-DefaultStallThreshold - time.Second)
-	tracker.lastOutputAt = lastOutputAt
-	tracker.mu.Unlock()
-
-	for i := 0; i < tracker.MaxSamples; i++ {
-		if _, err := tracker.UpdateWithOutput("baseline with output"); err != nil {
-			t.Fatalf("silent update %d: %v", i, err)
-		}
-	}
-
-	for _, sample := range tracker.GetSamples() {
-		if sample.CharsAdded != 0 {
-			t.Fatalf("expected retained samples to be silent, got %+v", sample)
-		}
-	}
-	if age := tracker.LastOutputAge(); age <= DefaultStallThreshold {
-		t.Fatalf("LastOutputAge() = %v, want greater than %v after output sample eviction", age, DefaultStallThreshold)
-	}
-	if got := tracker.LastOutputTime(); !got.Equal(lastOutputAt) {
-		t.Fatalf("LastOutputTime() = %v, want %v", got, lastOutputAt)
-	}
-}
-
 func TestClassifyState_StalledAfterGenerating(t *testing.T) {
 
 	sc := NewStateClassifier("test", &ClassifierConfig{
@@ -2446,32 +2162,6 @@ func TestActivityMonitorNilConfig(t *testing.T) {
 	}
 }
 
-func TestVelocityManagerConcurrentAccess(t *testing.T) {
-
-	vm := NewVelocityManager()
-
-	// Simulate concurrent access
-	done := make(chan bool)
-	for i := 0; i < 10; i++ {
-		go func(idx int) {
-			paneID := "pane_" + string(rune('0'+idx))
-			tracker := vm.GetOrCreate(paneID)
-			_ = tracker.CurrentVelocity()
-			_ = vm.GetAllVelocities()
-			done <- true
-		}(i)
-	}
-
-	// Wait for all goroutines
-	for i := 0; i < 10; i++ {
-		<-done
-	}
-
-	if vm.TrackerCount() != 10 {
-		t.Errorf("expected 10 trackers, got %d", vm.TrackerCount())
-	}
-}
-
 func TestActivityMonitorConcurrentAccess(t *testing.T) {
 
 	am := NewActivityMonitor(nil)
@@ -2512,39 +2202,6 @@ func TestStateClassifierConcurrentAccess(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		<-done
-	}
-}
-
-func TestVelocityTrackerResetClearsAll(t *testing.T) {
-
-	tracker := NewVelocityTrackerWithSize("test", 5)
-
-	// Add state
-	tracker.mu.Lock()
-	tracker.Samples = []VelocitySample{
-		{Velocity: 1.0}, {Velocity: 2.0}, {Velocity: 3.0},
-	}
-	tracker.LastCapture = "some content"
-	tracker.LastCaptureAt = time.Now()
-	tracker.mu.Unlock()
-
-	// Verify state exists
-	if tracker.SampleCount() != 3 {
-		t.Fatalf("expected 3 samples before reset, got %d", tracker.SampleCount())
-	}
-
-	// Reset
-	tracker.Reset()
-
-	// Verify all cleared
-	if tracker.SampleCount() != 0 {
-		t.Errorf("expected 0 samples after reset, got %d", tracker.SampleCount())
-	}
-	if tracker.LastCapture != "" {
-		t.Error("LastCapture should be empty after reset")
-	}
-	if !tracker.LastCaptureAt.IsZero() {
-		t.Error("LastCaptureAt should be zero after reset")
 	}
 }
 
@@ -2821,24 +2478,6 @@ func TestVelocityTracker_RestartSafeBaseline_WithGrowth(t *testing.T) {
 	}
 }
 
-func TestVelocityManager_WithStore(t *testing.T) {
-
-	store := newMockWatermarkStore()
-	manager := NewVelocityManager(WithManagerStore(store))
-
-	// Create tracker via manager
-	tracker := manager.GetOrCreate("managed-pane")
-
-	// Should have store wired up
-	_, _ = tracker.UpdateWithOutput("Content for managed tracker")
-
-	// Verify watermark was persisted
-	wm, _ := store.GetWatermark(WatermarkTypeVelocity, "managed-pane")
-	if wm == nil {
-		t.Error("watermark should have been persisted via manager-created tracker")
-	}
-}
-
 func TestStateClassifier_WithWatermarkStore(t *testing.T) {
 
 	store := newMockWatermarkStore()
@@ -2991,5 +2630,255 @@ func TestVelocityTracker_FirstSampleBaseline_ZeroCharsAdded(t *testing.T) {
 	// Velocity should also be 0
 	if sample.Velocity != 0 {
 		t.Errorf("first sample (no prior baseline): expected Velocity=0, got %f", sample.Velocity)
+	}
+}
+
+// =============================================================================
+// Durable output-change sequence tests (#246)
+// =============================================================================
+
+func TestAdvanceOutputSequenceContract(t *testing.T) {
+	store := newMockWatermarkStore()
+	scope := outputSeqScope("proj", "%3")
+	now := time.Now().UTC()
+
+	// First observation establishes a baseline: sequence 0, fresh epoch,
+	// no change timestamp.
+	first, err := advanceOutputSequence(store, scope, computeContentHash("hello"), now)
+	if err != nil {
+		t.Fatalf("first observation error = %v", err)
+	}
+	if first == nil || first.Epoch == "" {
+		t.Fatalf("first observation = %+v, want fresh epoch", first)
+	}
+	if first.Sequence != 0 || first.ChangedAt != "" {
+		t.Errorf("first observation = %+v, want sequence 0 with no changed_at", first)
+	}
+
+	// Repeated observation of unchanged content stays stable.
+	same, err := advanceOutputSequence(store, scope, computeContentHash("hello"), now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("stable observation error = %v", err)
+	}
+	if same.Sequence != 0 || same.Epoch != first.Epoch {
+		t.Errorf("stable observation = %+v, want unchanged sequence and epoch", same)
+	}
+
+	// A real content change advances the sequence within the same epoch.
+	changed, err := advanceOutputSequence(store, scope, computeContentHash("hello world"), now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("changed observation error = %v", err)
+	}
+	if changed.Sequence != 1 || changed.Epoch != first.Epoch {
+		t.Errorf("changed observation = %+v, want sequence 1 in epoch %s", changed, first.Epoch)
+	}
+	if changed.ChangedAt == "" {
+		t.Error("changed observation missing changed_at")
+	}
+
+	// Stability again after the change.
+	stable, err := advanceOutputSequence(store, scope, computeContentHash("hello world"), now.Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("post-change stable observation error = %v", err)
+	}
+	if stable.Sequence != 1 {
+		t.Errorf("post-change stable sequence = %d, want 1", stable.Sequence)
+	}
+
+	// A second change keeps advancing monotonically.
+	again, err := advanceOutputSequence(store, scope, computeContentHash("more"), now.Add(4*time.Second))
+	if err != nil {
+		t.Fatalf("second change error = %v", err)
+	}
+	if again.Sequence != 2 {
+		t.Errorf("second change sequence = %d, want 2", again.Sequence)
+	}
+}
+
+func TestAdvanceOutputSequenceSurvivesRestartAndRotatesEpochOnReset(t *testing.T) {
+	store := newMockWatermarkStore()
+	scope := outputSeqScope("proj", "%7")
+	now := time.Now().UTC()
+
+	first, err := advanceOutputSequence(store, scope, computeContentHash("a"), now)
+	if err != nil {
+		t.Fatalf("baseline error = %v", err)
+	}
+	if _, err := advanceOutputSequence(store, scope, computeContentHash("b"), now.Add(time.Second)); err != nil {
+		t.Fatalf("change error = %v", err)
+	}
+
+	// "Producer restart": a fresh observer over the same durable store must
+	// continue the same epoch and sequence rather than resetting.
+	restarted, err := advanceOutputSequence(store, scope, computeContentHash("b"), now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("restart observation error = %v", err)
+	}
+	if restarted.Epoch != first.Epoch || restarted.Sequence != 1 {
+		t.Errorf("restart observation = %+v, want epoch %s sequence 1", restarted, first.Epoch)
+	}
+
+	// State store reset (row lost): a NEW epoch is minted so consumers can
+	// detect the discontinuity instead of comparing incomparable sequences.
+	fresh := newMockWatermarkStore()
+	reset, err := advanceOutputSequence(fresh, scope, computeContentHash("b"), now.Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("reset observation error = %v", err)
+	}
+	if reset.Epoch == first.Epoch {
+		t.Error("epoch survived a state reset; want a fresh epoch")
+	}
+	if reset.Sequence != 0 {
+		t.Errorf("reset sequence = %d, want 0", reset.Sequence)
+	}
+}
+
+func TestAdvanceOutputSequenceNilStoreDegrades(t *testing.T) {
+	info, err := advanceOutputSequence(nil, "s|%1", computeContentHash("x"), time.Now())
+	if err != nil || info != nil {
+		t.Fatalf("nil store = (%+v, %v), want (nil, nil)", info, err)
+	}
+}
+
+func TestOutputSequenceScopesAreIndependent(t *testing.T) {
+	store := newMockWatermarkStore()
+	now := time.Now().UTC()
+
+	a1, _ := advanceOutputSequence(store, outputSeqScope("s", "%1"), computeContentHash("a"), now)
+	b1, _ := advanceOutputSequence(store, outputSeqScope("s", "%2"), computeContentHash("a"), now)
+	if a1.Epoch == b1.Epoch {
+		t.Error("distinct scopes share an epoch; want independent epochs")
+	}
+
+	// Advancing one scope must not move the other.
+	a2, _ := advanceOutputSequence(store, outputSeqScope("s", "%1"), computeContentHash("b"), now.Add(time.Second))
+	b2, _ := advanceOutputSequence(store, outputSeqScope("s", "%2"), computeContentHash("a"), now.Add(time.Second))
+	if a2.Sequence != 1 {
+		t.Errorf("scope A sequence = %d, want 1", a2.Sequence)
+	}
+	if b2.Sequence != 0 {
+		t.Errorf("scope B sequence = %d, want 0", b2.Sequence)
+	}
+}
+
+// TestObserveActivityStateSurvivesOneShotProcesses pins ntm#301: a StateClassifier
+// is per-process, so a one-shot `ntm activity` reported every state as brand
+// new. The durable watermark must hold state_since steady while the state is
+// unchanged, and move it only when the state actually changes.
+func TestObserveActivityStateSurvivesOneShotProcesses(t *testing.T) {
+	store := newMockWatermarkStore()
+	started := time.Date(2026, 9, 3, 11, 30, 0, 0, time.UTC)
+	scope := "agent-factory|%9|4242"
+
+	first, err := ObserveActivityState(store, scope, StateWaiting, started)
+	if err != nil {
+		t.Fatalf("first observation: %v", err)
+	}
+	second, err := ObserveActivityState(store, scope, StateWaiting, started.Add(37*time.Second))
+	if err != nil {
+		t.Fatalf("second observation: %v", err)
+	}
+	if !first.Equal(started) || !second.Equal(started) {
+		t.Fatalf("stable WAITING state_since = %v then %v, want %v both times", first, second, started)
+	}
+
+	changedAt := started.Add(38 * time.Second)
+	changed, err := ObserveActivityState(store, scope, StateThinking, changedAt)
+	if err != nil {
+		t.Fatalf("changed observation: %v", err)
+	}
+	if !changed.Equal(changedAt) {
+		t.Fatalf("THINKING state_since = %v, want the transition time %v", changed, changedAt)
+	}
+	stableAgain, err := ObserveActivityState(store, scope, StateThinking, changedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("stable THINKING observation: %v", err)
+	}
+	if !stableAgain.Equal(changedAt) {
+		t.Fatalf("stable THINKING state_since = %v, want %v", stableAgain, changedAt)
+	}
+
+	// A different pane lifetime must not inherit that age.
+	other, err := ObserveActivityState(store, "agent-factory|%9|5252", StateThinking, changedAt.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("other-scope observation: %v", err)
+	}
+	if other.Equal(changedAt) {
+		t.Fatal("a new pane PID inherited the previous pane's state age")
+	}
+}
+
+// TestObserveActivityStateWithoutStore keeps the degradation path honest: with
+// no runtime store the caller still gets a usable timestamp, never a zero time.
+func TestObserveActivityStateWithoutStore(t *testing.T) {
+	at := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	got, err := ObserveActivityState(nil, "s|%1|1", StateWaiting, at)
+	if err != nil {
+		t.Fatalf("nil store: %v", err)
+	}
+	if !got.Equal(at) {
+		t.Fatalf("nil store state_since = %v, want %v", got, at)
+	}
+	if got, err := ObserveActivityState(nil, "s|%1|1", StateWaiting, time.Time{}); err != nil || got.IsZero() {
+		t.Fatalf("zero observedAt must be filled in: %v, %v", got, err)
+	}
+}
+
+// TestObserveActivityStateIgnoresFutureWatermark guards against a corrupt or
+// clock-skewed watermark producing a negative age.
+func TestObserveActivityStateIgnoresFutureWatermark(t *testing.T) {
+	store := newMockWatermarkStore()
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	if err := store.SetWatermark(&state.OutputWatermark{
+		WatermarkType: WatermarkTypeActivityState,
+		Scope:         "s|%1|1",
+		LastTs:        &future,
+		Consumer:      string(StateWaiting),
+	}); err != nil {
+		t.Fatalf("seed watermark: %v", err)
+	}
+	got, err := ObserveActivityState(store, "s|%1|1", StateWaiting, now)
+	if err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	if !got.Equal(now) {
+		t.Fatalf("future watermark state_since = %v, want the observation time %v", got, now)
+	}
+}
+
+// TestStateClassifierLimitsTransientMarkersToVisiblePane pins the other half of
+// ntm#301: a capture includes scrollback, so on a short pane a codex "Working"
+// spinner that has scrolled off must not keep the pane in THINKING.
+func TestStateClassifierLimitsTransientMarkersToVisiblePane(t *testing.T) {
+	const offscreenSpinner = "• Working (12s • Esc to interrupt)\n" +
+		"historical output\n" +
+		"more historical output\n" +
+		"\n" +
+		"▌ Ask Codex to do something\n" +
+		"›\n" +
+		"  ⏎ send   ⌃J newline   ⌃T transcript   ⌃C quit\n"
+
+	idle := NewStateClassifier("%9", &ClassifierConfig{AgentType: "codex", PaneWidth: 80, PaneHeight: 4})
+	activity, err := idle.ClassifyWithOutput(offscreenSpinner)
+	if err != nil {
+		t.Fatalf("idle classification: %v", err)
+	}
+	if activity.State != StateWaiting {
+		t.Fatalf("off-screen spinner classified %s, want %s", activity.State, StateWaiting)
+	}
+
+	const onscreenSpinner = "historical output\n" +
+		"• Working (12s • Esc to interrupt)\n" +
+		"▌ Ask Codex to do something\n" +
+		"›\n" +
+		"  ⏎ send   ⌃J newline   ⌃T transcript   ⌃C quit\n"
+	working := NewStateClassifier("%10", &ClassifierConfig{AgentType: "codex", PaneWidth: 80, PaneHeight: 4})
+	activity, err = working.ClassifyWithOutput(onscreenSpinner)
+	if err != nil {
+		t.Fatalf("working classification: %v", err)
+	}
+	if activity.State != StateThinking {
+		t.Fatalf("on-screen spinner classified %s, want %s", activity.State, StateThinking)
 	}
 }

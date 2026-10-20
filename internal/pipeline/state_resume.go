@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -106,6 +108,11 @@ type ParallelGroupState struct {
 	UpdatedAt          time.Time `json:"updated_at,omitempty"`
 	CompletedAt        time.Time `json:"completed_at,omitempty"`
 	AllSubstepsSettled bool      `json:"all_substeps_settled,omitempty"`
+
+	// Immutable versioned JSON binds each settled child's definition, result
+	// and owned collection aliases. Persisted atomically with Steps; scoped
+	// reset removes this map together with the enclosing parallel group.
+	ChildCheckpoints map[string]string `json:"child_checkpoints,omitempty"`
 }
 
 // ScopeFrame is the serializable view of active loop/branch variable scopes.
@@ -123,6 +130,280 @@ type InFlightStepState struct {
 	StartedAt time.Time `json:"started_at,omitempty"`
 	Iteration int       `json:"iteration,omitempty"`
 	Output    string    `json:"output,omitempty"`
+}
+
+const (
+	commandExecutionVersion  = 1
+	commandExecutionStarting = "starting"
+	commandExecutionRunning  = "running"
+	commandExecutionSettled  = "settled"
+)
+
+// CommandExecutionState keeps a launch intent until the entire command group
+// has settled and its result is durable. InFlightSteps is scheduler bookkeeping:
+// another worker may checkpoint after it is cleared but before the StepResult
+// is published. It cannot prove that replaying an external command is safe.
+// ProcessID is diagnostic evidence only; a resumed process must never signal a
+// numeric PID from an earlier lifetime. A crash can leave that group running.
+type CommandExecutionState struct {
+	Version    int        `json:"version"`
+	StepID     string     `json:"step_id"`
+	StepHash   string     `json:"step_hash"`
+	Status     string     `json:"status"`
+	ProcessID  int        `json:"process_id,omitempty"`
+	Background bool       `json:"background,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	SettledAt  time.Time  `json:"settled_at,omitempty"`
+	Result     StepResult `json:"result,omitempty"`
+}
+
+func commandDefinitionHash(step *Step) (string, error) {
+	encoded, err := json.Marshal(step)
+	if err != nil {
+		return "", fmt.Errorf("hash command step: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func cloneCommandExecution(record CommandExecutionState) CommandExecutionState {
+	record.Result.ParsedData = cloneInterfaceValue(record.Result.ParsedData)
+	if record.Result.Error != nil {
+		copy := cloneStepErrorValue(*record.Result.Error)
+		record.Result.Error = &copy
+	}
+	return record
+}
+
+func (e *Executor) loadCommandExecution(stepID string) (CommandExecutionState, bool) {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.state == nil {
+		return CommandExecutionState{}, false
+	}
+	record, ok := e.state.CommandExecutions[stepID]
+	return cloneCommandExecution(record), ok
+}
+
+func (e *Executor) saveCommandExecution(record CommandExecutionState) error {
+	if err := validateCommandExecution(record.StepID, record); err != nil {
+		return err
+	}
+	e.stateMu.Lock()
+	if e.state == nil {
+		e.stateMu.Unlock()
+		return fmt.Errorf("cannot save command execution without execution state")
+	}
+	if e.state.CommandExecutions == nil {
+		e.state.CommandExecutions = make(map[string]CommandExecutionState)
+	}
+	e.state.CommandExecutions[record.StepID] = cloneCommandExecution(record)
+	e.stateMu.Unlock()
+	return e.persistState()
+}
+
+func validateCommandExecution(key string, record CommandExecutionState) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("invalid command execution for step %q: %s", key, reason)
+	}
+	if strings.TrimSpace(key) == "" || record.StepID != key || record.Version != commandExecutionVersion {
+		return invalid("unsupported version or mismatched step identity")
+	}
+	hash, err := hex.DecodeString(record.StepHash)
+	if err != nil || len(hash) != sha256.Size || record.StartedAt.IsZero() || record.ProcessID < 0 {
+		return invalid("missing definition hash, invalid process ID or start time")
+	}
+	switch record.Status {
+	case commandExecutionStarting, commandExecutionRunning:
+		if !record.SettledAt.IsZero() || record.Result.Status != "" {
+			return invalid("unfinished launch contains a settled outcome")
+		}
+		if record.Status == commandExecutionRunning && record.ProcessID == 0 {
+			return invalid("running command is missing its process ID")
+		}
+	case commandExecutionSettled:
+		if record.SettledAt.IsZero() || record.SettledAt.Before(record.StartedAt) || record.Result.StepID != key || record.Result.FinishedAt.IsZero() {
+			return invalid("missing or inconsistent settlement evidence")
+		}
+		switch record.Result.Status {
+		case StatusCompleted, StatusFailed, StatusCancelled:
+		default:
+			return invalid("invalid settled result status")
+		}
+	default:
+		return invalid(fmt.Sprintf("unknown status %q; refusing to discard launch evidence", record.Status))
+	}
+	return nil
+}
+
+func uncertainCommandExecutionError(stepID string, processID int) error {
+	return fmt.Errorf("command step %q has an unresolved launch (recorded process ID %d); its process group may still be running or may already have performed side effects. Ordinary resume will not execute it again. Inspect the command and its effects, stop any surviving work, then deliberately use --mode=restart-failed (or --keep-state=false for a whole-workflow replay) if repeating it is intended", stepID, processID)
+}
+
+const (
+	agentDeliveryVersion         = 1
+	agentDeliveryNotSent         = "not_sent"
+	agentDeliverySending         = "sending"
+	agentDeliveryDelivered       = "delivered"
+	agentDeliveryCompleted       = "completed"
+	agentDeliveryMaxCaptureBytes = 1 << 20
+	agentDeliveryMaxOutputBytes  = 1 << 20
+)
+
+// AgentDeliveryState journals a single runtime leaf's external dispatch. The
+// enclosing ExecutionState binds it to a run and workflow; StepID includes any
+// iteration or parallel namespace. Only not_sent proves no prompt actuation.
+// A sending record is deliberately ambiguous: recovery must not assume that
+// absence of a delivered timestamp means no send.
+type AgentDeliveryState struct {
+	Version        int       `json:"version"`
+	StepID         string    `json:"step_id"`
+	Kind           string    `json:"kind"`
+	Session        string    `json:"session"`
+	Endpoint       string    `json:"endpoint"`
+	PaneID         string    `json:"pane_id"`
+	PanePID        int       `json:"pane_pid"`
+	AgentType      string    `json:"agent_type"`
+	StepHash       string    `json:"step_hash"`
+	PromptHash     string    `json:"prompt_hash"`
+	PromptEchoHash string    `json:"prompt_echo_hash"`
+	Status         string    `json:"status"`
+	BeforeOutput   string    `json:"before_output,omitempty"`
+	Output         string    `json:"output,omitempty"`
+	StartedAt      time.Time `json:"started_at"`
+	DeliveredAt    time.Time `json:"delivered_at,omitempty"`
+	CompletedAt    time.Time `json:"completed_at,omitempty"`
+}
+
+func agentStepHash(step *Step) (string, error) {
+	if step == nil {
+		return "", fmt.Errorf("cannot hash a nil agent step")
+	}
+	encoded, err := json.Marshal(step)
+	if err != nil {
+		return "", fmt.Errorf("hash agent step %q: %w", step.ID, err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (e *Executor) loadAgentDelivery(stepID string) (AgentDeliveryState, bool) {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.state == nil {
+		return AgentDeliveryState{}, false
+	}
+	// Records contain only value fields, so callers cannot mutate the journal.
+	record, ok := e.state.AgentDeliveries[stepID]
+	return record, ok
+}
+
+func (e *Executor) saveAgentDelivery(record AgentDeliveryState) error {
+	e.stateMu.Lock()
+	if e.state == nil {
+		e.stateMu.Unlock()
+		return fmt.Errorf("cannot save agent delivery without execution state")
+	}
+	if err := validateAgentDelivery(record.StepID, record, e.state.Session); err != nil {
+		e.stateMu.Unlock()
+		return err
+	}
+	if e.state.AgentDeliveries == nil {
+		e.state.AgentDeliveries = make(map[string]AgentDeliveryState)
+	}
+	e.state.AgentDeliveries[record.StepID] = record
+	e.stateMu.Unlock()
+	return e.persistState()
+}
+
+// markAgentDeliveryNotSent is only for the live owner's final preflight
+// refusal, before PasteKeys. Crash recovery and post-paste errors cannot prove
+// non-delivery and must retain their sending receipt. Persist this proof before
+// permitting retry; a storage failure trips the existing checkpoint fence even
+// if the in-memory phase has already changed.
+func (e *Executor) markAgentDeliveryNotSent(record AgentDeliveryState) error {
+	e.stateMu.Lock()
+	if e.state == nil {
+		e.stateMu.Unlock()
+		return fmt.Errorf("cannot record an unsent agent delivery without execution state")
+	}
+	current, ok := e.state.AgentDeliveries[record.StepID]
+	if !ok || current != record || record.Status != agentDeliverySending {
+		e.stateMu.Unlock()
+		return fmt.Errorf("unsent agent delivery for step %q no longer matches its live owner", record.StepID)
+	}
+	record.Status, record.BeforeOutput = agentDeliveryNotSent, ""
+	e.state.AgentDeliveries[record.StepID] = record
+	e.stateMu.Unlock()
+	return e.persistState()
+}
+
+func validateAgentDelivery(key string, record AgentDeliveryState, session string) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("invalid agent delivery for step %q: %s", key, reason)
+	}
+	if strings.TrimSpace(key) == "" || record.StepID != key {
+		return invalid("journal key does not match its step identity")
+	}
+	if record.Version != agentDeliveryVersion {
+		return invalid(fmt.Sprintf("unsupported version %d", record.Version))
+	}
+	if record.Kind != StepKindPrompt && record.Kind != StepKindTemplate {
+		return invalid(fmt.Sprintf("unsupported step kind %q", record.Kind))
+	}
+	if strings.TrimSpace(record.Session) == "" || record.Session != session {
+		return invalid("session identity does not match execution state")
+	}
+	if record.Endpoint != "local" && (!strings.HasPrefix(record.Endpoint, "ssh:") || strings.TrimSpace(strings.TrimPrefix(record.Endpoint, "ssh:")) == "") {
+		return invalid("tmux endpoint must be local or ssh: followed by a remote target")
+	}
+	if len(record.PaneID) < 2 || record.PaneID[0] != '%' || record.PanePID <= 0 {
+		return invalid("physical pane ID and positive pane PID are required")
+	}
+	for _, digit := range record.PaneID[1:] {
+		if digit < '0' || digit > '9' {
+			return invalid("physical pane ID must contain only % followed by digits")
+		}
+	}
+	if strings.TrimSpace(record.AgentType) == "" {
+		return invalid("agent type is missing")
+	}
+	for _, hash := range []string{record.StepHash, record.PromptHash, record.PromptEchoHash} {
+		decoded, err := hex.DecodeString(hash)
+		if err != nil || len(decoded) != sha256.Size {
+			return invalid("step and prompt hashes must be SHA-256 hex digests")
+		}
+	}
+	if len(record.BeforeOutput) > agentDeliveryMaxCaptureBytes || len(record.Output) > agentDeliveryMaxOutputBytes {
+		return invalid("captured output exceeds the agent delivery size limit")
+	}
+	if record.StartedAt.IsZero() {
+		return invalid("start timestamp is missing")
+	}
+	switch record.Status {
+	case agentDeliveryNotSent:
+		if record.BeforeOutput != "" || record.Output != "" || !record.DeliveredAt.IsZero() || !record.CompletedAt.IsZero() {
+			return invalid("not-sent record contains capture, delivery, or completion evidence")
+		}
+	case agentDeliverySending:
+		if !record.DeliveredAt.IsZero() || !record.CompletedAt.IsZero() {
+			return invalid("sending record contains delivery or completion timestamps")
+		}
+	case agentDeliveryDelivered, agentDeliveryCompleted:
+		if record.DeliveredAt.IsZero() || record.DeliveredAt.Before(record.StartedAt) {
+			return invalid("delivery timestamp is missing or precedes dispatch")
+		}
+		if record.Status == agentDeliveryCompleted {
+			if record.CompletedAt.IsZero() || record.CompletedAt.Before(record.DeliveredAt) {
+				return invalid("completion timestamp is missing or precedes delivery")
+			}
+		} else if !record.CompletedAt.IsZero() {
+			return invalid("delivered record contains a completion timestamp")
+		}
+	default:
+		return invalid(fmt.Sprintf("unknown delivery status %q; refusing to discard dispatch evidence", record.Status))
+	}
+	return nil
 }
 
 func defaultResumeOptions() ResumeOptions {
@@ -192,9 +473,68 @@ func (e *Executor) applyResumeOptions(workflow *Workflow, opts ResumeOptions) er
 		e.stateMu.RUnlock()
 		return fmt.Errorf("resume state is nil")
 	}
+	graph := e.graph
+	if graph == nil && workflow != nil {
+		graph = NewDependencyGraph(workflow)
+	}
+	if graph != nil {
+		if phaseErrors := graph.validatePhaseOwnership(state); len(phaseErrors) > 0 {
+			e.stateMu.RUnlock()
+			return phaseErrors[0]
+		}
+	}
 	checkpoint := resumeCheckpointTime(state)
 	priorSession := state.Session
 	targetSession := e.config.Session
+	// Check every record before interpreting an explicit restart. In particular,
+	// a future or corrupt status must not be erased and mistaken for permission
+	// to send the same prompt again.
+	for stepID, record := range state.AgentDeliveries {
+		if err := validateAgentDelivery(stepID, record, priorSession); err != nil {
+			e.stateMu.RUnlock()
+			return err
+		}
+		if targetSession != "" && priorSession != targetSession && !resumeResetsAgentDelivery(state, opts, stepID) {
+			e.stateMu.RUnlock()
+			return fmt.Errorf("agent delivery for step %q belongs to session %q; explicit reset is required before moving to session %q", stepID, priorSession, targetSession)
+		}
+	}
+	for stepID, record := range state.CommandExecutions {
+		if err := validateCommandExecution(stepID, record); err != nil {
+			e.stateMu.RUnlock()
+			return err
+		}
+		if record.Status != commandExecutionSettled && !resumeResetsCommandExecution(state, opts, stepID) {
+			e.stateMu.RUnlock()
+			return uncertainCommandExecutionError(stepID, record.ProcessID)
+		}
+		if _, cleanup := resolveOnCancelRuntimeStep(workflow, stepID); cleanup && record.Status == commandExecutionSettled {
+			// Proven-settled cleanup belongs to the previous cancellation
+			// attempt. A resumed attempt can acquire resources again.
+			continue
+		}
+		if opts.KeepState && opts.Mode != ResumeModeForceIter &&
+			(record.Result.RerunOnResume || resumeResetsCommandExecution(state, opts, stepID)) {
+			if err := e.validateCommandReplayScopeLocked(workflow, state, stepID); err != nil {
+				e.stateMu.RUnlock()
+				return err
+			}
+		}
+	}
+	if opts.KeepState && opts.Mode == ResumeModeForceIter {
+		if err := validateForceResumeIteration(workflow, state, opts); err != nil {
+			e.stateMu.RUnlock()
+			return err
+		}
+	}
+	if err := e.validateLegacyAgentResumeLocked(state, opts, workflow); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
+	if err := e.validateLegacyCommandResumeLocked(state, opts, workflow); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
 	e.stateMu.RUnlock()
 
 	if opts.MaxResumeAge > 0 && !checkpoint.IsZero() && time.Since(checkpoint) > opts.MaxResumeAge {
@@ -219,8 +559,518 @@ func (e *Executor) applyResumeOptions(workflow *Workflow, opts ResumeOptions) er
 
 	if opts.Mode == ResumeModeForceIter {
 		e.forceResumeIteration(opts.StepID, opts.Iteration)
+	} else if opts.Mode == ResumeModeRestartFailed {
+		e.stateMu.Lock()
+		for stepID := range e.state.AgentDeliveries {
+			if resumeResetsAgentDelivery(e.state, opts, stepID) {
+				delete(e.state.AgentDeliveries, stepID)
+			}
+		}
+		for stepID := range e.state.CommandExecutions {
+			if resumeResetsCommandExecution(e.state, opts, stepID) {
+				// WaitNone records a synchronous Completed result while its
+				// process still runs. An explicit replay must reopen that leaf.
+				result := e.state.Steps[stepID]
+				result.StepID, result.Status = stepID, StatusPending
+				if e.state.Steps == nil {
+					e.state.Steps = make(map[string]StepResult)
+				}
+				e.state.Steps[stepID] = result
+				delete(e.state.CommandExecutions, stepID)
+			}
+		}
+		e.stateMu.Unlock()
+	}
+	e.resetSettledOnCancelState(workflow)
+
+	return nil
+}
+
+// Resolve cleanup ownership structurally, including dynamic iterations and
+// success hooks. A prefix match could otherwise erase an unrelated main step
+// whose authored name happens to start with a cleanup step's ID.
+func resolveOnCancelRuntimeStep(workflow *Workflow, stepID string) (*Step, bool) {
+	if workflow == nil {
+		return nil, false
+	}
+	for i := range workflow.Steps {
+		main := &workflow.Steps[i]
+		if main.ID == stepID {
+			return nil, false
+		}
+		if _, _, mainOwned := resolveScopedRuntimeChildren(main.ID, stepID, main); mainOwned {
+			// Authored IDs can collide with another phase's materialized
+			// namespace. Preserve main-work evidence when ownership is ambiguous.
+			return nil, false
+		}
+	}
+	for i := range workflow.Settings.OnCancel {
+		step := &workflow.Settings.OnCancel[i]
+		rootID := step.ID
+		if rootID == "" {
+			rootID = fmt.Sprintf("on_cancel_%d", i+1)
+		}
+		if stepID == rootID {
+			return step, true
+		}
+		if child, _, ok := resolveScopedRuntimeChildren(rootID, stepID, step); ok {
+			return child, true
+		}
+	}
+	return nil, false
+}
+
+// Called only after resume preflight accepts all launch evidence. Successful
+// on_cancel commands must run again after a later cancellation, including
+// bodies behind completed parallel groups or foreach iteration watermarks.
+// Unsettled command receipts are never discarded here.
+func (e *Executor) resetSettledOnCancelState(workflow *Workflow) {
+	if workflow == nil || len(workflow.Settings.OnCancel) == 0 {
+		return
+	}
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.varMu.Lock()
+	defer e.varMu.Unlock()
+	owned := make(map[string]*Step)
+	collect := func(id string) {
+		if step, ok := resolveOnCancelRuntimeStep(workflow, id); ok {
+			owned[id] = step
+		}
+	}
+	for id := range e.state.Steps {
+		collect(id)
+	}
+	for id := range e.state.CommandExecutions {
+		collect(id)
+	}
+	for id := range e.state.ForeachState {
+		collect(id)
+	}
+	for id := range e.state.ParallelState {
+		collect(id)
+	}
+	for id, step := range owned {
+		if record, ok := e.state.CommandExecutions[id]; ok && record.Status == commandExecutionSettled {
+			delete(e.state.CommandExecutions, id)
+		}
+		delete(e.state.Steps, id)
+		delete(e.state.ForeachState, id)
+		delete(e.state.ParallelState, id)
+		delete(e.state.InFlightSteps, id)
+		delete(e.state.Variables, "steps."+id+".output")
+		delete(e.state.Variables, "steps."+id+".data")
+		if step.OutputVar != "" {
+			delete(e.state.Variables, step.OutputVar)
+			delete(e.state.Variables, step.OutputVar+"_parsed")
+		}
+	}
+}
+
+// A crash midway through finalization adopts the completed tail. If resume
+// reopens actual main work, its old handoff/cleanup belongs to the previous
+// attempt and must run again after the new work. Inspect top-level roots,
+// because a completed container may retain unmarked child graph placeholders.
+// Admission has already validated launch evidence; unfinished receipts are
+// deliberately retained even when the surrounding tail bookkeeping is reset.
+func (e *Executor) resetPostPipelineForMainAttempt(workflow *Workflow) {
+	if workflow == nil || len(workflow.PostPipelineSteps) == 0 || e.graph == nil {
+		return
+	}
+	reopensMain := false
+	for _, step := range workflow.Steps {
+		if !e.graph.IsExecuted(step.ID) {
+			reopensMain = true
+			break
+		}
+	}
+	if !reopensMain {
+		return
+	}
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.varMu.Lock()
+	defer e.varMu.Unlock()
+	owned := make(map[string]*Step)
+	collect := func(id string) {
+		if step, ok := e.graph.resolvePostPipelineRuntimeStep(id); ok {
+			owned[id] = step
+		}
+	}
+	for id := range e.state.Steps {
+		collect(id)
+	}
+	for id := range e.state.CommandExecutions {
+		collect(id)
+	}
+	for id := range e.state.AgentDeliveries {
+		collect(id)
+	}
+	for id := range e.state.ForeachState {
+		collect(id)
+	}
+	for id := range e.state.ParallelState {
+		collect(id)
+	}
+	for id := range e.state.InFlightSteps {
+		collect(id)
+	}
+	for id, step := range owned {
+		if record, ok := e.state.CommandExecutions[id]; ok && record.Status == commandExecutionSettled {
+			delete(e.state.CommandExecutions, id)
+		}
+		if record, ok := e.state.AgentDeliveries[id]; ok && record.Status == agentDeliveryCompleted {
+			delete(e.state.AgentDeliveries, id)
+		}
+		delete(e.state.Steps, id)
+		delete(e.state.ForeachState, id)
+		delete(e.state.ParallelState, id)
+		delete(e.state.InFlightSteps, id)
+		delete(e.state.Variables, "steps."+id+".output")
+		delete(e.state.Variables, "steps."+id+".data")
+		if step.OutputVar != "" {
+			delete(e.state.Variables, step.OutputVar)
+			delete(e.state.Variables, step.OutputVar+"_parsed")
+		}
+	}
+}
+
+// validateForceResumeIteration checks the replay scope before any checkpoint
+// or session mutation. A forced suffix authorizes iteration replay, not reuse
+// of downstream results produced from the old loop output, nor automatic
+// redispatch of those consumers. Such recovery needs an explicit whole-run
+// reset. The caller holds stateMu for the supplied state.
+func validateForceResumeIteration(workflow *Workflow, state *ExecutionState, opts ResumeOptions) error {
+	if workflow == nil {
+		return fmt.Errorf("force-iter requires a workflow")
+	}
+	var target *Step
+	for i := range workflow.Steps {
+		if workflow.Steps[i].ID == opts.StepID {
+			target = &workflow.Steps[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("force-iter requires a top-level iteration step; %q is not one", opts.StepID)
+	}
+	if target.Foreach == nil && target.ForeachPane == nil && (target.Loop == nil || target.Loop.Items == "") {
+		return fmt.Errorf("force-iter step %q must use foreach, foreach_pane, or loop.items; while/times loops have no durable iteration cursor", opts.StepID)
+	}
+	if prior, ok := state.ForeachState[opts.StepID]; ok {
+		if prior.StepID != "" && prior.StepID != opts.StepID {
+			return fmt.Errorf("force-iter checkpoint for %q names a different step %q", opts.StepID, prior.StepID)
+		}
+		if prior.Total <= 0 || opts.Iteration >= prior.Total {
+			return fmt.Errorf("force-iter iteration %d is outside the %d recorded iterations for %q", opts.Iteration, prior.Total, opts.StepID)
+		}
+	} else if opts.Iteration != 0 {
+		return fmt.Errorf("force-iter step %q has no recorded iterations; only iteration 0 can restart an unstarted loop", opts.StepID)
+	}
+	if _, recorded := state.AgentDeliveries[opts.StepID]; recorded {
+		return fmt.Errorf("force-iter step %q has a leaf agent-delivery receipt; inspect it before an explicit reset", opts.StepID)
+	}
+	if _, recorded := state.CommandExecutions[opts.StepID]; recorded {
+		return fmt.Errorf("force-iter step %q has a leaf command-execution receipt; inspect it before an explicit reset", opts.StepID)
+	}
+	for _, step := range workflow.Steps {
+		if iterationIndexFromID(step.ID, opts.StepID+"_iter") >= opts.Iteration {
+			return fmt.Errorf("force-iter namespace for %q overlaps top-level step %q; refusing to discard unrelated work", opts.StepID, step.ID)
+		}
 	}
 
+	// Dependency edges are structural and independent of the live scheduler.
+	// Build from the supplied workflow so detached-worker preflight (before an
+	// executor graph exists) enforces the same boundary as foreground resume.
+	graph := NewDependencyGraph(workflow)
+	seen := map[string]bool{opts.StepID: true}
+	consumerSet := make(map[string]bool)
+	queue := []string{opts.StepID}
+	var consumers []string
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		for _, dependent := range graph.GetDependents(id) {
+			if seen[dependent] {
+				continue
+			}
+			seen[dependent] = true
+			queue = append(queue, dependent)
+			// A dependency declared in a nested body belongs to its owning
+			// top-level container's runtime namespace, not the authored child
+			// name. Inspect that container and follow its consumers as well.
+			owner := dependent
+			owners := make(map[string]bool)
+			for graph.container[owner] != "" {
+				if owners[owner] {
+					return fmt.Errorf("force-iter dependency %q has ambiguous container ownership", dependent)
+				}
+				owners[owner] = true
+				owner = graph.container[owner]
+			}
+			if owner == opts.StepID {
+				continue
+			}
+			if !consumerSet[owner] {
+				consumerSet[owner] = true
+				consumers = append(consumers, owner)
+			}
+			if !seen[owner] {
+				seen[owner] = true
+				queue = append(queue, owner)
+			}
+		}
+	}
+	sort.Strings(consumers)
+	for _, consumer := range consumers {
+		if hasRuntimeCheckpoint(state.Steps, consumer) ||
+			hasRuntimeCheckpoint(state.AgentDeliveries, consumer) ||
+			hasRuntimeCheckpoint(state.CommandExecutions, consumer) ||
+			hasRuntimeCheckpoint(state.InFlightSteps, consumer) ||
+			hasRuntimeCheckpoint(state.ForeachState, consumer) ||
+			hasRuntimeCheckpoint(state.ParallelState, consumer) {
+			return fmt.Errorf("force-iter step %q has downstream recovery evidence for %q; inspect that work and use an explicit reset instead of retaining stale dependent results", opts.StepID, consumer)
+		}
+	}
+	return nil
+}
+
+// A consumer's nested runtime work is evidence even when the containing step
+// has not checkpointed a result. Ambiguous textual overlaps only refuse replay;
+// they never authorize deleting another step's receipts.
+func hasRuntimeCheckpoint[T any](entries map[string]T, root string) bool {
+	for id := range entries {
+		if id == root || strings.HasPrefix(id, root+"_") || strings.HasPrefix(id, root+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func resumeResetsAgentDelivery(state *ExecutionState, opts ResumeOptions, stepID string) bool {
+	if !opts.KeepState {
+		return true
+	}
+	switch opts.Mode {
+	case ResumeModeRestartFailed:
+		// The receipt may reach disk before the containing step checkpoints its
+		// result or clears its in-flight marker. Its completion is authoritative.
+		if record, ok := state.AgentDeliveries[stepID]; ok && record.Status == agentDeliveryCompleted {
+			return false
+		}
+		if _, inFlight := state.InFlightSteps[stepID]; inFlight {
+			return true
+		}
+		switch state.Steps[stepID].Status {
+		case StatusFailed, StatusCancelled, StatusRunning, StatusPending:
+			return true
+		}
+	case ResumeModeForceIter:
+		return iterationIndexFromID(stepID, opts.StepID+"_iter") >= opts.Iteration
+	}
+	return false
+}
+
+func resumeResetsCommandExecution(state *ExecutionState, opts ResumeOptions, stepID string) bool {
+	if !opts.KeepState {
+		return true
+	}
+	switch opts.Mode {
+	case ResumeModeForceIter:
+		return iterationIndexFromID(stepID, opts.StepID+"_iter") >= opts.Iteration
+	case ResumeModeRestartFailed:
+		if record, ok := state.CommandExecutions[stepID]; ok {
+			if record.Status != commandExecutionSettled || record.Result.RerunOnResume {
+				return true
+			}
+			if record.Result.Status == StatusCompleted {
+				return false
+			}
+		}
+		if _, ok := state.InFlightSteps[stepID]; ok {
+			return true
+		}
+		if result, ok := state.Steps[stepID]; ok {
+			return shouldRerunStep(result)
+		}
+	}
+	return false
+}
+
+// Replaying a leaf must not silently retain a completed container/iteration
+// that prevents the scheduler from ever reaching it. Nor may a leaf-only
+// restart implicitly invalidate dependent work already produced by that
+// container. Existing force-iter and whole-run reset provide those explicit
+// replay scopes. Validate before deleting any launch evidence.
+func (e *Executor) validateCommandReplayScopeLocked(workflow *Workflow, state *ExecutionState, stepID string) error {
+	if workflow == nil {
+		return fmt.Errorf("command replay requires its saved workflow")
+	}
+	for i := range workflow.Steps {
+		if workflow.Steps[i].ID == stepID && stepKind(&workflow.Steps[i]) == StepKindCommand {
+			return nil // An independently scheduled command.
+		}
+	}
+	refuse := func(container string) error {
+		return fmt.Errorf("cannot replay command %q independently of completed or unscheduled container %q; inspect the old command and its effects, then use --mode=force-iter for a containing top-level iteration or --keep-state=false to deliberately repeat the whole workflow", stepID, container)
+	}
+	graph := e.graph
+	if graph == nil {
+		graph = NewDependencyGraph(workflow)
+	}
+	resolve := func(id string) (*Step, bool) {
+		if step, ok := graph.GetStep(id); ok {
+			return step, true
+		}
+		step, _, ok := graph.ResolveScopedRuntimeStep(id)
+		return step, ok
+	}
+	if step, ok := resolve(stepID); !ok || stepKind(step) != StepKindCommand {
+		// Post-pipeline hooks are not independently scheduled
+		// graph leaves. A normal resume cannot promise to invoke one again.
+		return refuse(stepID)
+	}
+	for parentID, result := range state.Steps {
+		if shouldRerunStep(result) {
+			continue
+		}
+		parent, ok := resolve(parentID)
+		if !ok {
+			continue
+		}
+		if _, _, owns := resolveScopedRuntimeChildren(parentID, stepID, parent); owns {
+			return refuse(parentID)
+		}
+	}
+	for parentID, progress := range state.ForeachState {
+		iterationID, ok := scopedRuntimeOrdinal(stepID, parentID+"_iter", 0)
+		if !ok || !strings.HasPrefix(stepID, iterationID+"_") {
+			continue
+		}
+		for _, completed := range progress.CompletedIterationIDs {
+			if completed == iterationID {
+				return refuse(iterationID)
+			}
+		}
+		lastRound := progress.CompletedRounds[iterationID]
+		parent, ok := resolve(parentID)
+		if !ok || lastRound <= 0 {
+			continue
+		}
+		for _, config := range []*ForeachConfig{parent.Foreach, parent.ForeachPane} {
+			if config == nil {
+				continue
+			}
+			body, err := foreachBodySteps(parent, config)
+			if err != nil {
+				return refuse(parentID)
+			}
+			for i, child := range body {
+				name := child.ID
+				if name == "" {
+					name = fmt.Sprintf("step%d", i)
+				}
+				prefix := iterationID + "_" + name + "_round"
+				roundID, ok := scopedRuntimeOrdinal(stepID, prefix, 1)
+				if ok {
+					round, _ := strconv.Atoi(strings.TrimPrefix(roundID, prefix))
+					if round <= lastRound {
+						return refuse(roundID)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Existing terminal failures retain ordinary retry semantics. A legacy running
+// command, however, has no proof its old process stopped or even that its side
+// effects were captured. It needs the same explicit replay decision as a new
+// unresolved launch receipt. The caller holds stateMu.
+func (e *Executor) validateLegacyCommandResumeLocked(state *ExecutionState, opts ResumeOptions, workflow *Workflow) error {
+	if !opts.KeepState {
+		return nil
+	}
+	graph := e.graph
+	if graph == nil && workflow != nil {
+		graph = NewDependencyGraph(workflow)
+	}
+	unfinished := make(map[string]bool)
+	for stepID := range state.InFlightSteps {
+		unfinished[stepID] = true
+	}
+	for stepID, result := range state.Steps {
+		if result.Status == StatusRunning || result.Status == StatusPending {
+			unfinished[stepID] = true
+		}
+	}
+	for stepID := range unfinished {
+		if _, recorded := state.CommandExecutions[stepID]; recorded || resumeResetsCommandExecution(state, opts, stepID) {
+			continue
+		}
+		command := state.InFlightSteps[stepID].Kind == StepKindCommand || state.Steps[stepID].AgentType == "command"
+		if graph != nil {
+			step, ok := graph.GetStep(stepID)
+			if !ok {
+				step, _, ok = graph.ResolveScopedRuntimeStep(stepID)
+			}
+			command = command || (ok && stepKind(step) == StepKindCommand)
+		}
+		if command {
+			return uncertainCommandExecutionError(stepID, 0)
+		}
+	}
+	return nil
+}
+
+// The caller holds stateMu. Legacy checkpoints have no way to distinguish a
+// delivered prompt from work that never reached tmux. Only an explicit restart
+// can authorize redispatch of a known unfinished agent leaf without a receipt.
+func (e *Executor) validateLegacyAgentResumeLocked(state *ExecutionState, opts ResumeOptions, workflow *Workflow) error {
+	if !opts.KeepState {
+		return nil
+	}
+	graph := e.graph
+	if graph == nil && workflow != nil {
+		// Detached resume preflight precedes executor graph construction.
+		// Classify against the same workflow there instead of silently
+		// bypassing the missing-delivery guard until after worker launch.
+		graph = NewDependencyGraph(workflow)
+	}
+	if graph == nil {
+		return nil
+	}
+	unfinished := make(map[string]bool)
+	for stepID, result := range state.Steps {
+		switch result.Status {
+		case StatusFailed, StatusCancelled, StatusRunning, StatusPending:
+			unfinished[stepID] = true
+		}
+	}
+	for stepID := range state.InFlightSteps {
+		unfinished[stepID] = true
+	}
+	for stepID := range unfinished {
+		if _, recorded := state.AgentDeliveries[stepID]; recorded || resumeResetsAgentDelivery(state, opts, stepID) {
+			continue
+		}
+		step, ok := graph.GetStep(stepID)
+		if !ok {
+			step, _, ok = graph.ResolveScopedRuntimeStep(stepID)
+		}
+		// A changed/ambiguous runtime namespace must not erase explicit
+		// evidence that the old execution dispatched agent work. The saved
+		// kind is independent of the current workflow's interpretation.
+		kind := state.InFlightSteps[stepID].Kind
+		agentWork := kind == StepKindPrompt || kind == StepKindTemplate
+		if ok {
+			agentWork = agentWork || stepKind(step) == StepKindPrompt || stepKind(step) == StepKindTemplate
+		}
+		if agentWork {
+			return fmt.Errorf("unfinished agent step %q has no durable delivery evidence; use an explicit restart-failed or reset to authorize resending", stepID)
+		}
+	}
 	return nil
 }
 
@@ -235,6 +1085,8 @@ func (e *Executor) resetResumeState(workflow *Workflow) {
 	e.state.ParallelState = nil
 	e.state.ScopeStack = nil
 	e.state.InFlightSteps = nil
+	e.state.AgentDeliveries = nil
+	e.state.CommandExecutions = nil
 	e.state.CurrentStep = ""
 	e.state.Errors = nil
 	e.stateMu.Unlock()
@@ -274,12 +1126,17 @@ func clearWorkflowStepVariables(vars map[string]interface{}, workflow *Workflow)
 			if step.ForeachPane != nil {
 				walk(step.ForeachPane.Steps)
 			}
+			walk(step.OnSuccess)
 		}
 	}
 	walk(workflow.Steps)
+	walk(workflow.PostPipelineSteps)
 }
 
 func (e *Executor) forceResumeIteration(stepID string, iteration int) {
+	if strings.TrimSpace(stepID) == "" || iteration < 0 {
+		return
+	}
 	var prunedStepIDs []string
 	e.stateMu.Lock()
 	if e.state == nil {
@@ -293,6 +1150,10 @@ func (e *Executor) forceResumeIteration(stepID string, iteration int) {
 	state.StepID = stepID
 	state.CurrentIteration = iteration
 	state.CompletedIterationIDs = filterCompletedIterationsBefore(state.CompletedIterationIDs, stepID, iteration)
+	prefix := fmt.Sprintf("%s_iter", stepID)
+	// A forced iteration must restart its rounds too. Otherwise max_rounds
+	// can skip every round even after its StepResults have been removed.
+	removeIterationEntries(state.CompletedRounds, prefix, iteration)
 	// bd-t3q8a: sequential foreach (loops.go) appends collected outputs in
 	// iteration order, so truncating to length=iteration drops the entries
 	// for the iterations that are about to rerun. Without this, the
@@ -303,14 +1164,22 @@ func (e *Executor) forceResumeIteration(stepID string, iteration int) {
 	}
 	state.UpdatedAt = time.Now()
 	e.state.ForeachState[stepID] = state
+	// Reopen the containing scheduler node as well as its iteration suffix.
+	// Keeping a completed parent result would make applyResumeState mark the
+	// whole loop executed and silently skip the requested replay.
+	delete(e.state.Steps, stepID)
+	delete(e.state.InFlightSteps, stepID)
+	prunedStepIDs = append(prunedStepIDs, stepID)
 
-	prefix := fmt.Sprintf("%s_iter", stepID)
-	for id := range e.state.Steps {
-		if iterationIndexFromID(id, prefix) >= iteration {
-			delete(e.state.Steps, id)
-			prunedStepIDs = append(prunedStepIDs, id)
-		}
-	}
+	// All iteration-local checkpoints participate in the rewind. Nested
+	// loops and parallel groups otherwise restore stale completion markers;
+	// receipts and in-flight markers can exist before any StepResult does.
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.Steps, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.AgentDeliveries, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.CommandExecutions, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.InFlightSteps, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.ParallelState, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.ForeachState, prefix, iteration)...)
 	e.stateMu.Unlock()
 
 	// bd-a3fwf: deleting StepResults is not enough — Substitutor.resolveSteps
@@ -325,22 +1194,49 @@ func (e *Executor) forceResumeIteration(stepID string, iteration int) {
 	// can be invoked before the workflow graph is rebuilt (and in unit tests
 	// the graph is never set), and the executor helper would NPE on
 	// e.graph.GetStep(id) in those cases.
-	if len(prunedStepIDs) > 0 {
-		e.varMu.Lock()
-		if e.state != nil && e.state.Variables != nil {
-			for _, id := range prunedStepIDs {
-				delete(e.state.Variables, "steps."+id+".output")
-				delete(e.state.Variables, "steps."+id+".data")
-				if e.graph != nil {
-					if step, ok := e.graph.GetStep(id); ok && step.OutputVar != "" {
+	e.varMu.Lock()
+	if e.state != nil && e.state.Variables != nil {
+		// Flat output keys may survive a checkpoint without a StepResult.
+		// Scan them independently rather than relying on prunedStepIDs alone.
+		for key := range e.state.Variables {
+			if !strings.HasPrefix(key, "steps.") {
+				continue
+			}
+			id := strings.TrimPrefix(key, "steps.")
+			switch {
+			case strings.HasSuffix(id, ".output"):
+				id = strings.TrimSuffix(id, ".output")
+			case strings.HasSuffix(id, ".data"):
+				id = strings.TrimSuffix(id, ".data")
+			default:
+				continue
+			}
+			if iterationIndexFromID(id, prefix) >= iteration {
+				delete(e.state.Variables, key)
+				prunedStepIDs = append(prunedStepIDs, id)
+			}
+		}
+		for _, id := range prunedStepIDs {
+			delete(e.state.Variables, "steps."+id+".output")
+			delete(e.state.Variables, "steps."+id+".data")
+			if e.graph != nil {
+				step, ok := e.graph.GetStep(id)
+				if !ok {
+					step, _, ok = e.graph.ResolveScopedRuntimeStep(id)
+				}
+				if ok {
+					if step.OutputVar != "" {
 						delete(e.state.Variables, step.OutputVar)
 						delete(e.state.Variables, step.OutputVar+"_parsed")
+					}
+					if step.Loop != nil && step.Loop.Collect != "" {
+						delete(e.state.Variables, step.Loop.Collect)
 					}
 				}
 			}
 		}
-		e.varMu.Unlock()
 	}
+	e.varMu.Unlock()
 }
 
 func filterCompletedIterationsBefore(ids []string, stepID string, iteration int) []string {
@@ -362,7 +1258,9 @@ func iterationIndexFromID(id, prefix string) int {
 	rest := strings.TrimPrefix(id, prefix)
 	for i, r := range rest {
 		if r < '0' || r > '9' {
-			if i == 0 {
+			// Runtime descendants are separated with underscores. An arbitrary
+			// textual suffix may instead name an unrelated workflow step.
+			if i == 0 || r != '_' {
 				return -1
 			}
 			var idx int
@@ -377,6 +1275,24 @@ func iterationIndexFromID(id, prefix string) int {
 		return -1
 	}
 	return idx
+}
+
+// removeIterationEntries clears a suffix of a loop's runtime namespace while
+// preserving prior iterations and unrelated work. Callers hold the lock that
+// protects entries. Returning the removed IDs also permits output-var cleanup
+// for checkpoints that have no corresponding StepResult yet.
+func removeIterationEntries[T any](entries map[string]T, prefix string, iteration int) []string {
+	if iteration < 0 {
+		return nil
+	}
+	var removed []string
+	for id := range entries {
+		if iterationIndexFromID(id, prefix) >= iteration {
+			delete(entries, id)
+			removed = append(removed, id)
+		}
+	}
+	return removed
 }
 
 func (e *Executor) markStepInFlight(stepID, kind string, iteration int) {
@@ -460,10 +1376,11 @@ func computeForeachItemsFingerprint(items []interface{}) string {
 // verifyForeachItemsFingerprint compares the supplied fingerprint against
 // the one persisted on prior foreach state. Returns nil if no prior state
 // exists, the fingerprints match, or there is no recorded fingerprint
-// (legacy state files predate this field). Returns an error when the prior
-// run completed at least one iteration with a fingerprint that no longer
-// matches — that is the unsafe-resume case where iteration N's completion
-// record applies to a different items[N] than the resume sees.
+// (legacy state files predate this field). Any iteration-local progress binds
+// the items, not just whole-iteration completion: interrupted rounds, nested
+// checkpoints and dispatch receipts can all predate the first completed
+// iteration. Reusing them against changed items would skip work or attribute
+// an earlier dispatch to a different item.
 func (e *Executor) verifyForeachItemsFingerprint(stepID, fingerprint string) error {
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
@@ -474,14 +1391,36 @@ func (e *Executor) verifyForeachItemsFingerprint(stepID, fingerprint string) err
 	if !ok {
 		return nil
 	}
-	if prior.ItemsFingerprint == "" || len(prior.CompletedIterationIDs) == 0 {
+	if prior.ItemsFingerprint == "" || prior.ItemsFingerprint == fingerprint {
 		return nil
 	}
-	if prior.ItemsFingerprint == fingerprint {
+	prefix := fmt.Sprintf("%s_iter", stepID)
+	hasProgress := len(prior.CompletedIterationIDs) > 0 ||
+		len(prior.CompletedRounds) > 0 || len(prior.CollectedOutputs) > 0 ||
+		hasIterationEntries(e.state.Steps, prefix) ||
+		hasIterationEntries(e.state.AgentDeliveries, prefix) ||
+		hasIterationEntries(e.state.CommandExecutions, prefix) ||
+		hasIterationEntries(e.state.InFlightSteps, prefix) ||
+		hasIterationEntries(e.state.ForeachState, prefix) ||
+		hasIterationEntries(e.state.ParallelState, prefix)
+	if !hasProgress {
 		return nil
 	}
-	return fmt.Errorf("foreach %q items changed since prior run (completed=%d, prior_fingerprint=%s, current_fingerprint=%s); resume would apply old iteration records to different items",
-		stepID, len(prior.CompletedIterationIDs), prior.ItemsFingerprint[:12], fingerprint[:12])
+	// Precision bounds diagnostics without slicing unchecked checkpoint data.
+	// A corrupt/short fingerprint must produce an error, not panic on resume.
+	return fmt.Errorf("foreach %q items changed since prior run (completed=%d, prior_fingerprint=%.12s, current_fingerprint=%.12s); resume would apply old iteration records to different items",
+		stepID, len(prior.CompletedIterationIDs), prior.ItemsFingerprint, fingerprint)
+}
+
+// hasIterationEntries recognizes only this loop's runtime namespace. Callers
+// hold the read lock protecting entries; unrelated steps do not bind its items.
+func hasIterationEntries[T any](entries map[string]T, prefix string) bool {
+	for id := range entries {
+		if iterationIndexFromID(id, prefix) >= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // appendForeachCollectedOutput persists a single loop.Collect output for

@@ -40,7 +40,8 @@ type EventBus struct {
 	history     *ring.Ring
 	historySize int
 	historyMu   sync.RWMutex
-	handlerSem  chan struct{} // semaphore to limit concurrent handlers
+	handlerSem  chan struct{} // semaphore to limit asynchronously spawned handlers
+	inflight    atomic.Int64  // active publish calls plus their unfinished async handlers
 }
 
 // NewEventBus creates a new event bus with the specified history size
@@ -101,6 +102,16 @@ func (b *EventBus) SubscribeAll(handler EventHandler) UnsubscribeFunc {
 
 // Publish sends an event to all matching subscribers
 func (b *EventBus) Publish(event BusEvent) {
+	// Keep a publication counted until every handler has been dispatched.
+	// This covers setup, caller-runs backpressure, and gaps between launching
+	// asynchronous handlers, when the handler count alone could reach zero.
+	b.inflight.Add(1)
+	defer b.inflight.Add(-1)
+
+	// Event implementations must not run under the subscriber registry lock:
+	// they can reenter the bus or panic without poisoning future subscriptions.
+	eventType := event.EventType()
+
 	// Add to history first
 	b.historyMu.Lock()
 	b.history.Value = event
@@ -109,35 +120,63 @@ func (b *EventBus) Publish(event BusEvent) {
 
 	// Get handlers under read lock
 	b.mu.RLock()
-	eventType := event.EventType()
 	entries := make([]handlerEntry, 0, len(b.subscribers[eventType])+len(b.subscribers["*"]))
 	entries = append(entries, b.subscribers[eventType]...)
 	entries = append(entries, b.subscribers["*"]...)
 	b.mu.RUnlock()
 
-	// Call handlers outside of lock with bounded concurrency
+	// Call handlers outside of the lock with bounded goroutine creation.
 	for _, entry := range entries {
-		// Acquire semaphore slot (blocks if at capacity to apply backpressure)
-		b.handlerSem <- struct{}{}
+		if !b.tryAcquireHandlerSlot() {
+			// Caller-runs backpressure is required here: a handler may publish a
+			// nested event. Blocking for capacity while every slot is held by
+			// reentrant handlers creates a wait cycle in which no slot can be
+			// released. Running inline applies backpressure without spawning another
+			// goroutine and breaks that cycle.
+			invokeEventHandler(entry.handler, event, "handler")
+			continue
+		}
 
-		// Run handler in goroutine for non-blocking publish
+		// The acquired slot bounds event-bus-owned handler goroutines.
+		b.inflight.Add(1)
 		go func(h EventHandler) {
 			defer func() {
 				// Release semaphore slot
 				<-b.handlerSem
+				b.inflight.Add(-1)
 			}()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("event bus: handler panic recovered: %v", r)
-				}
-			}()
-			h(event)
+			invokeEventHandler(h, event, "handler")
 		}(entry.handler)
 	}
 }
 
+// WaitHandlers waits until active Publish and PublishSync calls and their
+// handlers have returned, or timeout passes. This includes setup and handlers
+// running inline under backpressure, not only asynchronously spawned handlers.
+// Stop producers before a final drain: new publications can begin after an
+// idle bus is observed. Do not call from a handler, which would wait for itself.
+// A process drains before closing a webhook bridge or durable attention feed.
+func (b *EventBus) WaitHandlers(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for b.inflight.Load() > 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
 // PublishSync sends an event and waits for all handlers to complete
 func (b *EventBus) PublishSync(event BusEvent) {
+	// The synchronous caller owns all of its handlers until wg.Wait returns,
+	// including inline handlers. Other goroutines must see that pending work.
+	b.inflight.Add(1)
+	defer b.inflight.Add(-1)
+
+	// See Publish: invoking user-defined event methods under mu is unsafe.
+	eventType := event.EventType()
+
 	// Add to history first
 	b.historyMu.Lock()
 	b.history.Value = event
@@ -146,17 +185,20 @@ func (b *EventBus) PublishSync(event BusEvent) {
 
 	// Get handlers under read lock
 	b.mu.RLock()
-	eventType := event.EventType()
 	entries := make([]handlerEntry, 0, len(b.subscribers[eventType])+len(b.subscribers["*"]))
 	entries = append(entries, b.subscribers[eventType]...)
 	entries = append(entries, b.subscribers["*"]...)
 	b.mu.RUnlock()
 
-	// Call handlers synchronously with bounded concurrency
+	// Call handlers synchronously with bounded goroutine creation.
 	var wg sync.WaitGroup
 	for _, entry := range entries {
-		// Acquire semaphore slot (blocks if at capacity to apply backpressure)
-		b.handlerSem <- struct{}{}
+		if !b.tryAcquireHandlerSlot() {
+			// See Publish: waiting for a slot here can deadlock when every
+			// in-flight handler is synchronously publishing another event.
+			invokeEventHandler(entry.handler, event, "sync handler")
+			continue
+		}
 
 		wg.Add(1)
 		go func(h EventHandler) {
@@ -165,15 +207,28 @@ func (b *EventBus) PublishSync(event BusEvent) {
 				// Release semaphore slot
 				<-b.handlerSem
 			}()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("event bus: sync handler panic recovered: %v", r)
-				}
-			}()
-			h(event)
+			invokeEventHandler(h, event, "sync handler")
 		}(entry.handler)
 	}
 	wg.Wait()
+}
+
+func (b *EventBus) tryAcquireHandlerSlot() bool {
+	select {
+	case b.handlerSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func invokeEventHandler(handler EventHandler, event BusEvent, label string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("event bus: %s panic recovered: %v", label, r)
+		}
+	}()
+	handler(event)
 }
 
 // History returns recent events (newest first)
@@ -249,448 +304,11 @@ type HumanZoomEvent struct {
 	Cursor    int64  `json:"cursor,omitempty"`
 }
 
-// NewHumanZoomEvent creates a new human zoom event.
-func NewHumanZoomEvent(session string, paneIndex int, agentType string, cursor int64) HumanZoomEvent {
-	return HumanZoomEvent{
-		BaseEvent: BaseEvent{
-			Type:      EventHumanZoom,
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		PaneIndex: paneIndex,
-		AgentType: agentType,
-		Cursor:    cursor,
-	}
-}
-
 // HumanOverlayDismissEvent is emitted when a human dismisses the overlay.
 type HumanOverlayDismissEvent struct {
 	BaseEvent
 	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 	Cursor          int64   `json:"cursor,omitempty"`
-}
-
-// NewHumanOverlayDismissEvent creates a new human overlay dismiss event.
-func NewHumanOverlayDismissEvent(session string, durationSeconds float64, cursor int64) HumanOverlayDismissEvent {
-	if durationSeconds < 0 {
-		durationSeconds = 0
-	}
-	return HumanOverlayDismissEvent{
-		BaseEvent: BaseEvent{
-			Type:      EventHumanOverlayDismiss,
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		DurationSeconds: durationSeconds,
-		Cursor:          cursor,
-	}
-}
-
-// ----------------------------------------------------------------
-// Profile Events
-// ----------------------------------------------------------------
-
-// ProfileAssignedEvent is emitted when a profile is assigned to an agent
-type ProfileAssignedEvent struct {
-	BaseEvent
-	AgentID  string `json:"agent_id"`
-	Profile  string `json:"profile"`
-	Previous string `json:"previous,omitempty"` // Empty if new
-}
-
-// NewProfileAssignedEvent creates a new profile assigned event
-func NewProfileAssignedEvent(session, agentID, profile, previous string) ProfileAssignedEvent {
-	return ProfileAssignedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "profile_assigned",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		AgentID:  agentID,
-		Profile:  profile,
-		Previous: previous,
-	}
-}
-
-// ProfileSwitchedEvent is emitted when an agent's profile is changed
-type ProfileSwitchedEvent struct {
-	BaseEvent
-	AgentID    string `json:"agent_id"`
-	OldProfile string `json:"old_profile"`
-	NewProfile string `json:"new_profile"`
-}
-
-// NewProfileSwitchedEvent creates a new profile switched event
-func NewProfileSwitchedEvent(session, agentID, oldProfile, newProfile string) ProfileSwitchedEvent {
-	return ProfileSwitchedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "profile_switched",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		AgentID:    agentID,
-		OldProfile: oldProfile,
-		NewProfile: newProfile,
-	}
-}
-
-// ----------------------------------------------------------------
-// Context Rotation Events
-// ----------------------------------------------------------------
-
-// ContextWarningEvent is emitted when context usage approaches threshold
-type ContextWarningEvent struct {
-	BaseEvent
-	AgentID       string  `json:"agent_id"`
-	UsagePercent  float64 `json:"usage_percent"`
-	EstimatedRoom int64   `json:"estimated_room"` // Tokens remaining
-}
-
-// NewContextWarningEvent creates a new context warning event
-func NewContextWarningEvent(session, agentID string, usagePercent float64, estimatedRoom int64) ContextWarningEvent {
-	return ContextWarningEvent{
-		BaseEvent: BaseEvent{
-			Type:      "context_warning",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		AgentID:       agentID,
-		UsagePercent:  usagePercent,
-		EstimatedRoom: estimatedRoom,
-	}
-}
-
-// RotationStartedEvent is emitted when agent rotation begins
-type RotationStartedEvent struct {
-	BaseEvent
-	AgentID      string  `json:"agent_id"`
-	UsagePercent float64 `json:"usage_percent"`
-	Profile      string  `json:"profile,omitempty"`
-}
-
-// NewRotationStartedEvent creates a new rotation started event
-func NewRotationStartedEvent(session, agentID string, usagePercent float64, profile string) RotationStartedEvent {
-	return RotationStartedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "rotation_started",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		AgentID:      agentID,
-		UsagePercent: usagePercent,
-		Profile:      profile,
-	}
-}
-
-// RotationCompletedEvent is emitted when agent rotation completes
-type RotationCompletedEvent struct {
-	BaseEvent
-	OldAgentID    string `json:"old_agent_id"`
-	NewAgentID    string `json:"new_agent_id"`
-	SummaryTokens int    `json:"summary_tokens"`
-	Success       bool   `json:"success"`
-	Error         string `json:"error,omitempty"`
-}
-
-// NewRotationCompletedEvent creates a new rotation completed event
-func NewRotationCompletedEvent(session, oldAgentID, newAgentID string, summaryTokens int, success bool, err string) RotationCompletedEvent {
-	return RotationCompletedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "rotation_completed",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		OldAgentID:    oldAgentID,
-		NewAgentID:    newAgentID,
-		SummaryTokens: summaryTokens,
-		Success:       success,
-		Error:         err,
-	}
-}
-
-// ----------------------------------------------------------------
-// Checkpoint Events
-// ----------------------------------------------------------------
-
-// CheckpointCreatedEvent is emitted when a checkpoint is created
-type CheckpointCreatedEvent struct {
-	BaseEvent
-	Name       string `json:"name"`
-	Level      string `json:"level"` // light, standard, full
-	SizeBytes  int64  `json:"size_bytes"`
-	AgentCount int    `json:"agent_count"`
-}
-
-// NewCheckpointCreatedEvent creates a new checkpoint created event
-func NewCheckpointCreatedEvent(session, name, level string, sizeBytes int64, agentCount int) CheckpointCreatedEvent {
-	return CheckpointCreatedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "checkpoint_created",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Name:       name,
-		Level:      level,
-		SizeBytes:  sizeBytes,
-		AgentCount: agentCount,
-	}
-}
-
-// CheckpointRestoredEvent is emitted when a checkpoint is restored
-type CheckpointRestoredEvent struct {
-	BaseEvent
-	Name       string `json:"name"`
-	AgentCount int    `json:"agent_count"`
-}
-
-// NewCheckpointRestoredEvent creates a new checkpoint restored event
-func NewCheckpointRestoredEvent(session, name string, agentCount int) CheckpointRestoredEvent {
-	return CheckpointRestoredEvent{
-		BaseEvent: BaseEvent{
-			Type:      "checkpoint_restored",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Name:       name,
-		AgentCount: agentCount,
-	}
-}
-
-// ----------------------------------------------------------------
-// Workflow Events
-// ----------------------------------------------------------------
-
-// WorkflowStartedEvent is emitted when a workflow begins
-type WorkflowStartedEvent struct {
-	BaseEvent
-	Workflow string   `json:"workflow"`
-	RunID    string   `json:"run_id"`
-	Agents   []string `json:"agents"`
-}
-
-// NewWorkflowStartedEvent creates a new workflow started event
-func NewWorkflowStartedEvent(session, workflow, runID string, agents []string) WorkflowStartedEvent {
-	return WorkflowStartedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "workflow_started",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Workflow: workflow,
-		RunID:    runID,
-		Agents:   cloneStringSlice(agents),
-	}
-}
-
-// StageTransitionEvent is emitted when workflow transitions between stages
-type StageTransitionEvent struct {
-	BaseEvent
-	Workflow  string `json:"workflow"`
-	RunID     string `json:"run_id"`
-	FromStage string `json:"from_stage"`
-	ToStage   string `json:"to_stage"`
-	Trigger   string `json:"trigger,omitempty"` // What caused the transition
-}
-
-// NewStageTransitionEvent creates a new stage transition event
-func NewStageTransitionEvent(session, workflow, runID, fromStage, toStage, trigger string) StageTransitionEvent {
-	return StageTransitionEvent{
-		BaseEvent: BaseEvent{
-			Type:      "stage_transition",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Workflow:  workflow,
-		RunID:     runID,
-		FromStage: fromStage,
-		ToStage:   toStage,
-		Trigger:   trigger,
-	}
-}
-
-// WorkflowPausedEvent is emitted when a workflow is paused
-type WorkflowPausedEvent struct {
-	BaseEvent
-	Workflow string `json:"workflow"`
-	RunID    string `json:"run_id"`
-	Reason   string `json:"reason"`
-}
-
-// NewWorkflowPausedEvent creates a new workflow paused event
-func NewWorkflowPausedEvent(session, workflow, runID, reason string) WorkflowPausedEvent {
-	return WorkflowPausedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "workflow_paused",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Workflow: workflow,
-		RunID:    runID,
-		Reason:   reason,
-	}
-}
-
-// WorkflowCompletedEvent is emitted when a workflow completes
-type WorkflowCompletedEvent struct {
-	BaseEvent
-	Workflow    string `json:"workflow"`
-	RunID       string `json:"run_id"`
-	DurationSec int    `json:"duration_sec"`
-	StageCount  int    `json:"stage_count"`
-	Success     bool   `json:"success"`
-	Error       string `json:"error,omitempty"`
-}
-
-// NewWorkflowCompletedEvent creates a new workflow completed event
-func NewWorkflowCompletedEvent(session, workflow, runID string, durationSec, stageCount int, success bool, err string) WorkflowCompletedEvent {
-	return WorkflowCompletedEvent{
-		BaseEvent: BaseEvent{
-			Type:      "workflow_completed",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Workflow:    workflow,
-		RunID:       runID,
-		DurationSec: durationSec,
-		StageCount:  stageCount,
-		Success:     success,
-		Error:       err,
-	}
-}
-
-// ----------------------------------------------------------------
-// Agent Events
-// ----------------------------------------------------------------
-
-// AgentStallEvent is emitted when an agent appears stalled
-type AgentStallEvent struct {
-	BaseEvent
-	AgentID       string  `json:"agent_id"`
-	StallDuration float64 `json:"stall_duration_sec"`
-	LastActivity  string  `json:"last_activity,omitempty"`
-}
-
-// NewAgentStallEvent creates a new agent stall event
-func NewAgentStallEvent(session, agentID string, stallDuration float64, lastActivity string) AgentStallEvent {
-	return AgentStallEvent{
-		BaseEvent: BaseEvent{
-			Type:      "agent_stall",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		AgentID:       agentID,
-		StallDuration: stallDuration,
-		LastActivity:  lastActivity,
-	}
-}
-
-// AgentErrorEvent is emitted when an agent encounters an error
-type AgentErrorEvent struct {
-	BaseEvent
-	AgentID   string `json:"agent_id"`
-	ErrorType string `json:"error_type"`
-	Message   string `json:"message"`
-}
-
-// NewAgentErrorEvent creates a new agent error event
-func NewAgentErrorEvent(session, agentID, errorType, message string) AgentErrorEvent {
-	return AgentErrorEvent{
-		BaseEvent: BaseEvent{
-			Type:      "agent_error",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		AgentID:   agentID,
-		ErrorType: errorType,
-		Message:   message,
-	}
-}
-
-// ----------------------------------------------------------------
-// Alert Events
-// ----------------------------------------------------------------
-
-// AlertEvent is emitted when an alert is triggered
-type AlertEvent struct {
-	BaseEvent
-	AlertID   string `json:"alert_id"`
-	AlertType string `json:"alert_type"`
-	Severity  string `json:"severity"`
-	Message   string `json:"message"`
-}
-
-// NewAlertEvent creates a new alert event
-func NewAlertEvent(session, alertID, alertType, severity, message string) AlertEvent {
-	return AlertEvent{
-		BaseEvent: BaseEvent{
-			Type:      "alert",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		AlertID:   alertID,
-		AlertType: alertType,
-		Severity:  severity,
-		Message:   message,
-	}
-}
-
-// ----------------------------------------------------------------
-// Conflict Events
-// ----------------------------------------------------------------
-
-// ReservationConflictEvent is emitted when an agent's file reservation
-// conflicts with another agent's existing reservation.
-type ReservationConflictEvent struct {
-	BaseEvent
-	Path           string   `json:"path"`
-	RequestorAgent string   `json:"requestor_agent"`
-	RequestorPane  string   `json:"requestor_pane"`
-	Holders        []string `json:"holders"`
-}
-
-// NewReservationConflictEvent creates a new reservation conflict event.
-func NewReservationConflictEvent(session, path, requestorAgent, requestorPane string, holders []string) ReservationConflictEvent {
-	return ReservationConflictEvent{
-		BaseEvent: BaseEvent{
-			Type:      "conflict.reservation",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Path:           path,
-		RequestorAgent: requestorAgent,
-		RequestorPane:  requestorPane,
-		Holders:        cloneStringSlice(holders),
-	}
-}
-
-// FileConflictEvent is emitted when multiple agents modify the same file
-// concurrently, detected via the file watcher.
-type FileConflictEvent struct {
-	BaseEvent
-	Path   string   `json:"path"`
-	Agents []string `json:"agents"`
-}
-
-// NewFileConflictEvent creates a new file conflict event.
-func NewFileConflictEvent(session, path string, agents []string) FileConflictEvent {
-	return FileConflictEvent{
-		BaseEvent: BaseEvent{
-			Type:      "conflict.file",
-			Timestamp: time.Now().UTC(),
-			Session:   session,
-		},
-		Path:   path,
-		Agents: cloneStringSlice(agents),
-	}
-}
-
-func cloneStringSlice(values []string) []string {
-	if values == nil {
-		return nil
-	}
-	cloned := make([]string, len(values))
-	copy(cloned, values)
-	return cloned
 }
 
 // ----------------------------------------------------------------
@@ -702,11 +320,6 @@ func Subscribe(eventType string, handler EventHandler) UnsubscribeFunc {
 	return DefaultBus.Subscribe(eventType, handler)
 }
 
-// SubscribeAll registers a handler for all events on the default bus
-func SubscribeAll(handler EventHandler) UnsubscribeFunc {
-	return DefaultBus.SubscribeAll(handler)
-}
-
 // Publish sends an event to the default bus
 func Publish(event BusEvent) {
 	DefaultBus.Publish(event)
@@ -715,9 +328,4 @@ func Publish(event BusEvent) {
 // PublishSync sends an event to the default bus and waits for handlers
 func PublishSync(event BusEvent) {
 	DefaultBus.PublishSync(event)
-}
-
-// History returns recent events from the default bus
-func History(limit int) []BusEvent {
-	return DefaultBus.History(limit)
 }

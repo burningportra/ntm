@@ -530,6 +530,8 @@ func agentTypeToString(t tmux.AgentType) string {
 		return "aider"
 	case tmux.AgentOpencode:
 		return "oc"
+	case tmux.AgentOmp:
+		return "omp"
 	case tmux.AgentOllama:
 		return "ollama"
 	case tmux.AgentUser:
@@ -577,6 +579,8 @@ func incrementAgentCounts(counts *output.AgentCountsResponse, t tmux.AgentType) 
 		counts.Aider++
 	case tmux.AgentOpencode:
 		counts.Opencode++
+	case tmux.AgentOmp:
+		counts.Omp++
 	case tmux.AgentUser:
 		counts.User++
 	default:

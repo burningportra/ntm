@@ -8,6 +8,7 @@ Practical workflow examples demonstrating NTM pipeline patterns. For schema deta
 - [Implement-Review-Revise Workflow](#implement-review-revise-workflow)
 - [Durable Per-Pane Review Sequences](#durable-per-pane-review-sequences)
 - [Error Handling with Retry](#error-handling-with-retry)
+- [Restarting Crashed Agents in Orchestration Templates](#restarting-crashed-agents-in-orchestration-templates)
 - [Loop Workflows](#loop-workflows)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
@@ -106,14 +107,14 @@ steps:
 
 ```bash
 # Run the workflow
-ntm pipeline run design-implement-test.yaml \
+ntm pipeline run design-implement-test.yaml --session myproject \
   --var feature="Add rate limiting to the API endpoint" \
   --var target_file="internal/api/ratelimit.go"
 
-# Run with progress tracking
-ntm pipeline run design-implement-test.yaml \
+# Validate first without executing
+ntm pipeline run design-implement-test.yaml --session myproject \
   --var feature="Implement user authentication" \
-  --progress
+  --dry-run
 ```
 
 ---
@@ -267,11 +268,7 @@ the next prompt without rebuilding state in `/tmp` or shell arrays.
 # Create the ordered review rotation once from the project root.
 ntm --robot-sequence=review \
   --sequence-action=create \
-  --sequence-steps='[
-    "Inspect the changed files and identify concrete risks.",
-    "Challenge the proposed fix; look for missed edge cases.",
-    "Summarize findings with file and line evidence."
-  ]'
+  --sequence-steps='["Inspect the changed files and identify concrete risks.", "Challenge the proposed fix; look for missed edge cases.", "Summarize findings with file and line evidence."]'
 
 # Every pane starts at prompt zero independently.
 ntm --robot-sequence=review --sequence-pane=%12
@@ -425,6 +422,61 @@ ntm pipeline run error-handling-demo.yaml \
   --var api_endpoint="https://api.example.com/data" \
   --dry-run
 ```
+
+---
+
+## Restarting Crashed Agents in Orchestration Templates
+
+TOML orchestration templates run with `ntm workflow run` and handle agent
+failures in `[workflows.error_handling]`, not with per-step `on_error`. This
+template restarts a builder whose agent CLI crashes and pauses when an agent
+is rate limited or blocked:
+
+```toml
+[[workflows]]
+name = "resilient-build"
+description = "Build with automatic recovery from agent crashes"
+coordination = "pipeline"
+
+[[workflows.agents]]
+profile = "implementer"
+role = "build"
+
+[[workflows.agents]]
+profile = "tester"
+role = "qa"
+
+[workflows.flow]
+stages = ["build", "qa"]
+
+[[workflows.flow.transitions]]
+from = "build"
+to = "qa"
+[workflows.flow.transitions.trigger]
+type = "command_success"
+command = "go build ./..."
+
+[workflows.error_handling]
+on_agent_crash = "restart_agent"  # relaunch, then re-send the stage prompt
+on_agent_error = "pause"          # rate limit, auth error, or blocking dialog
+stage_timeout_minutes = 45
+on_timeout = "notify"
+```
+
+### Usage
+
+```bash
+ntm workflow run ./resilient-build.toml --session myproj --json
+```
+
+If the build agent exits back to its shell, the run restarts that pane with
+the same engine as `ntm respawn` and sends the `build` prompt again. Each pane
+can restart up to `[resilience] max_restarts` times per run (default 3); the
+next crash aborts the run. The `--json` result lists every handled fault in
+`faults`, and `restarts` counts successful restarts. If the run pauses, resume
+it with `--resume` after the agent is healthy. See
+[Agent Crashes, Errors, and Timeouts](WORKFLOW_SCHEMA.md#agent-crashes-errors-and-timeouts)
+for the detection rules and every action.
 
 ---
 
@@ -811,19 +863,19 @@ prompt: Hello ${vars.name | "User"}
 
 **Solutions**:
 ```bash
-# Check state file exists
+# Check state files exist
 ls .ntm/pipeline-state/
 
-# Use explicit state file
-ntm pipeline resume workflow.yaml --state-file .ntm/pipeline-state/run-xxx.json
+# Resume the specific run by its ID
+ntm pipeline resume run-20241230-123456-abcd
 ```
 
 ### Debugging Tips
 
-#### Enable Verbose Output
+#### Enable Machine-Readable Output
 
 ```bash
-ntm pipeline run workflow.yaml --verbose
+ntm pipeline run workflow.yaml --session myproject --json
 ```
 
 #### Dry Run First
@@ -845,15 +897,15 @@ ntm pipeline status workflow.yaml
 ntm pipeline list
 
 # Show specific run details
-ntm pipeline show <run-id>
+ntm pipeline status <run-id>
 ```
 
 #### Monitor Progress
 
 ```bash
-# Real-time progress
-ntm pipeline run workflow.yaml --progress
+# Poll run status (JSON for scripting)
+ntm pipeline status <run-id> --json
 
-# Tail execution logs
-ntm pipeline tail <run-id>
+# Stream the session's agent output while the pipeline runs
+ntm watch <session>
 ```

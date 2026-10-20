@@ -27,18 +27,22 @@ const (
 	AgentTypeWindsurf    AgentType = "windsurf" // Windsurf IDE
 	AgentTypeAider       AgentType = "aider"    // Aider CLI
 	AgentTypeOpencode    AgentType = "oc"       // Opencode (https://opencode.ai) — see ntm#116
+	AgentTypeOmp         AgentType = "omp"      // Oh My Pi (omp), the pi-agent fork (https://omp.sh)
 	AgentTypeUser        AgentType = "user"     // User/Shell pane
 	AgentTypeUnknown     AgentType = "unknown"  // Unable to determine agent type
 )
 
-// GrokPhaseOneCapabilityHint describes the intentionally narrow Grok Build
-// integration boundary. Keep robot and saved-session errors aligned with this
-// capability contract.
-const GrokPhaseOneCapabilityHint = "phase-one Grok Build supports launch, model and effort selection, discovery, counts, and topology-only restore; automated prompt delivery, restart, and restore-time relaunch are not implemented"
+// GrokPhaseOneCapabilityHint described the phase-one Grok Build integration
+// boundary. Phase 2 (GH#251) implemented the interactive TUI protocol —
+// composer-verified prompt delivery, submission verification, interrupt, and
+// relaunch — against live captures of grok 1.0.5, so the phase-one refusals
+// no longer fire. The constant remains for error-path callers that attach it
+// as a hint; those paths are now unreachable for grok.
+const GrokPhaseOneCapabilityHint = "Grok Build phase 2 (GH#251) implements automated prompt delivery, interrupt, and relaunch; update ntm if you see this refusal"
 
-// GrokPromptDeliveryCapabilityHint is the actionable message returned by
-// prompt-delivery surfaces when a Grok Build pane is in the target batch.
-const GrokPromptDeliveryCapabilityHint = "automated Grok Build prompt delivery is not implemented in phase one"
+// GrokPromptDeliveryCapabilityHint is retained for error-path callers; the
+// phase-one prompt-delivery refusal it annotated no longer fires (GH#251).
+const GrokPromptDeliveryCapabilityHint = GrokPhaseOneCapabilityHint
 
 // ErrAutomatedRelaunchNotImplemented is returned whenever an operation would
 // automatically stop, restart, restore, or resume a Grok Build process.
@@ -81,6 +85,8 @@ func (t AgentType) Canonical() AgentType {
 		return AgentTypeAider
 	case "oc", "opencode":
 		return AgentTypeOpencode
+	case "omp", "oh-my-pi", "oh_my_pi", "ohmypi":
+		return AgentTypeOmp
 	case "ollama":
 		return AgentTypeOllama
 	case "user":
@@ -121,6 +127,8 @@ func (t AgentType) DisplayName() string {
 		return "Aider"
 	case AgentTypeOpencode:
 		return "Opencode"
+	case AgentTypeOmp:
+		return "Oh My Pi"
 	case AgentTypeUser:
 		return "User"
 	default:
@@ -159,6 +167,8 @@ func (t AgentType) ProfileName() string {
 		return "Aider"
 	case AgentTypeOpencode:
 		return "Opencode"
+	case AgentTypeOmp:
+		return "OMP"
 	case AgentTypeUser:
 		return "User"
 	default:
@@ -190,6 +200,7 @@ func AgentTypes() []AgentType {
 		AgentTypeWindsurf,
 		AgentTypeAider,
 		AgentTypeOpencode,
+		AgentTypeOmp,
 		AgentTypeOllama,
 	}
 }
@@ -203,39 +214,25 @@ func (t AgentType) IsValid() bool {
 // ValidateAutomatedRelaunch fails closed for agent types whose interactive
 // lifecycle protocol is not implemented. Callers must run this preflight for
 // an entire target batch before mutating any pane or session.
+//
+// Grok Build passed this gate in phase 2 (GH#251): restart/relaunch reuses
+// the configured launch template (`grok --always-approve …`), and the TUI's
+// readiness/working markers are implemented in internal/agent and
+// internal/robot pattern sets from live grok 1.0.5 captures.
 func (t AgentType) ValidateAutomatedRelaunch() error {
-	if t.Canonical() == AgentTypeGrok {
-		return ErrAutomatedRelaunchNotImplemented
-	}
 	return nil
 }
 
 // ValidateAutomatedPromptDelivery fails closed for agent types whose
 // interactive input protocol is not implemented. Callers must preflight the
 // complete target batch before writing input to any pane.
+//
+// Grok Build passed this gate in phase 2 (GH#251): delivery is composer-gated
+// (tmux.ComposerReadyForDelivery knows grok's bordered "│ ❯" composer) and
+// submission-verified (tmux.VerifyGrokSubmissionContext), both proven against
+// the live TUI.
 func (t AgentType) ValidateAutomatedPromptDelivery() error {
-	if t.Canonical() == AgentTypeGrok {
-		return ErrAutomatedPromptDeliveryNotImplemented
-	}
 	return nil
-}
-
-// NeedsDoubleEnter returns true if the agent type typically requires a double-Enter
-// sequence to recognize input (often due to internal buffering or TUI quirks).
-func (t AgentType) NeedsDoubleEnter() bool {
-	switch t.Canonical() {
-	case AgentTypeCodex:
-		return true
-	case AgentTypeGemini:
-		// Gemini may also benefit from double-Enter in some cases
-		return true
-	case AgentTypeAntigravity:
-		// Antigravity is the Gemini CLI's successor and shares its interactive
-		// TUI input behavior, so mirror the double-Enter handling.
-		return true
-	default:
-		return false
-	}
 }
 
 // AgentState represents the parsed state from agent terminal output.

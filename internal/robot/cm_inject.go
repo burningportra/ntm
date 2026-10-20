@@ -1,0 +1,433 @@
+package robot
+
+// CM (CASS Memory) per-task rule injection for robot sends (bd-3j6hm).
+//
+// This mirrors the CASS context-injection pipeline (cass_inject.go) at the
+// send boundary: an opt-in --with-memory toggle on SendOptions queries the
+// cm daemon (MCP cm_context via internal/cm.Client) or the cm CLI as a
+// fallback, takes the top-N relevant rules within a token budget, and
+// prepends a compact "## Project rules" block to the outgoing message.
+// Injection metadata (rule IDs, token cost, skip reason) is recorded in the
+// send envelope as CMInjectionInfo, the same place CASSInjectionInfo lands.
+//
+// Memory is best-effort enrichment: cm being missing, wedged, or empty must
+// never fail or block a send beyond the bounded query timeout.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/Dicklesworthstone/ntm/internal/cm"
+	"github.com/Dicklesworthstone/ntm/internal/process"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
+)
+
+// DefaultCMQueryTimeout bounds the cm context query during a send. A wedged
+// memory daemon must never stall dispatch for longer than this.
+const DefaultCMQueryTimeout = 5 * time.Second
+
+// DefaultCMOutcomeTimeout bounds the automatic cm_outcome report fired after
+// a tracked send completes with a confirmed acknowledgment.
+const DefaultCMOutcomeTimeout = 3 * time.Second
+
+// defaultCMMaxRules and defaultCMBudgetTokens are the compiled-in defaults
+// for [memory] send_max_rules / send_budget_tokens (kept in sync with
+// config.DefaultMemoryConfig).
+const (
+	defaultCMMaxRules     = 5
+	defaultCMBudgetTokens = 1500
+)
+
+// CMContextClient is the subset of the cm client used for rule injection.
+// Both cm.Client (daemon MCP) and the CLI fallback adapter satisfy it.
+type CMContextClient interface {
+	GetContext(ctx context.Context, task string, workspace string) (*cm.ContextResult, error)
+}
+
+// CMOutcomeClient is the subset of the cm client used for outcome feedback.
+type CMOutcomeClient interface {
+	RecordOutcome(ctx context.Context, report cm.OutcomeReport) error
+}
+
+// CMInjectConfig configures per-send memory rule injection. The zero value is
+// NOT usable; start from DefaultCMInjectConfig and override.
+type CMInjectConfig struct {
+	// Enabled is the master switch (config [memory] enabled). When false the
+	// --with-memory toggle degrades to a recorded skip instead of an error.
+	Enabled bool
+
+	// MaxRules caps how many rules are injected (config send_max_rules).
+	MaxRules int
+
+	// BudgetTokens caps the estimated token cost of the injected block
+	// (config send_budget_tokens). Estimation is ~4 chars/token, matching
+	// the CASS injection pipeline.
+	BudgetTokens int
+
+	// QueryTimeout bounds the cm context query.
+	QueryTimeout time.Duration
+
+	// OutcomeTimeout bounds the automatic outcome report.
+	OutcomeTimeout time.Duration
+
+	// ProjectDir is the daemon-discovery root (contains .ntm/pids).
+	// Send operations bind it to the verified target project.
+	ProjectDir string
+
+	// Workspace is passed to cm as the workspace scope so same-basename
+	// projects do not bleed memory into each other (#132). Empty means
+	// ProjectDir.
+	Workspace string
+	// SessionID identifies the target session's daemon PID file. Discovery
+	// never substitutes another session's daemon from the same project.
+	SessionID string
+
+	// CLIBinary overrides the cm binary used by the CLI fallback. Empty
+	// means "cm" from PATH. Tests point it at a nonexistent path to make
+	// unavailability deterministic.
+	CLIBinary string
+
+	// Client overrides daemon/CLI discovery. Used by tests and embedders.
+	Client CMContextClient
+
+	// Outcome overrides daemon discovery for outcome feedback.
+	Outcome CMOutcomeClient
+}
+
+// DefaultCMInjectConfig returns the compiled-in defaults, matching
+// config.DefaultMemoryConfig's send-injection keys.
+func DefaultCMInjectConfig() CMInjectConfig {
+	return CMInjectConfig{
+		Enabled:        true,
+		MaxRules:       defaultCMMaxRules,
+		BudgetTokens:   defaultCMBudgetTokens,
+		QueryTimeout:   DefaultCMQueryTimeout,
+		OutcomeTimeout: DefaultCMOutcomeTimeout,
+	}
+}
+
+// normalized fills unusable zero values with defaults so a partially
+// populated config (e.g. decoded from JSON) still behaves sanely.
+func (c CMInjectConfig) normalized() CMInjectConfig {
+	if c.MaxRules <= 0 {
+		c.MaxRules = defaultCMMaxRules
+	}
+	if c.BudgetTokens <= 0 {
+		c.BudgetTokens = defaultCMBudgetTokens
+	}
+	if c.QueryTimeout <= 0 {
+		c.QueryTimeout = DefaultCMQueryTimeout
+	}
+	if c.OutcomeTimeout <= 0 {
+		c.OutcomeTimeout = DefaultCMOutcomeTimeout
+	}
+	if c.Workspace == "" {
+		c.Workspace = c.ProjectDir
+	}
+	return c
+}
+
+// CMInjectionInfo reports memory rule injection details in robot responses.
+// It is the CM analogue of CASSInjectionInfo and is additive (omitempty) on
+// SendOutput.
+type CMInjectionInfo struct {
+	// Enabled indicates whether memory injection was attempted.
+	Enabled bool `json:"enabled"`
+	// RulesInjected lists the IDs of the rules that were injected.
+	RulesInjected []string `json:"rules_injected,omitempty"`
+	// TokensAdded is the estimated token count of the injected block.
+	TokensAdded int `json:"tokens_added"`
+	// SkippedReason explains why injection was skipped, if applicable.
+	SkippedReason string `json:"skipped_reason,omitempty"`
+	// Source records which transport produced the rules: "daemon" or "cli".
+	Source string `json:"source,omitempty"`
+	// Workspace is the absolute project used for this retrieval.
+	Workspace string `json:"workspace,omitempty"`
+	outcome   CMOutcomeClient
+}
+
+// prepareCMSendContext binds optional memory to the selected live targets.
+// A remote cwd is not evidence of a matching local project, and an unresolved
+// scope must never fall back to the caller's cwd or a supplied stale default.
+func prepareCMSendContext(ctx context.Context, session string, panes []tmux.Pane, cfg CMInjectConfig) (CMInjectConfig, *CMInjectionInfo) {
+	info := &CMInjectionInfo{Enabled: cfg.Enabled}
+	if !cfg.Enabled {
+		info.SkippedReason = "memory integration disabled in config (memory.enabled=false)"
+		return cfg, info
+	}
+	if err := ctx.Err(); err != nil {
+		info.SkippedReason = fmt.Sprintf("memory scope resolution canceled: %v", err)
+		return cfg, info
+	}
+	if tmux.DefaultClient.Remote != "" {
+		info.SkippedReason = "local CM memory is unavailable for a remote session"
+		return cfg, info
+	}
+	cfg = cfg.normalized()
+	scopeCtx, cancel := context.WithTimeout(ctx, cfg.QueryTimeout)
+	defer cancel()
+	projectDir, err := ResolveLiveSessionProjectContext(scopeCtx, session, panes, func(ctx context.Context, paneID string) (string, error) {
+		return tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
+	})
+	if err != nil {
+		info.SkippedReason = fmt.Sprintf("memory target project is unavailable: %v", err)
+		return cfg, info
+	}
+	cfg.ProjectDir, cfg.Workspace, cfg.SessionID = projectDir, projectDir, session
+	return cfg, nil
+}
+
+// cmCLIContextAdapter adapts the cm CLI client to CMContextClient.
+type cmCLIContextAdapter struct {
+	cli *cm.CLIClient
+}
+
+func (a cmCLIContextAdapter) GetContext(ctx context.Context, task string, workspace string) (*cm.ContextResult, error) {
+	resp, err := a.cli.GetContext(ctx, task, workspace)
+	if err != nil || resp == nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("cm context returned an unsuccessful result")
+	}
+	return &cm.ContextResult{
+		Task:             resp.Task,
+		RelevantBullets:  resp.RelevantBullets,
+		AntiPatterns:     resp.AntiPatterns,
+		HistorySnippets:  resp.HistorySnippets,
+		SuggestedQueries: resp.SuggestedQueries,
+	}, nil
+}
+
+// discoverCMDaemonClient resolves only the requested session's live daemon.
+func discoverCMDaemonClient(projectDir, sessionID string) (*cm.Client, bool) {
+	if !filepath.IsAbs(projectDir) || strings.TrimSpace(sessionID) == "" || tmux.ValidateSessionName(sessionID) != nil {
+		return nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(projectDir, ".ntm", "pids", "cm-"+sessionID+".pid"))
+	if err != nil {
+		return nil, false
+	}
+	var info cm.PIDFileInfo
+	if json.Unmarshal(data, &info) != nil || info.PID <= 0 || !process.IsAlive(info.PID) || info.Port <= 0 || info.Port > 65535 {
+		return nil, false
+	}
+	return cm.NewPortClient(info.Port, sessionID), true
+}
+
+// resolveCMContextClient picks the query transport: explicit override first,
+// then a live daemon, then the cm CLI. The bool reports availability; the
+// string names the transport for CMInjectionInfo.Source.
+func resolveCMContextClient(cfg CMInjectConfig) (CMContextClient, string, bool) {
+	if cfg.Client != nil {
+		return cfg.Client, "daemon", true
+	}
+	if client, ok := discoverCMDaemonClient(cfg.ProjectDir, cfg.SessionID); ok {
+		return client, "daemon", true
+	}
+	cli := cm.NewCLIClient(cm.WithCLIBinaryPath(cfg.CLIBinary), cm.WithCLITimeout(cfg.QueryTimeout))
+	if cli.IsInstalled() {
+		return cmCLIContextAdapter{cli: cli}, "cli", true
+	}
+	return nil, "", false
+}
+
+// estimateCMTokens mirrors the CASS pipeline's rough 4-chars-per-token rule.
+func estimateCMTokens(s string) int {
+	return len(s) / 4
+}
+
+// cmSanitizeText replaces control and other non-printable runes with spaces.
+// strings.Fields collapses only whitespace (\r, \n, \t, ...): a raw ESC
+// (0x1B), C1 control, or DEL byte in rule content is NOT whitespace and would
+// survive into the composer send text as a live key/escape sequence — the
+// tmux delivery path sends message bytes literally (`send-keys -l`) and does
+// not strip control characters.
+func cmSanitizeText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if !unicode.IsPrint(r) && !unicode.IsSpace(r) {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// cmRuleLine renders one rule as a single compact bullet, collapsing internal
+// whitespace so multi-line rule content cannot break the block format, and
+// stripping non-printable runes so rule content cannot smuggle raw control
+// sequences into the send text.
+func cmRuleLine(rule cm.Rule) string {
+	content := strings.Join(strings.Fields(cmSanitizeText(rule.Content)), " ")
+	id := strings.TrimSpace(strings.Join(strings.Fields(cmSanitizeText(rule.ID)), " "))
+	if id == "" {
+		return "- " + content + "\n"
+	}
+	return "- [" + id + "] " + content + "\n"
+}
+
+// formatCMRulesBlock builds the compact "## Project rules" block from the
+// top-N rules that fit within the token budget. It returns the block and the
+// IDs of the rules included. A rule with an empty ID still counts against
+// maxRules and is injected, but contributes no entry to the returned IDs:
+// those IDs feed rules_injected and the automatic cm_outcome report, and an
+// empty-string rule ID would poison both.
+func formatCMRulesBlock(rules []cm.Rule, maxRules, budgetTokens int) (string, []string) {
+	if len(rules) == 0 {
+		return "", nil
+	}
+
+	var b strings.Builder
+	b.WriteString("## Project rules\n\n")
+
+	var ids []string
+	injected := 0
+	for _, rule := range rules {
+		if injected >= maxRules {
+			break
+		}
+		if strings.TrimSpace(rule.Content) == "" {
+			continue
+		}
+		line := cmRuleLine(rule)
+		if estimateCMTokens(b.String())+estimateCMTokens(line) > budgetTokens {
+			break
+		}
+		b.WriteString(line)
+		injected++
+		if id := strings.TrimSpace(rule.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+
+	if injected == 0 {
+		return "", nil
+	}
+	return b.String(), ids
+}
+
+// InjectCMRules queries CM for rules relevant to task and prepends them to
+// message. It never fails the send: every degraded path returns the message
+// unchanged with a populated SkippedReason.
+//
+// task is the retrieval query (the caller's original message text); message
+// is the payload to prepend to, which may already carry CASS-injected
+// context.
+func InjectCMRules(ctx context.Context, task, message string, cfg CMInjectConfig) (string, *CMInjectionInfo) {
+	info := &CMInjectionInfo{Enabled: true}
+
+	if !cfg.Enabled {
+		info.Enabled = false
+		info.SkippedReason = "memory integration disabled in config (memory.enabled=false)"
+		return message, info
+	}
+	cfg = cfg.normalized()
+	if err := ctx.Err(); err != nil {
+		info.SkippedReason = fmt.Sprintf("cm context query canceled: %v", err)
+		return message, info
+	}
+	if !filepath.IsAbs(cfg.ProjectDir) || !filepath.IsAbs(cfg.Workspace) {
+		info.SkippedReason = "cm context requires an absolute target project and workspace"
+		return message, info
+	}
+	info.Workspace = cfg.Workspace
+
+	client, source, ok := resolveCMContextClient(cfg)
+	if !ok {
+		info.SkippedReason = "cm is not available (no daemon running and cm CLI not installed)"
+		return message, info
+	}
+	info.Source = source
+
+	queryCtx, cancel := context.WithTimeout(ctx, cfg.QueryTimeout)
+	defer cancel()
+
+	result, err := client.GetContext(queryCtx, task, cfg.Workspace)
+	if queryCtx.Err() != nil {
+		err = queryCtx.Err()
+	}
+	if err != nil {
+		info.SkippedReason = fmt.Sprintf("cm context query failed: %v", err)
+		return message, info
+	}
+	if result == nil || len(result.RelevantBullets) == 0 {
+		info.SkippedReason = "no relevant rules found"
+		return message, info
+	}
+
+	block, ids := formatCMRulesBlock(result.RelevantBullets, cfg.MaxRules, cfg.BudgetTokens)
+	if block == "" {
+		info.SkippedReason = "token budget too small for any rule"
+		return message, info
+	}
+
+	info.RulesInjected = ids
+	info.TokensAdded = estimateCMTokens(block)
+	info.outcome = cfg.Outcome
+	if info.outcome == nil {
+		info.outcome, _ = client.(CMOutcomeClient)
+	}
+	return block + "\n---\n\n" + message, info
+}
+
+// shouldReportCMSendOutcome is the evidence gate for automatic outcome
+// feedback after a tracked send. Only unambiguous evidence reports: at least
+// one confirmed acknowledgment and no ack timeout. A timeout (or a send that
+// never injected rules) reports nothing — ambiguous results must not train
+// the memory system.
+func shouldReportCMSendOutcome(withMemory bool, info *CMInjectionInfo, confirmations int, timedOut bool) bool {
+	return withMemory &&
+		info != nil &&
+		len(info.RulesInjected) > 0 &&
+		confirmations > 0 &&
+		!timedOut
+}
+
+// reportCMOutcome sends automatic outcome feedback for previously injected
+// rules. It is evidence-gated by the caller (only called on a confirmed ack)
+// and conservative here: without a daemon (or explicit override) it does
+// nothing, and errors are logged, never surfaced. The RPC runs in a goroutine
+// bounded by OutcomeTimeout; the call itself returns once the report finishes
+// or the bound elapses, so a wedged daemon cannot hang the send path.
+func reportCMOutcome(cfg CMInjectConfig, status cm.OutcomeStatus, ruleIDs []string) {
+	if len(ruleIDs) == 0 {
+		return
+	}
+	cfg = cfg.normalized()
+	if !filepath.IsAbs(cfg.ProjectDir) || !filepath.IsAbs(cfg.Workspace) {
+		return
+	}
+
+	client := cfg.Outcome
+	if client == nil {
+		slog.Debug("cm outcome skipped: query had no outcome transport", "rules", ruleIDs)
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.OutcomeTimeout)
+		defer cancel()
+		report := cm.OutcomeReport{
+			Status:  status,
+			RuleIDs: ruleIDs,
+			Notes:   "ntm robot send: acknowledgment confirmed",
+		}
+		if err := client.RecordOutcome(ctx, report); err != nil {
+			slog.Debug("cm outcome report failed", "error", err, "rules", ruleIDs)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(cfg.OutcomeTimeout + 500*time.Millisecond):
+		slog.Debug("cm outcome report timed out", "rules", ruleIDs)
+	}
+}

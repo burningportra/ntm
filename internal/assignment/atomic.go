@@ -291,6 +291,9 @@ type ReservationReconciliationPort interface {
 // ReservationFunc adapts a function to ReservationPort.
 type ReservationFunc func(context.Context, ReservationRequest) (LeaseReceipt, error)
 
+// Reserve implements ReservationPort. Test-only hook: retained because tests
+// in other packages (notably internal/coordinator) use ReservationFunc as a
+// fake ReservationPort; production code never converts ReservationFunc.
 func (f ReservationFunc) Reserve(ctx context.Context, req ReservationRequest) (LeaseReceipt, error) {
 	return f(ctx, req)
 }
@@ -484,6 +487,13 @@ type AtomicRequest struct {
 	// RecoveredIntentSHA256 may carry the exact checksum from an existing same-key
 	// durable row when the original unredacted prompt is intentionally unavailable.
 	RecoveredIntentSHA256 string
+	// BaseIntentSHA256 is the checksum of the caller's rendered prompt before
+	// history/memory context enrichment (cass/cm), set only when the prompt
+	// was enriched. Prompt and IntentSHA256 cover the enriched payload; this
+	// lets a later invocation of the same template intent find the recorded
+	// row and replay its exact enriched prompt instead of re-querying. It is
+	// persisted on the new row and takes no part in intent matching.
+	BaseIntentSHA256 string
 	// RequireReservation fails closed before a new claim or dispatch when the
 	// reservation port is unavailable. RequestedPaths also implies this flag.
 	RequireReservation        bool
@@ -716,7 +726,7 @@ func (c *AtomicCoordinator) Execute(ctx context.Context, req AtomicRequest) (Ato
 	}
 	if occupied != nil {
 		result.Assignment = occupied
-		return result, fmt.Errorf("%w: %s is owned by bead %s", ErrTargetOccupied, req.Target, occupied.BeadID)
+		return result, targetOccupiedError(req.Target, occupied, c.now())
 	}
 
 	prior := c.store.Get(req.BeadID)
@@ -973,6 +983,26 @@ func (c *AtomicCoordinator) Execute(ctx context.Context, req AtomicRequest) (Ato
 	return result, nil
 }
 
+// targetOccupiedError names WHO owns a pane and for how long. "owned by bead X"
+// alone left operators unable to tell a live assignment from terminal residue
+// without hand-diffing the ledger (ntm#302).
+func targetOccupiedError(target string, occupied *Assignment, now time.Time) error {
+	if occupied == nil {
+		return fmt.Errorf("%w: %s has an unknown owner", ErrTargetOccupied, target)
+	}
+	age, assignedAt := "unknown", "unknown"
+	if !occupied.AssignedAt.IsZero() {
+		assignedAt = occupied.AssignedAt.UTC().Format(time.RFC3339)
+		elapsed := now.Sub(occupied.AssignedAt)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		age = elapsed.Truncate(time.Second).String()
+	}
+	return fmt.Errorf("%w: %s is owned by bead %s (status=%s, age=%s, assigned_at=%s)",
+		ErrTargetOccupied, target, occupied.BeadID, occupied.Status, age, assignedAt)
+}
+
 func assignmentEligibilityAuthorizationRequest(prior *Assignment, req AtomicRequest, actor string, replacementStart bool) AssignmentEligibilityAuthorizationRequest {
 	authorization := AssignmentEligibilityAuthorizationRequest{
 		BeadID:     req.BeadID,
@@ -1031,7 +1061,7 @@ func (c *AtomicCoordinator) releaseWorkingReplacementWithOperationLocks(ctx cont
 	}
 
 	if current.ClearState == ClearStateNone {
-		clearing, err := c.store.beginClearWithOperationLock(req.BeadID, c.now(), []AssignmentStatus{StatusWorking})
+		clearing, err := c.store.beginClearWithOperationLock(req.BeadID, c.now(), false, []AssignmentStatus{StatusWorking})
 		if err != nil {
 			return receipt, c.store.Get(req.BeadID), err
 		}
@@ -1915,6 +1945,7 @@ func (s *AssignmentStore) RecordAtomicIntent(req AtomicRequest, actor string, cr
 		OccupancyKey:             normalizeOccupancyKey(req.Target, req.OccupancyKey),
 		PromptSHA256:             PromptSHA256(req.Prompt),
 		IntentSHA256:             req.IntentSHA256,
+		BaseIntentSHA256:         strings.TrimSpace(req.BaseIntentSHA256),
 		PendingPrompt:            req.Prompt,
 	}
 	previous := existing

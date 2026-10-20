@@ -3,6 +3,8 @@ package panels
 import (
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/ntm/internal/cost"
 )
 
 func TestNewCostPanel(t *testing.T) {
@@ -15,8 +17,10 @@ func TestNewCostPanel(t *testing.T) {
 	if cfg.ID != "cost" {
 		t.Errorf("Expected ID 'cost', got %q", cfg.ID)
 	}
-	if cfg.Title != "Cost Tracking" {
-		t.Errorf("Expected Title 'Cost Tracking', got %q", cfg.Title)
+	// The title must not claim tracking: the figures are a token estimate over
+	// scraped pane output priced from a static table, never provider billing.
+	if cfg.Title != "Cost (estimated)" {
+		t.Errorf("Expected Title 'Cost (estimated)', got %q", cfg.Title)
 	}
 }
 
@@ -118,5 +122,94 @@ func TestCostPanelViewShowsScrollIndicatorWhenOverflowing(t *testing.T) {
 	view := panel.View()
 	if !strings.Contains(view, "%") {
 		t.Fatalf("expected overflowing cost panel to show percent badge, got %q", view)
+	}
+}
+
+// The cost column has to hold the widest cell the panel can produce. The "~"
+// prefix and the confidence marker each add a column, and a truncated currency
+// figure reads as precise while being the wrong number.
+func TestCostColumnFitsTheWidestCell(t *testing.T) {
+	panel := NewCostPanel()
+	cols := panel.costTableColumns(80)
+
+	var costWidth int
+	for _, col := range cols {
+		if col.Title == "Cost" {
+			costWidth = col.Width
+		}
+	}
+	if costWidth == 0 {
+		t.Fatal("no Cost column")
+	}
+
+	// Longest producible cell: a four-figure estimate priced from the default
+	// row, which carries the "?" marker.
+	widest := cost.FormatCostEstimate(1234.5) + "?"
+	if len(widest) > costWidth {
+		t.Errorf("widest cost cell %q is %d columns, but the column is %d — it will be truncated",
+			widest, len(widest), costWidth)
+	}
+}
+
+// GH #331: at table widths 36-43 the "In" column is dropped while "Out" stays,
+// and rows used to keep an input-token cell anyway. bubbles/table indexes its
+// columns by cell position, so the fifth cell panicked with "index out of range
+// [4] with length 4" once three or more agents made the rows visible.
+func TestCostPanel_RowsMatchColumnsAtEveryWidth(t *testing.T) {
+	data := CostPanelData{Agents: []CostAgentRow{
+		{PaneTitle: "cc_1", InputTokens: 12000, OutputTokens: 3400, CostUSD: 0.30},
+		{PaneTitle: "cc_2", InputTokens: 9000, OutputTokens: 2100, CostUSD: 0.20},
+		{PaneTitle: "cod_1", InputTokens: 5000, OutputTokens: 1500, CostUSD: 0.10},
+		{PaneTitle: "gmi_1", InputTokens: 100, OutputTokens: 50, CostUSD: 0.01},
+	}}
+
+	for tableWidth := 0; tableWidth <= 80; tableWidth++ {
+		panel := NewCostPanel()
+		panel.SetData(data, nil)
+		cols := panel.costTableColumns(tableWidth)
+		rows := panel.costTableRows(cols, len(data.Agents))
+		if len(rows) != len(data.Agents) {
+			t.Fatalf("tableWidth %d: got %d rows, want %d", tableWidth, len(rows), len(data.Agents))
+		}
+		for i, row := range rows {
+			if len(row) != len(cols) {
+				t.Fatalf("tableWidth %d row %d: %d cells for %d columns", tableWidth, i, len(row), len(cols))
+			}
+			for j, col := range cols {
+				var want string
+				switch col.Title {
+				case "In":
+					want = formatTokenShort(data.Agents[i].InputTokens)
+				case "Out":
+					want = formatTokenShort(data.Agents[i].OutputTokens)
+				default:
+					continue
+				}
+				if row[j] != want {
+					t.Errorf("tableWidth %d row %d column %q = %q, want %q", tableWidth, i, col.Title, row[j], want)
+				}
+			}
+		}
+	}
+}
+
+func TestCostPanel_ViewDoesNotPanicAtAnyWidth(t *testing.T) {
+	data := CostPanelData{Agents: []CostAgentRow{
+		{PaneTitle: "cc_1", CostUSD: 0.30},
+		{PaneTitle: "cc_2", CostUSD: 0.20},
+		{PaneTitle: "cod_1", CostUSD: 0.10},
+	}}
+	for width := 10; width <= 90; width++ {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("panel width %d: View panicked: %v", width, r)
+				}
+			}()
+			panel := NewCostPanel()
+			panel.SetSize(width, 20)
+			panel.SetData(data, nil)
+			_ = panel.View()
+		}()
 	}
 }

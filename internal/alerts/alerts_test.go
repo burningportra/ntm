@@ -1,9 +1,6 @@
 package alerts
 
 import (
-	"encoding/json"
-	"io"
-	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -150,7 +147,7 @@ func TestTrackerResolution(t *testing.T) {
 		t.Errorf("expected 'keep' alert to remain, got %s", active[0].ID)
 	}
 
-	resolved := tracker.GetResolved()
+	resolved := trackerResolved(tracker)
 	if len(resolved) != 1 {
 		t.Errorf("expected 1 resolved alert, got %d", len(resolved))
 	}
@@ -244,59 +241,6 @@ func TestTrackerRefresh(t *testing.T) {
 	}
 }
 
-func TestTrackerGettersCloneContextMap(t *testing.T) {
-	cfg := DefaultConfig()
-	tracker := NewTracker(cfg)
-
-	tracker.AddAlert(Alert{
-		ID:       "clone-context",
-		Type:     AlertAgentError,
-		Severity: SeverityWarning,
-		Message:  "context map aliasing",
-		Context:  map[string]interface{}{"usage": 88.0},
-	})
-
-	active := tracker.GetActive()
-	active[0].Context["usage"] = 12.0
-
-	fetched, ok := tracker.GetByID("clone-context")
-	if !ok {
-		t.Fatal("expected alert to be present")
-	}
-	if got := fetched.Context["usage"]; got != 88.0 {
-		t.Fatalf("tracker state was mutated through GetActive result: usage=%v", got)
-	}
-
-	filtered := tracker.GetActiveFiltered(nil, nil)
-	filtered[0].Context["usage"] = 33.0
-	fetched, ok = tracker.GetByID("clone-context")
-	if !ok {
-		t.Fatal("expected alert to be present after filtered fetch")
-	}
-	if got := fetched.Context["usage"]; got != 88.0 {
-		t.Fatalf("tracker state was mutated through GetActiveFiltered result: usage=%v", got)
-	}
-
-	allActive, _ := tracker.GetAll()
-	allActive[0].Context["usage"] = 44.0
-	fetched, ok = tracker.GetByID("clone-context")
-	if !ok {
-		t.Fatal("expected alert to be present after GetAll")
-	}
-	if got := fetched.Context["usage"]; got != 88.0 {
-		t.Fatalf("tracker state was mutated through GetAll result: usage=%v", got)
-	}
-
-	fetched.Context["usage"] = 55.0
-	final, ok := tracker.GetByID("clone-context")
-	if !ok {
-		t.Fatal("expected alert to be present after GetByID")
-	}
-	if got := final.Context["usage"]; got != 88.0 {
-		t.Fatalf("tracker state was mutated through GetByID result: usage=%v", got)
-	}
-}
-
 func TestTrackerClonesIncomingContextMaps(t *testing.T) {
 	cfg := DefaultConfig()
 	tracker := NewTracker(cfg)
@@ -312,7 +256,7 @@ func TestTrackerClonesIncomingContextMaps(t *testing.T) {
 
 	incoming.Context["usage"] = 5.0
 
-	stored, ok := tracker.GetByID("incoming-context")
+	stored, ok := trackerGetByID(tracker, "incoming-context")
 	if !ok {
 		t.Fatal("expected stored alert")
 	}
@@ -330,7 +274,7 @@ func TestTrackerClonesIncomingContextMaps(t *testing.T) {
 	tracker.Update([]Alert{refresh}, nil)
 	refresh.Context["usage"] = 1.0
 
-	stored, ok = tracker.GetByID("incoming-context")
+	stored, ok = trackerGetByID(tracker, "incoming-context")
 	if !ok {
 		t.Fatal("expected stored alert after refresh")
 	}
@@ -390,7 +334,7 @@ func TestTrackerReturnsAlertsInDeterministicOrder(t *testing.T) {
 		t.Fatalf("GetActive order = %v, want [a b c]", got)
 	}
 
-	filtered := tracker.GetActiveFiltered(nil, nil)
+	filtered := tracker.GetActive()
 	if got := []string{filtered[0].ID, filtered[1].ID, filtered[2].ID}; strings.Join(got, ",") != "a,b,c" {
 		t.Fatalf("GetActiveFiltered order = %v, want [a b c]", got)
 	}
@@ -403,7 +347,7 @@ func TestTrackerReturnsAlertsInDeterministicOrder(t *testing.T) {
 		t.Fatalf("GetAll resolved order = %v, want [resolved-a resolved-b]", got)
 	}
 
-	resolved := tracker.GetResolved()
+	resolved := trackerResolved(tracker)
 	if got := []string{resolved[0].ID, resolved[1].ID}; strings.Join(got, ",") != "resolved-a,resolved-b" {
 		t.Fatalf("GetResolved order = %v, want [resolved-a resolved-b]", got)
 	}
@@ -448,7 +392,7 @@ func TestTrackerManualResolve(t *testing.T) {
 		t.Errorf("expected 0 active alerts after manual resolve, got %d", len(active))
 	}
 
-	resolved := tracker.GetResolved()
+	resolved := trackerResolved(tracker)
 	if len(resolved) != 1 {
 		t.Errorf("expected 1 resolved alert, got %d", len(resolved))
 	}
@@ -473,7 +417,7 @@ func TestTrackerResolveIfUnchangedSkipsRefreshedAlert(t *testing.T) {
 	}
 
 	tracker.AddAlert(alert)
-	stored, ok := tracker.GetByID(alert.ID)
+	stored, ok := trackerGetByID(tracker, alert.ID)
 	if !ok {
 		t.Fatal("expected alert to be active")
 	}
@@ -488,7 +432,7 @@ func TestTrackerResolveIfUnchangedSkipsRefreshedAlert(t *testing.T) {
 		t.Fatalf("expected refreshed alert to remain active, got %+v", active)
 	}
 
-	refreshed, ok := tracker.GetByID(alert.ID)
+	refreshed, ok := trackerGetByID(tracker, alert.ID)
 	if !ok {
 		t.Fatal("expected refreshed alert to be active")
 	}
@@ -497,116 +441,6 @@ func TestTrackerResolveIfUnchangedSkipsRefreshedAlert(t *testing.T) {
 	}
 	if active := tracker.GetActive(); len(active) != 0 {
 		t.Fatalf("expected alert to resolve, got active=%+v", active)
-	}
-}
-
-func TestTrackerGetByID(t *testing.T) {
-	cfg := DefaultConfig()
-	tracker := NewTracker(cfg)
-
-	alert := Alert{ID: "findme", Type: AlertAgentError, Severity: SeverityWarning, Message: "Find me"}
-	tracker.Update([]Alert{alert}, nil)
-
-	// Find active alert
-	found, ok := tracker.GetByID("findme")
-	if !ok {
-		t.Error("expected to find alert by ID")
-	}
-	if found.ID != "findme" {
-		t.Errorf("expected ID 'findme', got %s", found.ID)
-	}
-
-	// Resolve and find in resolved
-	tracker.ManualResolve("findme")
-	found, ok = tracker.GetByID("findme")
-	if !ok {
-		t.Error("expected to find resolved alert by ID")
-	}
-	if !found.IsResolved() {
-		t.Error("expected found alert to be resolved")
-	}
-
-	// Not found
-	_, ok = tracker.GetByID("notfound")
-	if ok {
-		t.Error("expected not to find non-existent alert")
-	}
-}
-
-func TestTrackerClear(t *testing.T) {
-	cfg := DefaultConfig()
-	tracker := NewTracker(cfg)
-
-	alerts := []Alert{
-		{ID: "a", Type: AlertAgentError, Severity: SeverityWarning, Message: "A"},
-		{ID: "b", Type: AlertDiskLow, Severity: SeverityError, Message: "B"},
-	}
-	tracker.Update(alerts, nil)
-	tracker.ManualResolve("a")
-
-	// Verify state before clear
-	active, resolved := tracker.GetAll()
-	if len(active) != 1 || len(resolved) != 1 {
-		t.Fatalf("unexpected state before clear: %d active, %d resolved", len(active), len(resolved))
-	}
-
-	// Clear
-	tracker.Clear()
-
-	active, resolved = tracker.GetAll()
-	if len(active) != 0 || len(resolved) != 0 {
-		t.Errorf("expected 0 active and 0 resolved after clear, got %d active, %d resolved", len(active), len(resolved))
-	}
-}
-
-func TestTrackerFilterByType(t *testing.T) {
-	cfg := DefaultConfig()
-	tracker := NewTracker(cfg)
-
-	alerts := []Alert{
-		{ID: "err1", Type: AlertAgentError, Severity: SeverityWarning, Message: "Error 1"},
-		{ID: "err2", Type: AlertAgentError, Severity: SeverityError, Message: "Error 2"},
-		{ID: "disk", Type: AlertDiskLow, Severity: SeverityWarning, Message: "Disk"},
-	}
-	tracker.Update(alerts, nil)
-
-	// Filter by type
-	agentErrorType := AlertAgentError
-	filtered := tracker.GetActiveFiltered(&agentErrorType, nil)
-	if len(filtered) != 2 {
-		t.Errorf("expected 2 agent_error alerts, got %d", len(filtered))
-	}
-
-	diskLowType := AlertDiskLow
-	filtered = tracker.GetActiveFiltered(&diskLowType, nil)
-	if len(filtered) != 1 {
-		t.Errorf("expected 1 disk_low alert, got %d", len(filtered))
-	}
-}
-
-func TestTrackerFilterBySeverity(t *testing.T) {
-	cfg := DefaultConfig()
-	tracker := NewTracker(cfg)
-
-	alerts := []Alert{
-		{ID: "info", Type: AlertAgentError, Severity: SeverityInfo, Message: "Info"},
-		{ID: "warn", Type: AlertAgentError, Severity: SeverityWarning, Message: "Warning"},
-		{ID: "err", Type: AlertAgentError, Severity: SeverityError, Message: "Error"},
-		{ID: "crit", Type: AlertAgentError, Severity: SeverityCritical, Message: "Critical"},
-	}
-	tracker.Update(alerts, nil)
-
-	// Filter by minimum severity
-	warnSeverity := SeverityWarning
-	filtered := tracker.GetActiveFiltered(nil, &warnSeverity)
-	if len(filtered) != 3 {
-		t.Errorf("expected 3 alerts with severity >= warning, got %d", len(filtered))
-	}
-
-	errSeverity := SeverityError
-	filtered = tracker.GetActiveFiltered(nil, &errSeverity)
-	if len(filtered) != 2 {
-		t.Errorf("expected 2 alerts with severity >= error, got %d", len(filtered))
 	}
 }
 
@@ -1058,6 +892,44 @@ func TestGeneratorDetectErrorState_SeverityClassification(t *testing.T) {
 	}
 }
 
+// A Claude pane prints its own failed tool calls ("⎿  Error: Exit code 144",
+// captured from a live swarm pane that kept working) and the output of builds
+// it runs. Those are the agent's work, not the agent failing, unless the error
+// is Claude's newest marker or no Claude marker is left at all.
+func TestGeneratorDetectErrorState_ClaudeToolOutputIsNotAnAgentError(t *testing.T) {
+	t.Parallel()
+
+	gen := NewGenerator(DefaultConfig())
+	claude := tmux.Pane{ID: "%13", Type: tmux.AgentClaude, Width: 160}
+	toolFailure := "● Bash(pkill -f \"run_c7.sh\"; sleep 1; echo cleared)\n" +
+		"  ⎿  Error: Exit code 144\n\n" +
+		"● Bash(go build ./...)\n" +
+		"  ⎿  error: undefined: worksource.ProjectPolicy\n\n"
+	split := func(capture string) []string { return strings.Split(capture, "\n") }
+
+	tests := []struct {
+		name      string
+		pane      tmux.Pane
+		capture   string
+		wantAlert bool
+	}{
+		{"still working", claude, toolFailure + "✻ Simmering… (esc to interrupt · 12s)\n\n❯ \n", false},
+		{"turn completed", claude, toolFailure + "● Fixed the import; the build passes now.\n\n✻ Worked for 2m 4s · done 11:09 PM · 1 shell still running\n\n❯ \n", false},
+		{"stopped on the error", claude, toolFailure, true},
+		{"CLI exited to a shell", claude, "Error: unable to connect to the Anthropic API\nubuntu@host:~/proj$ \n", true},
+		{"other agents unchanged", tmux.Pane{ID: "%14", Type: tmux.AgentCodex}, toolFailure + "✻ Simmering… (esc to interrupt · 12s)\n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			alert := gen.detectErrorState("sess", tt.pane, split(tt.capture))
+			if got := alert != nil; got != tt.wantAlert {
+				t.Fatalf("alert = %+v, want alert=%v", alert, tt.wantAlert)
+			}
+		})
+	}
+}
+
 func TestGeneratorDetectRateLimit_Last20Lines(t *testing.T) {
 	t.Parallel()
 
@@ -1244,50 +1116,9 @@ func TestGeneratorCheckDiskSpace_ThresholdAndFallbackPath(t *testing.T) {
 	}
 }
 
-func TestFormatAlertString(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		alert Alert
-		want  string
-	}{
-		{
-			name:  "message only",
-			alert: Alert{Message: "hello"},
-			want:  "hello",
-		},
-		{
-			name:  "session prefix",
-			alert: Alert{Session: "sess", Message: "hello"},
-			want:  "sess: hello",
-		},
-		{
-			name:  "pane suffix",
-			alert: Alert{Pane: "3", Message: "hello"},
-			want:  "hello (pane 3)",
-		},
-		{
-			name:  "session and pane",
-			alert: Alert{Session: "sess", Pane: "3", Message: "hello"},
-			want:  "sess: hello (pane 3)",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := formatAlertString(tt.alert); got != tt.want {
-				t.Errorf("formatAlertString() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestGenerateAndTrack_DisabledResolvesExisting(t *testing.T) {
 	tracker := GetGlobalTracker()
-	tracker.Clear()
+	clearTracker(tracker)
 
 	tracker.AddAlert(Alert{
 		ID:       "seed",
@@ -1336,7 +1167,7 @@ func TestPreserveUnmanagedAlertSources(t *testing.T) {
 
 func TestGenerateAndTrack_PreservesEventBasedAlerts(t *testing.T) {
 	tracker := GetGlobalTracker()
-	tracker.Clear()
+	clearTracker(tracker)
 
 	tracker.AddAlert(Alert{
 		ID:       "seed-event-alert",
@@ -1361,66 +1192,107 @@ func TestGenerateAndTrack_PreservesEventBasedAlerts(t *testing.T) {
 	t.Fatal("expected event-based alert to remain active after GenerateAndTrack")
 }
 
-func TestGetAlertStrings_DisabledReturnsEmpty(t *testing.T) {
-	tracker := GetGlobalTracker()
-	tracker.Clear()
+// clearTracker resets a tracker's state for test isolation.
+func clearTracker(tr *Tracker) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.active = make(map[string]*Alert)
+	tr.resolved = make([]*Alert, 0)
+}
 
-	cfg := DefaultConfig()
-	cfg.Enabled = false
+// trackerResolved returns the tracker's resolved alerts.
+func trackerResolved(tr *Tracker) []Alert {
+	_, resolved := tr.GetAll()
+	return resolved
+}
 
-	msgs := GetAlertStrings(cfg)
-	if len(msgs) != 0 {
-		t.Errorf("expected 0 alert strings, got %d", len(msgs))
+// trackerGetByID returns the active alert with the given ID, if present.
+func trackerGetByID(tr *Tracker, id string) (Alert, bool) {
+	for _, alert := range tr.GetActive() {
+		if alert.ID == id {
+			return alert, true
+		}
+	}
+	return Alert{}, false
+}
+
+// TestGeneratorDetectErrorState_ProseIsNotAnIncident is the ntm#299
+// regression: the alert generator promotes an agent_error into aggregate
+// session health, so ordinary agent prose that merely contains "exception",
+// "timeout" or "failed" must not become one. A healthy reviewer session was
+// reported degraded with three such alerts while --robot-health reported the
+// same session healthy in the same minute.
+func TestGeneratorDetectErrorState_ProseIsNotAnIncident(t *testing.T) {
+	t.Parallel()
+
+	gen := NewGenerator(DefaultConfig())
+	pane := tmux.Pane{ID: "pane-prose"}
+
+	prose := []string{
+		"the service status line reports a configured wait timeout 20000ms",
+		"a review finding says cleanup catches BaseException",
+		"planning prose discussing a diagnostics timeout for the next pass",
+		"... it failed naming exactly the seven against the HEAD ci.yml before the edit,",
+		"the planted negative failed as expected",
+		"we should add a stack trace to the error path later",
+	}
+	for _, line := range prose {
+		if alert := gen.detectErrorState("sess", pane, []string{line}); alert != nil {
+			t.Errorf("prose became an agent_error alert: %q -> %s", line, alert.Message)
+		}
+	}
+
+	// Positive controls: real runtime failures must still fire loudly.
+	positives := map[string]Severity{
+		"Traceback (most recent call last):":       SeverityError,
+		"panic: runtime error: index out of range": SeverityCritical,
+		"ValueError: bad input":                    SeverityError,
+		"Failed to connect to api.anthropic.com":   SeverityWarning,
+		"command exited with code 2":               SeverityWarning,
+		"signal SIGSEGV: segmentation violation":   SeverityCritical,
+		"Error: overloaded_error":                  SeverityError,
+		"read: connection timed out":               SeverityWarning,
+	}
+	for line, wantSev := range positives {
+		alert := gen.detectErrorState("sess", pane, []string{line})
+		if alert == nil {
+			t.Errorf("real failure produced no alert: %q", line)
+			continue
+		}
+		if alert.Severity != wantSev {
+			t.Errorf("%q severity = %s, want %s", line, alert.Severity, wantSev)
+		}
 	}
 }
 
-func TestPrintAlerts_DisabledConfig(t *testing.T) {
-	tracker := GetGlobalTracker()
-	tracker.Clear()
+// TestGeneratorDetectRateLimit_BareNumbersAreNotEvidence pins the other half of
+// ntm#299: a SHA-256 that happens to contain "429" is not a provider limit.
+func TestGeneratorDetectRateLimit_BareNumbersAreNotEvidence(t *testing.T) {
+	t.Parallel()
 
-	cfg := DefaultConfig()
-	cfg.Enabled = false
+	gen := NewGenerator(DefaultConfig())
+	pane := tmux.Pane{ID: "pane-rl"}
 
-	out, err := captureStdout(t, func() error {
-		return PrintAlerts(cfg, false)
-	})
-	if err != nil {
-		t.Fatalf("PrintAlerts error: %v", err)
+	negatives := []string{
+		"6f764f0c7344e437767e61f189f493065dca56cadc7048610948be7a5d42963f",
+		"scanned 429 files in the worktree",
+		"we should handle rate limit errors in a follow-up",
+	}
+	for _, line := range negatives {
+		if alert := gen.detectRateLimit("sess", pane, []string{line}); alert != nil {
+			t.Errorf("bare number or prose became a rate-limit alert: %q", line)
+		}
 	}
 
-	var got AlertsOutput
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("json.Unmarshal error: %v\noutput:\n%s", err, string(out))
+	positives := []string{
+		"HTTP/1.1 429 Too Many Requests",
+		"Rate limit exceeded. Try again in 60s.",
+		"You've hit your rate limit for this model",
+		"quota exceeded for this account",
 	}
-	if got.Config.Enabled {
-		t.Errorf("Config.Enabled = true, want false")
+	for _, line := range positives {
+		if alert := gen.detectRateLimit("sess", pane, []string{line}); alert == nil {
+			t.Errorf("real rate limit produced no alert: %q", line)
+		}
 	}
-	if len(got.Active) != 0 {
-		t.Errorf("Active count = %d, want 0", len(got.Active))
-	}
-	if got.Summary.TotalActive != 0 {
-		t.Errorf("Summary.TotalActive = %d, want 0", got.Summary.TotalActive)
-	}
-}
-
-func captureStdout(t *testing.T, fn func() error) ([]byte, error) {
-	t.Helper()
-
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe error: %v", err)
-	}
-	os.Stdout = w
-
-	fnErr := fn()
-	_ = w.Close()
-	os.Stdout = oldStdout
-
-	out, readErr := io.ReadAll(r)
-	_ = r.Close()
-	if readErr != nil {
-		t.Fatalf("io.ReadAll error: %v", readErr)
-	}
-	return out, fnErr
 }

@@ -48,6 +48,12 @@ func (f *PTYFetcher) FetchQuota(ctx context.Context, paneID string, provider Pro
 		captureLines = 100
 	}
 
+	if provider == ProviderOmp {
+		// Never type a guessed usage command into an omp composer: omp has
+		// no quota API, so report that explicitly instead of a fake reading.
+		return &QuotaInfo{Provider: provider, FetchedAt: time.Now(), Unsupported: OmpQuotaUnsupported}, nil
+	}
+
 	cmds, ok := providerCommands[provider]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", provider)
@@ -167,11 +173,9 @@ func (f *PTYFetcher) waitForNewOutput(ctx context.Context, paneID, initialOutput
 
 // fetchStatus sends a status command and captures output
 func (f *PTYFetcher) fetchStatus(ctx context.Context, paneID, statusCmd string, lines int, timeout time.Duration) (string, error) {
-	// Don't send if status command is same as usage command
-	// Note: We need to check the specific provider's commands, but we don't have provider here.
-	// However, this logic was slightly flawed in original code (checked ProviderClaude only).
-	// For now, we assume caller handles deduplication or we check against known duplicates.
-	// But simply checking output change is safe.
+	// Callers are responsible for not passing a status command identical to
+	// the usage command (this helper has no provider context to check);
+	// waiting on output change below keeps a duplicate send harmless anyway.
 
 	initialOutput, err := tmux.CapturePaneOutput(paneID, lines)
 	if err != nil {

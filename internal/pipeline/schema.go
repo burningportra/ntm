@@ -48,8 +48,9 @@ type Workflow struct {
 	// Step definitions
 	Steps []Step `yaml:"steps" toml:"steps" json:"steps"`
 
-	// PostPipelineSteps run after the main step graph completes successfully.
-	// Failures here are reported but don't retroactively fail the pipeline.
+	// PostPipelineSteps run after the main graph succeeds or fails, unless
+	// cancelled. Resume adopts completed hooks when continuing a partial tail,
+	// and runs a fresh tail if main work reopens. Hook failures are advisory.
 	PostPipelineSteps []Step `yaml:"post_pipeline_steps,omitempty" toml:"post_pipeline_steps,omitempty" json:"post_pipeline_steps,omitempty"`
 }
 
@@ -237,9 +238,14 @@ type LimitsConfig struct {
 	MaxCommandStdinBytes  int64 `yaml:"max_command_stdin_bytes,omitempty" toml:"max_command_stdin_bytes,omitempty" json:"max_command_stdin_bytes,omitempty"`
 	MaxForeachRounds      int   `yaml:"max_foreach_rounds,omitempty" toml:"max_foreach_rounds,omitempty" json:"max_foreach_rounds,omitempty"`
 	SubstepParallelMax    int   `yaml:"substep_parallel_max,omitempty" toml:"substep_parallel_max,omitempty" json:"substep_parallel_max,omitempty"`
-	MaxTemplateBytes      int64 `yaml:"max_template_bytes,omitempty" toml:"max_template_bytes,omitempty" json:"max_template_bytes,omitempty"`
-	MaxStepCountTotal     int   `yaml:"max_step_count_total,omitempty" toml:"max_step_count_total,omitempty" json:"max_step_count_total,omitempty"`
-	MaxSubstitutionDepth  int   `yaml:"max_substitution_recursion,omitempty" toml:"max_substitution_recursion,omitempty" json:"max_substitution_recursion,omitempty"`
+	// MaxParallelSteps bounds how many simultaneously-ready independent
+	// top-level steps the executor dispatches concurrently (bd-jio7h).
+	// Zero/unset means DefaultMaxParallelSteps; 1 forces the legacy serial
+	// scheduling.
+	MaxParallelSteps     int   `yaml:"max_parallel_steps,omitempty" toml:"max_parallel_steps,omitempty" json:"max_parallel_steps,omitempty"`
+	MaxTemplateBytes     int64 `yaml:"max_template_bytes,omitempty" toml:"max_template_bytes,omitempty" json:"max_template_bytes,omitempty"`
+	MaxStepCountTotal    int   `yaml:"max_step_count_total,omitempty" toml:"max_step_count_total,omitempty" json:"max_step_count_total,omitempty"`
+	MaxSubstitutionDepth int   `yaml:"max_substitution_recursion,omitempty" toml:"max_substitution_recursion,omitempty" json:"max_substitution_recursion,omitempty"`
 }
 
 const (
@@ -249,6 +255,7 @@ const (
 	DefaultMaxCommandStderrBytes = 4 * 1024 * 1024  // 4 MB
 	DefaultMaxCommandStdinBytes  = 1 * 1024 * 1024  // 1 MB (bd-1ka2t)
 	DefaultSubstepParallelMax    = 8                // bd-dmjn3
+	DefaultMaxParallelSteps      = 4                // bd-jio7h
 	DefaultMaxTemplateBytes      = 256 * 1024       // 256 KB
 	DefaultMaxStepCountTotal     = 100000
 	DefaultMaxSubstitutionDepth  = 8
@@ -276,6 +283,9 @@ func (lc LimitsConfig) EffectiveLimits() LimitsConfig {
 	}
 	if lc.SubstepParallelMax <= 0 {
 		lc.SubstepParallelMax = DefaultSubstepParallelMax
+	}
+	if lc.MaxParallelSteps <= 0 {
+		lc.MaxParallelSteps = DefaultMaxParallelSteps
 	}
 	if lc.MaxTemplateBytes <= 0 {
 		lc.MaxTemplateBytes = DefaultMaxTemplateBytes
@@ -891,7 +901,7 @@ func (a *AfterRef) UnmarshalTOML(data any) error {
 // (Branch/Branches are shell-driven switch statements; see Step.Branch +
 // Step.Branches above. Each map value is either a single step or a list of
 // steps; structurally `interface{}` so we accept both shapes without forcing
-// a custom unmarshaller. The executor treats this as a no-op for now and
+// a custom unmarshaller. The executor deliberately treats this as a no-op;
 // orchestration-style pipelines use it as structural documentation.)
 
 // ParallelSpec is parallel: in either of two forms — a list of sub-steps to
@@ -1307,6 +1317,11 @@ const (
 	// StatusSkipped by on_failure setting a runtime variable (bd-2ytru).
 	// Distinguishes user-driven recovery from unclassified skips.
 	SkipKindOnFailureAction SkipKind = "on_failure_action"
+	// SkipKindPaneBusy marks a step that was NOT dispatched because another
+	// ntm process held the target pane for the whole wait budget (ntm#324).
+	// It is deliberately distinct from cancelled: nothing was pasted and no
+	// prompt was queued, so the step is safe to re-run once the pane frees.
+	SkipKindPaneBusy SkipKind = "pane_busy_other_process"
 )
 
 // StepResult contains the result of executing a step
@@ -1361,11 +1376,13 @@ type ExecutionState struct {
 
 	// Phase-B resume metadata. This is ntm's internal persisted execution
 	// format and may change between pipeline schema revisions.
-	LastCheckpointAt time.Time                        `json:"last_checkpoint_at,omitempty"`
-	ForeachState     map[string]ForeachIterationState `json:"foreach_state,omitempty"`
-	ParallelState    map[string]ParallelGroupState    `json:"parallel_state,omitempty"`
-	ScopeStack       []ScopeFrame                     `json:"scope_stack,omitempty"`
-	InFlightSteps    map[string]InFlightStepState     `json:"in_flight_steps,omitempty"`
+	LastCheckpointAt  time.Time                        `json:"last_checkpoint_at,omitempty"`
+	ForeachState      map[string]ForeachIterationState `json:"foreach_state,omitempty"`
+	ParallelState     map[string]ParallelGroupState    `json:"parallel_state,omitempty"`
+	ScopeStack        []ScopeFrame                     `json:"scope_stack,omitempty"`
+	InFlightSteps     map[string]InFlightStepState     `json:"in_flight_steps,omitempty"`
+	AgentDeliveries   map[string]AgentDeliveryState    `json:"agent_deliveries,omitempty"`
+	CommandExecutions map[string]CommandExecutionState `json:"command_executions,omitempty"`
 
 	// OutputValidation records the post-run check of Workflow.Outputs (bd-3uqce).
 	// nil when the workflow declared no outputs or validation was skipped (e.g.
@@ -1407,23 +1424,6 @@ type ParallelGroupResult struct {
 	Partial   bool         `json:"partial"` // Some succeeded, some failed
 }
 
-// DefaultWorkflowSettings returns sensible defaults for workflow settings
-func DefaultWorkflowSettings() WorkflowSettings {
-	logDispatch := true
-	return WorkflowSettings{
-		Timeout:          Duration{Duration: 30 * time.Minute},
-		OnError:          ErrorActionFail,
-		LogDispatch:      &logDispatch,
-		NotifyOnComplete: false,
-		NotifyOnError:    true,
-	}
-}
-
-// DefaultStepTimeout returns the default timeout for a step
-func DefaultStepTimeout() Duration {
-	return Duration{Duration: 5 * time.Minute}
-}
-
 // NormalizeAgentType converts agent type aliases to canonical form.
 // Case-insensitive: "Claude", "CLAUDE", "claude" all normalize to "claude".
 func NormalizeAgentType(t string) string {
@@ -1437,6 +1437,8 @@ func NormalizeAgentType(t string) string {
 		return "gemini"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
+	case agent.AgentTypeOmp:
+		return "omp"
 	case agent.AgentTypePi:
 		return "pi"
 	case agent.AgentTypeKimi:
@@ -1462,7 +1464,7 @@ func NormalizeAgentType(t string) string {
 // Case-insensitive: "Claude", "CLAUDE", "claude" are all valid.
 func IsValidAgentType(t string) bool {
 	switch NormalizeAgentType(t) {
-	case "claude", "codex", "gemini", "antigravity", "pi", "kimi", "muse", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "antigravity", "omp", "pi", "kimi", "muse", "cursor", "windsurf", "aider", "oc", "ollama":
 		return true
 	default:
 		return false

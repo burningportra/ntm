@@ -142,6 +142,14 @@ var contentPatterns = []struct {
 		},
 	},
 	{
+		// Oh My Pi (omp): the welcome banner's top edge ("╭─── omp v18.2.3",
+		// ascii "+--- omp v18.2.3"). A bare "omp" word is not evidence.
+		agentType: "omp",
+		patterns: []*regexp.Regexp{
+			regexp.MustCompile(`(?m)^\s*(?:╭─+|\+-+)\s+omp\s+v\d+\.\d+`),
+		},
+	},
+	{
 		agentType: "ollama",
 		patterns: []*regexp.Regexp{
 			regexp.MustCompile(`(?im)(^ollama>\s*$|\bollama\s+(run|chat|serve|pull)\b|^\s*ollama\s+cli\b)`),
@@ -211,6 +219,15 @@ func detectFromProcess(command string) AgentDetection {
 	if exactProcessExecutable(command, "grok") {
 		return AgentDetection{
 			Type:       "grok",
+			Confidence: 0.95,
+			Method:     MethodProcess,
+		}
+	}
+	// "omp" is short and appears in unrelated names (libomp, OpenMP); like
+	// grok it only identifies Oh My Pi as the exact executable basename.
+	if exactProcessExecutable(command, "omp") {
+		return AgentDetection{
+			Type:       "omp",
 			Confidence: 0.95,
 			Method:     MethodProcess,
 		}
@@ -342,6 +359,8 @@ func DetectFromNTMTitle(title string) AgentDetection {
 		return AgentDetection{Type: "muse", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "grok"):
 		return AgentDetection{Type: "grok", Confidence: 0.9, Method: MethodTitle}
+	case containsShortForm(lower, "omp"):
+		return AgentDetection{Type: "omp", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "cursor"):
 		return AgentDetection{Type: "cursor", Confidence: 0.9, Method: MethodTitle}
 	case containsShortForm(lower, "windsurf"), containsShortForm(lower, "ws"):
@@ -353,25 +372,4 @@ func DetectFromNTMTitle(title string) AgentDetection {
 	}
 
 	return AgentDetection{Type: "unknown", Confidence: 0.0, Method: MethodUnknown}
-}
-
-// DetectAllAgents detects agent types for all panes in a session
-func DetectAllAgents(session string) (map[int]AgentDetection, error) {
-	panes, err := tmux.GetPanes(session)
-	if err != nil {
-		return nil, err
-	}
-
-	results := make(map[int]AgentDetection)
-	for _, pane := range panes {
-		// Try to capture some content for detection
-		content := ""
-		if captured, err := tmux.CapturePaneOutput(pane.ID, 50); err == nil {
-			content = captured
-		}
-
-		results[pane.Index] = DetectAgentTypeEnhanced(pane, content)
-	}
-
-	return results, nil
 }

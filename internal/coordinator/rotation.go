@@ -1,0 +1,685 @@
+// Package coordinator: rotation.go wires the context rotation engine into the
+// coordinator tick (bd-rpmg8).
+//
+// When [rotation] usage_percent_threshold is > 0, every coordinator cycle
+// compares each agent pane's TRANSCRIPT-SOURCED context usage — ground truth
+// read from the agent CLI's own session transcript (or, for Oh My Pi, the
+// context gauge the agent itself renders in its composer border), never
+// scrollback estimates (that minimum-confidence gate is fixed by design, not
+// configurable) — against the threshold. Panes above it get a pending
+// rotation enqueued through internal/context's existing pending/confirm
+// machinery (the same storage `ntm rotate context pending/confirm` reads);
+// with [rotation] auto_confirm = true the pending rotation is executed
+// immediately via the existing Rotator.ConfirmRotation path.
+//
+// Safety gates, all mandatory and checked at fire time on a fresh capture:
+// the pane must not be actively working, rate-limited, showing an interactive
+// gate, or holding unsubmitted composer input / queued messages. Every skip
+// is logged with its reason and published to the attention feed.
+package coordinator
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
+	"github.com/Dicklesworthstone/ntm/internal/models"
+	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
+)
+
+// rotationCaptureLines is how much fresh pane tail is captured for the
+// fire-time safety gates. The working/gate/composer detectors all operate on
+// bounded tails, so a moderate capture is sufficient and cheap.
+const rotationCaptureLines = 100
+
+// rotationDecision records one trigger decision for logging and tests.
+type rotationDecision struct {
+	PaneID     string  // tmux pane ID (%N)
+	AgentID    string  // canonical agent ID (pane title, e.g. sess__cc_1)
+	Action     string  // "enqueued", "auto_confirmed", "auto_confirm_failed", "skipped"
+	SkipReason string  // populated when Action == "skipped"
+	UsagePct   float64 // transcript-sourced usage percentage
+	Tokens     int     // evidence: transcript context occupancy tokens
+	Limit      int     // evidence: context window (transcript-reported or models registry)
+	Source     string  // evidence: transcript file path
+	Confidence string  // evidence: transcript freshness confidence ("high"/"medium")
+}
+
+// rotationChecker performs the per-tick transcript-usage rotation check. All
+// collaborators are injectable for tests; production wiring is installed by
+// newRotationChecker.
+type rotationChecker struct {
+	session     string
+	workDir     string
+	threshold   float64
+	autoConfirm bool
+
+	// [rotation.thresholds] restart triggers (WS6-wire,
+	// bd-ws6-config-truth-ienmd.1). Active only while the transcript-usage
+	// checker itself is enabled (usage_percent_threshold > 0); zero disables
+	// the individual trigger.
+	restartTokensAbove float64       // rotation.thresholds.restart_if_tokens_above
+	restartSessionAge  time.Duration // rotation.thresholds.restart_if_session_hours
+
+	rotator    *ntmctx.Rotator
+	ctxMonitor *ntmctx.ContextMonitor
+	forecaster *ntmctx.ExhaustionForecaster
+
+	// Seams (default to real implementations).
+	getPanes func(session string) ([]tmux.Pane, error)
+	allPanes func(context.Context) (map[string][]tmux.Pane, error)
+	paneCwd  func(paneID string) (string, bool)
+	// Fleet probes share one deadline instead of multiplying command timeouts.
+	paneCwdContext func(context.Context, string) (string, bool)
+	processUsage   func(agentType string, panePID int) (*ntmctx.TranscriptUsage, bool)
+	// An injected reader owns workspace attribution in its observation domain.
+	// Production leaves this nil and checks the entire tmux server below.
+	transcriptUsage func(agentType, cwd string) (*ntmctx.TranscriptUsage, bool)
+	capturePane     func(paneID string, lines int) (string, error)
+	contextLimit    func(model string) int
+	sessionCreated  func(session string) (time.Time, bool)
+	storedPending   func(agentID string) (*ntmctx.PendingRotation, error)
+	enqueue         func(agentID, paneID string, usagePct float64) *ntmctx.PendingRotation
+	confirm         func(ctx context.Context, agentID string) ntmctx.RotationResult
+	publish         func(record robot.ActuationRecord)
+	publishForecast func(event robot.AttentionEvent)
+	now             func() time.Time
+}
+
+// newRotationChecker builds a production checker, or nil when the trigger is
+// disabled (threshold <= 0). ntmCfg may be nil; it is only used for the
+// replacement-agent launch commands and context rotation tunables.
+func newRotationChecker(session, workDir string, coordCfg CoordinatorConfig, ntmCfg *config.Config) *rotationChecker {
+	if coordCfg.RotationUsageThreshold <= 0 {
+		return nil
+	}
+
+	rotCfg := config.DefaultContextRotationConfig()
+	thresholds := config.DefaultRotationConfig().Thresholds
+	if ntmCfg != nil {
+		rotCfg = ntmCfg.ContextRotation
+		thresholds = ntmCfg.Rotation.Thresholds
+	}
+	// The checker decides eligibility itself and only uses the Rotator's
+	// pending/confirm machinery and rotation path.
+
+	ctxMonitor := ntmctx.NewContextMonitor(ntmctx.DefaultMonitorConfig())
+	rotator := ntmctx.NewRotator(ntmctx.RotatorConfig{
+		Monitor: ctxMonitor,
+		Spawner: ntmctx.NewDefaultPaneSpawner(ntmCfg),
+		Config:  rotCfg,
+	})
+
+	rc := &rotationChecker{
+		session:     session,
+		workDir:     workDir,
+		threshold:   coordCfg.RotationUsageThreshold,
+		autoConfirm: coordCfg.RotationAutoConfirm,
+		// [rotation.thresholds] restart triggers ride the same enqueue/confirm
+		// machinery (WS6-wire): tokens above restart_if_tokens_above or a
+		// session older than restart_if_session_hours also trigger rotation.
+		restartTokensAbove: thresholds.RestartIfTokensAbove,
+		restartSessionAge:  time.Duration(thresholds.RestartIfSessionHours) * time.Hour,
+		rotator:            rotator,
+		ctxMonitor:         ctxMonitor,
+		getPanes:           tmux.GetPanes,
+		sessionCreated: func(session string) (time.Time, bool) {
+			created, err := tmux.SessionCreatedAt(session)
+			return created, err == nil
+		},
+		paneCwd: func(paneID string) (string, bool) {
+			cwd, err := tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
+			if err != nil {
+				return "", false
+			}
+			cwd = strings.TrimSpace(cwd)
+			return cwd, cwd != ""
+		},
+		processUsage: ntmctx.ProcessTranscriptUsage,
+		paneCwdContext: func(ctx context.Context, paneID string) (string, bool) {
+			cwd, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
+			cwd = strings.TrimSpace(cwd)
+			return cwd, err == nil && cwd != ""
+		},
+		capturePane:   tmux.CapturePaneOutput,
+		contextLimit:  models.GetContextLimit,
+		storedPending: ntmctx.GetPendingRotationByID,
+		publish: func(record robot.ActuationRecord) {
+			robot.GetAttentionFeed().PublishActuation(record)
+		},
+		publishForecast: func(event robot.AttentionEvent) {
+			robot.GetAttentionFeed().Append(event)
+		},
+		now: time.Now,
+	}
+	rc.enqueue = func(agentID, paneID string, usagePct float64) *ntmctx.PendingRotation {
+		return rc.rotator.EnqueuePendingRotation(rc.session, agentID, paneID, usagePct, rc.workDir)
+	}
+	rc.confirm = func(ctx context.Context, agentID string) ntmctx.RotationResult {
+		return rc.rotator.ConfirmRotationContext(ctx, agentID, ntmctx.ConfirmRotate, 0)
+	}
+	return rc
+}
+
+// runOnce executes one rotation check pass and returns the decisions made.
+// Panes without an unambiguous transcript-sourced usage reading are ignored
+// entirely (the fixed minimum-confidence gate). Below-threshold panes may
+// publish advisory forecasts, but forecasts never trigger rotation.
+func (rc *rotationChecker) runOnce(ctx context.Context) []rotationDecision {
+	if rc == nil || rc.threshold <= 0 {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil
+	}
+
+	panes, err := rc.getPanes(rc.session)
+	if err != nil {
+		rc.reportContextForecasts(nil, nil)
+		slog.Warn("context rotation check could not list panes",
+			"session", rc.session, "error", err)
+		return nil
+	}
+
+	usages := rc.resolvePaneTranscripts(panes)
+	if ctx != nil && ctx.Err() != nil {
+		return nil
+	}
+	rc.reportContextForecasts(panes, usages)
+	if len(usages) == 0 {
+		return nil
+	}
+
+	// Deterministic order for logs and tests.
+	ordered := make([]tmux.Pane, 0, len(panes))
+	for _, pane := range panes {
+		if _, ok := usages[pane.ID]; ok {
+			ordered = append(ordered, pane)
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ID < ordered[j].ID })
+
+	var decisions []rotationDecision
+	for _, pane := range ordered {
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
+		if decision, acted := rc.checkPane(ctx, pane, usages[pane.ID]); acted {
+			decisions = append(decisions, decision)
+		}
+	}
+	return decisions
+}
+
+// checkPane evaluates one pane's transcript usage against the threshold and,
+// when exceeded, runs the safety gates and enqueues/auto-confirms a rotation.
+// The bool result reports whether a decision (enqueue/confirm/skip) was made.
+func (rc *rotationChecker) checkPane(ctx context.Context, pane tmux.Pane, usage *ntmctx.TranscriptUsage) (rotationDecision, bool) {
+	now := rc.now()
+
+	// Usage percent: transcript-reported window when available (Codex),
+	// otherwise the models registry window for the transcript's model —
+	// mirroring internal/robot's snapshot computation.
+	limit := usage.ContextWindow
+	if limit <= 0 {
+		limit = rc.contextLimit(usage.Model)
+	}
+	if limit <= 0 {
+		return rotationDecision{}, false
+	}
+	pct := float64(usage.Tokens) / float64(limit) * 100
+	if pct > 100 {
+		// An over-100% reading means the registry window for this model is
+		// wrong; cap at the safe rotation-triggering ceiling.
+		pct = 100
+	}
+	// Trigger evaluation: transcript usage percent is the primary trigger;
+	// the [rotation.thresholds] restart knobs add two more (WS6-wire,
+	// bd-ws6-config-truth-ienmd.1): absolute transcript tokens above
+	// restart_if_tokens_above, and session age above
+	// restart_if_session_hours. Each individual trigger is disabled at zero.
+	triggerReason := ""
+	switch {
+	case pct > rc.threshold:
+		triggerReason = "usage_percent"
+	case rc.restartTokensAbove > 0 && float64(usage.Tokens) > rc.restartTokensAbove:
+		triggerReason = "tokens_above"
+	case rc.restartSessionAge > 0 && rc.sessionCreated != nil:
+		if created, ok := rc.sessionCreated(rc.session); ok && now.Sub(created) > rc.restartSessionAge {
+			triggerReason = "session_age"
+		}
+	}
+	if triggerReason == "" {
+		return rotationDecision{}, false
+	}
+
+	decision := rotationDecision{
+		PaneID:     pane.ID,
+		AgentID:    pane.Title,
+		UsagePct:   pct,
+		Tokens:     usage.Tokens,
+		Limit:      limit,
+		Source:     rotationUsageSource(usage),
+		Confidence: ntmctx.TranscriptConfidence(usage.UpdatedAt, now),
+	}
+	if pane.Type.Canonical() == agent.AgentTypeGemini &&
+		(usage.UpdatedAt.IsZero() || usage.UpdatedAt.After(now) || decision.Confidence != "high") {
+		// Gemini metadata writes and rewinds do not refresh the accounting
+		// timestamp. An old conversation must not trigger a fresh rotation.
+		decision.Action = "skipped"
+		decision.SkipReason = "stale_transcript"
+		rc.reportSkip(decision)
+		return decision, true
+	}
+
+	if strings.TrimSpace(pane.Title) == "" {
+		decision.Action = "skipped"
+		decision.SkipReason = "missing_pane_title"
+		rc.reportSkip(decision)
+		return decision, true
+	}
+
+	// Already pending (in this rotator or in the persistent store another
+	// process wrote): do not re-enqueue or republish every tick.
+	if rc.rotator != nil && rc.rotator.HasPendingRotation(decision.AgentID) {
+		if pending := rc.rotator.GetPendingRotation(decision.AgentID); pending != nil && !pending.IsExpired() {
+			return rotationDecision{}, false
+		}
+	}
+	if rc.storedPending != nil {
+		if stored, err := rc.storedPending(decision.AgentID); err == nil && stored != nil {
+			return rotationDecision{}, false
+		}
+	}
+
+	// Fire-time safety gates on a FRESH capture. A pane we cannot observe is
+	// a pane we must not rotate.
+	captured, err := rc.capturePane(pane.ID, rotationCaptureLines)
+	if err != nil {
+		decision.Action = "skipped"
+		decision.SkipReason = "capture_failed"
+		rc.reportSkip(decision)
+		return decision, true
+	}
+	if reason := rotationSafetySkipReason(captured, pane); reason != "" {
+		decision.Action = "skipped"
+		decision.SkipReason = reason
+		rc.reportSkip(decision)
+		return decision, true
+	}
+
+	pending := rc.enqueue(decision.AgentID, pane.ID, pct)
+	decision.Action = "enqueued"
+	slog.Info("context rotation enqueued from transcript usage",
+		"session", rc.session, "pane", pane.ID, "agent", decision.AgentID,
+		"trigger", triggerReason,
+		"usage_percent", pct, "threshold", rc.threshold,
+		"tokens", usage.Tokens, "limit", limit,
+		"source", usage.Path, "confidence", decision.Confidence,
+		"auto_confirm", rc.autoConfirm)
+	rc.publishDecision(robot.ActuationRecord{
+		Stage:          robot.ActuationStageRequest,
+		Targets:        []string{decision.AgentID},
+		Summary:        fmt.Sprintf("context rotation enqueued for %s: transcript usage %.1f%% > threshold %.1f%%", decision.AgentID, pct, rc.threshold),
+		ReasonCode:     "context_rotation_enqueued",
+		MessagePreview: rotationEvidence(decision),
+		Severity:       robot.SeverityInfo,
+	})
+
+	if !rc.autoConfirm || pending == nil {
+		return decision, true
+	}
+
+	// Auto-confirm executes through the existing confirm path. The rotator's
+	// monitor must know the agent so rotateAgent can resolve its state.
+	if rc.ctxMonitor != nil {
+		rc.ctxMonitor.RegisterAgent(decision.AgentID, pane.ID, usage.Model)
+		rc.ctxMonitor.SetAgentType(decision.AgentID, string(pane.Type.Canonical()))
+	}
+	result := rc.confirm(ctx, decision.AgentID)
+	if result.Success {
+		decision.Action = "auto_confirmed"
+		slog.Info("context rotation auto-confirmed",
+			"session", rc.session, "agent", decision.AgentID,
+			"new_agent", result.NewAgentID, "new_pane", result.NewPaneID,
+			"state", string(result.State))
+	} else {
+		decision.Action = "auto_confirm_failed"
+		slog.Warn("context rotation auto-confirm failed",
+			"session", rc.session, "agent", decision.AgentID,
+			"state", string(result.State), "error", result.Error)
+	}
+	severity := robot.SeverityInfo
+	resultWord := "completed"
+	if !result.Success {
+		severity = robot.SeverityWarning
+		resultWord = "failed"
+	}
+	rc.publishDecision(robot.ActuationRecord{
+		Stage:          robot.ActuationStageOutcome,
+		Targets:        []string{decision.AgentID},
+		Summary:        fmt.Sprintf("context rotation auto-confirm %s for %s (state=%s)", resultWord, decision.AgentID, result.State),
+		ReasonCode:     "context_rotation_auto_confirm",
+		MessagePreview: rotationEvidence(decision),
+		Result:         resultWord,
+		Error:          result.Error,
+		Severity:       severity,
+	})
+	return decision, true
+}
+
+// reportSkip logs and publishes a safety-gate (or observability) skip.
+func (rc *rotationChecker) reportSkip(decision rotationDecision) {
+	slog.Info("context rotation skipped by safety gate",
+		"session", rc.session, "pane", decision.PaneID, "agent", decision.AgentID,
+		"reason", decision.SkipReason,
+		"usage_percent", decision.UsagePct, "threshold", rc.threshold,
+		"tokens", decision.Tokens, "limit", decision.Limit,
+		"source", decision.Source, "confidence", decision.Confidence)
+	target := decision.AgentID
+	if target == "" {
+		target = decision.PaneID
+	}
+	rc.publishDecision(robot.ActuationRecord{
+		Stage:          robot.ActuationStageOutcome,
+		Targets:        []string{target},
+		Summary:        fmt.Sprintf("context rotation for %s skipped: %s (usage %.1f%% > threshold %.1f%%)", target, decision.SkipReason, decision.UsagePct, rc.threshold),
+		ReasonCode:     "context_rotation_safety_skip",
+		MessagePreview: rotationEvidence(decision),
+		Blocked:        true,
+		Severity:       robot.SeverityInfo,
+	})
+}
+
+// publishDecision fills the shared actuation-record fields and publishes to
+// the attention feed.
+func (rc *rotationChecker) publishDecision(record robot.ActuationRecord) {
+	if rc.publish == nil {
+		return
+	}
+	record.Session = rc.session
+	record.Action = "context_rotation"
+	record.Source = "coordinator.rotation"
+	record.Method = "transcript_usage"
+	record.Actionability = robot.ActionabilityInteresting
+	rc.publish(record)
+}
+
+// rotationEvidence renders the triggering evidence (tokens, limit, source
+// path, confidence) for attention-feed consumers.
+// rotationUsageSource names a usage reading's evidence: the transcript path,
+// or "status_bar" for an agent-rendered gauge reading (which has no file).
+func rotationUsageSource(usage *ntmctx.TranscriptUsage) string {
+	if usage.Path == "" {
+		return "status_bar"
+	}
+	return usage.Path
+}
+
+func rotationEvidence(d rotationDecision) string {
+	return fmt.Sprintf("usage=%.1f%% tokens=%d limit=%d source=%s confidence=%s",
+		d.UsagePct, d.Tokens, d.Limit, d.Source, d.Confidence)
+}
+
+// rotationSafetySkipReason applies the mandatory fire-time safety gates to a
+// fresh capture and returns a non-empty machine-readable reason when the pane
+// must not be rotated:
+//
+//  1. working            — the agent is mid-turn (live spinner / in-flight marker)
+//  2. rate_limited       — the pane shows rate-limit output
+//  3. interactive_gate   — a login/trust/permission dialog is on screen
+//  4. unsubmitted_input  — the composer holds typed-but-unsent text
+//  5. queued_messages    — the TUI reports queued unsubmitted messages
+//
+// This gate admits only agent types with an authoritative live working
+// detector; every other type is refused outright rather than typed into while
+// its state is unknown. Context rotation itself reaches this gate for Claude
+// Code, Codex, Gemini, and Oh My Pi panes (the types that can produce a ground-truth
+// usage trigger: transcripts, or omp's own context gauge), and the mail nudge
+// loop shares the gate and can reach it for Grok Build too: its TUI working
+// detector and composer inspection are capture-based and independent of
+// transcript discovery.
+func rotationSafetySkipReason(captured string, pane tmux.Pane) string {
+	canonical := pane.Type.Canonical()
+	switch canonical {
+	case agent.AgentTypeClaudeCode:
+		if agent.ClaudeActivelyWorking(captured, pane.Width) {
+			return "working"
+		}
+	case agent.AgentTypeCodex:
+		if agent.CodexActivelyWorking(captured, pane.Width) {
+			return "working"
+		}
+	case agent.AgentTypeGemini:
+		// Unlike absence of a spinner, an observed empty live composer is
+		// positive readiness evidence. Unknown or modal frames fail closed.
+		switch agent.DetectGeminiTurn(captured) {
+		case agent.GeminiTurnWorking:
+			return "working"
+		case agent.GeminiTurnRateLimited:
+			return "rate_limited"
+		case agent.GeminiTurnIdle:
+		default:
+			return "unknown_agent_state"
+		}
+	case agent.AgentTypeGrok:
+		if agent.GrokActivelyWorking(captured, pane.Width) {
+			return "working"
+		}
+	case agent.AgentTypeOmp:
+		// omp's composer-anchored detector (spinner+timer, Esc-hint line,
+		// pending steering) is authoritative; composer inspection below
+		// parses the same box for unsubmitted drafts.
+		if agent.OmpActivelyWorking(captured, pane.Width) {
+			return "working"
+		}
+	default:
+		return "unsupported_agent_type"
+	}
+
+	if ratelimit.DetectRateLimitForAgent(captured, string(canonical)).RateLimited {
+		return "rate_limited"
+	}
+
+	if gate, found := agent.DetectInteractiveGate(captured, pane.Width); found {
+		return "interactive_gate:" + gate
+	}
+
+	composer := tmux.InspectComposer(captured, canonical)
+	if composer.HoldsText {
+		return "unsubmitted_input"
+	}
+	if composer.QueuedMessages {
+		return "queued_messages"
+	}
+
+	return ""
+}
+
+// resolvePaneTranscripts correlates panes with their agent CLI's own session
+// transcripts, returning usage keyed by pane ID, under the same attribution
+// rule as robot's context and snapshot views (ntmctx.AttributePaneTranscripts).
+//
+// A pane whose agent process names its session (Claude Code's per-process
+// session record, a resumed session id) reads exactly that transcript, even
+// when several panes of its type share one directory — the normal NTM swarm
+// layout. Otherwise correlation is by (agent type, cwd) and only for a pane
+// that is the sole pane of its type there; panes left ambiguous get NO reading
+// (the check simply does not fire for them) rather than another pane's.
+//
+// Oh My Pi panes are read from their own composer-border context gauge first
+// (ntmctx.OmpStatusBarUsage, the same reading robot's snapshot and context
+// views prefer): it is the agent's own live accounting and belongs to the
+// captured pane by construction.
+func (rc *rotationChecker) resolvePaneTranscripts(panes []tmux.Pane) map[string]*ntmctx.TranscriptUsage {
+	refs := make([]ntmctx.PaneTranscriptRef, 0, len(panes))
+	gauges := make(map[string]*ntmctx.TranscriptUsage)
+	remote := tmux.DefaultClient != nil && tmux.DefaultClient.Remote != ""
+	for _, pane := range panes {
+		if pane.Dead || pane.IsServicePane() {
+			continue
+		}
+		var agentType string
+		switch pane.Type.Canonical() {
+		case agent.AgentTypeClaudeCode:
+			agentType = "claude"
+		case agent.AgentTypeCodex:
+			agentType = "codex"
+		case agent.AgentTypeGemini:
+			agentType = "gemini"
+		case agent.AgentTypeOmp:
+			// omp renders its own context accounting in the composer border.
+			// That reading is attributed to this pane by construction, so it
+			// needs no cwd correlation and survives the shared-directory swarm
+			// layout that leaves transcripts ambiguous.
+			if rc.capturePane != nil {
+				if captured, err := rc.capturePane(pane.ID, rotationCaptureLines); err == nil {
+					if usage, ok := ntmctx.OmpStatusBarUsage(captured, rc.now()); ok {
+						gauges[pane.ID] = usage
+					}
+				}
+			}
+			agentType = "omp"
+		default:
+			// Other agent CLIs have no known transcript locations; the fixed
+			// transcript-only confidence gate excludes them.
+			continue
+		}
+		if remote {
+			continue // A captured gauge is remote evidence; local files/PIDs are not.
+		}
+		cwd, _ := rc.paneCwd(pane.ID)
+		refs = append(refs, ntmctx.PaneTranscriptRef{PaneID: pane.ID, AgentType: agentType, PID: pane.PID, Cwd: cwd})
+	}
+	known := ntmctx.AttributePaneTranscripts(refs, gauges, rc.processUsage, nil)
+	if rc.transcriptUsage != nil {
+		return ntmctx.AttributePaneTranscripts(refs, known, nil, rc.transcriptUsage)
+	}
+	return rc.resolveServerScopedTranscripts(refs, known)
+}
+
+// resolveServerScopedTranscripts adds only workspace readings proven unique in
+// a complete, fresh server inventory. A different session shares the same native
+// transcript store; a local-session count cannot prove ownership. Exact process
+// readings and pane-local gauges survive an unavailable inventory, but never
+// remove a peer from the ambiguity count. No other session's transcript is read.
+func (rc *rotationChecker) resolveServerScopedTranscripts(targets []ntmctx.PaneTranscriptRef, known map[string]*ntmctx.TranscriptUsage) map[string]*ntmctx.TranscriptUsage {
+	needed := make(map[string]bool)
+	for _, target := range targets {
+		if known[target.PaneID] == nil {
+			needed[target.AgentType] = true
+		}
+	}
+	if len(needed) == 0 {
+		return known
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	list := rc.allPanes
+	if list == nil {
+		list = tmux.GetAllPanesContext
+	}
+	inventory, err := list(ctx)
+	if err != nil || ctx.Err() != nil {
+		return known
+	}
+	physical := make(map[string]tmux.Pane)
+	for _, panes := range inventory {
+		for _, pane := range panes {
+			previous, exists := physical[pane.ID]
+			if exists &&
+				(previous.PID != pane.PID || previous.Type.Canonical() != pane.Type.Canonical() || previous.Dead != pane.Dead || previous.Service != pane.Service) {
+				return known // Conflicting observations are not a complete inventory.
+			}
+			if pane.ID == "" || (!exists && len(physical) >= 4096) || ctx.Err() != nil {
+				return known
+			}
+			physical[pane.ID] = pane
+		}
+	}
+	ids := make([]string, 0, len(physical))
+	for id := range physical {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	type scopeKey struct{ provider, cwd string }
+	refs := make([]ntmctx.PaneTranscriptRef, 0, len(physical))
+	uncertain := make(map[string]bool)
+	claudeStores := make(map[string]int)
+	eligible := make(map[scopeKey]string) // canonical group -> original target cwd
+	targetByID := make(map[string]ntmctx.PaneTranscriptRef, len(targets))
+	for _, target := range targets {
+		targetByID[target.PaneID] = target
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return known
+		}
+		pane := physical[id]
+		if pane.Dead || pane.IsServicePane() {
+			continue
+		}
+		provider := ""
+		switch pane.Type.Canonical() {
+		case agent.AgentTypeClaudeCode:
+			provider = "claude"
+		case agent.AgentTypeCodex:
+			provider = "codex"
+		case agent.AgentTypeGemini:
+			provider = "gemini"
+		case agent.AgentTypeOmp:
+			provider = "omp"
+		}
+		if !needed[provider] {
+			continue
+		}
+		var cwd string
+		var ok bool
+		if rc.paneCwdContext != nil {
+			cwd, ok = rc.paneCwdContext(ctx, id)
+		} else if rc.paneCwd != nil {
+			cwd, ok = rc.paneCwd(id)
+		}
+		canonical, pathErr := filepath.EvalSymlinks(cwd)
+		if !ok || !filepath.IsAbs(cwd) || pathErr != nil {
+			uncertain[provider] = true // Unknown cwd may overlap any target of this type.
+			continue
+		}
+		canonical = filepath.Clean(canonical)
+		refs = append(refs, ntmctx.PaneTranscriptRef{PaneID: id, AgentType: provider, PID: pane.PID, Cwd: canonical})
+		if provider == "claude" {
+			claudeStores[ntmctx.MungeProjectPath(cwd)]++
+		}
+		target, isTarget := targetByID[id]
+		targetCwd, targetErr := filepath.EvalSymlinks(target.Cwd)
+		if isTarget && target.PID == pane.PID && target.AgentType == provider && targetErr == nil && filepath.Clean(targetCwd) == canonical {
+			eligible[scopeKey{provider, canonical}] = target.Cwd
+		}
+	}
+	result := ntmctx.AttributePaneTranscripts(refs, known, nil, func(provider, cwd string) (*ntmctx.TranscriptUsage, bool) {
+		original, ok := eligible[scopeKey{provider, cwd}]
+		if !ok || uncertain[provider] || ctx.Err() != nil ||
+			(provider == "claude" && claudeStores[ntmctx.MungeProjectPath(original)] != 1) {
+			return nil, false
+		}
+		return ntmctx.LatestAgentTranscriptUsage(provider, original, time.Time{})
+	})
+	if ctx.Err() != nil {
+		return known
+	}
+	for id := range result {
+		if _, isTarget := targetByID[id]; !isTarget {
+			delete(result, id)
+		}
+	}
+	return result
+}

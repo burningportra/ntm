@@ -48,7 +48,7 @@ Examples:
 
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "skip confirmation")
 	cmd.Flags().StringVarP(&panes, "panes", "p", "", "comma-separated pane indices to restart (e.g., 1,2,3)")
-	cmd.Flags().StringVarP(&agentType, "type", "t", "", "filter by agent type (cc, claude, cod, codex, gmi, gemini, agy, antigravity, grok, grok-build)")
+	cmd.Flags().StringVarP(&agentType, "type", "t", "", "filter by agent type (cc, claude, cod, codex, gmi, gemini, agy, antigravity, grok, grok-build, omp, oh-my-pi)")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "include all panes (including user pane)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview which panes would be restarted")
 
@@ -89,6 +89,11 @@ func runRespawn(ctx context.Context, session string, force bool, panesFlag strin
 		paneFilter = strings.Split(panesFlag, ",")
 		for i := range paneFilter {
 			paneFilter[i] = strings.TrimSpace(paneFilter[i])
+			// Reject malformed selectors before the confirmation prompt; the
+			// restart engine refuses them anyway.
+			if _, err := tmux.ParsePaneSelector(paneFilter[i]); err != nil {
+				return fmt.Errorf("--panes: %w", err)
+			}
 		}
 	}
 

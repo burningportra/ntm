@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	sessionPkg "github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -108,6 +109,7 @@ func newCheckpointSaveCmd() *cobra.Command {
 	var description string
 	var scrollbackLines int
 	var noGit bool
+	var includeUntracked bool
 
 	cmd := &cobra.Command{
 		Use:   "save <session>",
@@ -118,15 +120,20 @@ The checkpoint includes:
 - All pane configurations (titles, agent types, commands)
 - Pane scrollback buffers (configurable depth)
 - Git repository state (branch, commit, dirty status)
-- Diff patch of uncommitted changes (optional)
+- Binary-capable diff patch of tracked changes (optional)
+- Non-ignored untracked files when --include-untracked is specified
 
 Examples:
   ntm checkpoint save myproject
   ntm checkpoint save myproject -m "Before major refactor"
   ntm checkpoint save myproject --scrollback=500
+  ntm checkpoint save myproject --include-untracked
   ntm checkpoint save myproject --no-git`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if includeUntracked && noGit {
+				return fmt.Errorf("--include-untracked cannot be combined with --no-git")
+			}
 			session, err := resolveCheckpointLiveSessionArg(args[0], cmd.OutOrStdout())
 			if err != nil {
 				return err
@@ -141,6 +148,7 @@ Examples:
 			opts := []checkpoint.CheckpointOption{
 				checkpoint.WithScrollbackLines(scrollbackLines),
 				checkpoint.WithGitCapture(!noGit),
+				checkpoint.WithUntrackedCapture(includeUntracked),
 			}
 			if description != "" {
 				opts = append(opts, checkpoint.WithDescription(description))
@@ -154,15 +162,20 @@ Examples:
 
 			if jsonOutput {
 				return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-					"id":                cp.ID,
-					"session":           session,
-					"created_at":        cp.CreatedAt,
-					"description":       cp.Description,
-					"pane_count":        cp.PaneCount,
-					"has_git":           cp.Git.Commit != "",
-					"assignments_count": len(cp.Assignments),
-					"assignments":       cp.Assignments,
-					"bv_summary":        cp.BVSummary,
+					"id":                 cp.ID,
+					"session":            session,
+					"created_at":         cp.CreatedAt,
+					"description":        cp.Description,
+					"pane_count":         cp.PaneCount,
+					"working_dir":        cp.WorkingDir,
+					"working_dir_error":  cp.WorkingDirError,
+					"has_git":            cp.Git.HasState(),
+					"git_unavailable":    checkpoint.DescribeGitUnavailable(cp),
+					"untracked_count":    cp.Git.UntrackedCount,
+					"untracked_captured": cp.Git.UntrackedCaptured,
+					"assignments_count":  len(cp.Assignments),
+					"assignments":        cp.Assignments,
+					"bv_summary":         cp.BVSummary,
 				})
 			}
 
@@ -180,6 +193,11 @@ Examples:
 					fmt.Printf("  Uncommitted: %d staged, %d unstaged\n",
 						cp.Git.StagedCount, cp.Git.UnstagedCount)
 				}
+				if cp.Git.UntrackedCount > 0 {
+					fmt.Printf("  Untracked: %d of %d files captured\n", cp.Git.UntrackedCaptured, cp.Git.UntrackedCount)
+				}
+			} else if reason := checkpoint.DescribeGitUnavailable(cp); reason != "" {
+				fmt.Printf("  Git: %snot captured%s (%s)\n", colorize(t.Warning), "\033[0m", reason)
 			}
 			if cp.Description != "" {
 				fmt.Printf("  Description: %s\n", cp.Description)
@@ -200,11 +218,95 @@ Examples:
 	cmd.Flags().StringVarP(&description, "message", "m", "", "checkpoint description")
 	cmd.Flags().IntVar(&scrollbackLines, "scrollback", 1000, "lines of scrollback to capture per pane")
 	cmd.Flags().BoolVar(&noGit, "no-git", false, "skip capturing git state")
+	cmd.Flags().BoolVar(&includeUntracked, "include-untracked", false, "capture non-ignored untracked files in the git patch (may contain sensitive data)")
 
 	return cmd
 }
 
+// CheckpointListOutput is the paginated JSON envelope for
+// `ntm checkpoint list <session>` (D1, bd-ws3-contract-breadth-psvyu.1).
+type CheckpointListOutput struct {
+	Success                   bool                        `json:"success"`
+	Session                   string                      `json:"session"`
+	Checkpoints               []*checkpoint.Checkpoint    `json:"checkpoints"`
+	Count                     int                         `json:"count"`
+	TotalMatches              int                         `json:"total_matches"`
+	HasMore                   bool                        `json:"has_more"`
+	InvalidCheckpointsPresent bool                        `json:"invalid_checkpoints_present,omitempty"`
+	InvalidCheckpointIDs      []string                    `json:"invalid_checkpoint_ids"`
+	Pagination                *robot.PaginationInfo       `json:"pagination,omitempty"`
+	AgentHints                *robot.PaginationAgentHints `json:"_agent_hints,omitempty"`
+}
+
+// buildCheckpointListOutput pages a session's checkpoint inventory.
+func buildCheckpointListOutput(session string, cps []*checkpoint.Checkpoint, invalidIDs []string, invalidPresent bool, limit, offset int) *CheckpointListOutput {
+	out := &CheckpointListOutput{
+		Success:                   true,
+		Session:                   session,
+		TotalMatches:              len(cps),
+		InvalidCheckpointsPresent: invalidPresent,
+		InvalidCheckpointIDs:      invalidIDs,
+	}
+	if out.InvalidCheckpointIDs == nil {
+		out.InvalidCheckpointIDs = []string{}
+	}
+	page, info := robot.ApplyPagination(cps, robot.PaginationOptions{Limit: limit, Offset: offset})
+	out.Checkpoints = page
+	if out.Checkpoints == nil {
+		out.Checkpoints = []*checkpoint.Checkpoint{}
+	}
+	out.Count = len(page)
+	if info != nil {
+		out.Pagination = info
+		out.HasMore = info.HasMore
+		out.AgentHints = robot.PaginationHints(info)
+	}
+	return out
+}
+
+// CheckpointSessionsOutput is the paginated JSON envelope for
+// `ntm checkpoint list` across all sessions.
+type CheckpointSessionsOutput struct {
+	Success      bool                        `json:"success"`
+	Sessions     []CheckpointSessionInfo     `json:"sessions"`
+	Count        int                         `json:"count"`
+	TotalMatches int                         `json:"total_matches"`
+	HasMore      bool                        `json:"has_more"`
+	Pagination   *robot.PaginationInfo       `json:"pagination,omitempty"`
+	AgentHints   *robot.PaginationAgentHints `json:"_agent_hints,omitempty"`
+}
+
+// CheckpointSessionInfo is one session's checkpoint inventory row.
+type CheckpointSessionInfo struct {
+	Session                   string                   `json:"session"`
+	Checkpoints               []*checkpoint.Checkpoint `json:"checkpoints"`
+	InvalidCheckpointsPresent bool                     `json:"invalid_checkpoints_present,omitempty"`
+	InvalidCheckpointIDs      []string                 `json:"invalid_checkpoint_ids,omitempty"`
+}
+
+// buildCheckpointSessionsOutput pages the all-sessions checkpoint overview
+// (the outer sessions list is the unbounded dimension).
+func buildCheckpointSessionsOutput(rows []CheckpointSessionInfo, limit, offset int) *CheckpointSessionsOutput {
+	out := &CheckpointSessionsOutput{
+		Success:      true,
+		TotalMatches: len(rows),
+	}
+	page, info := robot.ApplyPagination(rows, robot.PaginationOptions{Limit: limit, Offset: offset})
+	out.Sessions = page
+	if out.Sessions == nil {
+		out.Sessions = []CheckpointSessionInfo{}
+	}
+	out.Count = len(page)
+	if info != nil {
+		out.Pagination = info
+		out.HasMore = info.HasMore
+		out.AgentHints = robot.PaginationHints(info)
+	}
+	return out
+}
+
 func newCheckpointListCmd() *cobra.Command {
+	var limit, offset int
 	cmd := &cobra.Command{
 		Use:   "list [session]",
 		Short: "List checkpoints",
@@ -212,7 +314,8 @@ func newCheckpointListCmd() *cobra.Command {
 
 Examples:
   ntm checkpoint list              # List all checkpoints
-  ntm checkpoint list myproject    # List checkpoints for session`,
+  ntm checkpoint list myproject    # List checkpoints for session
+  ntm checkpoint list myproject --limit=20 --offset=20`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			storage := checkpoint.NewStorage()
@@ -223,7 +326,7 @@ Examples:
 				if err != nil {
 					return err
 				}
-				return listSessionCheckpoints(storage, session)
+				return listSessionCheckpoints(storage, session, limit, offset)
 			}
 
 			// List all sessions with checkpoints
@@ -234,23 +337,14 @@ Examples:
 
 			if len(sessions) == 0 {
 				if jsonOutput {
-					return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-						"sessions": []interface{}{},
-						"count":    0,
-					})
+					return json.NewEncoder(os.Stdout).Encode(buildCheckpointSessionsOutput(nil, limit, offset))
 				}
 				fmt.Println("No checkpoints found.")
 				return nil
 			}
 
 			if jsonOutput {
-				type sessionInfo struct {
-					Session                   string                   `json:"session"`
-					Checkpoints               []*checkpoint.Checkpoint `json:"checkpoints"`
-					InvalidCheckpointsPresent bool                     `json:"invalid_checkpoints_present,omitempty"`
-					InvalidCheckpointIDs      []string                 `json:"invalid_checkpoint_ids,omitempty"`
-				}
-				var result []sessionInfo
+				var result []CheckpointSessionInfo
 				for _, sess := range sessions {
 					cps, err := storage.List(sess)
 					if err != nil {
@@ -264,17 +358,14 @@ Examples:
 					if err != nil {
 						return fmt.Errorf("listing invalid checkpoints for session %q: %w", sess, err)
 					}
-					result = append(result, sessionInfo{
+					result = append(result, CheckpointSessionInfo{
 						Session:                   sess,
 						Checkpoints:               cps,
 						InvalidCheckpointsPresent: hasCandidates && len(cps) == 0,
 						InvalidCheckpointIDs:      invalidIDs,
 					})
 				}
-				return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-					"sessions": result,
-					"count":    len(sessions),
-				})
+				return json.NewEncoder(os.Stdout).Encode(buildCheckpointSessionsOutput(result, limit, offset))
 			}
 
 			t := theme.Current()
@@ -328,6 +419,9 @@ Examples:
 		},
 	}
 
+	cmd.Flags().IntVar(&limit, "limit", 0, "maximum entries per page (0 = all)")
+	cmd.Flags().IntVar(&offset, "offset", 0, "pagination offset (use _agent_hints.next_offset for the next page)")
+
 	return cmd
 }
 
@@ -353,7 +447,7 @@ func listCheckpointSessions(storage *checkpoint.Storage) ([]string, error) {
 	return sessions, nil
 }
 
-func listSessionCheckpoints(storage *checkpoint.Storage, session string) error {
+func listSessionCheckpoints(storage *checkpoint.Storage, session string, limit, offset int) error {
 	cps, err := storage.List(session)
 	if err != nil {
 		return fmt.Errorf("listing checkpoints: %w", err)
@@ -369,13 +463,8 @@ func listSessionCheckpoints(storage *checkpoint.Storage, session string) error {
 			return fmt.Errorf("checking checkpoint candidates: %w", err)
 		}
 		if jsonOutput {
-			return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-				"session":                     session,
-				"checkpoints":                 []interface{}{},
-				"count":                       0,
-				"invalid_checkpoints_present": hasCandidates,
-				"invalid_checkpoint_ids":      invalidIDs,
-			})
+			return json.NewEncoder(os.Stdout).Encode(
+				buildCheckpointListOutput(session, nil, invalidIDs, hasCandidates, limit, offset))
 		}
 		if hasCandidates {
 			fmt.Printf("Session %q has checkpoint entries on disk, but none could be loaded.\n", session)
@@ -389,12 +478,8 @@ func listSessionCheckpoints(storage *checkpoint.Storage, session string) error {
 	}
 
 	if jsonOutput {
-		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-			"session":                session,
-			"checkpoints":            cps,
-			"count":                  len(cps),
-			"invalid_checkpoint_ids": invalidIDs,
-		})
+		return json.NewEncoder(os.Stdout).Encode(
+			buildCheckpointListOutput(session, cps, invalidIDs, false, limit, offset))
 	}
 
 	t := theme.Current()
@@ -488,6 +573,9 @@ Examples:
 				} else {
 					fmt.Printf("    Status: %sclean%s\n", colorize(t.Success), "\033[0m")
 				}
+			} else if reason := checkpoint.DescribeGitUnavailable(cp); reason != "" {
+				fmt.Println()
+				fmt.Printf("  %sGit State:%s %snot captured%s (%s)\n", "\033[1m", "\033[0m", colorize(t.Warning), "\033[0m", reason)
 			}
 
 			if summary := summarizeAssignmentCounts(cp.Assignments); summary.total > 0 {
@@ -594,6 +682,7 @@ func newCheckpointRestoreCmd() *cobra.Command {
 		injectContext   bool
 		dryRun          bool
 		customDirectory string
+		targetSession   string
 		scrollbackLines int
 	)
 
@@ -604,6 +693,11 @@ func newCheckpointRestoreCmd() *cobra.Command {
 
 If checkpoint-id is omitted, the most recent checkpoint is restored.
 
+Use --as to restore into a different tmux session while retaining the original
+session and checkpoint. This isolates panes, not files; use --directory to
+select a separate working tree. Cancellation leaves partial progress available
+for inspection and stops further restoration.
+
 The checkpoint-id can be:
 - A full checkpoint ID (e.g. 20251210-143052)
 - A partial ID prefix or checkpoint name
@@ -613,6 +707,7 @@ Examples:
   ntm checkpoint restore myproject
   ntm checkpoint restore myproject 20251210-143052
   ntm checkpoint restore myproject ~2 --dry-run
+  ntm checkpoint restore myproject last --as myproject-recovered
   ntm checkpoint restore myproject --inject-context
   ntm checkpoint restore myproject last --force`,
 		Args: cobra.RangeArgs(1, 2),
@@ -625,6 +720,11 @@ Examples:
 			}
 			if scrollbackLines < 0 {
 				return fmt.Errorf("--scrollback must be >= 0")
+			}
+			if targetSession != "" {
+				if err := tmux.ValidateSessionName(targetSession); err != nil {
+					return fmt.Errorf("invalid --as session: %w", err)
+				}
 			}
 
 			sessionName, err := resolveCheckpointStorageSessionArg(args[0])
@@ -686,6 +786,8 @@ Examples:
 			}
 
 			opts := checkpoint.RestoreOptions{
+				Config:          cfg,
+				TargetSession:   targetSession,
 				Force:           force,
 				SkipGitCheck:    skipGitCheck,
 				InjectContext:   injectContext,
@@ -695,36 +797,57 @@ Examples:
 			}
 
 			restorer := checkpoint.NewRestorer()
-			result, err := restorer.RestoreFromCheckpoint(cp, opts)
+			result, err := restorer.RestoreFromCheckpointContext(cmd.Context(), cp, opts)
 			if err != nil {
-				if jsonOutput {
-					cause := fmt.Errorf("restoring checkpoint: %w", err)
-					return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
-						"success":        false,
-						"session":        sessionName,
-						"checkpoint_ref": checkpointRef,
-						"checkpoint_id":  cp.ID,
-						"error":          err.Error(),
-					}, cause)
+				cause := fmt.Errorf("restoring checkpoint: %w", err)
+				payload := map[string]interface{}{
+					"success":        false,
+					"session":        sessionName,
+					"source_session": sessionName,
+					"checkpoint_ref": checkpointRef,
+					"checkpoint_id":  cp.ID,
+					"error":          err.Error(),
 				}
-				return fmt.Errorf("restoring checkpoint: %w", err)
+				if targetSession != "" {
+					payload["session"] = targetSession
+				}
+				if result != nil {
+					payload["session"] = result.SessionName
+					payload["panes_restored"] = result.PanesRestored
+					payload["context_injected"] = result.ContextInjected
+					payload["context_panes_injected"] = result.ContextPanesInjected
+					payload["stage"] = result.Stage
+					payload["interrupted"] = result.Interrupted
+					payload["warnings"] = result.Warnings
+					payload["dry_run"] = result.DryRun
+					cause = fmt.Errorf("%w (session %q, stage %s, %d panes restored; inspect the session before retrying)",
+						cause, result.SessionName, result.Stage, result.PanesRestored)
+				}
+				if jsonOutput {
+					return emitJSONFailureEnvelopeWithCause(payload, cause)
+				}
+				return cause
 			}
 
 			if jsonOutput {
 				return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-					"success":           true,
-					"session":           result.SessionName,
-					"checkpoint_id":     cp.ID,
-					"checkpoint_ref":    checkpointRef,
-					"created_at":        cp.CreatedAt,
-					"description":       cp.Description,
-					"panes_restored":    result.PanesRestored,
-					"context_injected":  result.ContextInjected,
-					"dry_run":           result.DryRun,
-					"warnings":          result.Warnings,
-					"assignments_count": len(result.Assignments),
-					"assignments":       result.Assignments,
-					"bv_summary":        result.BVSummary,
+					"success":                true,
+					"session":                result.SessionName,
+					"source_session":         result.SourceSession,
+					"checkpoint_id":          cp.ID,
+					"checkpoint_ref":         checkpointRef,
+					"created_at":             cp.CreatedAt,
+					"description":            cp.Description,
+					"panes_restored":         result.PanesRestored,
+					"context_injected":       result.ContextInjected,
+					"context_panes_injected": result.ContextPanesInjected,
+					"dry_run":                result.DryRun,
+					"stage":                  result.Stage,
+					"interrupted":            result.Interrupted,
+					"warnings":               result.Warnings,
+					"assignments_count":      len(result.Assignments),
+					"assignments":            result.Assignments,
+					"bv_summary":             result.BVSummary,
 				})
 			}
 
@@ -806,6 +929,7 @@ Examples:
 	cmd.Flags().BoolVar(&skipGitCheck, "skip-git-check", false, "skip git branch and commit mismatch warnings")
 	cmd.Flags().BoolVar(&injectContext, "inject-context", false, "inject captured scrollback into restored panes")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the restore without making changes")
+	cmd.Flags().StringVar(&targetSession, "as", "", "restore into another tmux session, retaining the source session and checkpoint")
 	cmd.Flags().StringVar(&customDirectory, "directory", "", "override the checkpoint working directory")
 	cmd.Flags().IntVar(&scrollbackLines, "scrollback", 0, "lines of captured scrollback to inject (0 = all captured)")
 

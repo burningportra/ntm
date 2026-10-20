@@ -27,29 +27,6 @@ func rotatingAgentID(data RotationAlertData) string {
 	return strings.TrimSpace(data.AgentID)
 }
 
-// EmitContextWarning emits a warning alert when an agent approaches context threshold.
-func EmitContextWarning(data RotationAlertData) {
-	alert := Alert{
-		ID:       generateAlertID(AlertContextWarning, data.Session, data.AgentID),
-		Type:     AlertContextWarning,
-		Severity: SeverityWarning,
-		Source:   "context_rotation",
-		Message:  fmt.Sprintf("Agent %s context at %.0f%% - rotation soon", data.AgentID, data.ContextUsage),
-		Session:  data.Session,
-		Pane:     data.Pane,
-		Context: map[string]interface{}{
-			"agent_id":      data.AgentID,
-			"context_usage": data.ContextUsage,
-		},
-		CreatedAt:  time.Now(),
-		LastSeenAt: time.Now(),
-		Count:      1,
-	}
-
-	tracker := GetGlobalTracker()
-	tracker.AddAlert(alert)
-}
-
 // EmitRotationStarted emits an info alert when rotation begins.
 func EmitRotationStarted(data RotationAlertData) {
 	alert := Alert{
@@ -81,10 +58,6 @@ func EmitRotationComplete(data RotationAlertData) {
 	tracker := GetGlobalTracker()
 	startedID := generateAlertID(AlertRotationStarted, data.Session, agentID)
 	tracker.ManualResolve(startedID)
-
-	// Also resolve the context warning if it exists
-	warningID := generateAlertID(AlertContextWarning, data.Session, agentID)
-	tracker.ManualResolve(warningID)
 
 	alert := Alert{
 		ID:       generateAlertID(AlertRotationComplete, data.Session, agentID),
@@ -154,20 +127,4 @@ type RotationEventOutput struct {
 	DurationMs    int64   `json:"duration_ms,omitempty"`
 	GeneratedAt   string  `json:"generated_at"`
 	SessionName   string  `json:"session_name,omitempty"`
-}
-
-// NewRotationEventOutput creates a RotationEventOutput for robot mode JSON.
-func NewRotationEventOutput(data RotationAlertData, status string) RotationEventOutput {
-	return RotationEventOutput{
-		Type:          "context_rotation",
-		OldAgent:      rotatingAgentID(data),
-		NewAgent:      data.NewAgentID,
-		UsagePercent:  data.ContextUsage,
-		SummaryTokens: data.SummaryTokens,
-		Status:        status,
-		Error:         data.Error,
-		DurationMs:    data.DurationMs,
-		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
-		SessionName:   data.Session,
-	}
 }

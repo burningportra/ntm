@@ -51,6 +51,13 @@ type TriggerContext struct {
 	Outputs     []AgentOutput
 	Activities  []AgentActivity
 	Now         func() time.Time
+
+	// TransitionEvidence contains verified agent_says receipts for the current
+	// stage visit, keyed by the template's complete Flow.Transitions indexes.
+	// A nonnil map replaces raw-output matching for those transitions, allowing
+	// durable receipts to survive scrollback rollover and runner restarts.
+	// Nil preserves ordinary trigger evaluation against Outputs.
+	TransitionEvidence map[int]bool
 }
 
 func (c *TriggerContext) now() time.Time {
@@ -110,6 +117,13 @@ func (r *TriggerRegistry) Create(config Trigger) (RuntimeTrigger, error) {
 	return factory(config)
 }
 
+// fileBaseline is the size/mtime of a just-created file, recorded so a write
+// that the notification backend never reports can still be detected by stat.
+type fileBaseline struct {
+	size    int64
+	modTime time.Time
+}
+
 type fileTrigger struct {
 	kind    TriggerType
 	pattern string
@@ -125,10 +139,13 @@ type fileTrigger struct {
 	watcher *fsnotify.Watcher
 	done    chan struct{}
 	wg      sync.WaitGroup
-	// pending holds matching files that were still empty when they appeared.
-	// Check looks at them again, because a write that lands before kqueue
-	// watches the new file is never reported as an event.
-	pending map[string]struct{}
+	// pending tracks pattern-matching files that appeared empty (by a Create
+	// event or in the walk of a new directory) but whose first Write event
+	// may never arrive: on kqueue platforms (macOS/BSD) fsnotify registers
+	// the new file's own watch asynchronously after the Create event, so a
+	// create-then-write-once sequence can lose the write. Check falls back to
+	// stat-ing these files.
+	pending map[string]fileBaseline
 }
 
 func newFileCreatedTrigger(config Trigger) (RuntimeTrigger, error) {
@@ -166,7 +183,7 @@ func (t *fileTrigger) Start(ctx *TriggerContext) error {
 	t.root = root
 	t.fired = false
 	t.err = nil
-	t.pending = nil
+	t.pending = make(map[string]fileBaseline)
 	t.watcher = watcher
 	t.done = make(chan struct{})
 	done := t.done
@@ -231,25 +248,27 @@ func (t *fileTrigger) observe(watcher *fsnotify.Watcher, event fsnotify.Event) {
 }
 
 // fileAppeared records a regular file that showed up after Start, whether
-// fsnotify reported its Create or the walk of a new directory found it. A
-// file that already holds content counts as written: kqueue (macOS, BSD)
-// watches each file separately and fsnotify opens a new file's watch only
-// after reporting its Create, so the writes that follow straight away may
-// never arrive as Write events. An empty file waits in pending for Check.
+// fsnotify reported its Create or the walk of a new directory found it. This
+// is the kqueue write-loss fallback: kqueue (macOS, BSD) watches each file
+// separately and fsnotify opens a new file's watch only after reporting its
+// Create, so a write landing straight after creation may produce no Write
+// event at all. A matching file that already holds content counts as
+// written, and an empty one waits in pending with its baseline so Check can
+// detect the write by stat.
 func (t *fileTrigger) fileAppeared(path string, info os.FileInfo) {
 	if !t.matches(path) {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.op == fsnotify.Create || info.Size() > 0 {
+	if t.op&fsnotify.Write == 0 || info.Size() > 0 {
 		t.fired = true
 		return
 	}
 	if t.pending == nil {
-		t.pending = make(map[string]struct{})
+		t.pending = make(map[string]fileBaseline)
 	}
-	t.pending[path] = struct{}{}
+	t.pending[path] = fileBaseline{size: info.Size(), modTime: info.ModTime()}
 }
 
 func (t *fileTrigger) matches(name string) bool {
@@ -344,21 +363,52 @@ func matchPathPattern(pattern, rel string) bool {
 
 func (t *fileTrigger) Check(_ *TriggerContext) (bool, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if err := t.err; err != nil {
+		// Each failure is returned once (see the err field).
 		t.err = nil
+		t.mu.Unlock()
 		return false, fmt.Errorf("watch filesystem: %w", err)
 	}
-	for path := range t.pending {
-		if t.fired {
-			break
+	if t.fired {
+		t.mu.Unlock()
+		return true, nil
+	}
+	// Stat fallback for writes whose notification was lost (see
+	// fileAppeared): compare each pending created file against its
+	// creation-time baseline.
+	pending := make(map[string]fileBaseline, len(t.pending))
+	for name, baseline := range t.pending {
+		pending[name] = baseline
+	}
+	t.mu.Unlock()
+
+	fired := false
+	var settled []string
+	for name, baseline := range pending {
+		info, err := os.Stat(name)
+		if err != nil {
+			// Removed (or unreadable): a future rewrite produces a fresh
+			// Create event, so stop tracking this instance.
+			settled = append(settled, name)
+			continue
 		}
-		info, err := os.Stat(path)
-		switch {
-		case err == nil && info.Size() > 0:
-			t.fired = true
-		case errors.Is(err, fs.ErrNotExist):
-			delete(t.pending, path)
+		if info.Size() != baseline.size || info.ModTime().After(baseline.modTime) {
+			fired = true
+			settled = append(settled, name)
+		}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if fired {
+		t.fired = true
+	}
+	for _, name := range settled {
+		// Only drop the entry we actually judged: between the snapshot and
+		// this re-lock, run() may have recorded a FRESH baseline for the same
+		// name (file deleted and recreated), and deleting that would lose the
+		// very tracking the kqueue fallback exists to provide.
+		if current, ok := t.pending[name]; ok && current == pending[name] {
+			delete(t.pending, name)
 		}
 	}
 	return t.fired, nil

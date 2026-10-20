@@ -150,9 +150,36 @@ Each section can be independently truncated:
 | `--cursor` | string | - | Cursor-based pagination (events) |
 | `--since` | timestamp | - | Time-based filtering |
 
+### 4.1a Paginated Surfaces (exact scope)
+
+Offset/limit pagination is NOT list-wide. It is implemented on exactly the
+surfaces flagged `paginated: true` in the robot registry (the WS0-G6
+single-declaration map `SchemaPagination` in
+`internal/robot/schema_pagination.go`, exposed per surface via
+`--robot-capabilities` as `paginated`/`paginated_reason` and enforced by
+registry-walk conformance tests):
+
+| Surface | Command | Contract |
+|---------|---------|----------|
+| `status` | `ntm --robot-status --limit/--robot-offset` | `pagination` + `_agent_hints.next_offset` |
+| `snapshot` | `ntm --robot-snapshot --limit/--robot-offset` | `pagination` + `_agent_hints.next_offset` |
+| `history` (robot) | `ntm --robot-history=<s> --limit/--offset` | `pagination` + `_agent_hints.next_offset` |
+| `ensemble_modes` | `ntm --robot-ensemble-modes --limit/--offset` | `pagination` + `_agent_hints.next_offset` |
+| `session_list` | `ntm list --json --limit/--offset` | `count`/`total_matches`/`has_more` + hints |
+| `history_list` | `ntm history --json --limit/--offset` | offset counts back from newest |
+| `audit_query` | `ntm audit show/search --json --limit/--offset` | `count`/`total_matches`/`has_more` + hints |
+| `checkpoint_list` | `ntm checkpoint list [session] --json --limit/--offset` | `count`/`total_matches`/`has_more` + hints |
+| `approvals_list` | `ntm approve list --json --limit/--offset` | `count`/`total_matches`/`has_more` + hints |
+
+Every other list-shaped surface is **UNPAGINATED BY DESIGN** (bounded
+cardinality, per-request result echoes, or cursor-based continuation like
+`events`/`attention`); each carries its reason in the registry flag. An
+unflagged list surface fails the conformance test, so this table's scope
+cannot silently drift.
+
 ### 4.2 Offset-Based Pagination
 
-For stable collections (sessions, beads, alerts):
+For the offset-paginated collections above (e.g. status/snapshot sessions):
 
 ```bash
 # First page
@@ -174,14 +201,14 @@ For event streams where offset is unstable:
 ntm --robot-events
 
 # Continue from cursor
-ntm --robot-events --cursor=evt_20260322033000123456
+ntm --robot-events --since-cursor=42
 ```
 
 Response includes:
 ```json
 {
   "events": [...],
-  "cursor": "evt_20260322033000789012",
+  "cursor": 42,
   "has_more": true
 }
 ```
@@ -307,9 +334,13 @@ Surfaces support multiple detail levels to trade verbosity for tokens:
 
 ### 6.2 Specifying Detail Level
 
+The shipped CLI knob is `--robot-verbosity` (env `NTM_ROBOT_VERBOSITY`), whose
+profiles are `terse`, `default`, and `debug`; the five-level ladder above is
+the conceptual model those profiles collapse into.
+
 ```bash
-ntm --robot-status --verbosity=minimal
-ntm --robot-snapshot --verbosity=full
+ntm --robot-status --robot-verbosity=terse
+ntm --robot-snapshot --robot-verbosity=debug
 ```
 
 ### 6.3 Detail Level Defaults
@@ -367,7 +398,7 @@ Example for `SessionInfo`:
   "beads": {
     "compressed": true,
     "compression_reason": "summary_only",
-    "drill_down": "ntm --robot-bead-list"
+    "drill_down": "ntm --robot-beads-list"
   }
 }
 ```

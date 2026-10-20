@@ -66,11 +66,13 @@ func (m *FileReservationManager) SetTTL(seconds int) {
 
 // Pre-compiled regexes for file path extraction (avoid recompilation per call).
 // Use lookahead-like logic by not consuming the trailing boundary to avoid overlap.
+// A path may open after a line start, whitespace, an opening bracket or quote,
+// or a Markdown code-span backtick (ntm#336).
 var (
-	filePathRegex = regexp.MustCompile(`(?m)(?:^|\s|[(\["'])([a-zA-Z0-9_./-]+(?:\.[a-zA-Z0-9]+)+)(?:\:\d+(?::\d+)?)?`)
-	dotfileRegex  = regexp.MustCompile(`(?m)(?:^|\s|[(\["'])(\.[a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9]+)*)`)
-	dirPathRegex  = regexp.MustCompile(`(?m)(?:^|\s|[(\["'])([a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)+)`)
-	globRegex     = regexp.MustCompile(`(?m)(?:^|\s|[(\["'])([a-zA-Z0-9_./*-]+\*[a-zA-Z0-9_./*-]*)`)
+	filePathRegex = regexp.MustCompile("(?m)(?:^|\\s|[(\\[\"'`])([a-zA-Z0-9_./-]+(?:\\.[a-zA-Z0-9]+)+)(?:\\:\\d+(?::\\d+)?)?")
+	dotfileRegex  = regexp.MustCompile("(?m)(?:^|\\s|[(\\[\"'`])(\\.[a-zA-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z0-9]+)*)")
+	dirPathRegex  = regexp.MustCompile("(?m)(?:^|\\s|[(\\[\"'`])([a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)+)")
+	globRegex     = regexp.MustCompile("(?m)(?:^|\\s|[(\\[\"'`])([a-zA-Z0-9_./*-]+\\*[a-zA-Z0-9_./*-]*)")
 	// isValidPath regexes - pre-compiled for performance
 	versionLikeRegex = regexp.MustCompile(`^\d+\.\d+`)
 	validExtRegex    = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9]{0,9}$`)
@@ -103,10 +105,15 @@ func ExtractFilePaths(title, description string) []string {
 		}
 	}
 
-	// Extract directory paths
-	for _, match := range dirPathRegex.FindAllStringSubmatch(combined, -1) {
-		if len(match) > 1 {
-			dir := match[1]
+	// Extract directory paths. A match that runs straight into ".ext" is the
+	// directory part of a file name (docs/notes.md), not a directory the
+	// bead names, so it must not widen into a docs/notes/**/* glob.
+	for _, loc := range dirPathRegex.FindAllStringSubmatchIndex(combined, -1) {
+		if len(loc) >= 4 && loc[2] >= 0 {
+			if end := loc[3]; end+1 < len(combined) && combined[end] == '.' && isPathWordByte(combined[end+1]) {
+				continue
+			}
+			dir := combined[loc[2]:loc[3]]
 			// Trim trailing slash if present
 			dir = strings.TrimSuffix(dir, "/")
 			if isValidPath(dir) && !seen[dir] {
@@ -129,6 +136,205 @@ func ExtractFilePaths(title, description string) []string {
 	}
 
 	return paths
+}
+
+func isPathWordByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// Owned-files sections in a bead description (ntm#336). A section starts at
+// a Markdown ATX heading or a standalone label line ("Owned outputs:",
+// "**Files to modify**"). A section opened by a heading runs to the next
+// heading of the same or a higher level, so its own sub-labels ("Primary:",
+// "Tests:") and sub-headings stay inside it. A section opened by a label line
+// runs to the next heading or label line. Fenced code blocks are content,
+// never headings: a "# comment" in a shell snippet does not end a section.
+var (
+	markdownHeadingRegex   = regexp.MustCompile(`^\s{0,3}(#{1,6})\s+(.+?)[\s#]*$`)
+	markdownLabelTextRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z /()-]{0,60}$`)
+	ownedSectionTitleRegex = regexp.MustCompile(`(?i)^(?:owned\b.*|.*\bowned (?:outputs?|files|paths)\b.*|outputs?|output files|deliverables|files to (?:edit|change|modify|create|touch|write)|write set|edit surface)$`)
+)
+
+// ReservationPathsForBead returns the paths an assignment should reserve for
+// a bead. When the description declares the bead's owned files under a
+// heading such as "## Owned outputs" (or a "Files to modify:" label line),
+// only the paths in that section are returned: inputs the bead merely reads
+// must not become exclusive reservations. Otherwise every path in the title
+// and description is returned, as ExtractFilePaths finds them. A declared
+// section that names no path yields nil, so a reservation-required
+// assignment fails closed instead of reserving the wrong files (ntm#336);
+// DeclaresOwnedPaths tells that case apart from a bead that names no files.
+func ReservationPathsForBead(title, description string) []string {
+	if section, declared := ownedPathsSection(description); declared {
+		return ExtractFilePaths("", section)
+	}
+	return ExtractFilePaths(title, description)
+}
+
+// DeclaresOwnedPaths reports whether a bead description has an owned-files
+// section, whose paths ReservationPathsForBead then reserves exclusively.
+func DeclaresOwnedPaths(description string) bool {
+	_, declared := ownedPathsSection(description)
+	return declared
+}
+
+// ErrNoReservationPaths rejects a reservation-required assignment whose bead
+// names no files, before the bead is claimed (ntm#336). The opt-out it names
+// is spelled the same on `ntm assign` and `ntm --robot-bulk-assign`.
+var ErrNoReservationPaths = errors.New("no file paths to reserve in the bead title or description; " +
+	"list the files it will change (for example under an \"## Owned outputs\" heading) or pass --reserve-files=false")
+
+// ErrOwnedSectionHasNoPaths rejects a bead whose description declares an
+// owned-files section ("## Owned outputs", "## Deliverables", "Files to
+// modify:") that names no file. Paths elsewhere in the description are read
+// as inputs, so "no file paths" alone would be misleading.
+var ErrOwnedSectionHasNoPaths = errors.New("the bead description has an owned-files section " +
+	"(such as \"## Owned outputs\", \"## Deliverables\" or \"Files to modify:\") that names no file paths; " +
+	"paths elsewhere in the description are treated as inputs and are not reserved. " +
+	"List the files it will change in that section or pass --reserve-files=false")
+
+// ReservationPathsForAssignment resolves the files a reservation-required
+// assignment must reserve from the live bead's title and description, before
+// anything is claimed. It fails with ErrOwnedSectionHasNoPaths when an
+// owned-files section is declared but empty, and with ErrNoReservationPaths
+// when the bead names no files, so such a bead is refused unclaimed instead of
+// being claimed and then failing its reservation (ntm#336). Every assignment
+// surface that reserves by default (`ntm assign`, `--robot-bulk-assign`) uses
+// it so they agree on what a bead's file scope is.
+func ReservationPathsForAssignment(title, description string) ([]string, error) {
+	paths := ReservationPathsForBead(title, description)
+	if len(paths) == 0 {
+		if DeclaresOwnedPaths(description) {
+			return nil, ErrOwnedSectionHasNoPaths
+		}
+		return nil, ErrNoReservationPaths
+	}
+	return paths, nil
+}
+
+// BeadTextReader reads one bead's live title and description from a project.
+type BeadTextReader func(ctx context.Context, projectDir, beadID string) (title, description string, err error)
+
+// DiscoverReservationPaths finds the reservation surface for a reservation
+// request that names no paths: a durable intent recorded with discovery, or a
+// caller that defers path selection to the reservation port. It reads the live
+// bead so paths listed only in the description count, not just those in the
+// title (ntm#336); when the bead cannot be read, the request's title still
+// counts. Reservation ports call it from both Reserve and ReconcileReservation
+// so the two always see the same path set.
+func DiscoverReservationPaths(ctx context.Context, projectDir string, req assignmentstore.ReservationRequest, read BeadTextReader) []string {
+	title := req.BeadTitle
+	description := ""
+	if strings.TrimSpace(projectDir) != "" && read != nil {
+		if liveTitle, liveDescription, err := read(ctx, projectDir, req.BeadID); err == nil {
+			if strings.TrimSpace(title) == "" {
+				title = liveTitle
+			}
+			description = liveDescription
+		}
+	}
+	return ReservationPathsForBead(title, description)
+}
+
+// ownedPathsSection returns the text of every owned-files section in a
+// Markdown description, including the text of each opening heading so a path
+// written on it ("## Owned outputs: `a.go`") counts.
+func ownedPathsSection(description string) (string, bool) {
+	var (
+		section   []string
+		declared  bool
+		inside    bool
+		openLevel int // ATX level of the heading that opened the section; 0 for a label line
+		fence     string
+	)
+	for _, line := range strings.Split(description, "\n") {
+		if marker := codeFenceMarker(line); marker != "" {
+			switch {
+			case fence == "":
+				fence = marker
+			case strings.HasPrefix(marker, fence):
+				fence = ""
+			}
+			if inside {
+				section = append(section, line)
+			}
+			continue
+		}
+		if fence == "" {
+			if title, level, isHeading := sectionTitle(line); isHeading {
+				if inside && openLevel > 0 && (level == 0 || level > openLevel) {
+					// A sub-label or deeper heading inside the open
+					// heading-level owned section belongs to it. Its text,
+					// not the raw line: "**Tests**" is not a glob.
+					section = append(section, title)
+					continue
+				}
+				inside = ownedSectionTitleRegex.MatchString(title)
+				openLevel = level
+				declared = declared || inside
+				if inside && level > 0 {
+					section = append(section, title)
+				}
+				continue
+			}
+		}
+		if inside {
+			section = append(section, line)
+		}
+	}
+	return strings.Join(section, "\n"), declared
+}
+
+// codeFenceMarker returns the run of backticks or tildes (three or more) that
+// opens or closes a fenced code block on this line, or "".
+func codeFenceMarker(line string) string {
+	trimmed := strings.TrimLeft(line, " ")
+	if len(line)-len(trimmed) > 3 {
+		return ""
+	}
+	for _, ch := range []byte{'`', '~'} {
+		n := 0
+		for n < len(trimmed) && trimmed[n] == ch {
+			n++
+		}
+		if n >= 3 {
+			return trimmed[:n]
+		}
+	}
+	return ""
+}
+
+// sectionTitle reports whether line is a Markdown ATX heading or a
+// standalone label line, returning its text without emphasis markers or a
+// trailing colon, and its heading level (0 for a label line). A label line
+// is bold, or ends in a colon, and holds only words: list items and
+// sentences are never labels.
+func sectionTitle(line string) (string, int, bool) {
+	if m := markdownHeadingRegex.FindStringSubmatch(line); m != nil {
+		return cleanSectionTitle(m[2]), len(m[1]), true
+	}
+	trimmed := strings.TrimSpace(line)
+	bold := len(trimmed) > 4 && (strings.HasPrefix(trimmed, "**") || strings.HasPrefix(trimmed, "__"))
+	colon := strings.HasSuffix(strings.TrimRight(trimmed, "*_ "), ":")
+	if !bold && !colon {
+		return "", 0, false
+	}
+	title := cleanSectionTitle(trimmed)
+	if !markdownLabelTextRegex.MatchString(title) {
+		return "", 0, false
+	}
+	return title, 0, true
+}
+
+func cleanSectionTitle(text string) string {
+	text = strings.TrimSpace(text)
+	for {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(strings.Trim(text, "*_ "), ":"))
+		if trimmed == text {
+			return text
+		}
+		text = trimmed
+	}
 }
 
 // isValidPath checks if a path looks valid (not a URL, version, etc.)
@@ -234,7 +440,8 @@ func (m *FileReservationManager) reservePathsForBead(ctx context.Context, beadID
 		result.Error = "agent mail client not configured"
 		return result, nil
 	}
-	if err := m.ensureProject(ctx); err != nil {
+	expectedProjectID, err := m.ensureProject(ctx)
+	if err != nil {
 		result.Error = err.Error()
 		return result, err
 	}
@@ -253,7 +460,7 @@ func (m *FileReservationManager) reservePathsForBead(ctx context.Context, beadID
 		// Check if it's a conflict error with partial results
 		if reservationResult != nil {
 			result.Conflicts = reservationResult.Conflicts
-			if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), time.Now().UTC(), false); validationErr != nil {
+			if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), expectedProjectID, time.Now().UTC(), false); validationErr != nil {
 				result.Error = validationErr.Error()
 				return result, validationErr
 			}
@@ -269,7 +476,7 @@ func (m *FileReservationManager) reservePathsForBead(ctx context.Context, beadID
 		return result, errors.New(result.Error)
 	}
 	// Process successful reservations
-	if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), time.Now().UTC(), false); validationErr != nil {
+	if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), expectedProjectID, time.Now().UTC(), false); validationErr != nil {
 		result.Error = validationErr.Error()
 		return result, validationErr
 	}
@@ -291,7 +498,8 @@ func (m *FileReservationManager) ReconcileForBead(ctx context.Context, beadID, a
 		result.Error = "agent mail client not configured"
 		return result, errors.New(result.Error)
 	}
-	if err := m.ensureProject(ctx); err != nil {
+	expectedProjectID, err := m.ensureProject(ctx)
+	if err != nil {
 		result.Error = err.Error()
 		return result, err
 	}
@@ -338,6 +546,9 @@ func (m *FileReservationManager) ReconcileForBead(ctx context.Context, beadID, a
 			result.GrantedPaths = append(result.GrantedPaths, path)
 		}
 		result.ReservationIDs = append(result.ReservationIDs, reservation.ID)
+		if reservation.ProjectID != expectedProjectID {
+			validationErrors = append(validationErrors, fmt.Errorf("active reservation %d for %s belongs to project %d, want %d", reservation.ID, path, reservation.ProjectID, expectedProjectID))
+		}
 		if !reservation.Exclusive {
 			validationErrors = append(validationErrors, fmt.Errorf("active reservation %d for %s is not exclusive", reservation.ID, path))
 		}
@@ -361,38 +572,35 @@ func (m *FileReservationManager) ReconcileForBead(ctx context.Context, beadID, a
 	return result, nil
 }
 
-// ensureProject binds m.projectKey to an Agent Mail project before any
-// reservation call. Reservation grants and listing rows carry no project, so
-// this binding is what places them: every call names m.projectKey.
-func (m *FileReservationManager) ensureProject(ctx context.Context) error {
+func (m *FileReservationManager) ensureProject(ctx context.Context) (int, error) {
 	if m == nil || m.client == nil {
-		return errors.New("agent mail client not configured")
+		return 0, errors.New("agent mail client not configured")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	project, err := m.client.EnsureProject(ctx, m.projectKey)
 	if err != nil {
-		return fmt.Errorf("ensure Agent Mail project %q: %w", m.projectKey, err)
+		return 0, fmt.Errorf("ensure Agent Mail project %q: %w", m.projectKey, err)
 	}
 	if project == nil || project.ID <= 0 {
-		return fmt.Errorf("ensure Agent Mail project %q returned no durable project ID", m.projectKey)
+		return 0, fmt.Errorf("ensure Agent Mail project %q returned no durable project ID", m.projectKey)
 	}
 	expectedKey := strings.TrimSpace(m.projectKey)
 	if expectedKey == "" {
-		return errors.New("agent-mail project binding requires a non-empty project key")
+		return 0, errors.New("agent-mail project binding requires a non-empty project key")
 	}
 	// Symlink-equivalent compare: Agent Mail canonicalizes project paths, so
 	// the returned human key may be the resolved form of a symlinked key
 	// (GH#239). Fail-closed semantics are preserved for genuinely different
 	// directories.
 	if humanKey := strings.TrimSpace(project.HumanKey); !agentmail.ProjectKeysEquivalent(humanKey, expectedKey) {
-		return fmt.Errorf("agent-mail project binding mismatch: got %q, want %q", humanKey, m.projectKey)
+		return 0, fmt.Errorf("agent-mail project binding mismatch: got %q, want %q", humanKey, m.projectKey)
 	}
-	return nil
+	return project.ID, nil
 }
 
-func collectGrantedReservations(result *FileReservationResult, granted []agentmail.FileReservation, requested []string, agentName, expectedReason string, now time.Time, allowDuplicatePaths bool) error {
+func collectGrantedReservations(result *FileReservationResult, granted []agentmail.FileReservation, requested []string, agentName, expectedReason string, expectedProjectID int, now time.Time, allowDuplicatePaths bool) error {
 	wanted := make(map[string]struct{}, len(requested))
 	for _, raw := range requested {
 		if path := strings.TrimSpace(raw); path != "" {
@@ -413,6 +621,9 @@ func collectGrantedReservations(result *FileReservationResult, granted []agentma
 			validHandle = false
 		} else {
 			seenIDs[reservation.ID] = struct{}{}
+		}
+		if reservation.ProjectID != expectedProjectID {
+			validationErrors = append(validationErrors, fmt.Errorf("reservation %d for %q belongs to project %d, want %d", reservation.ID, path, reservation.ProjectID, expectedProjectID))
 		}
 		if reservation.ReleasedTS != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("reservation %d for %q is already released", reservation.ID, path))
@@ -460,44 +671,6 @@ func recordGrantedReservation(result *FileReservationResult, granted agentmail.F
 	}
 }
 
-// ReleaseForBead releases all reservations held by an agent for a bead.
-func (m *FileReservationManager) ReleaseForBead(ctx context.Context, agentName string, reservationIDs []int) error {
-	if m.client == nil || len(reservationIDs) == 0 {
-		return nil
-	}
-
-	releaseResult, err := m.client.ReleaseReservations(ctx, m.projectKey, agentName, nil, reservationIDs)
-	if err != nil {
-		return err
-	}
-	if releaseResult == nil {
-		return fmt.Errorf("release returned no result")
-	}
-	if releaseResult.Released < len(reservationIDs) {
-		return fmt.Errorf("released %d of %d reservations", releaseResult.Released, len(reservationIDs))
-	}
-	return nil
-}
-
-// ReleaseByPaths releases reservations by path patterns.
-func (m *FileReservationManager) ReleaseByPaths(ctx context.Context, agentName string, paths []string) error {
-	if m.client == nil || len(paths) == 0 {
-		return nil
-	}
-
-	releaseResult, err := m.client.ReleaseReservations(ctx, m.projectKey, agentName, paths, nil)
-	if err != nil {
-		return err
-	}
-	if releaseResult == nil {
-		return fmt.Errorf("release returned no result")
-	}
-	if releaseResult.Released == 0 {
-		return fmt.Errorf("released 0 reservations for %d path patterns", len(paths))
-	}
-	return nil
-}
-
 // ReleaseExactForBead releases active leases only after a durable assignment
 // barrier prevents a newer generation for the same bead. Paths are used to
 // recover a unique exact-binding lease whose Agent Mail ID drifted; ambiguous
@@ -513,7 +686,8 @@ func (m *FileReservationManager) ReleaseExactForBead(ctx context.Context, barrie
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := m.ensureProject(ctx); err != nil {
+	expectedProjectID, err := m.ensureProject(ctx)
+	if err != nil {
 		return nil, err
 	}
 	reason := fmt.Sprintf("bead assignment: %s", strings.TrimSpace(beadID))
@@ -534,7 +708,7 @@ func (m *FileReservationManager) ReleaseExactForBead(ctx context.Context, barrie
 			return nil, fmt.Errorf("list active reservations for exact release: %w", listErr)
 		}
 		selectedIDs, selectedPaths, selectErr := selectExactReleaseReservations(
-			active, beadID, agentName, reason, wantedIDs, wantedPaths,
+			active, expectedProjectID, beadID, agentName, reason, wantedIDs, wantedPaths,
 		)
 		if selectErr != nil {
 			return nil, selectErr
@@ -555,7 +729,7 @@ func (m *FileReservationManager) ReleaseExactForBead(ctx context.Context, barrie
 		return nil, fmt.Errorf("verify exact reservation release: %w", err)
 	}
 	selectedIDs, _, err := selectExactReleaseReservations(
-		remaining, beadID, agentName, reason, wantedIDs, wantedPaths,
+		remaining, expectedProjectID, beadID, agentName, reason, wantedIDs, wantedPaths,
 	)
 	if err != nil {
 		return nil, err
@@ -586,6 +760,7 @@ func exactReleaseBarrierBinding(barrier *assignmentstore.Assignment) (string, st
 
 func selectExactReleaseReservations(
 	active []agentmail.FileReservation,
+	expectedProjectID int,
 	beadID, agentName, reason string,
 	wantedIDs map[int]struct{},
 	wantedPaths map[string]struct{},
@@ -600,7 +775,7 @@ func selectExactReleaseReservations(
 		path := strings.TrimSpace(reservation.PathPattern)
 		_, requestedByID := wantedIDs[reservation.ID]
 		_, requestedByPath := wantedPaths[path]
-		exactBinding := reservation.ID > 0 &&
+		exactBinding := reservation.ID > 0 && reservation.ProjectID == expectedProjectID &&
 			strings.TrimSpace(reservation.AgentName) == agentName && strings.TrimSpace(reservation.Reason) == reason
 		if requestedByID && !exactBinding {
 			return nil, nil, fmt.Errorf("reservation %d is not authoritatively bound to bead %s", reservation.ID, beadID)
@@ -608,7 +783,7 @@ func selectExactReleaseReservations(
 		if requestedByID && len(wantedPaths) > 0 && !requestedByPath {
 			return nil, nil, fmt.Errorf("reservation %d path %q is not authoritatively bound to bead %s durable paths", reservation.ID, path, beadID)
 		}
-		if requestedByPath &&
+		if requestedByPath && reservation.ProjectID == expectedProjectID &&
 			strings.TrimSpace(reservation.AgentName) == agentName && strings.TrimSpace(reservation.Reason) == reason && reservation.ID <= 0 {
 			return nil, nil, fmt.Errorf("active reservation for path %q has no durable ID", path)
 		}
@@ -680,27 +855,4 @@ func mapKeysSorted(values map[string]struct{}) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-// RenewReservations extends the TTL for an agent's reservations.
-func (m *FileReservationManager) RenewReservations(ctx context.Context, agentName string, extendSeconds int) error {
-	if m.client == nil {
-		return nil
-	}
-
-	renewResult, err := m.client.RenewReservations(ctx, agentmail.RenewReservationsOptions{
-		ProjectKey:    m.projectKey,
-		AgentName:     agentName,
-		ExtendSeconds: extendSeconds,
-	})
-	if err != nil {
-		return err
-	}
-	if renewResult == nil {
-		return fmt.Errorf("renew returned no result")
-	}
-	if renewResult.Renewed == 0 {
-		return fmt.Errorf("renewed 0 reservations")
-	}
-	return nil
 }

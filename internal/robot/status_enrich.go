@@ -10,8 +10,11 @@ import (
 	"sync"
 	"time"
 
+	gopsprocess "github.com/shirou/gopsutil/v4/process"
+
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tokens"
 	"github.com/Dicklesworthstone/ntm/internal/util"
 )
@@ -35,6 +38,11 @@ var rateLimitPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)too many requests`),
 	regexp.MustCompile(`RESOURCE_EXHAUSTED`),
 	regexp.MustCompile(`resets \d+[ap]m`),
+	// Provider usage-limit banners ("hit your usage limit", "plan limit
+	// reached", quota exhaustion) are NOT duplicated here: detectRateLimit
+	// falls through to ratelimit.DetectRateLimitForAgent, whose canonical
+	// usageLimitBannerPatterns vocabulary covers them for every agent type
+	// (bd-wtm0w). Add new banner phrasings there, once.
 }
 
 var codexRateLimitPatterns = []*regexp.Regexp{
@@ -86,14 +94,42 @@ func enrichAgentStatus(agent *Agent, sessionName, modelName string, content stri
 		agent.RateLimitDetected = detected
 		agent.RateLimitMatch = match
 
-		// Output activity
+		// Output activity. The in-process tracker only has a baseline for
+		// panes this process has already looked at; a fresh CLI invocation
+		// starts with none, so it reports no activity rather than fabricating
+		// a "just changed" reading (#288).
+		observedAt := time.Now().UTC()
 		lastOutputTS, linesDelta := updateActivity(agent.Pane, content)
+
+		// Durable output-change sequence (#246). agent.Pane carries the tmux
+		// pane ID on this path, matching the scope used by --robot-activity.
+		agent.OutputSequence = observeOutputSequence(sessionName, agent.Pane, content, observedAt)
+
+		if lastOutputTS.IsZero() {
+			// No in-process baseline: fall back to the durable sequence, which
+			// survives across CLI processes. A sequence advance during THIS
+			// observation means the tail changed since the previous observer
+			// looked, which is real output evidence; an older changed_at is a
+			// last-output clock without a line delta; no changed_at at all
+			// leaves the pane without an output clock so the classifier must
+			// decide from the captured tail alone.
+			if changedAt, ok := outputSequenceChangedAt(agent.OutputSequence); ok {
+				lastOutputTS = changedAt
+				if agent.OutputSequence.advanced {
+					linesDelta = 1
+				}
+			}
+		}
 		agent.LastOutputTS = lastOutputTS
 		agent.OutputLinesSinceLast = linesDelta
-
 		if !agent.LastOutputTS.IsZero() {
 			agent.SecondsSinceOutput = int(time.Since(agent.LastOutputTS).Seconds())
 		}
+
+		// Composer visibility (bd-v8dqd).
+		composer := tmux.InspectComposer(content, tmux.AgentType(agent.Type))
+		agent.UnsubmittedInput = composer.HoldsText
+		agent.QueuedMessages = composer.QueuedMessages
 
 		if modelName != "" {
 			agent.ContextModel = modelName
@@ -120,6 +156,16 @@ func getProcessMemoryMB(pid int) (int, error) {
 					return kb / 1024, nil
 				}
 			}
+		}
+	}
+
+	// Native path (darwin/windows): gopsutil answers RSS via libproc /
+	// process snapshot without spawning a subprocess. Robot status calls
+	// this once per pane, serially, so a ~300ms `ps` spawn per pane is a
+	// visible chunk of the canonical surface's wall time (bd-4479y).
+	if proc, err := gopsprocess.NewProcess(int32(pid)); err == nil {
+		if mem, err := proc.MemoryInfo(); err == nil && mem != nil && mem.RSS > 0 {
+			return int(mem.RSS / (1024 * 1024)), nil
 		}
 	}
 
@@ -168,13 +214,16 @@ func updateActivity(paneID, content string) (time.Time, int) {
 	currentLines := util.CountNonEmptyLines(content)
 	state, ok := paneStates[paneID]
 	if !ok {
-		state = &paneState{
-			lastTS:        time.Now(), // Initialize with current time
+		// First observation in this process: record the baseline but report
+		// no activity. There is no prior capture to diff against, so neither
+		// the timestamp nor the line count is evidence of output — treating
+		// the whole visible buffer as "lines written just now" is what made
+		// every pane look busy on each fresh --robot-status process (#288).
+		paneStates[paneID] = &paneState{
 			lastHash:      content,
 			lastLineCount: currentLines,
 		}
-		paneStates[paneID] = state
-		return state.lastTS, currentLines
+		return time.Time{}, 0
 	}
 
 	linesDelta := currentLines - state.lastLineCount
@@ -195,11 +244,16 @@ func updateActivity(paneID, content string) (time.Time, int) {
 	return state.lastTS, linesDelta
 }
 
-func getLastOutput(paneID string) time.Time {
-	outputStateMu.RLock()
-	defer outputStateMu.RUnlock()
-	if state, ok := paneStates[paneID]; ok {
-		return state.lastTS
+// outputSequenceChangedAt extracts the durable last-change timestamp carried
+// by an output-sequence observation. ok is false when the scope has never
+// advanced (first observation ever, or the store is unavailable).
+func outputSequenceChangedAt(info *OutputSequenceInfo) (time.Time, bool) {
+	if info == nil || info.ChangedAt == "" {
+		return time.Time{}, false
 	}
-	return time.Time{}
+	ts, err := time.Parse(time.RFC3339, info.ChangedAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts.UTC(), true
 }

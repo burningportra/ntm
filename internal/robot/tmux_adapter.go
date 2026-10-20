@@ -13,7 +13,10 @@ import (
 	"strings"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -30,6 +33,17 @@ type TmuxAdapterConfig struct {
 	// AgentStaleness is how long agent projections are considered fresh.
 	// Default: 5 seconds
 	AgentStaleness time.Duration
+
+	// StallThreshold is seconds without output before an agent is considered stalled.
+	// Default: 300 seconds (5 minutes)
+	StallThreshold int
+
+	// IdleThreshold is seconds of output silence that suggest idle state.
+	// Default: 30 seconds
+	IdleThreshold int
+
+	// PatternLibrary for agent state detection. If nil, uses default patterns.
+	PatternLibrary *PatternLibrary
 }
 
 // DefaultTmuxAdapterConfig returns sensible defaults.
@@ -37,6 +51,9 @@ func DefaultTmuxAdapterConfig() TmuxAdapterConfig {
 	return TmuxAdapterConfig{
 		SessionStaleness: 5 * time.Second,
 		AgentStaleness:   5 * time.Second,
+		StallThreshold:   300,
+		IdleThreshold:    30,
+		PatternLibrary:   nil, // Will use global default
 	}
 }
 
@@ -47,19 +64,33 @@ func DefaultTmuxAdapterConfig() TmuxAdapterConfig {
 // TmuxAdapter normalizes tmux data into canonical projection shapes.
 type TmuxAdapter struct {
 	config TmuxAdapterConfig
+	lib    *PatternLibrary
 }
 
 // NewTmuxAdapter creates a new adapter with the given configuration.
 func NewTmuxAdapter(config TmuxAdapterConfig) *TmuxAdapter {
-	return &TmuxAdapter{config: config}
+	lib := config.PatternLibrary
+	if lib == nil {
+		lib = NewPatternLibrary()
+	}
+	return &TmuxAdapter{
+		config: config,
+		lib:    lib,
+	}
 }
 
 // =============================================================================
 // Session Normalization
 // =============================================================================
 
-// NormalizeSession transforms a tmux.Session into a RuntimeSession.
-func (a *TmuxAdapter) NormalizeSession(sess *tmux.Session, agents []Agent) *state.RuntimeSession {
+// The no-tails NormalizeSession wrapper lives in tmux_adapter_helpers_test.go:
+// #288 moved every production caller to normalizeSessionWithTails, leaving the
+// wrapper reachable only from tests and so flagged by the G1 dead-code gate.
+
+// normalizeSessionWithTails is the session normalizer with the captured pane tails
+// available, so the per-session state counts use the same tail-aware
+// classification as the agent rows (#288).
+func (a *TmuxAdapter) normalizeSessionWithTails(sess *tmux.Session, agents []Agent, outputTails map[string]string) *state.RuntimeSession {
 	now := time.Now()
 
 	// Parse creation time
@@ -74,9 +105,9 @@ func (a *TmuxAdapter) NormalizeSession(sess *tmux.Session, agents []Agent) *stat
 	var activeAgents, idleAgents, errorAgents int
 	var lastActivity time.Time
 	for _, agent := range agents {
-		agentState := a.classifyAgentState(&agent)
+		agentState := a.classifyAgentState(&agent, outputTails[agent.Pane])
 		switch agentState {
-		case state.AgentStateBusy:
+		case state.AgentStateActive, state.AgentStateBusy:
 			activeAgents++
 		case state.AgentStateIdle:
 			idleAgents++
@@ -123,30 +154,20 @@ func (a *TmuxAdapter) NormalizeSession(sess *tmux.Session, agents []Agent) *stat
 	}
 }
 
-// NormalizeSessions transforms multiple tmux sessions.
-func (a *TmuxAdapter) NormalizeSessions(sessions []tmux.Session, agentsBySession map[string][]Agent) []state.RuntimeSession {
-	result := make([]state.RuntimeSession, 0, len(sessions))
-	for i := range sessions {
-		agents := agentsBySession[sessions[i].Name]
-		rs := a.NormalizeSession(&sessions[i], agents)
-		result = append(result, *rs)
-	}
-	return result
-}
-
 // =============================================================================
 // Agent Normalization
 // =============================================================================
 
 // NormalizeAgent transforms a robot.Agent into a RuntimeAgent.
-func (a *TmuxAdapter) NormalizeAgent(sessionName string, agent *Agent) *state.RuntimeAgent {
+func (a *TmuxAdapter) NormalizeAgent(sessionName string, agent *Agent, outputTail string) *state.RuntimeAgent {
 	now := time.Now()
 
 	// Compute agent ID
 	agentID := fmt.Sprintf("%s:%s", sessionName, agent.Pane)
 
-	agentState := a.classifyAgentState(agent)
-	stateReason := a.classifyStateReason(agent, agentState)
+	// Classify state using patterns and heuristics
+	agentState := a.classifyAgentState(agent, outputTail)
+	stateReason := a.classifyStateReason(agent, agentState, outputTail)
 
 	// Compute health
 	healthStatus, healthReason := a.computeAgentHealth(agent, agentState)
@@ -189,10 +210,11 @@ func (a *TmuxAdapter) NormalizeAgent(sessionName string, agent *Agent) *state.Ru
 }
 
 // NormalizeAgents transforms multiple robot.Agent structs.
-func (a *TmuxAdapter) NormalizeAgents(sessionName string, agents []Agent) []state.RuntimeAgent {
+func (a *TmuxAdapter) NormalizeAgents(sessionName string, agents []Agent, outputTails map[string]string) []state.RuntimeAgent {
 	result := make([]state.RuntimeAgent, 0, len(agents))
 	for i := range agents {
-		ra := a.NormalizeAgent(sessionName, &agents[i])
+		tail := outputTails[agents[i].Pane]
+		ra := a.NormalizeAgent(sessionName, &agents[i], tail)
 		result = append(result, *ra)
 	}
 	return result
@@ -202,45 +224,197 @@ func (a *TmuxAdapter) NormalizeAgents(sessionName string, agents []Agent) []stat
 // State Classification
 // =============================================================================
 
-// classifyAgentState determines the agent's state. A zombie or stopped agent
-// process is an error whatever its pane shows. Otherwise the state is the
-// --robot-is-working verdict the collector attached from the pane's one
-// capture (bd-p7es6). The adapter used to guess from output timing, and since
-// a process's first look at a pane counted as fresh output, every pane in a
-// one-shot CLI call came out busy.
-func (a *TmuxAdapter) classifyAgentState(agent *Agent) state.AgentState {
-	agentState := runtimeAgentState(agent.Type, agent.work)
-	if agentState == state.AgentStateUser {
-		return agentState
+// classifyAgentState determines the agent's state from available signals.
+//
+// Evidence ranking (#288): a pane only has an "output clock"
+// (agent.LastOutputTS) when some observer actually saw its content change —
+// this process earlier, or a previous process via the durable output
+// sequence. Without that clock, SecondsSinceOutput is meaningless and the
+// timing heuristics must not run; the captured tail, classified by the same
+// canonical detector that backs --robot-is-working, decides instead. A pane
+// with neither a clock nor a decisive tail is reported unknown, never busy.
+func (a *TmuxAdapter) classifyAgentState(agent *Agent, outputTail string) state.AgentState {
+	if isNonAgentPaneType(agent.Type) {
+		return a.classifyNonAgentPaneState(agent, outputTail)
 	}
-	if processStoppedOrZombie(agent.ProcessState) {
+
+	// Check for error conditions
+	if agent.RateLimitDetected {
 		return state.AgentStateError
 	}
-	return agentState
+
+	// Check process state
+	if agent.ProcessState == "Z" { // Zombie
+		return state.AgentStateError
+	}
+	if agent.ProcessState == "T" { // Stopped/traced
+		return state.AgentStateError
+	}
+
+	hasOutputClock := !agent.LastOutputTS.IsZero() && agent.SecondsSinceOutput >= 0
+
+	// Fresh output change observed within the busy window is the strongest
+	// busy signal and outranks whatever the tail happens to look like.
+	if hasOutputClock && agent.SecondsSinceOutput < 5 && agent.OutputLinesSinceLast > 0 {
+		return state.AgentStateBusy
+	}
+
+	// Canonical tail classification (idle prompt / working chrome). This is
+	// the same detector --robot-is-working uses, so the projection agrees
+	// with the authoritative live surface.
+	tailState := a.classifyTailState(agent, outputTail)
+	if tailState == status.StateIdle {
+		return state.AgentStateIdle
+	}
+	// Oh My Pi's error verdict is structural (a dismissable provider-error
+	// block framed above its quiet composer), so it is current state rather
+	// than scrollback history: project it as an error, not busy/active.
+	if tailState == status.StateError && normalizeAgentType(agent.Type) == "omp" {
+		return state.AgentStateError
+	}
+
+	// Check for stalled state: output was seen at some point, then nothing
+	// for longer than the stall threshold, and the tail does not show a
+	// resting prompt.
+	if hasOutputClock && agent.SecondsSinceOutput > a.config.StallThreshold {
+		return state.AgentStateError // Stalled is an error condition
+	}
+
+	if tailState == status.StateWorking {
+		return state.AgentStateBusy
+	}
+
+	// Check process activity
+	if agent.ProcessState == "R" { // Running
+		return state.AgentStateActive
+	}
+
+	// Context compaction detection
+	if agent.ContextPercent > 95 {
+		return state.AgentStateCompacting
+	}
+
+	if !hasOutputClock {
+		return state.AgentStateUnknown
+	}
+
+	// Check idle threshold
+	if agent.SecondsSinceOutput > a.config.IdleThreshold {
+		// Likely idle - would need pattern matching for confirmation
+		return state.AgentStateIdle
+	}
+
+	// Recent output (older than the busy window, younger than the idle
+	// threshold) without a decisive tail: active.
+	return state.AgentStateActive
 }
 
-// classifyStateReason explains the state in a short phrase.
-func (a *TmuxAdapter) classifyStateReason(agent *Agent, agentState state.AgentState) string {
-	switch {
-	case agentState == state.AgentStateUser:
-		return "user pane"
-	case agentState == state.AgentStateError && agent.ProcessState == "Z":
-		return "process zombie"
-	case agentState == state.AgentStateError && agent.ProcessState == "T":
-		return "process stopped"
-	case agent.work != nil:
-		return fmt.Sprintf("%s (%s)", agent.work.RecommendationReason, agent.work.IndicatorBasis)
-	case agent.CaptureError != "":
-		return "pane output unavailable: " + agent.CaptureError
+// isNonAgentPaneType reports whether a pane's type says it is not running an
+// agent: a plain user shell, or a pane ntm could not attribute to any agent
+// CLI. The same rule --robot-health already applies (ntm#335).
+func isNonAgentPaneType(agentType string) bool {
+	switch normalizeAgentType(agentType) {
+	case "user", "unknown":
+		return true
 	default:
-		return "insufficient signals"
+		return false
 	}
 }
 
-// processStoppedOrZombie reports whether a ps state code means the process can
-// no longer run: Z is a zombie, T is stopped or traced.
-func processStoppedOrZombie(processState string) bool {
-	return processState == "Z" || processState == "T"
+// classifyNonAgentPaneState reports the activity of a non-agent pane without
+// any of the agent error heuristics (ntm#335). A shell that has printed
+// nothing for a while is simply idle: its prompt is whatever the user
+// configured, so "quiet and no recognised agent prompt" proves nothing, and
+// a rate-limit phrase in its scrollback is text the user was looking at, not
+// an agent being throttled. Non-agent panes therefore never enter the error
+// state that turns a session critical.
+func (a *TmuxAdapter) classifyNonAgentPaneState(agent *Agent, outputTail string) state.AgentState {
+	hasOutputClock := !agent.LastOutputTS.IsZero() && agent.SecondsSinceOutput >= 0
+	if hasOutputClock && agent.SecondsSinceOutput < 5 && agent.OutputLinesSinceLast > 0 {
+		return state.AgentStateBusy
+	}
+	switch a.classifyTailState(agent, outputTail) {
+	case status.StateIdle:
+		return state.AgentStateIdle
+	case status.StateWorking:
+		return state.AgentStateBusy
+	}
+	if !hasOutputClock {
+		return state.AgentStateUnknown
+	}
+	if agent.SecondsSinceOutput > a.config.IdleThreshold {
+		return state.AgentStateIdle
+	}
+	return state.AgentStateActive
+}
+
+// classifyTailState runs the canonical status detector over the captured
+// pane tail. It returns StateUnknown when there is no tail to inspect.
+func (a *TmuxAdapter) classifyTailState(agent *Agent, outputTail string) status.AgentState {
+	if strings.TrimSpace(outputTail) == "" {
+		return status.StateUnknown
+	}
+	detector := status.NewDetector()
+	observed := detector.Analyze(agent.Pane, "", normalizeAgentType(agent.Type), outputTail, agent.LastOutputTS)
+	return observed.State
+}
+
+// classifyStateReason provides human-readable reason for the state.
+func (a *TmuxAdapter) classifyStateReason(agent *Agent, agentState state.AgentState, outputTail string) string {
+	switch agentState {
+	case state.AgentStateError:
+		if agent.RateLimitDetected {
+			return fmt.Sprintf("rate limited: %s", agent.RateLimitMatch)
+		}
+		if agent.ProcessState == "Z" {
+			return "process zombie"
+		}
+		if agent.ProcessState == "T" {
+			return "process stopped"
+		}
+		if normalizeAgentType(agent.Type) == "omp" {
+			if summary, ok := agentpkg.OmpProviderError(outputTail); ok {
+				return fmt.Sprintf("provider error (%s): %s", agentpkg.OmpProviderErrorRecovery, summary)
+			}
+		}
+		if agent.SecondsSinceOutput > a.config.StallThreshold {
+			return fmt.Sprintf("stalled: no output for %ds", agent.SecondsSinceOutput)
+		}
+		return "error detected"
+
+	case state.AgentStateBusy:
+		if !agent.LastOutputTS.IsZero() && agent.OutputLinesSinceLast > 0 && agent.SecondsSinceOutput < 5 {
+			return fmt.Sprintf("generating output (%d lines in last %ds)", agent.OutputLinesSinceLast, agent.SecondsSinceOutput)
+		}
+		return "live tail shows active work"
+
+	case state.AgentStateActive:
+		if agent.ProcessState == "R" {
+			return "process running"
+		}
+		return "active"
+
+	case state.AgentStateCompacting:
+		return fmt.Sprintf("context at %.1f%%, likely compacting", agent.ContextPercent)
+
+	case state.AgentStateIdle:
+		// Use pattern library to detect prompt state
+		if outputTail != "" && a.lib != nil {
+			agentType := normalizeAgentType(agent.Type)
+			match := a.lib.MatchOutput(outputTail, agentType)
+			if match != nil && match.State == StateWaiting {
+				return fmt.Sprintf("waiting at prompt: %s", match.Name)
+			}
+		}
+		if agent.LastOutputTS.IsZero() {
+			return "idle at prompt"
+		}
+		return fmt.Sprintf("idle for %ds", agent.SecondsSinceOutput)
+
+	case state.AgentStateUnknown:
+		return "insufficient signals"
+	}
+	return ""
 }
 
 // =============================================================================
@@ -254,16 +428,25 @@ func (a *TmuxAdapter) computeSessionHealth(sess *tmux.Session, agents []Agent, e
 	}
 
 	if errorCount > 0 {
-		if errorCount == len(agents) {
+		// Only agent panes can be in error (ntm#335), so they are the
+		// denominator: a user shell beside one failed agent must not hide
+		// that every agent has failed.
+		agentPanes := 0
+		for _, agent := range agents {
+			if !isNonAgentPaneType(agent.Type) {
+				agentPanes++
+			}
+		}
+		if errorCount >= agentPanes {
 			return state.HealthStatusCritical, fmt.Sprintf("all %d agents in error state", errorCount)
 		}
-		return state.HealthStatusWarning, fmt.Sprintf("%d/%d agents in error state", errorCount, len(agents))
+		return state.HealthStatusWarning, fmt.Sprintf("%d/%d agents in error state", errorCount, agentPanes)
 	}
 
 	// Check for rate limiting
 	rateLimited := 0
 	for _, agent := range agents {
-		if agent.RateLimitDetected {
+		if agent.RateLimitDetected && !isNonAgentPaneType(agent.Type) {
 			rateLimited++
 		}
 	}
@@ -290,8 +473,8 @@ func (a *TmuxAdapter) computeAgentHealth(agent *Agent, agentState state.AgentSta
 		return state.HealthStatusUnknown, "state unknown"
 
 	default:
-		// Check context usage
-		if agent.ContextPercent > 80 {
+		// Check context usage. A non-agent pane has no context window.
+		if agent.ContextPercent > 80 && !isNonAgentPaneType(agent.Type) {
 			return state.HealthStatusWarning, fmt.Sprintf("context at %.0f%%", agent.ContextPercent)
 		}
 		return state.HealthStatusHealthy, ""
@@ -324,14 +507,39 @@ func (a *TmuxAdapter) computeTypeConfidence(agent *Agent) (float64, string) {
 // Helpers
 // =============================================================================
 
-// extractSessionLabel extracts a human-friendly label from session name.
-// For example: "myproject" from "myproject" or "myproject" from "myproject__cc_1"
+// extractSessionLabel extracts the session label (the part after the canonical
+// "--" separator) from a session name via the single-definition helper in
+// internal/config/label.go (WS0-G6). Returns "" for unlabeled sessions.
+// For example: "" from "myproject", "frontend" from "myproject--frontend".
 func extractSessionLabel(name string) string {
-	// Strip NTM pane suffix if present
-	if idx := strings.Index(name, "__"); idx > 0 {
-		return name[:idx]
+	return config.SessionLabel(name)
+}
+
+// =============================================================================
+// Pattern Matching Integration
+// =============================================================================
+
+// MatchOutput finds the best matching pattern for output text.
+func (lib *PatternLibrary) MatchOutput(output string, agentType string) *Pattern {
+	if lib == nil || !lib.compiled {
+		return nil
 	}
-	return name
+
+	lib.mu.RLock()
+	defer lib.mu.RUnlock()
+
+	for i := range lib.Patterns {
+		p := &lib.Patterns[i]
+		// Check agent type match
+		if p.Agent != "*" && p.Agent != agentType {
+			continue
+		}
+		// Check regex match
+		if p.Regex != nil && p.Regex.MatchString(output) {
+			return p
+		}
+	}
+	return nil
 }
 
 // =============================================================================
@@ -349,6 +557,7 @@ type NormalizedSnapshot struct {
 func (a *TmuxAdapter) NormalizeSnapshot(
 	sessions []tmux.Session,
 	agentsBySession map[string][]Agent,
+	outputTailsByPane map[string]map[string]string, // session -> pane -> output
 ) *NormalizedSnapshot {
 	now := time.Now()
 
@@ -361,13 +570,17 @@ func (a *TmuxAdapter) NormalizeSnapshot(
 	for i := range sessions {
 		sess := &sessions[i]
 		agents := agentsBySession[sess.Name]
+		outputTails := outputTailsByPane[sess.Name]
+		if outputTails == nil {
+			outputTails = make(map[string]string)
+		}
 
 		// Normalize session
-		rs := a.NormalizeSession(sess, agents)
+		rs := a.normalizeSessionWithTails(sess, agents, outputTails)
 		snapshot.Sessions = append(snapshot.Sessions, *rs)
 
 		// Normalize agents
-		normalizedAgents := a.NormalizeAgents(sess.Name, agents)
+		normalizedAgents := a.NormalizeAgents(sess.Name, agents, outputTails)
 		snapshot.Agents = append(snapshot.Agents, normalizedAgents...)
 	}
 

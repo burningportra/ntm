@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -51,8 +53,21 @@ type RobotSequenceOutput struct {
 	Pane     *workflow.PaneSequencePosition `json:"pane,omitempty"`
 }
 
+// robotSequenceExpectedPositionFlag is the root --sequence-expected-position
+// flag. It is looked up once in init rather than through rootCmd inside
+// printRobotSequence: rootCmd's initializer reaches printRobotSequence via its
+// Run closure, so a direct rootCmd reference there is an initialization cycle
+// that fails the whole package build.
+var robotSequenceExpectedPositionFlag *pflag.Flag
+
 func init() {
+	rootCmd.Flags().Int("sequence-expected-position", 0,
+		"Zero-based position being completed; makes retries safe without skipping prompts. Optional with --robot-sequence and --sequence-action=advance")
+	robotSequenceExpectedPositionFlag = rootCmd.Flags().Lookup("sequence-expected-position")
 	robot.MustRegisterSchemaCommand("sequence", RobotSequenceOutput{})
+	robot.MustRegisterSchemaPagination("sequence", robot.SchemaPaginationFlag{
+		Reason: "bounded: one pane sequence echo with its nested step list",
+	})
 }
 
 func printRobotSequence(projectDir, name, action, pane, rawSteps string) error {
@@ -63,6 +78,20 @@ func printRobotSequence(projectDir, name, action, pane, rawSteps string) error {
 	action = strings.ToLower(strings.TrimSpace(action))
 	if action == "" {
 		action = "next"
+	}
+	var expectedPosition []int
+	if robotSequenceExpectedPositionFlag != nil && robotSequenceExpectedPositionFlag.Changed {
+		expected, err := strconv.Atoi(robotSequenceExpectedPositionFlag.Value.String())
+		if err != nil {
+			return fmt.Errorf("--sequence-expected-position: %w", err)
+		}
+		if expected < 0 {
+			return fmt.Errorf("--sequence-expected-position must be non-negative")
+		}
+		if action != "advance" {
+			return fmt.Errorf("--sequence-expected-position requires --sequence-action=advance")
+		}
+		expectedPosition = []int{expected}
 	}
 	output := RobotSequenceOutput{
 		RobotResponse: robot.NewRobotResponse(true),
@@ -86,7 +115,7 @@ func printRobotSequence(projectDir, name, action, pane, rawSteps string) error {
 		}
 		output.Pane = &position
 	case "advance":
-		position, err := store.Advance(name, pane)
+		position, err := store.Advance(name, pane, expectedPosition...)
 		if err != nil {
 			return err
 		}
@@ -115,14 +144,23 @@ Sources (in precedence order):
   2. User templates (~/.config/ntm/workflows/)
   3. Project templates (.ntm/workflows/) (highest priority)
 
+For durable per-pane review progress, use --robot-sequence. Complete a prompt
+with --sequence-action=advance --sequence-expected-position=N, where N is the
+position returned by the preceding query. Repeating that request is a no-op
+once N has been consumed, even after restart; future positions are rejected.
+
 Examples:
   ntm workflows list                # List all available templates
   ntm workflows show red-green      # Show details of a template
+  ntm workflow run red-green        # Execute a template's coordination loop
   ntm workflows list --json         # JSON output for scripts`,
 	}
 
 	cmd.AddCommand(newWorkflowsListCmd())
 	cmd.AddCommand(newWorkflowsShowCmd())
+	cmd.AddCommand(newWorkflowsRunCmd())
+	cmd.AddCommand(newWorkflowCheckpointCmd("status"))
+	cmd.AddCommand(newWorkflowCheckpointCmd("recover"))
 
 	return cmd
 }

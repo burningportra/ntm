@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/Dicklesworthstone/ntm/internal/cli/tiers"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 )
@@ -30,6 +32,44 @@ func TestLevelShowDisplaysCurrentTier(t *testing.T) {
 	// Default tier should be Apprentice
 	if cfg.GetTier() != tiers.TierApprentice {
 		t.Errorf("expected Apprentice tier, got %s", cfg.GetTier())
+	}
+}
+
+// `ntm level` showed "Commands run: 0" forever: nothing in production
+// recorded usage. The post-run hook now records each successful interactive
+// command, counting spawn/create/quick as sessions and send as prompts.
+func TestRecordProficiencyUsageFeedsLevelStats(t *testing.T) {
+	setupTestProficiency(t)
+	for _, command := range []string{"spawn", "send", "send", "status", "mail send"} {
+		recordProficiencyUsage(command)
+	}
+	cfg, err := config.LoadProficiency()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := cfg.GetUsageStats()
+	if stats.CommandsRun != 5 || stats.SessionsCreated != 1 || stats.PromptsSent != 2 {
+		t.Fatalf("stats = %+v, want 5 commands, 1 session, 2 prompts (a subcommand named send is not a prompt)", stats)
+	}
+	if cfg.GetUniqueCommandCount() != 4 {
+		t.Fatalf("unique commands = %d, want 4", cfg.GetUniqueCommandCount())
+	}
+
+	// The hook itself never writes stats from a test binary.
+	root := &cobra.Command{Use: "ntm"}
+	child := &cobra.Command{Use: "status"}
+	hidden := &cobra.Command{Use: "internal-monitor", Hidden: true}
+	completion := &cobra.Command{Use: "__complete"}
+	root.AddCommand(child, hidden, completion)
+	recordInteractiveUsage(child)
+	if after, _ := config.LoadProficiency(); after.GetUsageStats().CommandsRun != 5 {
+		t.Fatal("recordInteractiveUsage wrote stats from a test binary")
+	}
+
+	// Shell completion runs __complete on every TAB press; neither it nor
+	// hidden internal commands are the operator's usage.
+	if !isInteractiveUsage(child) || isInteractiveUsage(root) || isInteractiveUsage(hidden) || isInteractiveUsage(completion) {
+		t.Fatal("only visible subcommands count as interactive usage")
 	}
 }
 
@@ -255,21 +295,6 @@ func TestLevelConfigPersistence(t *testing.T) {
 	stats := cfg2.GetUsageStats()
 	if stats.CommandsRun != 50 {
 		t.Errorf("commands not persisted: expected 50, got %d", stats.CommandsRun)
-	}
-}
-
-func TestLevelConfigPathExists(t *testing.T) {
-	cleanup := setupTestProficiency(t)
-	defer cleanup()
-
-	// Load and save config
-	cfg, _ := config.LoadProficiency()
-	cfg.Save()
-
-	// Verify file exists
-	path := config.ProficiencyConfigPath()
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Errorf("config file should exist at %s", path)
 	}
 }
 

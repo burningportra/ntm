@@ -91,27 +91,6 @@ func TestEscapeQuotes(t *testing.T) {
 	}
 }
 
-func TestFormatTarget(t *testing.T) {
-	tests := []struct {
-		name    string
-		session string
-		pane    int
-		want    string
-	}{
-		{"basic", "mysession", 0, "mysession:1.0"},
-		{"pane 5", "test", 5, "test:1.5"},
-		{"complex session name", "my-ai-session", 12, "my-ai-session:1.12"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := formatTarget(tt.session, tt.pane)
-			if got != tt.want {
-				t.Errorf("formatTarget(%q, %d) = %q, want %q", tt.session, tt.pane, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestFormatTargetWinPreservesExplicitWindowIndex(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -120,8 +99,11 @@ func TestFormatTargetWinPreservesExplicitWindowIndex(t *testing.T) {
 		pane    int
 		want    string
 	}{
-		{name: "zero based window", session: "mysession", window: 0, pane: 3, want: "mysession:0.3"},
-		{name: "positive window", session: "mysession", window: 7, pane: 2, want: "mysession:7.2"},
+		// The "=" prefix exact-matches the session portion so a sibling
+		// session sharing the name as a prefix can never be hit (see
+		// formatTargetWin / tmux.ExactTarget).
+		{name: "zero based window", session: "mysession", window: 0, pane: 3, want: "=mysession:0.3"},
+		{name: "positive window", session: "mysession", window: 7, pane: 2, want: "=mysession:7.2"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -268,6 +250,24 @@ func TestDetectReservationConflicts(t *testing.T) {
 				{PathPattern: "internal/cli/*.go", AgentName: "Beta", Exclusive: false},
 			},
 			wantCount: 1,
+		},
+		{
+			// Neither glob matches the other's spelling, but both match
+			// src/service/main.go: a conflict before that file exists.
+			name: "intersecting globs conflict",
+			reservations: []agentmail.FileReservation{
+				{PathPattern: "src/*/main.go", AgentName: "Alpha", Exclusive: true},
+				{PathPattern: "src/service/*.go", AgentName: "Beta", Exclusive: true},
+			},
+			wantCount: 1,
+		},
+		{
+			name: "a single star does not cross directories",
+			reservations: []agentmail.FileReservation{
+				{PathPattern: "src/*.go", AgentName: "Alpha", Exclusive: true},
+				{PathPattern: "src/deep/main.go", AgentName: "Beta", Exclusive: true},
+			},
+			wantCount: 0,
 		},
 	}
 	for _, tt := range tests {

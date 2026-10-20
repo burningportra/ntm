@@ -4,7 +4,12 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 )
 
 func TestAMAdapter_SetServerURL_TrimsTrailingSlash(t *testing.T) {
@@ -17,19 +22,33 @@ func TestAMAdapter_SetServerURL_TrimsTrailingSlash(t *testing.T) {
 	}
 }
 
-func TestAMAdapter_Capabilities_ServerAvailable(t *testing.T) {
-	t.Parallel()
+// livenessServer serves Agent Mail's liveness endpoint, optionally requiring a
+// bearer token the way an authenticated deployment does.
+func livenessServer(t *testing.T, requiredToken string, status int) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
 
+	var unauthorized atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/health/liveness" {
+		if r.URL.Path != "/"+agentmail.HealthCheckPath {
 			http.NotFound(w, r)
 			return
 		}
+		if requiredToken != "" && r.Header.Get("Authorization") != "Bearer "+requiredToken {
+			unauthorized.Add(1)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	t.Cleanup(ts.Close)
+
+	return ts, &unauthorized
+}
+
+func TestAMAdapter_Capabilities_ServerAvailable(t *testing.T) {
+	ts, _ := livenessServer(t, "", http.StatusOK)
 
 	a := NewAMAdapter()
 	a.SetServerURL(ts.URL + "/")
@@ -44,27 +63,12 @@ func TestAMAdapter_Capabilities_ServerAvailable(t *testing.T) {
 	if !containsCapability(caps, Capability("server_available")) {
 		t.Fatalf("expected %q in capabilities", "server_available")
 	}
-
-	out, err := a.HealthCheck(context.Background())
-	if err != nil {
-		t.Fatalf("HealthCheck() error: %v", err)
-	}
-	if string(out) != `{"ok":true}` {
-		t.Fatalf("HealthCheck() = %q, want %q", string(out), `{"ok":true}`)
-	}
 }
 
 func TestAMAdapter_Capabilities_ServerUnavailableOnNonOK(t *testing.T) {
-	t.Parallel()
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/health/liveness" {
-			http.NotFound(w, r)
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(ts.Close)
+	// 5xx is a genuine failure verdict, unlike 4xx which only means the
+	// endpoint cannot answer and sends the client to the MCP fallback.
+	ts, _ := livenessServer(t, "", http.StatusServiceUnavailable)
 
 	a := NewAMAdapter()
 	a.SetServerURL(ts.URL)
@@ -75,6 +79,98 @@ func TestAMAdapter_Capabilities_ServerUnavailableOnNonOK(t *testing.T) {
 	}
 	if containsCapability(caps, Capability("server_available")) {
 		t.Fatalf("did not expect %q in capabilities", "server_available")
+	}
+}
+
+// TestAMAdapter_Health_AuthenticatedServer is the ntm#316 regression. An
+// Agent Mail endpoint that requires a bearer token is healthy when the
+// adapter presents the configured token, and the adapter must actually
+// present it — the old probe sent an unauthenticated GET to a hard-coded
+// loopback URL, so `ntm doctor` reported a working authenticated server as
+// unhealthy while robot Mail talked to it fine.
+func TestAMAdapter_Health_AuthenticatedServer(t *testing.T) {
+	const token = "s3cret-token"
+
+	t.Run("with the configured token the server is healthy", func(t *testing.T) {
+		ts, unauthorized := livenessServer(t, token, http.StatusOK)
+
+		a := NewAMAdapter()
+		a.SetServerURL(ts.URL)
+		a.SetToken(token)
+
+		if !a.isServerHealthy(context.Background()) {
+			t.Error("authenticated server reported unhealthy despite a valid bearer token")
+		}
+		if got := unauthorized.Load(); got != 0 {
+			t.Errorf("probe was rejected %d times; the bearer token was not attached", got)
+		}
+	})
+
+	t.Run("without the token the server is not healthy", func(t *testing.T) {
+		ts, unauthorized := livenessServer(t, token, http.StatusOK)
+
+		a := NewAMAdapter()
+		a.SetServerURL(ts.URL)
+
+		if a.isServerHealthy(context.Background()) {
+			t.Error("server reported healthy without presenting the required token")
+		}
+		if got := unauthorized.Load(); got == 0 {
+			t.Error("expected the unauthenticated probe to be rejected at least once")
+		}
+	})
+}
+
+// TestAMAdapter_ProbesConfiguredEndpoint verifies the adapter no longer pins
+// itself to 127.0.0.1:8765: the endpoint it probes is the one it was given
+// (ntm#316).
+func TestAMAdapter_ProbesConfiguredEndpoint(t *testing.T) {
+	var hits atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	a := NewAMAdapter()
+	a.SetServerURL(ts.URL)
+
+	if got := a.ServerURL(); !strings.HasPrefix(got, ts.URL) {
+		t.Fatalf("ServerURL() = %q, want the configured endpoint %q", got, ts.URL)
+	}
+	if !a.isServerHealthy(context.Background()) {
+		t.Fatal("configured endpoint reported unhealthy")
+	}
+	if hits.Load() == 0 {
+		t.Error("the configured endpoint was never contacted; the probe used a different URL")
+	}
+}
+
+// TestAMAdapter_DownServerFailsFast pins a performance contract, not just
+// behaviour. The tools registry probes Agent Mail on every inventory pass and
+// snapshot, and the overwhelmingly common case on a developer box is that the
+// server is not running at all.
+//
+// Routing the probe through the shared client (ntm#316) briefly made that case
+// cost ~1.25s: IsAvailableContext is built to gate mutating verbs, so it
+// retries three times with backoff before conceding. An inventory row must
+// instead resolve on the refused connection. The budget here is deliberately
+// far above the observed ~2ms and far below a single retry cycle, so it
+// catches a regression without being flaky on a loaded machine.
+func TestAMAdapter_DownServerFailsFast(t *testing.T) {
+	a := NewAMAdapter()
+	a.SetServerURL("http://127.0.0.1:1") // nothing listens on port 1
+
+	start := time.Now()
+	healthy := a.isServerHealthy(context.Background())
+	elapsed := time.Since(start)
+
+	if healthy {
+		t.Error("reported healthy against a port with no listener")
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("a refused connection took %s; an inventory probe must fail fast, not retry", elapsed)
 	}
 }
 

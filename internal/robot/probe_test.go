@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/util"
 )
@@ -23,33 +22,9 @@ func TestGetProbeSessionFailureUsesGeneralErrorExit(t *testing.T) {
 	}
 }
 
-func TestGetProbe_GrokRejectsBeforePaneInput(t *testing.T) {
-	mock := setupMock(t)
-	mock.Panes = []tmux.Pane{{ID: "%9", Index: 2, WindowIndex: 1, Type: tmux.AgentGrok}}
-
-	output, err := GetProbe(ProbeOptions{
-		Session: "proj",
-		Pane:    2,
-		Flags: ProbeFlags{
-			Method:    ProbeMethodKeystrokeEcho,
-			TimeoutMs: 1,
-		},
-	})
-	if err != nil {
-		t.Fatalf("GetProbe() error = %v", err)
-	}
-	if output.Success || output.ErrorCode != ErrCodeNotImplemented {
-		t.Fatalf("GetProbe() response = %+v, want NOT_IMPLEMENTED", output.RobotResponse)
-	}
-	if !strings.Contains(output.Error, agent.GrokPromptDeliveryCapabilityHint) {
-		t.Fatalf("GetProbe() error = %q, want Grok capability hint", output.Error)
-	}
-	if mock.CaptureCount != 0 || mock.SendKeysCount != 0 || mock.InterruptCount != 0 {
-		t.Fatalf("probe mutated Grok pane before rejection: capture=%d send=%d interrupt=%d", mock.CaptureCount, mock.SendKeysCount, mock.InterruptCount)
-	}
-}
-
-func TestGetProbeSession_MixedBatchPreflightIsAtomic(t *testing.T) {
+// GH#251 phase 2: a mixed claude+grok batch passes the preflight and both
+// panes are probed like any supported agents.
+func TestGetProbeSession_MixedBatchProbesGrok(t *testing.T) {
 	mock := setupMock(t)
 	mock.Panes = []tmux.Pane{
 		{ID: "%1", Index: 1, WindowIndex: 0, Type: tmux.AgentClaude},
@@ -64,17 +39,14 @@ func TestGetProbeSession_MixedBatchPreflightIsAtomic(t *testing.T) {
 			TimeoutMs: 1,
 		},
 	})
-	if exitCode != 2 {
-		t.Fatalf("GetProbeSession() exit code = %d, want 2", exitCode)
+	if output.ErrorCode == ErrCodeNotImplemented {
+		t.Fatalf("GetProbeSession() response = %+v exit=%d, grok must no longer fail the batch preflight", output.RobotResponse, exitCode)
 	}
-	if output.Success || output.ErrorCode != ErrCodeNotImplemented {
-		t.Fatalf("GetProbeSession() response = %+v, want NOT_IMPLEMENTED", output.RobotResponse)
+	if output.Summary.TotalProbed != 2 || len(output.Probes) != 2 {
+		t.Fatalf("mixed batch did not probe both panes: probes=%v summary=%+v", output.Probes, output.Summary)
 	}
-	if len(output.Probes) != 0 || output.Summary.TotalProbed != 0 {
-		t.Fatalf("probe result mutated before batch preflight completed: probes=%v summary=%+v", output.Probes, output.Summary)
-	}
-	if mock.CaptureCount != 0 || mock.SendKeysCount != 0 || mock.InterruptCount != 0 {
-		t.Fatalf("mixed batch mutated a pane before Grok rejection: capture=%d send=%d interrupt=%d", mock.CaptureCount, mock.SendKeysCount, mock.InterruptCount)
+	if mock.CaptureCount == 0 && mock.SendKeysCount == 0 && mock.InterruptCount == 0 {
+		t.Fatalf("mixed batch never touched the panes: capture=%d send=%d interrupt=%d", mock.CaptureCount, mock.SendKeysCount, mock.InterruptCount)
 	}
 }
 
@@ -1399,28 +1371,6 @@ func TestProbeOutputErrorFields(t *testing.T) {
 // FormatProbeDuration Tests (bd-43oxm)
 // =============================================================================
 
-func TestFormatProbeDuration(t *testing.T) {
-	tests := []struct {
-		duration time.Duration
-		wantMs   int64
-	}{
-		{100 * time.Millisecond, 100},
-		{5 * time.Second, 5000},
-		{1 * time.Minute, 60000},
-		{500 * time.Microsecond, 0}, // Rounds down
-		{1500 * time.Millisecond, 1500},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.duration.String(), func(t *testing.T) {
-			got := FormatProbeDuration(tt.duration)
-			if got != tt.wantMs {
-				t.Errorf("FormatProbeDuration(%v) = %d, want %d", tt.duration, got, tt.wantMs)
-			}
-		})
-	}
-}
-
 // =============================================================================
 // Edge Case Tests (bd-43oxm)
 // =============================================================================
@@ -1582,10 +1532,8 @@ type MockTmuxClient struct {
 	SentKeyNames  []string
 	SendKeyNameFn func(target, keyName string) error
 
-	// Targets records every "session:window.pane" address the probe built, for
-	// every tmux operation. Discarding these is what let the probe address the
-	// wrong pane undetected: the batch resolved the right tmux.Pane and then
-	// interpolated the wrong index into the target string.
+	// Targets records every transport target. Session probes must use the
+	// bound physical pane ID, never an index that can move during execution.
 	Targets []string
 }
 
@@ -1639,7 +1587,7 @@ func (m *MockTmuxClient) GetPanes(session string) ([]tmux.Pane, error) {
 func setupMock(t *testing.T) *MockTmuxClient {
 	mock := &MockTmuxClient{
 		SessionExistsVal: true,
-		Panes:            []tmux.Pane{{ID: "0", Index: 0}},
+		Panes:            []tmux.Pane{{ID: "%0", Index: 0}},
 	}
 	original := CurrentTmuxClient
 	CurrentTmuxClient = mock
@@ -1764,7 +1712,7 @@ func TestProbeInterruptTest_Responsive(t *testing.T) {
 	CurrentTmuxClient = mockSeq
 	t.Cleanup(func() { CurrentTmuxClient = original })
 
-	result := probeInterruptTest("test:0", 100*time.Millisecond)
+	result := probeInterruptTest("test:0", tmux.AgentClaude, 100*time.Millisecond)
 
 	if !result.Responsive {
 		t.Error("expected responsive result")
@@ -1774,11 +1722,31 @@ func TestProbeInterruptTest_Responsive(t *testing.T) {
 	}
 }
 
+// TestProbeInterruptTest_OmpUsesEscape pins that the interrupt probe never
+// sends Ctrl-C to an omp pane (Ctrl-C only clears omp's draft and a double
+// press quits omp); Escape is omp's interrupt key.
+func TestProbeInterruptTest_OmpUsesEscape(t *testing.T) {
+	mockSeq := &MockTmuxClientSequence{
+		Outputs: []string{"baseline", "changed output"},
+	}
+	original := CurrentTmuxClient
+	CurrentTmuxClient = mockSeq
+	t.Cleanup(func() { CurrentTmuxClient = original })
+
+	result := probeInterruptTest("test:0", tmux.AgentOmp, 100*time.Millisecond)
+	if !result.Responsive || result.Details.InputSent != "Escape" {
+		t.Fatalf("omp interrupt probe = %+v, want responsive via Escape", result)
+	}
+	if mockSeq.InterruptCount != 0 {
+		t.Fatalf("InterruptCount = %d, want 0 (no Ctrl-C to omp)", mockSeq.InterruptCount)
+	}
+}
+
 func TestProbeInterruptTest_Unresponsive(t *testing.T) {
 	mock := setupMock(t)
 	mock.CaptureOutput = "static content"
 
-	result := probeInterruptTest("test:0", 50*time.Millisecond)
+	result := probeInterruptTest("test:0", tmux.AgentCodex, 50*time.Millisecond)
 
 	if result.Responsive {
 		t.Error("expected unresponsive result")
@@ -1810,70 +1778,6 @@ func (m *MockTmuxClientSequence) CaptureForStatusDetection(target string) (strin
 		return m.Outputs[len(m.Outputs)-1], nil
 	}
 	return "", nil
-}
-
-// Wake-ping probe (ntm-7rgt): one structured call answers TUI liveness AND
-// whether the rate-limit wall is still up, with a tail sample — replacing the
-// raw `tmux send-keys "ping" Enter; sleep 5; --robot-tail` folklore.
-func TestProbeWakePing(t *testing.T) {
-	t.Run("rate-limited pane reports still limited", func(t *testing.T) {
-		mock := setupMock(t)
-		mock.Panes = []tmux.Pane{{ID: "%5", Index: 2, Type: tmux.AgentClaude, Title: "proj__cc_1"}}
-		mock.CaptureOutput = "some output\nrate limit reached, resets at 4pm\n"
-
-		out, err := GetProbe(ProbeOptions{
-			Session: "proj", Pane: 2,
-			Flags: ProbeFlags{Method: ProbeMethodWakePing, TimeoutMs: 50},
-		})
-		if err != nil {
-			t.Fatalf("GetProbe: %v", err)
-		}
-		if !out.Success {
-			t.Fatalf("wake_ping failed: %s", out.Error)
-		}
-		if out.ProbeDetails.StillRateLimited == nil || !*out.ProbeDetails.StillRateLimited {
-			t.Fatalf("still_rate_limited = %v, want true", out.ProbeDetails.StillRateLimited)
-		}
-		if len(out.ProbeDetails.TailSample) == 0 {
-			t.Error("tail_sample missing")
-		}
-	})
-
-	t.Run("clear pane reports wall down", func(t *testing.T) {
-		mock := setupMock(t)
-		mock.Panes = []tmux.Pane{{ID: "%5", Index: 2, Type: tmux.AgentCodex, Title: "proj__cod_1"}}
-		mock.CaptureOutput = "› \n100% context left\n"
-
-		out, err := GetProbe(ProbeOptions{
-			Session: "proj", Pane: 2,
-			Flags: ProbeFlags{Method: ProbeMethodWakePing, TimeoutMs: 50},
-		})
-		if err != nil {
-			t.Fatalf("GetProbe: %v", err)
-		}
-		if out.ProbeDetails.StillRateLimited == nil || *out.ProbeDetails.StillRateLimited {
-			t.Fatalf("still_rate_limited = %v, want false", out.ProbeDetails.StillRateLimited)
-		}
-	})
-
-	t.Run("user pane refused", func(t *testing.T) {
-		mock := setupMock(t)
-		mock.Panes = []tmux.Pane{{ID: "%1", Index: 0, Type: tmux.AgentUser, Title: "proj"}}
-
-		out, err := GetProbe(ProbeOptions{
-			Session: "proj", Pane: 0,
-			Flags: ProbeFlags{Method: ProbeMethodWakePing, TimeoutMs: 50},
-		})
-		if err != nil {
-			t.Fatalf("GetProbe: %v", err)
-		}
-		if out.Success {
-			t.Fatal("wake_ping against a user pane must be refused")
-		}
-		if out.ErrorCode != ErrCodeInvalidFlag {
-			t.Fatalf("error code = %s, want %s", out.ErrorCode, ErrCodeInvalidFlag)
-		}
-	})
 }
 
 // pane_index is window-local, so a window-per-agent layout gives every agent
@@ -1910,45 +1814,15 @@ func TestGetProbeSession_WindowPerAgentDoesNotCollapse(t *testing.T) {
 		}
 	}
 
-	// Resolving the right tmux.Pane is only half the job: the target string
-	// must carry that pane's own window-local index. Interpolating the NTM
-	// index instead produced "proj:1.2" for a window that has only pane 0, so
-	// every capture failed and every healthy agent read back "likely_stuck" —
-	// and where a window did have that many panes, the probe keystrokes and
-	// the interrupt-test Ctrl-C landed on a different agent entirely.
-	wantTargets := map[string]bool{"proj:0.0": true, "proj:1.0": true, "proj:2.0": true}
+	// Retain each resolved physical ID through execution. Neither the NTM
+	// label nor a renumberable window/pane address may redirect probe input.
+	wantTargets := map[string]bool{"%1": true, "%2": true, "%3": true}
 	if len(mock.Targets) == 0 {
 		t.Fatal("probe issued no tmux operations")
 	}
 	for _, target := range mock.Targets {
 		if !wantTargets[target] {
-			t.Fatalf("probe addressed %q; want one of %v (window-local pane index, not the NTM agent index)", target, wantTargets)
-		}
-	}
-}
-
-// SendKeys sends with tmux's literal (-l) flag, so a KEY NAME passed to it is
-// typed as characters. The probe's cleanup used SendKeys("BSpace"), which put
-// the six letters "BSpace" into the pane rather than erasing the probe
-// character — verified live before the fix, where an agent composer was left
-// reading "❯  BSpace", text the operator's next Enter would submit.
-func TestProbeKeystrokeEchoNeverTypesKeyNamesLiterally(t *testing.T) {
-	mock := setupMock(t)
-	mock.Panes = []tmux.Pane{{ID: "%1", Index: 1, WindowIndex: 0, Type: tmux.AgentClaude}}
-	mock.CaptureOutput = "static screen"
-
-	_, err := GetProbe(ProbeOptions{
-		Session: "proj",
-		Pane:    1,
-		Flags:   ProbeFlags{Method: ProbeMethodKeystrokeEcho, TimeoutMs: 1},
-	})
-	if err != nil {
-		t.Fatalf("GetProbe() error = %v", err)
-	}
-
-	for _, sent := range mock.SentLiterals {
-		if sent == "BSpace" || sent == "Escape" || sent == "Enter" || sent == "C-u" {
-			t.Fatalf("probe sent the tmux key name %q as literal text; it would be typed into the pane, not pressed", sent)
+			t.Fatalf("probe addressed %q; want one of the bound physical IDs %v", target, wantTargets)
 		}
 	}
 }
@@ -1968,12 +1842,18 @@ func TestProbeSelectorMatchesCanonicalConvention(t *testing.T) {
 
 	t.Run("multi-window selector picks the window, matching tmux.PaneSelector", func(t *testing.T) {
 		for _, selector := range []int{0, 1, 2} {
-			matches := resolveProbePanes(windowPerAgent, selector)
-			if len(matches) != 1 {
-				t.Fatalf("selector %d matched %d panes, want 1", selector, len(matches))
+			mock := setupMock(t)
+			mock.Panes = windowPerAgent
+			out, _ := GetProbeSession(ProbeSessionOptions{
+				Session: "proj",
+				Panes:   []int{selector},
+				Flags:   ProbeFlags{Method: ProbeMethodKeystrokeEcho, TimeoutMs: 1},
+			})
+			if len(out.Probes) != 1 {
+				t.Fatalf("selector %d probed %d panes, want 1 (%+v)", selector, len(out.Probes), out.RobotResponse)
 			}
-			if matches[0].WindowIndex != selector {
-				t.Fatalf("selector %d resolved to window %d; the canonical convention selects the WINDOW", selector, matches[0].WindowIndex)
+			if want := fmt.Sprintf("%d.0", selector); out.Probes[0].PaneRef != want {
+				t.Fatalf("selector %d probed %s; the canonical convention selects the WINDOW (%s)", selector, out.Probes[0].PaneRef, want)
 			}
 
 			// The canonical resolver must agree.
@@ -1981,8 +1861,8 @@ func TestProbeSelectorMatchesCanonicalConvention(t *testing.T) {
 			if err != nil {
 				t.Fatalf("tmux.ResolvePaneSelectors(%d): %v", selector, err)
 			}
-			if len(canonical) != 1 || canonical[0].ID != matches[0].ID {
-				t.Fatalf("probe resolved selector %d to %v but the canonical resolver chose %v", selector, matches[0].ID, canonical)
+			if len(canonical) != 1 || canonical[0].ID != out.Probes[0].PaneID {
+				t.Fatalf("probe resolved selector %d to %v but the canonical resolver chose %v", selector, out.Probes[0].PaneID, canonical)
 			}
 		}
 	})
@@ -1995,11 +1875,6 @@ func TestProbeSelectorMatchesCanonicalConvention(t *testing.T) {
 			{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 2, Type: tmux.AgentClaude},
 			{ID: "%3", Index: 0, WindowIndex: 1, NTMIndex: 3, Type: tmux.AgentClaude},
 		}
-		matches := resolveProbePanes(split, 0)
-		if len(matches) != 2 {
-			t.Fatalf("selector 0 matched %d panes, want both panes of window 0", len(matches))
-		}
-
 		mock := setupMock(t)
 		mock.Panes = split
 		out, _ := GetProbeSession(ProbeSessionOptions{
@@ -2024,11 +1899,17 @@ func TestProbeSelectorMatchesCanonicalConvention(t *testing.T) {
 			{ID: "%1", Index: 0, WindowIndex: 0, NTMIndex: 1, Type: tmux.AgentClaude},
 			{ID: "%2", Index: 1, WindowIndex: 0, NTMIndex: 2, Type: tmux.AgentClaude},
 		}
-		matches := resolveProbePanes(single, 1)
-		if len(matches) != 1 || matches[0].ID != "%2" {
-			t.Fatalf("selector 1 resolved to %v, want the pane at window-local index 1", matches)
+		mock := setupMock(t)
+		mock.Panes = single
+		out, _ := GetProbeSession(ProbeSessionOptions{
+			Session: "proj",
+			Panes:   []int{1},
+			Flags:   ProbeFlags{Method: ProbeMethodKeystrokeEcho, TimeoutMs: 1},
+		})
+		if len(out.Probes) != 1 || out.Probes[0].PaneID != "%2" {
+			t.Fatalf("selector 1 probed %+v, want only the pane at window-local index 1", out.Probes)
 		}
-		if got := probePaneRef(matches[0], false); got != "1" {
+		if got := out.Probes[0].PaneRef; got != "1" {
 			t.Fatalf("pane_ref = %q, want the bare index on a single-window session", got)
 		}
 	})

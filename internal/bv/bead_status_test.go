@@ -68,6 +68,7 @@ func TestParseBeadAssignmentDetailsOutput(t *testing.T) {
 	details, err := parseBeadAssignmentDetailsOutput(`[{
 		"id":"ntm-target",
 		"title":"Exact assignment target",
+		"description":"## Owned outputs\n- ` + "`docs/out.md`" + `\n",
 		"status":"open",
 		"priority":2,
 		"assignee":"  ExactActor  ",
@@ -87,6 +88,10 @@ func TestParseBeadAssignmentDetailsOutput(t *testing.T) {
 	}
 	if details.ID != "ntm-target" || details.Title != "Exact assignment target" || details.Status != "open" || details.Priority != 2 || details.Assignee != "ExactActor" {
 		t.Fatalf("details=%+v", details)
+	}
+	// ntm#336: reservation discovery reads paths from the description.
+	if want := "## Owned outputs\n- `docs/out.md`\n"; details.Description != want {
+		t.Fatalf("description=%q, want %q", details.Description, want)
 	}
 	if want := []string{"ntm-conditional", "ntm-open-a", "ntm-open-b", "ntm-wait"}; !reflect.DeepEqual(details.BlockedBy, want) {
 		t.Fatalf("blocked_by=%v, want %v", details.BlockedBy, want)
@@ -144,6 +149,33 @@ func TestParseBeadAssignmentDetailsOutputRejectsAmbiguousOrMalformedRows(t *test
 				t.Fatalf("parseBeadAssignmentDetailsOutput(%q) error=nil", input)
 			}
 		})
+	}
+}
+
+func TestBeadTextReaderNarrowsLiveDetails(t *testing.T) {
+	t.Parallel()
+
+	var gotDir, gotBead string
+	read := BeadTextReader(func(_ context.Context, dir, beadID string) (*BeadAssignmentDetails, error) {
+		gotDir, gotBead = dir, beadID
+		return &BeadAssignmentDetails{ID: beadID, Title: "Fix internal/a.go", Description: "## Owned outputs\n- internal/b.go\n"}, nil
+	})
+	title, description, err := read(t.Context(), "/project", "bd-1")
+	if err != nil || title != "Fix internal/a.go" || description != "## Owned outputs\n- internal/b.go\n" || gotDir != "/project" || gotBead != "bd-1" {
+		t.Fatalf("read = %q, %q, %v (dir %q bead %q)", title, description, err, gotDir, gotBead)
+	}
+
+	readErr := errors.New("br unavailable")
+	for name, reader := range map[string]func(context.Context, string, string) (string, string, error){
+		"read error": BeadTextReader(func(context.Context, string, string) (*BeadAssignmentDetails, error) { return nil, readErr }),
+		"nil details": BeadTextReader(func(context.Context, string, string) (*BeadAssignmentDetails, error) {
+			return nil, nil
+		}),
+		"no reader": BeadTextReader(nil),
+	} {
+		if _, _, err := reader(t.Context(), "/project", "bd-1"); err == nil {
+			t.Fatalf("%s: err = nil, want a failed read", name)
+		}
 	}
 }
 
@@ -253,6 +285,24 @@ func TestParseBeadClaimOutput(t *testing.T) {
 	}
 }
 
+// Under a workflow capacity soft limit br wraps update --json rows as
+// {"updated":[...],"warnings":[...]} (UpdateWithCapacityWarnings in br's
+// update.rs); the claim succeeded and must not be reported as failed.
+func TestParseBeadClaimOutputAcceptsCapacityWarningEnvelope(t *testing.T) {
+	t.Parallel()
+
+	claim, err := parseBeadClaimOutput(`{"updated":[{"id":"ntm-123","title":"Atomic assignment","status":"in_progress"}],"warnings":[{"kind":"in_progress_soft_limit","limit":3,"count":3}]}`)
+	if err != nil || claim.ID != "ntm-123" || claim.Status != "in_progress" {
+		t.Fatalf("parseBeadClaimOutput(envelope) = %+v, %v", claim, err)
+	}
+	if _, err := parseBeadClaimOutput(`{"updated":[{"id":"ntm-123","status":"open"}],"warnings":[]}`); err == nil {
+		t.Fatal("an enveloped row that is not in_progress must still fail")
+	}
+	if _, err := parseBeadClaimOutput(`{"warnings":[]}`); err == nil {
+		t.Fatal("an object without updated rows must fail")
+	}
+}
+
 func TestParseBeadClaimOutputRejectsNonClaimedState(t *testing.T) {
 	t.Parallel()
 
@@ -291,12 +341,12 @@ func TestOperatorGatedLabelsCanonicalVocabulary(t *testing.T) {
 		t.Fatalf("OperatorGatedLabels()=%v, want %v", got, want)
 	}
 	for _, label := range want {
-		if !IsOperatorGatedLabel(label) || !IsOperatorGatedLabel("  "+strings.ToUpper(label)+"  ") {
+		if !IsOperatorGatedLabelInPolicy(label, nil) || !IsOperatorGatedLabelInPolicy("  "+strings.ToUpper(label)+"  ", nil) {
 			t.Fatalf("canonical operator label %q was not recognized after normalization", label)
 		}
 	}
 	for _, label := range []string{"", "backend", "operator", "blocked"} {
-		if IsOperatorGatedLabel(label) {
+		if IsOperatorGatedLabelInPolicy(label, nil) {
 			t.Fatalf("non-gated label %q was classified as operator gated", label)
 		}
 	}
@@ -996,16 +1046,24 @@ func TestReleaseBeadClaimRetryFinalizesCommittedSQLiteMutation(t *testing.T) {
 	if err != nil || !txnResult.Released || !txnResult.NeedsFinalization || txnResult.Status != "open" {
 		t.Fatalf("release transaction result=%+v error=%v", txnResult, err)
 	}
-	database, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(databasePath, "busy_timeout(5000)", "foreign_keys(ON)"))
-	if err != nil {
-		t.Fatalf("open Beads database: %v", err)
+	// Each inspection closes its connection: br cannot finish the recovery
+	// sync while another connection to the database stays open (br 0.7.4
+	// timed out after 30s with this test's idle handle held).
+	inspect := func(stage string) (int, sql.NullString) {
+		t.Helper()
+		database, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(databasePath, "busy_timeout(5000)", "foreign_keys(ON)"))
+		if err != nil {
+			t.Fatalf("open Beads database: %v", err)
+		}
+		defer database.Close()
+		var dirty int
+		var contentHash sql.NullString
+		if err := database.QueryRow("SELECT EXISTS(SELECT 1 FROM dirty_issues WHERE issue_id = ?), content_hash FROM issues WHERE id = ?", beadID, beadID).Scan(&dirty, &contentHash); err != nil {
+			t.Fatalf("inspect %s release: %v", stage, err)
+		}
+		return dirty, contentHash
 	}
-	defer database.Close()
-	var dirty int
-	var contentHash sql.NullString
-	if err := database.QueryRow("SELECT EXISTS(SELECT 1 FROM dirty_issues WHERE issue_id = ?), content_hash FROM issues WHERE id = ?", beadID, beadID).Scan(&dirty, &contentHash); err != nil {
-		t.Fatalf("inspect interrupted release: %v", err)
-	}
+	dirty, contentHash := inspect("interrupted")
 	if dirty != 1 || contentHash.Valid {
 		t.Fatalf("interrupted release dirty=%d content_hash=%q", dirty, contentHash.String)
 	}
@@ -1014,9 +1072,7 @@ func TestReleaseBeadClaimRetryFinalizesCommittedSQLiteMutation(t *testing.T) {
 	if err != nil || released {
 		t.Fatalf("recovery ReleaseBeadClaim() released=%v error=%v", released, err)
 	}
-	if err := database.QueryRow("SELECT EXISTS(SELECT 1 FROM dirty_issues WHERE issue_id = ?), content_hash FROM issues WHERE id = ?", beadID, beadID).Scan(&dirty, &contentHash); err != nil {
-		t.Fatalf("inspect finalized release: %v", err)
-	}
+	dirty, contentHash = inspect("finalized")
 	if dirty != 0 || !contentHash.Valid || strings.TrimSpace(contentHash.String) == "" {
 		t.Fatalf("finalized release dirty=%d content_hash=%q", dirty, contentHash.String)
 	}

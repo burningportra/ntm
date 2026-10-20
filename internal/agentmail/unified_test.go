@@ -291,6 +291,10 @@ func TestUnifiedMessengerRead_AgentMailMarksRead(t *testing.T) {
 func TestUnifiedMessengerRead_ReadsMessageResource(t *testing.T) {
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
 		var req JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)

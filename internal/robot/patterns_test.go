@@ -465,28 +465,11 @@ func TestDefaultLibrary(t *testing.T) {
 	}
 }
 
-func TestMatchPatterns(t *testing.T) {
-	// Test convenience function
-	matches := MatchPatterns("claude>", "claude")
-	if len(matches) == 0 {
-		t.Error("expected matches from convenience function")
-	}
-}
-
 func TestMatchFirstPattern(t *testing.T) {
 	// Test convenience function
 	match := MatchFirstPattern("panic: error", "*")
 	if match == nil {
 		t.Error("expected match from convenience function")
-	}
-}
-
-func TestHasErrorPattern(t *testing.T) {
-	if !HasErrorPattern("Rate limit exceeded", "*") {
-		t.Error("should detect rate limit error")
-	}
-	if HasErrorPattern("everything is fine", "*") {
-		t.Error("should not detect error in normal text")
 	}
 }
 
@@ -502,12 +485,6 @@ func TestHasIdlePattern(t *testing.T) {
 	}
 	if !HasIdlePattern("$ ", "user") {
 		t.Error("shell prompt should still look idle for user panes")
-	}
-}
-
-func TestHasThinkingPattern(t *testing.T) {
-	if !HasThinkingPattern("Thinking...", "*") {
-		t.Error("should detect thinking pattern")
 	}
 }
 
@@ -699,7 +676,7 @@ func TestPatternLibraryErrorPatternVariants(t *testing.T) {
 	errorTexts := []string{
 		"Rate limit exceeded",
 		"rate limit",
-		"429",
+		"HTTP/1.1 429 Too Many Requests",
 		"HTTP 429",
 		"too many requests",
 		"quota exceeded",
@@ -724,6 +701,26 @@ func TestPatternLibraryErrorPatternVariants(t *testing.T) {
 	for _, text := range errorTexts {
 		if !lib.HasError(text, "*") {
 			t.Errorf("expected error detection for %q", text)
+		}
+	}
+
+	// Negative controls: ordinary agent prose that merely mentions failure,
+	// and a bare status number. These used to classify as operational errors,
+	// marking healthy panes ERROR and degrading whole sessions (ntm#297,
+	// ntm#299).
+	nonErrorTexts := []string{
+		"429",
+		"6f764f0c7344e437767e61f189f493065dca56cadc7048610948be7a5d42963f",
+		"it failed naming exactly the seven against the HEAD ci.yml before the edit,",
+		"the planted negative failed as expected, and 19/19 switches discriminate after",
+		"the review finding says cleanup catches BaseException",
+		"the service status line reports a configured wait timeout 20000ms",
+		"we should handle the diagnostics timeout in a follow-up",
+		"scanned 429 files in the worktree",
+	}
+	for _, text := range nonErrorTexts {
+		if lib.HasError(text, "*") {
+			t.Errorf("prose must not be an operational error: %q matched %v", text, lib.MatchByCategory(text, "*", CategoryError))
 		}
 	}
 }
@@ -894,7 +891,7 @@ func TestPatternLibraryMultipleMatches(t *testing.T) {
 	lib := NewPatternLibrary()
 
 	// Content that could match multiple patterns
-	content := "Rate limit 429 error"
+	content := "Rate limit exceeded: HTTP 429 too many requests"
 	matches := lib.Match(content, "*")
 
 	if len(matches) < 2 {
@@ -1123,7 +1120,7 @@ func TestMusePatterns_ComposerIdleUnlessWorkingLineLive(t *testing.T) {
 		if lib.HasThinkingIndicator(screen, "muse") {
 			t.Errorf("%s Muse screen matched a thinking pattern", name)
 		}
-		if IsLiveBusy(screen, "muse") {
+		if IsLiveBusy(screen, "muse", 0) {
 			t.Errorf("IsLiveBusy(%s Muse screen) = true, want false", name)
 		}
 		if lib.HasError(screen, "muse") {
@@ -1134,7 +1131,7 @@ func TestMusePatterns_ComposerIdleUnlessWorkingLineLive(t *testing.T) {
 	if !lib.HasThinkingIndicator(museTestWorkingScreen, "muse") {
 		t.Fatal("working Muse screen has no thinking pattern match")
 	}
-	if !IsLiveBusy(museTestWorkingScreen, "muse-code") {
+	if !IsLiveBusy(museTestWorkingScreen, "muse-code", 0) {
 		t.Fatal("IsLiveBusy(working Muse screen) = false, want true")
 	}
 	if got := lib.MatchFirst(museTestWorkingScreen, "muse"); got == nil || got.Pattern != "muse_working" {
@@ -1308,14 +1305,14 @@ func TestMusePatterns_BusyScreensReadBusy(t *testing.T) {
 		"  echo · …/ws · YOLO"
 
 	for name, screen := range map[string]string{"long draft": longDraft, "26 columns": narrow} {
-		if !IsLiveBusy(screen, "muse") {
+		if !IsLiveBusy(screen, "muse", 0) {
 			t.Errorf("%s: IsLiveBusy = false, want true", name)
 		}
 		if got := determineState(screen, "muse"); got != "active" {
 			t.Errorf("%s: determineState = %q, want active", name, got)
 		}
 	}
-	if !HasThinkingPattern(narrow, "muse") {
+	if !DefaultLibrary.HasThinkingIndicator(narrow, "muse") {
 		t.Error("26 columns: muse_working did not match the cut working line")
 	}
 }
@@ -1461,7 +1458,7 @@ func TestPiPatterns_EditorIdleUnlessStatusShowing(t *testing.T) {
 		if lib.HasThinkingIndicator(screen, "pi") {
 			t.Errorf("idle Pi screen (%s) matched a thinking pattern: %v", name, lib.MatchByCategory(screen, "pi", CategoryThinking))
 		}
-		if IsLiveBusy(screen, "pi") {
+		if IsLiveBusy(screen, "pi", 0) {
 			t.Errorf("IsLiveBusy(idle Pi screen, %s) = true, want false", name)
 		}
 	}
@@ -1470,7 +1467,7 @@ func TestPiPatterns_EditorIdleUnlessStatusShowing(t *testing.T) {
 		"indicator in the top rule":  piTestWorkingNarrowScreen,
 		"indicator above the editor": piTestWorkingAboveEditorScreen,
 	} {
-		if !IsLiveBusy(screen, "pi") {
+		if !IsLiveBusy(screen, "pi", 0) {
 			t.Errorf("IsLiveBusy(working Pi screen, %s) = false, want true", name)
 		}
 		if got := lib.MatchFirst(screen, "pi"); got == nil || got.Pattern != "pi_working" {
@@ -1593,7 +1590,7 @@ func TestOpencodePatterns_AgreeWithRecognizers(t *testing.T) {
 				if got := determineState(screen, agentType); got != wantState {
 					t.Errorf("determineState(%s) = %q, want %q", agentType, got, wantState)
 				}
-				if got := IsLiveBusy(screen, agentType); got != tc.working {
+				if got := IsLiveBusy(screen, agentType, 0); got != tc.working {
 					t.Errorf("IsLiveBusy(%s) = %v, want %v", agentType, got, tc.working)
 				}
 			}

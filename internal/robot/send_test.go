@@ -97,7 +97,7 @@ func TestVerifySendRenderEvidenceDistinguishesRenderedUnchangedAndUnavailable(t 
 		}
 	}
 
-	evidence := verifySendRenderEvidenceWith(panes, keys, []string{"0", "1", "2"}, baselines, postCapture)
+	evidence := verifySendRenderEvidenceWith(panes, keys, []string{"0", "1", "2"}, baselines, postCapture, sendRenderSettle{polls: 3})
 	if len(evidence) != 3 {
 		t.Fatalf("evidence length = %d, want 3", len(evidence))
 	}
@@ -112,6 +112,71 @@ func TestVerifySendRenderEvidenceDistinguishesRenderedUnchangedAndUnavailable(t 
 	}
 	if sendRenderEvidenceComplete(evidence) {
 		t.Fatal("mixed evidence must not count as complete")
+	}
+}
+
+// TestVerifySendRenderEvidencePollsForLateComposerRedraw is the GH #332
+// regression: a stage-only send (--enter=false) returns the moment the keys are
+// written, and Claude Code redraws its composer a few ms later. A single
+// post-send capture matched the baseline and reported a landed paste as
+// failed; the verifier must keep re-capturing within its bounded window.
+func TestVerifySendRenderEvidencePollsForLateComposerRedraw(t *testing.T) {
+	panes := []tmux.Pane{{ID: "%1"}, {ID: "%2"}, {ID: "%3"}}
+	keys := []string{"0", "1", "2"}
+	composer := "❯ \n──────\n  ? for shortcuts"
+	baselines := map[string]sendRenderBaseline{
+		"0": {output: composer},
+		"1": {output: composer},
+		"2": {output: composer},
+	}
+	captures := map[string]int{}
+	postCapture := func(pane tmux.Pane) (string, error) {
+		captures[pane.ID]++
+		switch pane.ID {
+		case "%1":
+			// Composer redraws with the payload on the third look.
+			if captures[pane.ID] >= 3 {
+				return "❯ probe\n──────\n  ? for shortcuts", nil
+			}
+			return composer, nil
+		default:
+			// %2 never renders; %3 was not delivered.
+			return composer, nil
+		}
+	}
+	var slept []time.Duration
+	settle := sendRenderSettle{polls: 5, interval: 50 * time.Millisecond, sleep: func(d time.Duration) { slept = append(slept, d) }}
+
+	evidence := verifySendRenderEvidenceWith(panes, keys, []string{"0", "1"}, baselines, postCapture, settle)
+	if len(evidence) != 3 {
+		t.Fatalf("evidence length = %d, want 3", len(evidence))
+	}
+	if !evidence[0].DeliveredAndRendered || !evidence[0].RenderChanged {
+		t.Fatalf("late-redraw evidence = %+v, want delivered and rendered", evidence[0])
+	}
+	if captures["%1"] != 3 {
+		t.Fatalf("pane %%1 captured %d times, want polling to stop once the render changed (3)", captures["%1"])
+	}
+	if evidence[1].DeliveredAndRendered || evidence[1].RenderChanged || !evidence[1].RenderAvailable {
+		t.Fatalf("never-rendered evidence = %+v, want available but unchanged", evidence[1])
+	}
+	if captures["%2"] != 1+settle.polls {
+		t.Fatalf("pane %%2 captured %d times, want the full bounded window (%d)", captures["%2"], 1+settle.polls)
+	}
+	if evidence[2].Delivered || evidence[2].DeliveredAndRendered {
+		t.Fatalf("undelivered evidence = %+v, must not count as rendered", evidence[2])
+	}
+	if captures["%3"] != 1 {
+		t.Fatalf("undelivered pane captured %d times, want a single look (no polling)", captures["%3"])
+	}
+	if len(slept) != settle.polls {
+		t.Fatalf("slept %d times, want %d (bounded window)", len(slept), settle.polls)
+	}
+	if sendRenderEvidenceComplete(evidence) {
+		t.Fatal("evidence with an unrendered delivered pane must not count as complete")
+	}
+	if !sendRenderEvidenceComplete(evidence[:1]) {
+		t.Fatal("late-rendered pane alone must count as complete")
 	}
 }
 
@@ -480,23 +545,6 @@ func TestInterruptPaneAgentTypePrefersParsedPaneType(t *testing.T) {
 
 	if got := interruptPaneAgentType(pane); got != "codex" {
 		t.Fatalf("interruptPaneAgentType() = %q, want codex", got)
-	}
-}
-
-func TestSelectInterruptTargetsUsesParsedPaneType(t *testing.T) {
-	panes := []tmux.Pane{
-		{Index: 0, ID: "%0", Title: "shell", Type: tmux.AgentUser},
-		{Index: 1, ID: "%1", Title: "custom scratchpad", Type: tmux.AgentClaude},
-		{Index: 2, ID: "%2", Title: "claude-notes", Type: tmux.AgentUser},
-		{Index: 3, ID: "%3", Title: "codex focus", Type: tmux.AgentCodex},
-	}
-
-	selected := selectInterruptTargets(panes, map[string]bool{}, false)
-	if len(selected) != 2 {
-		t.Fatalf("selectInterruptTargets() returned %d panes, want 2", len(selected))
-	}
-	if selected[0].Index != 1 || selected[1].Index != 3 {
-		t.Fatalf("selectInterruptTargets() picked indices [%d %d], want [1 3]", selected[0].Index, selected[1].Index)
 	}
 }
 
@@ -1278,7 +1326,7 @@ func TestRobotDispatchServiceAdapterParity(t *testing.T) {
 			deliveries = append(deliveries, delivery)
 			return nil
 		}),
-		dispatchsvc.PacerFunc(func(_ context.Context, pace dispatchsvc.Pace) error {
+		testPacerFunc(func(_ context.Context, pace dispatchsvc.Pace) error {
 			paces = append(paces, pace)
 			return nil
 		}),
@@ -1321,7 +1369,10 @@ func TestRobotDispatchServiceAdapterParity(t *testing.T) {
 	}
 }
 
-func TestRobotDispatchRejectsDetectedGrokAsUnavailableWithoutDelivery(t *testing.T) {
+// GH#251 phase 2: a title-detected grok pane is a deliverable target, so the
+// dispatch delivers to it alongside the claude pane instead of failing the
+// whole batch as NOT_IMPLEMENTED.
+func TestRobotDispatchDeliversToDetectedGrok(t *testing.T) {
 	t.Parallel()
 	panes := []tmux.Pane{
 		{ID: "%1", Index: 0, Type: tmux.AgentClaude, Title: "proj__cc_1"},
@@ -1333,11 +1384,11 @@ func TestRobotDispatchRejectsDetectedGrokAsUnavailableWithoutDelivery(t *testing
 		t.Fatalf("detected Grok request type = %q, want %q", request.Panes[1].Type, tmux.AgentGrok)
 	}
 
-	var deliveries int
+	var deliveries []dispatchsvc.Delivery
 	service, _, err := newRobotDispatchService(
 		redaction.Config{Mode: redaction.ModeOff},
-		dispatchsvc.DelivererFunc(func(context.Context, dispatchsvc.Delivery) error {
-			deliveries++
+		dispatchsvc.DelivererFunc(func(_ context.Context, delivery dispatchsvc.Delivery) error {
+			deliveries = append(deliveries, delivery)
 			return nil
 		}),
 		nil,
@@ -1345,18 +1396,12 @@ func TestRobotDispatchRejectsDetectedGrokAsUnavailableWithoutDelivery(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.Execute(context.Background(), request)
-	var dispatchErr *dispatchsvc.Error
-	if !errors.As(err, &dispatchErr) || dispatchErr.Code != dispatchsvc.ErrPromptDeliveryUnsupported {
-		t.Fatalf("dispatch error = %T %v, want %q", err, err, dispatchsvc.ErrPromptDeliveryUnsupported)
+	result, err := service.Execute(context.Background(), request)
+	if err != nil {
+		t.Fatalf("dispatch error = %v, want nil (grok delivery is supported)", err)
 	}
-	if deliveries != 0 {
-		t.Fatalf("delivery calls = %d, want 0", deliveries)
-	}
-
-	response := robotDispatchPrepareErrorResponse(err)
-	if response.Success || response.ErrorCode != ErrCodeNotImplemented || ExitCodeForResponse(response) != 2 {
-		t.Fatalf("robot response = %+v, want NOT_IMPLEMENTED / exit 2", response)
+	if !result.Success || result.Delivered != 2 || len(deliveries) != 2 {
+		t.Fatalf("result=%+v deliveries=%d, want both panes delivered", result, len(deliveries))
 	}
 }
 
@@ -1394,5 +1439,53 @@ func TestSelectSendTargetsPreservesDetectedTypeFilteringAndOriginalPane(t *testi
 	}
 	if !reflect.DeepEqual(keys, []string{"1"}) || len(targets) != 1 || targets[0].ID != "%2" || targets[0].Type != tmux.AgentUnknown {
 		t.Fatalf("targets=%+v keys=%v", targets, keys)
+	}
+}
+
+// The send guard refuses fail-closed: a dcg verdict, an interrupted check and
+// a broken check each stop dispatch with a distinct typed code.
+func TestGuardSendCommandRefusalCodes(t *testing.T) {
+	oldGuard := sendCommandGuard
+	t.Cleanup(func() { SetSendCommandGuard(oldGuard) })
+	panes := []tmux.Pane{{ID: "%1", Type: tmux.AgentCodex}}
+
+	SetSendCommandGuard(nil)
+	output := SendOutput{RobotResponse: NewRobotResponse(true)}
+	if !guardSendCommand(context.Background(), &output, "git reset --hard", "s", panes, false) || !output.Success {
+		t.Fatalf("no guard refused the send: %+v", output)
+	}
+
+	tests := []struct {
+		name    string
+		err     error
+		code    string
+		blocked bool
+	}{
+		{"dcg verdict", errors.Join(ErrSendCommandBlocked, errors.New("destroys uncommitted work")), ErrCodeDestructiveCommandBlocked, true},
+		{"interrupted check", context.DeadlineExceeded, ErrCodeTimeout, false},
+		{"broken check", errors.New("dcg test failed: exit status 2"), ErrCodeInternalError, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotMessage string
+			SetSendCommandGuard(func(_ context.Context, message, _ string, _ []tmux.Pane) error {
+				gotMessage = message
+				return tt.err
+			})
+			output := SendOutput{RobotResponse: NewRobotResponse(true), Failed: []SendError{}}
+			if guardSendCommand(context.Background(), &output, "git reset --hard", "s", panes, true) {
+				t.Fatal("guard error did not refuse the send")
+			}
+			if gotMessage != "git reset --hard" {
+				t.Fatalf("guard saw %q, want the payload", gotMessage)
+			}
+			if output.Success || output.ErrorCode != tt.code || output.Blocked != tt.blocked || !output.DryRun {
+				t.Fatalf("output = success %v code %q blocked %v dry_run %v, want code %q blocked %v",
+					output.Success, output.ErrorCode, output.Blocked, output.DryRun, tt.code, tt.blocked)
+			}
+			if len(output.Failed) != 1 || output.Failed[0].Pane != "guard" {
+				t.Fatalf("failed = %+v, want one guard entry", output.Failed)
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package workflow
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -218,8 +219,13 @@ func (l *Loader) Get(name string) (*WorkflowTemplate, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("workflow template not found: %s", name)
+	return nil, fmt.Errorf("%w: %s", ErrWorkflowNotFound, name)
 }
+
+// ErrWorkflowNotFound distinguishes "no template by that name" from a load
+// failure (e.g. a malformed user TOML aborting LoadAll) so callers don't
+// report a parse error as a missing workflow.
+var ErrWorkflowNotFound = errors.New("workflow template not found")
 
 // BuiltinNames returns the names of all builtin workflow templates.
 func BuiltinNames() []string {
@@ -257,6 +263,8 @@ func ProfileToAgentType(profile string) string {
 		return string(agent.AgentTypeGemini)
 	case agent.AgentTypeAntigravity:
 		return string(agent.AgentTypeAntigravity)
+	case agent.AgentTypeOmp:
+		return string(agent.AgentTypeOmp)
 	case agent.AgentTypeCursor:
 		return string(agent.AgentTypeCursor)
 	case agent.AgentTypeWindsurf:

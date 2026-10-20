@@ -83,30 +83,6 @@ func TestLoopExecutorAliasScopeRestoresOuterAlias(t *testing.T) {
 	}
 }
 
-func TestBranchVariableSnapshotRestoresMutations(t *testing.T) {
-	state := &ExecutionState{Variables: map[string]interface{}{
-		"global": "before",
-		"keep":   "same",
-	}}
-
-	snapshot := captureAllVariables(state.Variables)
-	state.Variables["global"] = "branch-local"
-	state.Variables["temporary"] = "created in branch"
-	delete(state.Variables, "keep")
-
-	restoreAllVariables(state, snapshot)
-
-	if state.Variables["global"] != "before" {
-		t.Fatalf("global = %v, want before", state.Variables["global"])
-	}
-	if state.Variables["keep"] != "same" {
-		t.Fatalf("keep = %v, want same", state.Variables["keep"])
-	}
-	if _, ok := state.Variables["temporary"]; ok {
-		t.Fatalf("temporary variable leaked after branch restore: %v", state.Variables["temporary"])
-	}
-}
-
 func assertSubstituted(t *testing.T, state *ExecutionState, input, want string) {
 	t.Helper()
 	sub := NewSubstitutor(state, "sess", "wf")
@@ -131,7 +107,12 @@ func TestRestoreBranchVariablesLeavesConcurrentSiblingWrites(t *testing.T) {
 
 	// The branch body writes its own keys and mutates a pre-existing one.
 	bodyStepIDs := []string{"route_child_1", "route_child_2"}
-	ownedOutputVars := branchBodyOutputVars([]Step{{ID: "emit", OutputVar: "branch_local"}})
+	// A real branch can shadow a named value only by declaring that output.
+	// Unrelated pre-existing keys may belong to concurrently running siblings.
+	ownedOutputVars := branchBodyOutputVars([]Step{
+		{ID: "emit", OutputVar: "branch_local"},
+		{ID: "shadow", OutputVar: "global"},
+	})
 	state.Variables["global"] = "branch-local"
 	state.Variables["branch_local"] = "body output"
 	state.Variables["steps.route_child_1.output"] = "body step output"

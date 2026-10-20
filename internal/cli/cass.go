@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/cass"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -58,17 +60,32 @@ tuned for quick lookups.`,
   ntm search 'error handling' --limit=5 --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCassSearch(args[0], agent, session, since, limit, offset)
+			return runCassSearch(args[0], agent, sessionWorkspace(session), since, limit, offset)
 		},
 	}
 
-	cmd.Flags().StringVarP(&session, "session", "s", "", "Filter by session/project workspace")
+	cmd.Flags().StringVarP(&session, "session", "s", "", "Filter by ntm session (searches its project directory) or an absolute workspace path")
 	cmd.Flags().StringVarP(&agent, "agent", "a", "", "Filter by agent type (e.g. claude_code)")
 	cmd.Flags().StringVar(&since, "since", "", "Filter by time (e.g. 1h, 7d, 30d)")
 	cmd.Flags().IntVarP(&limit, "limit", "n", 20, "Max results to return")
 	cmd.Flags().IntVar(&offset, "offset", 0, "Result offset for pagination")
 
 	return cmd
+}
+
+// sessionWorkspace maps `ntm search --session` to the workspace path cass
+// filters on: cass matches --workspace against full project paths, so an ntm
+// session name becomes its project directory; an absolute path passes through.
+func sessionWorkspace(session string) string {
+	session = strings.TrimSpace(session)
+	if session == "" || filepath.IsAbs(session) {
+		return session
+	}
+	c := cfg
+	if c == nil {
+		c = config.Default()
+	}
+	return c.GetProjectDir(session)
 }
 
 func handleCassError(err error) error {
@@ -155,12 +172,24 @@ func runCassStatus() error {
 	}
 
 	fmt.Printf("  Healthy:        %s\n", healthyMark)
-	fmt.Printf("  Conversations:  %d\n", status.Conversations)
-	fmt.Printf("  Messages:       %d\n", status.Messages)
+	if status.Database.CountsSkipped {
+		fmt.Printf("  Conversations:  not counted (cass skipped the database counts)\n")
+	} else {
+		fmt.Printf("  Conversations:  %d\n", status.Conversations)
+		fmt.Printf("  Messages:       %d\n", status.Messages)
+	}
 	fmt.Printf("  Last Indexed:   %s\n", formatAge(status.LastIndexedAt.Time))
-	fmt.Printf("  Index Size:     %.1f MB\n", status.Index.SizeMB())
+	fmt.Printf("  Documents:      %d\n", status.Index.Documents)
+	fmt.Printf("  Database Size:  %.1f MB\n", status.Database.SizeMB())
+	if status.Index.SizeBytes > 0 { // legacy cass reports the index size
+		fmt.Printf("  Index Size:     %.1f MB\n", status.Index.SizeMB())
+	}
 	if status.Pending.HasPending() {
-		fmt.Printf("  Pending:        %d sessions, %d files\n", status.Pending.Sessions, status.Pending.Files)
+		fmt.Printf("  Pending:        %d sessions", status.Pending.Sessions)
+		if status.Pending.Files > 0 {
+			fmt.Printf(", %d files", status.Pending.Files)
+		}
+		fmt.Println()
 	}
 
 	return nil
@@ -246,9 +275,10 @@ func newCassInsightsCmd() *cobra.Command {
 func runCassInsights(since string) error {
 	client := newCassClient()
 	resp, err := client.Search(context.Background(), cass.SearchOptions{
-		Query: "*",
-		Since: since,
-		Limit: 0,
+		Query:     "*",
+		Since:     since,
+		Limit:     0,
+		Aggregate: "agent,workspace",
 	})
 	if err != nil {
 		return handleCassError(err)
@@ -262,38 +292,30 @@ func runCassInsights(since string) error {
 	fmt.Printf("%sAgent Insights (Since %s)%s\n", "\033[1m", since, "\033[0m")
 
 	if resp.Aggregations != nil {
-		printAggregations("Top Agents", resp.Aggregations.Agents, t)
-		printAggregations("Top Workspaces", resp.Aggregations.Workspaces, t)
-		printAggregations("Common Tags", resp.Aggregations.Tags, t)
+		printAggregations("Top Agents", resp.Aggregations.Agent, t)
+		printAggregations("Top Workspaces", resp.Aggregations.Workspace, t)
 	}
 
 	return nil
 }
 
-type kv struct {
-	Key   string
-	Value int
-}
-
-func printAggregations(title string, counts map[string]int, t theme.Theme) {
-	if len(counts) == 0 {
+// printAggregations prints a field's top five cass buckets (cass already
+// orders them largest first).
+func printAggregations(title string, agg *cass.AggregationBuckets, t theme.Theme) {
+	if agg == nil || len(agg.Buckets) == 0 {
 		return
 	}
 	fmt.Printf("\n  %s%s%s\n", colorize(t.Info), title, "\033[0m")
 
-	var sorted []kv
-	for k, v := range counts {
-		sorted = append(sorted, kv{k, v})
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Value > sorted[j].Value
-	})
-
-	for i, item := range sorted {
+	for i, bucket := range agg.Buckets {
 		if i >= 5 {
 			break
 		}
-		fmt.Printf("    %-20s %d\n", item.Key, item.Value)
+		key := bucket.Key
+		if key == "" {
+			key = "(none)"
+		}
+		fmt.Printf("    %-20s %d\n", key, bucket.Count)
 	}
 }
 
@@ -307,7 +329,7 @@ func newCassTimelineCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", "24h", "Timeline period")
-	cmd.Flags().StringVar(&groupBy, "group-by", "hour", "Grouping (hour, day)")
+	cmd.Flags().StringVar(&groupBy, "group-by", "hour", "Grouping (hour, day, none)")
 	return cmd
 }
 
@@ -323,32 +345,55 @@ func runCassTimeline(since, groupBy string) error {
 	}
 
 	t := theme.Current()
-	fmt.Printf("%sActivity Timeline (%s)%s\n", colorize(t.Primary), since, "\033[0m")
+	fmt.Printf("%sActivity Timeline (%s): %d sessions%s\n", colorize(t.Primary), since, resp.TotalSessions, "\033[0m")
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "Time\tType\tCount")
-	fmt.Fprintln(w, "────\t────\t─────")
-
-	for _, entry := range resp.Entries {
-		ts := entry.TimestampTime().Format("15:04")
-		if groupBy == "day" {
-			ts = entry.TimestampTime().Format("Jan 02")
+	if resp.Sessions != nil {
+		fmt.Fprintln(w, "Started\tAgent\tTitle")
+		fmt.Fprintln(w, "───────\t─────\t─────")
+		for _, s := range resp.Sessions {
+			fmt.Fprintf(w, "%s\t%s\t%s\n", s.StartTime().Format("Jan 02 15:04"), s.Agent, truncateRunes(s.Title, 60, "…"))
 		}
-
-		count := 1
-		if c, ok := entry.Data.(float64); ok {
-			count = int(c)
-		} else if m, ok := entry.Data.(map[string]interface{}); ok {
-			if c, ok := m["count"].(float64); ok {
-				count = int(c)
-			}
+	} else {
+		fmt.Fprintln(w, "Period\tSessions\tAgents")
+		fmt.Fprintln(w, "──────\t────────\t──────")
+		periods := make([]string, 0, len(resp.Groups))
+		for period := range resp.Groups {
+			periods = append(periods, period)
 		}
-
-		fmt.Fprintf(w, "%s\t%s\t%d\n", ts, entry.Type, count)
+		sort.Strings(periods)
+		for _, period := range periods {
+			sessions := resp.Groups[period]
+			fmt.Fprintf(w, "%s\t%d\t%s\n", period, len(sessions), timelineAgents(sessions))
+		}
 	}
 	w.Flush()
 
 	return nil
+}
+
+// timelineAgents summarizes which agents ran in a timeline period, busiest
+// first, e.g. "claude_code×12, codex×3".
+func timelineAgents(sessions []cass.TimelineSession) string {
+	counts := make(map[string]int)
+	for _, s := range sessions {
+		counts[s.Agent]++
+	}
+	agents := make([]string, 0, len(counts))
+	for agent := range counts {
+		agents = append(agents, agent)
+	}
+	sort.Slice(agents, func(i, j int) bool {
+		if counts[agents[i]] != counts[agents[j]] {
+			return counts[agents[i]] > counts[agents[j]]
+		}
+		return agents[i] < agents[j]
+	})
+	parts := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		parts = append(parts, fmt.Sprintf("%s×%d", agent, counts[agent]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func newCassPreviewCmd() *cobra.Command {
