@@ -1110,6 +1110,7 @@ func TestGenerateHandoffOptionsDefault(t *testing.T) {
 func TestFetchAgentMailThreadsPrefersNewestUniqueThreadEntry(t *testing.T) {
 	g := NewGenerator(t.TempDir())
 	threadID := "thread-1"
+	markReadArgs := make(chan interface{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			JSONRPC string          `json:"jsonrpc"`
@@ -1120,6 +1121,15 @@ func TestFetchAgentMailThreadsPrefersNewestUniqueThreadEntry(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
+		var params agentmail.ToolCallParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			t.Fatalf("decode tool params: %v", err)
+		}
+		markRead, set := params.Arguments["mark_read"]
+		if !set {
+			markRead = "<unset>"
+		}
+		markReadArgs <- markRead
 
 		result, err := json.Marshal(map[string]interface{}{
 			"result": []agentmail.InboxMessage{
@@ -1176,6 +1186,11 @@ func TestFetchAgentMailThreadsPrefersNewestUniqueThreadEntry(t *testing.T) {
 	}
 	if got := threads[1]; got != "Second thread (from: GreenStone)" {
 		t.Fatalf("threads[1] = %q, want second newest distinct thread", got)
+	}
+	// The handoff only lists thread subjects for the successor, who still has
+	// to read the mail, so the fetch must leave it unread.
+	if got := <-markReadArgs; got != false {
+		t.Fatalf("fetch_inbox mark_read = %v, want false", got)
 	}
 }
 

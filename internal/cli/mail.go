@@ -482,11 +482,13 @@ func runMailInbox(cmd *cobra.Command, client mailInboxClient, session string, se
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("fetching inbox: %w", ctxErr)
 		}
+		// The operator is viewing agents' inboxes; `ntm mail read` marks read.
 		msgs, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 			ProjectKey: projectKey,
 			AgentName:  name,
 			UrgentOnly: urgent,
 			Limit:      limit,
+			Peek:       true,
 		})
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -797,12 +799,15 @@ func runMailMark(cmd *cobra.Command, session, agent string, action mailAction, i
 	}
 
 	if len(ids) == 0 {
+		// Peek while selecting: only the messages matching the filters below
+		// get marked, by the explicit calls that follow.
 		inbox, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 			ProjectKey:    projectKey,
 			AgentName:     agent,
 			UrgentOnly:    urgent,
 			IncludeBodies: false,
 			Limit:         limit,
+			Peek:          true,
 		})
 		if err != nil {
 			return fmt.Errorf("fetching inbox: %w", err)

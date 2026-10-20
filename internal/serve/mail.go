@@ -711,9 +711,12 @@ func (s *Server) handleMailInbox(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
+	// A GET under read_mail must not change read state; POST
+	// /mail/messages/{id}/read marks a message read.
 	opts := agentmail.FetchInboxOptions{
 		ProjectKey: s.projectDirSnapshot(),
 		AgentName:  agentName,
+		Peek:       true,
 	}
 
 	// Parse optional query params

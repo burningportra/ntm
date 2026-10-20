@@ -28,6 +28,7 @@ type MockMailClient struct {
 	ListAgentsErr       error
 	FetchInboxErr       error
 	ListAgentsCalls     int
+	FetchInboxOpts      []agentmail.FetchInboxOptions
 }
 
 func (m *MockMailClient) IsAvailableContext(ctx context.Context) bool {
@@ -59,6 +60,7 @@ func (m *MockMailClient) ListProjectAgents(ctx context.Context, projectKey strin
 }
 
 func (m *MockMailClient) FetchInbox(ctx context.Context, opts agentmail.FetchInboxOptions) ([]agentmail.InboxMessage, error) {
+	m.FetchInboxOpts = append(m.FetchInboxOpts, opts)
 	if m.FetchInboxErr != nil {
 		return nil, m.FetchInboxErr
 	}
@@ -227,6 +229,16 @@ func TestRunMailInbox(t *testing.T) {
 				// Verify agent filter - "Msg for Blue" should NOT be present
 				if tt.agentFilter == "RedStone" && strings.Contains(output, "Msg for Blue") {
 					t.Error("output contained message not matching agent filter")
+				}
+				// The operator is viewing other agents' inboxes, so the
+				// fetch must not mark their mail read.
+				if len(tt.client.FetchInboxOpts) == 0 {
+					t.Error("expected at least one inbox fetch")
+				}
+				for _, opts := range tt.client.FetchInboxOpts {
+					if !opts.Peek {
+						t.Errorf("fetch_inbox for %s did not peek", opts.AgentName)
+					}
 				}
 			}
 		})

@@ -4966,11 +4966,14 @@ func recoveryAgentCandidates(sessionName, agentName string) []string {
 func fetchRecoveryInbox(ctx context.Context, client recoveryMailClient, projectKey, sessionName, agentName string) ([]agentmail.InboxMessage, string, error) {
 	var lastErr error
 	for _, candidate := range recoveryAgentCandidates(sessionName, agentName) {
+		// Peek: the recovery prompt only summarizes (and may trim) recent
+		// mail, so the agents still need to see it unread.
 		inbox, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 			ProjectKey:    projectKey,
 			AgentName:     candidate,
 			Limit:         10,
 			IncludeBodies: true,
+			Peek:          true,
 		})
 		if err == nil {
 			return inbox, candidate, nil

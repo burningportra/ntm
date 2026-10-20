@@ -473,6 +473,13 @@ func TestExecuteMailStep_DispatchesThroughAgentMail(t *testing.T) {
 			if got := gotRequest.args["sender_name"]; got != nil && got != "YellowBluff" {
 				t.Fatalf("sender_name = %#v, want YellowBluff", got)
 			}
+			// mail_inbox_check polls an agent's inbox for acks; checking
+			// must leave the agent's mail unread.
+			if gotRequest.name == "fetch_inbox" {
+				if got, set := gotRequest.args["mark_read"]; !set || got != false {
+					t.Fatalf("fetch_inbox mark_read = %#v (set=%t), want false", got, set)
+				}
+			}
 			var output map[string]interface{}
 			if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
 				t.Fatalf("unmarshal output: %v", err)

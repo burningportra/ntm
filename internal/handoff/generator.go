@@ -1030,10 +1030,13 @@ func (g *Generator) fetchAgentMailThreads(ctx context.Context, client *agentmail
 	if err := requireGeneratorContext(ctx, "fetch agent mail threads"); err != nil {
 		return nil, err
 	}
+	// Peek: the handoff lists thread subjects; the successor still has to
+	// read the mail itself.
 	messages, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 		ProjectKey: projectKey,
 		AgentName:  agentName,
 		Limit:      10, // Limit to recent messages
+		Peek:       true,
 	})
 	if err != nil {
 		return nil, err

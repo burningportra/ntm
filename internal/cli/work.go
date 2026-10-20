@@ -1210,12 +1210,15 @@ func collectCommitReadyMail(projectDir string, agentName string) ([]commitlint.I
 	ctx, cancel := context.WithTimeout(context.Background(), queueDryReservationTimeout)
 	defer cancel()
 
+	// Peek: marking the urgent mail read here would let the next check pass
+	// without the agent ever seeing it.
 	messages, err := commitReadyFetchInbox(ctx, client, agentmail.FetchInboxOptions{
 		ProjectKey:    projectDir,
 		AgentName:     agentName,
 		UrgentOnly:    true,
 		Limit:         50,
 		IncludeBodies: false,
+		Peek:          true,
 	})
 	if err != nil {
 		evidence.Error = err.Error()

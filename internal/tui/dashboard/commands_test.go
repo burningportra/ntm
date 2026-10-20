@@ -649,6 +649,75 @@ func TestHandleConflictAction_ForceRegistersDashboardAgent(t *testing.T) {
 	}
 }
 
+// The dashboard shows the session agents' inboxes to the operator; polling
+// them must not mark the agents' mail read.
+func TestFetchAgentMailInboxesPeek(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	const session = "inboxpeek"
+	projectDir := t.TempDir()
+	pane := tmux.Pane{ID: "%7", Index: 1, Title: "inboxpeek__cod_1", Type: tmux.AgentCodex}
+	registry := agentmail.NewSessionAgentRegistry(session, projectDir)
+	registry.AddAgent(pane.Title, pane.ID, "BlueLake")
+	if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+		t.Fatalf("SaveSessionAgentRegistry: %v", err)
+	}
+
+	var (
+		mu        sync.Mutex
+		markReads []any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		var result any = map[string]any{}
+		if req["method"] == "tools/call" {
+			params, _ := req["params"].(map[string]any)
+			args, _ := params["arguments"].(map[string]any)
+			if params["name"] != "fetch_inbox" {
+				t.Errorf("unexpected tool %v", params["name"])
+			}
+			markRead, set := args["mark_read"]
+			if !set {
+				markRead = "<unset>"
+			}
+			mu.Lock()
+			markReads = append(markReads, markRead)
+			mu.Unlock()
+			result = []agentmail.InboxMessage{{ID: 1, Subject: "status?", From: "GreenStone", BodyMD: "body"}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req["id"], "result": result})
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	m := newTestModel(120)
+	m.session = session
+	m.projectDir = projectDir
+	m.panes = []tmux.Pane{pane}
+
+	summary, ok := m.fetchAgentMailInboxes()().(AgentMailInboxSummaryMsg)
+	if !ok || summary.Err != nil || len(summary.Inboxes[pane.ID]) != 1 {
+		t.Fatalf("inbox summary = %+v, want one message for %s", summary, pane.ID)
+	}
+	detail, ok := m.fetchAgentMailInboxDetails(pane)().(AgentMailInboxDetailMsg)
+	if !ok || detail.Err != nil || len(detail.Messages) != 1 {
+		t.Fatalf("inbox detail = %+v, want one message", detail)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []any{false, false}; !slices.Equal(markReads, want) {
+		t.Fatalf("fetch_inbox mark_read = %v, want %v", markReads, want)
+	}
+}
+
 // Test that commands return tea.Cmd (not nil)
 func TestCommandsReturnTeaCmd(t *testing.T) {
 

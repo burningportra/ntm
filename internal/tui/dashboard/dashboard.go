@@ -872,6 +872,7 @@ func (m *Model) fetchAgentMailInboxes() tea.Cmd {
 						UrgentOnly:    false,
 						Limit:         5,
 						IncludeBodies: false,
+						Peek:          true,
 					})
 					cancel()
 					results <- result{paneID: j.paneID, inbox: msgs, err: err}
@@ -948,6 +949,7 @@ func (m *Model) fetchAgentMailInboxDetails(pane tmux.Pane) tea.Cmd {
 			UrgentOnly:    false,
 			Limit:         5,
 			IncludeBodies: true,
+			Peek:          true,
 		})
 		cancel()
 

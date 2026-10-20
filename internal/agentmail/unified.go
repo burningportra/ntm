@@ -108,11 +108,13 @@ func (m *UnifiedMessenger) Inbox(ctx context.Context) ([]UnifiedMessage, error) 
 		return nil, err
 	}
 	if amAvailable {
+		// Listing peeks: Read marks a single message read when it is opened.
 		opts := FetchInboxOptions{
 			ProjectKey:    m.projectKey,
 			AgentName:     m.agentName,
 			Limit:         50,
 			IncludeBodies: true,
+			Peek:          true,
 		}
 		inbox, err := m.amClient.FetchInbox(ctx, opts)
 		if cancellationErr := unifiedCancellationError(ctx, err, "fetch agent mail inbox"); cancellationErr != nil {

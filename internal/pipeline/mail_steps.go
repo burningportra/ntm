@@ -235,9 +235,12 @@ func (e *Executor) executeMailInboxCheckStep(ctx context.Context, step *Step, re
 	}
 
 	client := e.mailClient(projectKey)
+	// The step checks (and may poll) an agent's inbox for acks; checking
+	// must leave the agent's mail unread.
 	messages, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 		ProjectKey: projectKey,
 		AgentName:  agentName,
+		Peek:       true,
 	})
 	if err != nil {
 		return failMailStep(result, "agent_mail", fmt.Sprintf("mail_inbox_check failed: %v", err))

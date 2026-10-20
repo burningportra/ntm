@@ -55,6 +55,9 @@ type fetchCall struct {
 	Urgent  bool
 	From    string
 	Project string
+	// Peek records a fetch that asked the server not to mark the returned
+	// messages read (mark_read=false).
+	Peek bool
 }
 
 type releaseCall struct {
@@ -299,11 +302,13 @@ func newMailStub(t *testing.T, inbox []agentmail.InboxMessage) *mailStub {
 		case "list_agents":
 			writeResponse(stub.listAgents)
 		case "fetch_inbox":
+			markRead, markReadSet := args["mark_read"].(bool)
 			call := fetchCall{
 				Agent:   toString(args["agent_name"]),
 				Project: toString(args["project_key"]),
 				Urgent:  toBool(args["urgent_only"]),
 				Limit:   toInt(args["limit"]),
+				Peek:    markReadSet && !markRead,
 			}
 			stub.fetchCalls = append(stub.fetchCalls, call)
 			messages := stub.inbox
@@ -448,6 +453,7 @@ func (s *mailStub) FetchInbox(ctx context.Context, opts agentmail.FetchInboxOpti
 		Project: opts.ProjectKey,
 		Urgent:  opts.UrgentOnly,
 		Limit:   opts.Limit,
+		Peek:    opts.Peek,
 	}
 	s.fetchCalls = append(s.fetchCalls, call)
 
@@ -887,6 +893,11 @@ func TestMailReadWithFilters(t *testing.T) {
 	if len(stub.fetchCalls) != 1 || !stub.fetchCalls[0].Urgent {
 		t.Fatalf("expected urgent fetch, got %+v", stub.fetchCalls)
 	}
+	// The selecting fetch returns LilacDog's urgent message too; only the
+	// explicit mark_message_read call may change read state.
+	if !stub.fetchCalls[0].Peek {
+		t.Fatalf("selecting fetch_inbox did not send mark_read=false: %+v", stub.fetchCalls[0])
+	}
 }
 
 func TestMailReadWithAllSkipsAlreadyReadMessages(t *testing.T) {
@@ -1064,6 +1075,9 @@ func TestMailInboxUsesProjectRootFromSubdir(t *testing.T) {
 	}
 	if stub.fetchCalls[0].Project != projectKey {
 		t.Fatalf("expected inbox project %q, got %q", projectKey, stub.fetchCalls[0].Project)
+	}
+	if !stub.fetchCalls[0].Peek {
+		t.Fatalf("ntm mail inbox did not send mark_read=false: %+v", stub.fetchCalls[0])
 	}
 }
 

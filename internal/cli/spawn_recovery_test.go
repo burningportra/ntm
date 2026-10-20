@@ -23,11 +23,13 @@ type recoveryMailStub struct {
 	resByAgent        map[string][]agentmail.FileReservation
 	resErrByAgent     map[string]error
 	fetchInboxAgents  []string
+	fetchInboxPeeks   []bool
 	listReserveAgents []string
 }
 
 func (s *recoveryMailStub) FetchInbox(_ context.Context, opts agentmail.FetchInboxOptions) ([]agentmail.InboxMessage, error) {
 	s.fetchInboxAgents = append(s.fetchInboxAgents, opts.AgentName)
+	s.fetchInboxPeeks = append(s.fetchInboxPeeks, opts.Peek)
 	if err := s.inboxErrByAgent[opts.AgentName]; err != nil {
 		return nil, err
 	}
@@ -78,6 +80,11 @@ func TestFetchRecoveryInbox_ReturnsEffectiveFallbackAgentName(t *testing.T) {
 	}
 	if got := strings.Join(stub.fetchInboxAgents, ","); got != "GreenCastle,session-1" {
 		t.Fatalf("expected fetch order GreenCastle then session-1, got %q", got)
+	}
+	// The recovery prompt summarizes (and may trim) recent mail for the new
+	// panes; it must leave the messages unread for the agents to fetch.
+	if want := []bool{true, true}; !reflect.DeepEqual(stub.fetchInboxPeeks, want) {
+		t.Fatalf("fetch peeks = %v, want %v", stub.fetchInboxPeeks, want)
 	}
 }
 

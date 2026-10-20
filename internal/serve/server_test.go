@@ -1580,6 +1580,46 @@ func TestHandleMailInbox_DoesNotEmitMailReceivedEvent(t *testing.T) {
 	}
 }
 
+// GET /mail/inbox needs only read_mail and serves operators viewing any
+// agent's inbox, so it must not mark the agent's mail read; POST
+// /mail/messages/{id}/read is the explicit way to do that.
+func TestHandleMailInbox_PeeksWithoutMarkingRead(t *testing.T) {
+	markReadArgs := make(chan interface{}, 1)
+	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
+		"fetch_inbox": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+			markRead, set := args["mark_read"]
+			if !set {
+				markRead = "<unset>"
+			}
+			markReadArgs <- markRead
+			return []agentmail.InboxMessage{
+				{ID: 1, Subject: "Hello", From: "BlueLake", Importance: "normal", Kind: "to"},
+			}, nil
+		},
+	})
+
+	srv, _ := setupTestServer(t)
+	srv.projectDir = t.TempDir()
+	srv.mailClient = mailClient
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/inbox?agent_name=GreenStone", nil)
+
+	srv.handleMailInbox(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	select {
+	case got := <-markReadArgs:
+		if got != false {
+			t.Fatalf("fetch_inbox mark_read = %v, want false", got)
+		}
+	default:
+		t.Fatal("fetch_inbox was not called")
+	}
+}
+
 func TestHandleRequestContact_ReturnsLinkAndExpiry(t *testing.T) {
 
 	expiresAt := "2026-03-22T12:34:56Z"

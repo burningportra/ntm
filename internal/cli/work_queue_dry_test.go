@@ -1062,6 +1062,33 @@ func TestCollectCommitReadyMailUnavailableBlocksMutation(t *testing.T) {
 	}
 }
 
+// The commit-ready gate reports unread urgent mail; reading the inbox to check
+// must not mark that mail read, or the next check passes without the agent
+// ever seeing it.
+func TestCollectCommitReadyMailPeeksAtInbox(t *testing.T) {
+	stub := newMailStub(t, []agentmail.InboxMessage{
+		{ID: 5, Subject: "stop editing robot.go", From: "BlueLake", Importance: "urgent", AckRequired: true, CreatedTS: agentmail.FlexTime{Time: time.Now()}},
+	})
+	defer stub.Close()
+
+	oldNewClient := queueDryNewAgentMailClient
+	t.Cleanup(func() { queueDryNewAgentMailClient = oldNewClient })
+	queueDryNewAgentMailClient = func(string) *agentmail.Client {
+		return agentmail.NewClient(agentmail.WithBaseURL(stub.server.URL + "/"))
+	}
+
+	views, evidence := collectCommitReadyMail("/repo", "TopazDeer")
+	if !evidence.Available || len(views) != 1 || views[0].ReadAt != nil {
+		t.Fatalf("views=%+v evidence=%+v, want one unread urgent message", views, evidence)
+	}
+	if len(stub.fetchCalls) != 1 || !stub.fetchCalls[0].Peek {
+		t.Fatalf("fetch calls = %+v, want one fetch_inbox with mark_read=false", stub.fetchCalls)
+	}
+	if len(stub.readIDs) != 0 {
+		t.Fatalf("commit-ready marked messages read: %v", stub.readIDs)
+	}
+}
+
 func fixtureQueueDryDiagnostic(dry bool) QueueDryResponse {
 	report := QueueDryResponse{
 		Success:  true,

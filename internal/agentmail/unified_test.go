@@ -16,6 +16,7 @@ type fakeAMClient struct {
 	inboxResponses      [][]InboxMessage
 	inboxErrors         []error
 	fetchCalls          int
+	fetchOpts           []FetchInboxOptions
 
 	sendCalls []SendMessageOptions
 	sendErr   error
@@ -69,6 +70,7 @@ func (f *fakeAMClient) GetMessage(ctx context.Context, projectKey string, messag
 
 func (f *fakeAMClient) FetchInbox(ctx context.Context, opts FetchInboxOptions) ([]InboxMessage, error) {
 	f.fetchCalls++
+	f.fetchOpts = append(f.fetchOpts, opts)
 	if len(f.inboxResponses) == 0 {
 		if len(f.inboxErrors) > 0 {
 			return nil, f.inboxErrors[0]
@@ -196,6 +198,11 @@ func TestUnifiedMessengerInbox_MergesAndSorts(t *testing.T) {
 	}
 	if msgs[1].ID != "am-1" || msgs[2].ID != "am-2" {
 		t.Fatalf("unexpected order: %s, %s", msgs[1].ID, msgs[2].ID)
+	}
+	// Listing the inbox must not consume it: `ntm message read <id>` is the
+	// command that marks a message read.
+	if len(am.fetchOpts) != 1 || !am.fetchOpts[0].Peek {
+		t.Fatalf("FetchInbox opts = %+v, want one peeking fetch", am.fetchOpts)
 	}
 }
 
