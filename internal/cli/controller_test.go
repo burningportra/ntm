@@ -543,55 +543,69 @@ func TestRobotControllerNoPromptFlagRegistered(t *testing.T) {
 	}
 }
 
-// TestBuildControllerResponse_MusePromptArrivesAsPaste launches a Muse
-// controller whose "agent" turns on bracketed paste and records its raw input.
-// Muse submits a multi-line prompt only when it arrives as a paste; typed with
-// send-keys it stays an unsent draft in the composer.
-func TestBuildControllerResponse_MusePromptArrivesAsPaste(t *testing.T) {
+// TestBuildControllerResponse_PromptArrivesAsSubmittedPaste launches a
+// controller whose "agent" turns on bracketed paste and records its raw input,
+// once per agent type. Every type goes through the shared agent-aware submit,
+// so the multi-line prompt arrives as one bracketed paste with its newline
+// intact and an Enter after it. Typed with send-keys, Muse kept the prompt as
+// an unsent draft and Claude and Codex got it as keystrokes.
+func TestBuildControllerResponse_PromptArrivesAsSubmittedPaste(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 
-	tmpDir := t.TempDir()
-	received := filepath.Join(tmpDir, "received.txt")
-	promptFile := filepath.Join(tmpDir, "prompt.txt")
-	if err := os.WriteFile(promptFile, []byte("coordinate the agents\nstart with a snapshot"), 0o644); err != nil {
-		t.Fatalf("write prompt file: %v", err)
-	}
+	for _, agentType := range []string{"claude", "codex", "muse"} {
+		t.Run(agentType, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			received := filepath.Join(tmpDir, "received.txt")
+			promptFile := filepath.Join(tmpDir, "prompt.txt")
+			if err := os.WriteFile(promptFile, []byte("coordinate the agents\nstart with a snapshot"), 0o644); err != nil {
+				t.Fatalf("write prompt file: %v", err)
+			}
 
-	oldCfg := cfg
-	t.Cleanup(func() { cfg = oldCfg })
-	cfg = newTmuxIntegrationTestConfig(tmpDir)
-	// -u keeps BSD cat from buffering its output to the file until exit.
-	cfg.Agents.Muse = fmt.Sprintf(`sh -c 'printf "\033[?2004h"; exec cat -uv > %s'`, received)
+			oldCfg := cfg
+			t.Cleanup(func() { cfg = oldCfg })
+			cfg = newTmuxIntegrationTestConfig(tmpDir)
+			// -u keeps BSD cat from buffering its output to the file until exit.
+			recorder := fmt.Sprintf(`sh -c 'printf "\033[?2004h"; exec cat -uv > %s'`, received)
+			switch agentType {
+			case "claude":
+				cfg.Agents.Claude = recorder
+			case "codex":
+				cfg.Agents.Codex = recorder
+			case "muse":
+				cfg.Agents.Muse = recorder
+			}
 
-	session := fmt.Sprintf("ntm-test-controller-muse-%d", time.Now().UnixNano())
-	if err := tmux.CreateSession(session, tmpDir); err != nil {
-		t.Fatalf("create session: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.KillSession(session) })
+			session := fmt.Sprintf("ntm-test-controller-%s-%d", agentType, time.Now().UnixNano())
+			if err := tmux.CreateSession(session, tmpDir); err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			t.Cleanup(func() { _ = tmux.KillSession(session) })
 
-	resp, err := buildControllerResponse(t.Context(), ControllerInput{
-		Session:    session,
-		AgentType:  "muse",
-		PromptFile: promptFile,
-	})
-	if err != nil {
-		t.Fatalf("buildControllerResponse: %v", err)
-	}
-	if resp.AgentType != "muse" {
-		t.Fatalf("AgentType = %q, want muse", resp.AgentType)
-	}
+			resp, err := buildControllerResponse(t.Context(), ControllerInput{
+				Session:    session,
+				AgentType:  agentType,
+				PromptFile: promptFile,
+			})
+			if err != nil {
+				t.Fatalf("buildControllerResponse: %v", err)
+			}
+			if resp.AgentType != agentType {
+				t.Fatalf("AgentType = %q, want %s", resp.AgentType, agentType)
+			}
 
-	var got string
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data, _ := os.ReadFile(received)
-		got = string(data)
-		if strings.Contains(got, "start with a snapshot") {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !strings.Contains(got, "^[[200~coordinate the agents") {
-		t.Fatalf("Muse controller prompt did not arrive as a bracketed paste; pane input:\n%s", got)
+			// The tty turns the paste's CR and the Enter into newlines.
+			const want = "^[[200~coordinate the agents\nstart with a snapshot^[[201~\n"
+			var got string
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				data, _ := os.ReadFile(received)
+				got = string(data)
+				if strings.Contains(got, want) {
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			t.Fatalf("%s controller prompt did not arrive as a submitted bracketed paste; pane input:\n%q", agentType, got)
+		})
 	}
 }

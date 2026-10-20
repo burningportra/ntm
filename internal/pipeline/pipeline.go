@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/util"
@@ -63,7 +64,7 @@ func Execute(ctx context.Context, p Pipeline) error {
 		}
 
 		// 3. Send prompt
-		if err := sendPrompt(realTmuxClient{}, paneID, stage.AgentType, prompt); err != nil {
+		if err := dispatch.SubmitPrompt(ctx, paneID, tmux.AgentType(stage.AgentType), prompt); err != nil {
 			return fmt.Errorf("stage %d sending prompt: %w", i+1, err)
 		}
 

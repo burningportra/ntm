@@ -87,9 +87,6 @@ func TestIntegrationCommandAndTemplatePipeline(t *testing.T) {
 	if len(history) != 1 {
 		t.Fatalf("PasteHistory length = %d, want one template dispatch", len(history))
 	}
-	if !history[0].Enter {
-		t.Fatal("template dispatch did not send Enter")
-	}
 	for _, want := range []string{"Template dispatch says world"} {
 		if !strings.Contains(history[0].Content, want) {
 			t.Fatalf("template dispatch missing %q:\n%s", want, history[0].Content)
@@ -192,9 +189,6 @@ func TestIntegrationForeachPaneTemplateRendersPerPaneSubstitution(t *testing.T) 
 		}
 		if len(history) != 1 {
 			t.Fatalf("PasteHistory(%s) length = %d, want 1", paneID, len(history))
-		}
-		if !history[0].Enter {
-			t.Fatalf("PasteHistory(%s) did not send Enter", paneID)
 		}
 		if !strings.Contains(history[0].Content, want) {
 			t.Fatalf("PasteHistory(%s) missing %q:\n%s", paneID, want, history[0].Content)

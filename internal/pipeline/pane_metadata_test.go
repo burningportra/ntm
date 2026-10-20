@@ -299,11 +299,7 @@ func (c *countingPaneMetadataClient) GetPanes(string) ([]tmux.Pane, error) {
 	return out, nil
 }
 
-func (c *countingPaneMetadataClient) PasteKeys(string, string, bool) error {
-	return nil
-}
-
-func (c *countingPaneMetadataClient) SendKeysForAgent(string, string, bool, tmux.AgentType) error {
+func (c *countingPaneMetadataClient) SubmitPrompt(context.Context, string, tmux.AgentType, string) error {
 	return nil
 }
 
@@ -517,9 +513,8 @@ type erroringTmuxClient struct {
 }
 
 func (e *erroringTmuxClient) GetPanes(string) ([]tmux.Pane, error)          { return nil, e.err }
-func (e *erroringTmuxClient) PasteKeys(string, string, bool) error          { return nil }
 func (e *erroringTmuxClient) CapturePaneOutput(string, int) (string, error) { return "", nil }
-func (e *erroringTmuxClient) SendKeysForAgent(string, string, bool, tmux.AgentType) error {
+func (e *erroringTmuxClient) SubmitPrompt(context.Context, string, tmux.AgentType, string) error {
 	return nil
 }
 

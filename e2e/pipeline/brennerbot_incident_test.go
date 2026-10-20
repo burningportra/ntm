@@ -96,8 +96,8 @@ func TestBrennerbotIncidentPipelineRunsEndToEndAgainstMocks(t *testing.T) {
 	if err := scripter.Wait(waitCtx, 2); err != nil {
 		t.Fatalf("scripted agent responses were not produced: %v", err)
 	}
-	assertDispatchHistory(t, mockTmux, "%1", "MO-04a Investigate", "H-001")
-	assertDispatchHistory(t, mockTmux, "%2", "MO-04a Investigate", "H-002")
+	assertDispatchHistory(t, mockTmux, "%1", tmux.AgentClaude, "MO-04a Investigate", "H-001")
+	assertDispatchHistory(t, mockTmux, "%2", tmux.AgentCodex, "MO-04a Investigate", "H-002")
 	assertPaneOutputContains(t, mockTmux, "%1", "MO-04a result: H-001 evidence captured")
 	assertPaneOutputContains(t, mockTmux, "%2", "MO-04a result: H-002 evidence captured")
 	assertDispatchGolden(t, workspace, filepath.Join("testdata", "goldens", "brennerbot-incident-dispatch.golden"))
@@ -162,7 +162,7 @@ func assertFileContains(t *testing.T, path, want string) {
 	}
 }
 
-func assertDispatchHistory(t *testing.T, mockTmux *pipelinepkg.MockTmuxClient, paneID string, wants ...string) {
+func assertDispatchHistory(t *testing.T, mockTmux *pipelinepkg.MockTmuxClient, paneID string, agentType tmux.AgentType, wants ...string) {
 	t.Helper()
 
 	history, err := mockTmux.PasteHistory(paneID)
@@ -177,8 +177,8 @@ func assertDispatchHistory(t *testing.T, mockTmux *pipelinepkg.MockTmuxClient, p
 			t.Fatalf("PasteHistory(%s) missing %q:\n%s", paneID, want, history[0].Content)
 		}
 	}
-	if !history[0].Enter {
-		t.Fatalf("PasteHistory(%s) Enter = false, want true", paneID)
+	if history[0].AgentType != agentType {
+		t.Fatalf("PasteHistory(%s) submitted as %q, want %q", paneID, history[0].AgentType, agentType)
 	}
 }
 

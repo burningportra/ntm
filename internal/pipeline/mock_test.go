@@ -64,11 +64,11 @@ func TestMockTmuxClientPasteAndCaptureArePaneScoped(t *testing.T) {
 	if err := mock.SetPaneOutput("%1", "seed\n"); err != nil {
 		t.Fatalf("SetPaneOutput returned error: %v", err)
 	}
-	if err := mock.PasteKeys("%1", "first\nsecond", true); err != nil {
-		t.Fatalf("PasteKeys returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "first\nsecond"); err != nil {
+		t.Fatalf("SubmitPrompt returned error: %v", err)
 	}
-	if err := mock.PasteKeys("%2", "other", true); err != nil {
-		t.Fatalf("PasteKeys second pane returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%2", tmux.AgentGemini, "other"); err != nil {
+		t.Fatalf("SubmitPrompt second pane returned error: %v", err)
 	}
 
 	got, err := mock.CapturePaneOutput("%1", 0)
@@ -99,8 +99,8 @@ func TestMockTmuxClientPasteAndCaptureArePaneScoped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PasteHistory returned error: %v", err)
 	}
-	if len(history) != 1 || history[0].Content != "first\nsecond" || !history[0].Enter {
-		t.Fatalf("PasteHistory = %+v, want one entered paste", history)
+	if len(history) != 1 || history[0].Content != "first\nsecond" || history[0].AgentType != tmux.AgentCodex {
+		t.Fatalf("PasteHistory = %+v, want one codex submit", history)
 	}
 }
 
@@ -115,14 +115,14 @@ func TestAgentScripterSubstringRegexAndDefaultResponses(t *testing.T) {
 	mock.SetAgentScripter(scripter)
 	t.Cleanup(mock.Reset)
 
-	if err := mock.PasteKeys("%1", "dispatch MO-04a-investigate H_ID=H-001", true); err != nil {
-		t.Fatalf("PasteKeys substring returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "dispatch MO-04a-investigate H_ID=H-001"); err != nil {
+		t.Fatalf("SubmitPrompt substring returned error: %v", err)
 	}
-	if err := mock.PasteKeys("%1", "mode=audit-42", true); err != nil {
-		t.Fatalf("PasteKeys regex returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "mode=audit-42"); err != nil {
+		t.Fatalf("SubmitPrompt regex returned error: %v", err)
 	}
-	if err := mock.PasteKeys("%1", "no registered pattern here", true); err != nil {
-		t.Fatalf("PasteKeys default returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "no registered pattern here"); err != nil {
+		t.Fatalf("SubmitPrompt default returned error: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -150,11 +150,11 @@ func TestAgentScripterSequentialResponses(t *testing.T) {
 	mock.SetAgentScripter(scripter)
 	t.Cleanup(mock.Reset)
 
-	if err := mock.PasteKeys("%1", "repeat prompt", true); err != nil {
-		t.Fatalf("first PasteKeys returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "repeat prompt"); err != nil {
+		t.Fatalf("first SubmitPrompt returned error: %v", err)
 	}
-	if err := mock.PasteKeys("%1", "repeat prompt", true); err != nil {
-		t.Fatalf("second PasteKeys returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "repeat prompt"); err != nil {
+		t.Fatalf("second SubmitPrompt returned error: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -188,11 +188,11 @@ func TestAgentScripterResetCancelsInFlightDelayedResponses(t *testing.T) {
 	mock.SetAgentScripter(scripter)
 	t.Cleanup(mock.Reset)
 
-	if err := mock.PasteKeys("%1", "ping prompt", true); err != nil {
-		t.Fatalf("PasteKeys returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "ping prompt"); err != nil {
+		t.Fatalf("SubmitPrompt returned error: %v", err)
 	}
 
-	// PasteKeys schedules delayed delivery before returning, so Reset can
+	// SubmitPrompt schedules delayed delivery before returning, so Reset can
 	// deterministically invalidate that generation immediately.
 	mock.Reset()
 	releaseDelivery()
@@ -221,8 +221,8 @@ func TestAgentScripterDirectResetCancelsInFlightDelayedResponses(t *testing.T) {
 	mock.SetAgentScripter(scripter)
 	t.Cleanup(mock.Reset)
 
-	if err := mock.PasteKeys("%1", "ping prompt", true); err != nil {
-		t.Fatalf("PasteKeys returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "ping prompt"); err != nil {
+		t.Fatalf("SubmitPrompt returned error: %v", err)
 	}
 	scripter.Reset()
 	releaseDelivery()
@@ -254,8 +254,8 @@ func TestAgentScripterResetAllowsFreshDeliveryAfterStaleDrop(t *testing.T) {
 	mock.SetAgentScripter(scripter)
 	t.Cleanup(mock.Reset)
 
-	if err := mock.PasteKeys("%1", "first prompt", true); err != nil {
-		t.Fatalf("first PasteKeys returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "first prompt"); err != nil {
+		t.Fatalf("first SubmitPrompt returned error: %v", err)
 	}
 	mock.Reset()
 	mock.setScriptedDeliveryGate(nil)
@@ -263,8 +263,8 @@ func TestAgentScripterResetAllowsFreshDeliveryAfterStaleDrop(t *testing.T) {
 	// Re-arm with a same-pattern rule and dispatch fresh — the new generation
 	// should deliver normally.
 	scripter.Match("second", "FRESH\n")
-	if err := mock.PasteKeys("%1", "second prompt", true); err != nil {
-		t.Fatalf("second PasteKeys returned error: %v", err)
+	if err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "second prompt"); err != nil {
+		t.Fatalf("second SubmitPrompt returned error: %v", err)
 	}
 	releaseStaleDelivery()
 	mock.waitForScriptedDeliveries()
@@ -292,12 +292,12 @@ func TestAgentScripterNoMatchReturnsClearError(t *testing.T) {
 	mock.SetAgentScripter(NewAgentScripter())
 	t.Cleanup(mock.Reset)
 
-	err := mock.PasteKeys("%1", "unmatched prompt", true)
+	err := mock.SubmitPrompt(t.Context(), "%1", tmux.AgentCodex, "unmatched prompt")
 	if err == nil {
-		t.Fatal("PasteKeys returned nil error, want script exhaustion error")
+		t.Fatal("SubmitPrompt returned nil error, want script exhaustion error")
 	}
 	if !strings.Contains(err.Error(), "no response") {
-		t.Fatalf("PasteKeys error = %q, want clear no-response message", err.Error())
+		t.Fatalf("SubmitPrompt error = %q, want clear no-response message", err.Error())
 	}
 
 	history, err := mock.PasteHistory("%1")
@@ -360,18 +360,21 @@ func TestExecutorRunUsesMockTmuxClient(t *testing.T) {
 	if len(history) != 1 {
 		t.Fatalf("PasteHistory length = %d, want 1", len(history))
 	}
-	if history[0].Content != "hello from mock" || !history[0].Enter {
-		t.Fatalf("PasteHistory[0] = %+v, want entered prompt", history[0])
+	if history[0].Content != "hello from mock" || history[0].AgentType != tmux.AgentCodex {
+		t.Fatalf("PasteHistory[0] = %+v, want the prompt submitted as codex", history[0])
 	}
 }
 
-// A Muse Code pane needs the agent-aware send, which pastes a multi-line
-// prompt and holds Enter for tmux.MuseEnterDelay; every other agent keeps
-// PasteKeys. Covers the prompt step and the parallel sub-step send paths.
-func TestExecutorSendsMusePromptsThroughAgentAwareSend(t *testing.T) {
+// Every pane's prompt goes through SubmitPrompt with that pane's agent type,
+// so the real client picks the agent's submit protocol: no agent type is
+// typed with plain send-keys anymore. Covers the prompt step and the parallel
+// sub-step send paths.
+func TestExecutorSubmitsEveryPromptWithItsPaneAgentType(t *testing.T) {
 	mock := NewMockTmuxClient(
 		tmux.Pane{ID: "%1", Index: 1, Title: "mock-session__muse_1", Type: tmux.AgentMuse},
 		tmux.Pane{ID: "%2", Index: 2, Title: "mock-session__cod_1", Type: tmux.AgentCodex},
+		tmux.Pane{ID: "%3", Index: 3, Title: "mock-session__cc_1", Type: tmux.AgentClaude},
+		tmux.Pane{ID: "%4", Index: 4, Title: "mock-session__user_1", Type: tmux.AgentUser},
 	)
 	cfg := DefaultExecutorConfig("mock-session")
 	cfg.ProjectDir = t.TempDir()
@@ -380,13 +383,16 @@ func TestExecutorSendsMusePromptsThroughAgentAwareSend(t *testing.T) {
 
 	workflow := &Workflow{
 		SchemaVersion: SchemaVersion,
-		Name:          "muse-send-workflow",
+		Name:          "agent-send-workflow",
 		Settings:      DefaultWorkflowSettings(),
 		Steps: []Step{
 			{ID: "muse", Prompt: "review the diff\nthen report", Pane: PaneSpec{Index: 1}, Wait: WaitNone},
 			{ID: "codex", Prompt: "review the diff\nthen report", Pane: PaneSpec{Index: 2}, Wait: WaitNone},
+			{ID: "claude", Prompt: "review the diff\nthen report", Pane: PaneSpec{Index: 3}, Wait: WaitNone},
+			{ID: "shell", Prompt: "echo one\necho two", Pane: PaneSpec{Index: 4}, Wait: WaitNone},
 			{ID: "fan", Parallel: ParallelSpec{Steps: []Step{
 				{ID: "fan-muse", Prompt: "fan out\nto muse", Pane: PaneSpec{Index: 1}, Wait: WaitNone},
+				{ID: "fan-claude", Prompt: "fan out\nto claude", Pane: PaneSpec{Index: 3}, Wait: WaitNone},
 			}}},
 		},
 	}
@@ -395,7 +401,7 @@ func TestExecutorSendsMusePromptsThroughAgentAwareSend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	for _, id := range []string{"muse", "codex", "fan"} {
+	for _, id := range []string{"muse", "codex", "claude", "shell", "fan"} {
 		if got := state.Steps[id]; got.Status != StatusCompleted {
 			t.Fatalf("step %s status = %q, want %q; error: %+v", id, got.Status, StatusCompleted, got.Error)
 		}
@@ -403,7 +409,9 @@ func TestExecutorSendsMusePromptsThroughAgentAwareSend(t *testing.T) {
 
 	for pane, want := range map[string][]tmux.AgentType{
 		"%1": {tmux.AgentMuse, tmux.AgentMuse},
-		"%2": {""},
+		"%2": {tmux.AgentCodex},
+		"%3": {tmux.AgentClaude, tmux.AgentClaude},
+		"%4": {tmux.AgentUser},
 	} {
 		history, err := mock.PasteHistory(pane)
 		if err != nil {
@@ -411,13 +419,10 @@ func TestExecutorSendsMusePromptsThroughAgentAwareSend(t *testing.T) {
 		}
 		got := make([]tmux.AgentType, len(history))
 		for i, paste := range history {
-			if !paste.Enter {
-				t.Fatalf("PasteHistory(%s)[%d] = %+v, want an entered prompt", pane, i, paste)
-			}
 			got[i] = paste.AgentType
 		}
 		if !slices.Equal(got, want) {
-			t.Fatalf("pane %s sends used agent types %q, want %q (empty = PasteKeys)", pane, got, want)
+			t.Fatalf("pane %s prompts were submitted as %q, want %q", pane, got, want)
 		}
 	}
 }

@@ -370,6 +370,29 @@ func (TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 	}
 }
 
+// SubmitPrompt types prompt into the pane target and submits it with the
+// protocol DefaultProtocolPlanner picks for agentType, delivered by
+// TMUXDeliverer: an agent pane gets the agent-aware text send (a paste for a
+// multi-line prompt), the double Enter and, for Claude and Codex, the
+// submission check that ntm send and --robot-send use, while a user or
+// unknown pane gets one Enter after the shell delay. Callers that address one
+// pane outside a dispatch plan, such as ntm controller and pipeline steps, use
+// it so every prompt goes through the same submit path.
+func SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error {
+	dest := Target{Ref: tmux.PaneRef{ID: target}, AgentType: agentType}
+	plan, err := DefaultProtocolPlanner{}.PlanDelivery(ctx, dest, true)
+	if err != nil {
+		return err
+	}
+	return TMUXDeliverer{}.Deliver(ctx, Delivery{
+		Target:           dest,
+		Message:          prompt,
+		Protocol:         plan.Protocol,
+		EnterDelay:       plan.EnterDelay,
+		SecondEnterDelay: plan.SecondEnterDelay,
+	})
+}
+
 // ClearComposerForDelivery runs the pre-send composer clear when the
 // delivery requests it (ntm-5p0b). A composer that POSITIVELY still holds
 // text after the clear is a distinct hard failure — typing into it would

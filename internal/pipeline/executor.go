@@ -24,6 +24,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/status"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
@@ -1065,7 +1066,7 @@ func (e *Executor) executeStepOnce(ctx context.Context, step *Step, workflow *Wo
 	beforeOutput, _ := e.tmuxClient().CapturePaneOutput(paneID, 2000)
 
 	// Send prompt
-	if err := sendPrompt(e.tmuxClient(), paneID, agentType, prompt); err != nil {
+	if err := e.tmuxClient().SubmitPrompt(ctx, paneID, tmux.AgentType(agentType), prompt); err != nil {
 		result.Status = StatusFailed
 		result.Error = &StepError{
 			Type:      "send",
@@ -1681,7 +1682,7 @@ func (e *Executor) executeTemplate(ctx context.Context, step *Step, workflow *Wo
 		return e.markTemplateCancelled(&result, step, workflow, paneID, ctx.Err().Error())
 	}
 
-	if err := sendPrompt(e.tmuxClient(), paneID, agentType, rendered); err != nil {
+	if err := e.tmuxClient().SubmitPrompt(ctx, paneID, tmux.AgentType(agentType), rendered); err != nil {
 		if ctx.Err() != nil {
 			return e.markTemplateCancelled(&result, step, workflow, paneID, ctx.Err().Error())
 		}
@@ -2373,7 +2374,7 @@ func (e *Executor) executeParallelStep(ctx context.Context, step *Step, workflow
 		beforeOutput, _ = e.tmuxClient().CapturePaneOutput(paneID, 2000)
 
 		// Send prompt
-		if err := sendPrompt(e.tmuxClient(), paneID, agentType, prompt); err != nil {
+		if err := e.tmuxClient().SubmitPrompt(ctx, paneID, tmux.AgentType(agentType), prompt); err != nil {
 			result.Status = StatusFailed
 			result.Error = &StepError{
 				Type:      "send",
