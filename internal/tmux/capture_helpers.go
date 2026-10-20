@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ============== Optimized Capture Helpers ==============
@@ -197,6 +198,24 @@ func CaptureForStatusDetection(target string) (string, error) {
 // CaptureForStatusDetectionContext captures with context support (default client).
 func CaptureForStatusDetectionContext(ctx context.Context, target string) (string, error) {
 	return DefaultClient.CaptureForStatusDetectionContext(ctx, target)
+}
+
+// CaptureVisibleStyledContext captures the visible screen of a pane with the
+// escape sequences for its colors and attributes (capture-pane -e). Status
+// detection reads plain captures; this one is for the rare verdict that
+// depends on how text is drawn, such as telling the dim ghost suggestion in
+// a Pi editor from text a user typed.
+func (c *Client) CaptureVisibleStyledContext(ctx context.Context, target string) (string, error) {
+	started := time.Now()
+	output, err := c.RunContext(ctx, "capture-pane", "-t", target, "-p", "-e", "-S", "0")
+	c.recordCaptureBackpressure(target, 0, time.Since(started), err)
+	return output, err
+}
+
+// CaptureVisibleStyledContext captures the visible screen with its escape
+// sequences (default client).
+func CaptureVisibleStyledContext(ctx context.Context, target string) (string, error) {
+	return DefaultClient.CaptureVisibleStyledContext(ctx, target)
 }
 
 // CaptureForHealthCheck captures output for health analysis and error detection.

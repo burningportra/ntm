@@ -873,6 +873,122 @@ func TestPiIdlePromptShowing(t *testing.T) {
 	}
 }
 
+// Pi 1.3.0 with pi-prompt-suggester 0.3.10, captured live in tmux at 40
+// columns after a turn with nothing typed. The extension restored its
+// suggestion and drew it after the cursor of the empty editor, wrapped onto a
+// second line. piGhostStyledScreen is the same screen captured with -e: the
+// suggestion is in 256-color grey 244, and its second line starts with no
+// escape because tmux carries colors across lines.
+var (
+	piGhostScreen = " s/pi-coding-agent/docs/models.md\n\n" +
+		piRule40 + "\n" +
+		" rename main.go to app.go and update the\n" +
+		"imports in every package that uses it\n" +
+		piRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.0%/..."
+	piGhostStyledScreen = "\x1b[39m \x1b[38;2;205;154;34ms/pi-coding-agent/docs/models.md\x1b[39m\n\n" +
+		"\x1b[38;2;108;118;123m" + piRule40 + "\n" +
+		"\x1b[7m\x1b[39m \x1b[0m\x1b[38;5;244mrename main.go to app.go and update the\n" +
+		"imports in every package that uses it\x1b[39m\n" +
+		"\x1b[38;2;108;118;123m" + piRule40 + "\n" +
+		"\x1b[38;2;126;136;142m/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.0%/\x1b[39m..."
+)
+
+// piEditorLine returns a one-line editor screen in the shape of
+// piGhostScreen, with line between the rules, and its -e capture with styled
+// in its place.
+func piEditorLine(line, styled string) (plain, styledScreen string) {
+	plain = strings.Replace(piGhostScreen, " rename main.go to app.go and update the\nimports in every package that uses it", line, 1)
+	styledScreen = strings.Replace(piGhostStyledScreen,
+		"\x1b[7m\x1b[39m \x1b[0m\x1b[38;5;244mrename main.go to app.go and update the\nimports in every package that uses it\x1b[39m", styled, 1)
+	return plain, styledScreen
+}
+
+// TestPiClearGhostSuggestion is the bd-3hin5 regression: an editor holding
+// only pi-prompt-suggester's dim suggestion read as unsent text, so the pane
+// was never dispatched to or restarted. Typed text is drawn in the default
+// color, so anything else in the editor keeps the pane a draft.
+func TestPiClearGhostSuggestion(t *testing.T) {
+	t.Parallel()
+
+	// The suggestion on one line, as at 80 columns, with Pi's fake cursor and
+	// with the hardware cursor (showHardwareCursor), which leaves the cursor
+	// cell unstyled.
+	ghostWide, ghostWideStyled := piEditorLine(" rename main.go to app.go",
+		"\x1b[7m\x1b[39m \x1b[0m\x1b[38;5;244mrename main.go to app.go\x1b[39m")
+	_, ghostHardwareCursorStyled := piEditorLine(" rename main.go to app.go",
+		"\x1b[39m \x1b[38;5;244mrename main.go to app.go\x1b[39m")
+	// Typed text, as captured live from the same Pi: default color, cursor
+	// after it.
+	draft, draftStyled := piEditorLine("fix the flaky test", "\x1b[39mfix the flaky test\x1b[7m \x1b[0m")
+	// A pasted draft that starts with spaces fits a ghost in plain text.
+	indented, indentedStyled := piEditorLine("  func main() {", "\x1b[39m  func main() {\x1b[7m \x1b[0m")
+	// Text typed in front of the suggestion: the extension keeps drawing the
+	// rest of the suggestion after the cursor.
+	prefixed, prefixedStyled := piEditorLine("ren ame main.go to app.go",
+		"\x1b[39mren\x1b[7m \x1b[0m\x1b[38;5;244mame main.go to app.go\x1b[39m")
+	// A wrapped suggestion whose second line went back to the default color.
+	mixedStyled := strings.Replace(piGhostStyledScreen, "\nimports in every", "\n\x1b[39mimports in every", 1)
+	// The user typed between the two captures.
+	_, typedSinceStyled := piEditorLine("fix", "\x1b[39mfix\x1b[7m \x1b[0m")
+	// A turn started between the two captures.
+	turnStartedStyled := strings.Replace(piGhostStyledScreen, "\n\n\x1b[38;2;108;118;123m"+piRule40, "\n \x1b[38;5;75m⠧\x1b[39m Working\n\x1b[38;2;108;118;123m"+piRule40, 1)
+
+	tests := []struct {
+		name     string
+		output   string
+		styled   string
+		wantMay  bool
+		wantIdle bool
+	}{
+		{name: "wrapped suggestion", output: piGhostScreen, styled: piGhostStyledScreen, wantMay: true, wantIdle: true},
+		{name: "one-line suggestion", output: ghostWide, styled: ghostWideStyled, wantMay: true, wantIdle: true},
+		{name: "hardware cursor", output: ghostWide, styled: ghostHardwareCursorStyled, wantMay: true, wantIdle: true},
+		{name: "typed draft", output: draft, styled: draftStyled},
+		{name: "indented draft", output: indented, styled: indentedStyled, wantMay: true},
+		{name: "text typed in front of the suggestion", output: prefixed, styled: prefixedStyled},
+		{name: "second line in the default color", output: piGhostScreen, styled: mixedStyled, wantMay: true},
+		{name: "screen changed between captures", output: ghostWide, styled: typedSinceStyled, wantMay: true},
+		{name: "turn started between captures", output: piGhostScreen, styled: turnStartedStyled, wantMay: true},
+		{name: "no styled capture", output: piGhostScreen, styled: "", wantMay: true},
+		{name: "empty editor", output: piIdleNarrowScreen, styled: piIdleNarrowScreen},
+		{name: "working", output: piWorkingNarrowScreen, styled: piWorkingNarrowScreen},
+		{name: "working above the editor", output: piWorkingAboveEditorScreen, styled: piWorkingAboveEditorScreen},
+		{name: "no editor drawn", output: "/repo (main)\n0.0%/1.0M (auto)  model", styled: "/repo (main)\n0.0%/1.0M (auto)  model"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := PiEditorMayHoldGhostSuggestion(tt.output); got != tt.wantMay {
+				t.Errorf("PiEditorMayHoldGhostSuggestion() = %v, want %v", got, tt.wantMay)
+			}
+			cleared, ok := PiClearGhostSuggestion(tt.output, tt.styled)
+			if ok != tt.wantIdle {
+				t.Fatalf("PiClearGhostSuggestion() ok = %v, want %v", ok, tt.wantIdle)
+			}
+			if !ok {
+				if cleared != tt.output {
+					t.Errorf("PiClearGhostSuggestion() changed output it did not clear:\n%s", cleared)
+				}
+				return
+			}
+			if !PiIdlePromptShowing(cleared) {
+				t.Errorf("cleared screen is not an idle prompt:\n%s", cleared)
+			}
+			if strings.Contains(cleared, "rename") {
+				t.Errorf("cleared screen still holds the suggestion:\n%s", cleared)
+			}
+			before := strings.Split(tt.output, "\n")
+			after := strings.Split(cleared, "\n")
+			if len(after) != len(before) || after[0] != before[0] || after[len(after)-1] != before[len(before)-1] {
+				t.Errorf("clearing touched lines outside the editor:\n%s", cleared)
+			}
+		})
+	}
+}
+
 // TestParser_Parse_PiStates pins the parser to the Pi recognizers. Before
 // bd-7bzre it read Pi with substring guesses: an idle pane after a turn read
 // as working ("running ", the "Thinking..." label) and never as idle, since

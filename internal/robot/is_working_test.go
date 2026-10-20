@@ -589,6 +589,69 @@ func TestClassifyPaneWork_PiPanes(t *testing.T) {
 	}
 }
 
+// TestClassifyPaneWork_PiGhostSuggestion is the bd-3hin5 regression at the
+// verdict --robot-is-working, smart restart and dispatch read. A Pi editor
+// holding only pi-prompt-suggester's dim suggestion read UNKNOWN and not safe
+// to dispatch, because a plain capture shows the suggestion as unsent text.
+// The editor lines are as captured with -e from Pi 1.3.0 running the
+// extension.
+func TestClassifyPaneWork_PiGhostSuggestion(t *testing.T) {
+	ghost := strings.Replace(piTestIdleNarrowScreen, piTestRule40+"\n\n"+piTestRule40,
+		piTestRule40+"\n rename main.go to app.go\n"+piTestRule40, 1)
+	ghostStyled := strings.Replace(ghost, "\n rename main.go to app.go\n",
+		"\n\x1b[7m\x1b[39m \x1b[0m\x1b[38;5;244mrename main.go to app.go\x1b[39m\n", 1)
+	// A pasted draft that starts with spaces fits a ghost in plain text, but
+	// it is drawn in the default color.
+	indented := strings.Replace(ghost, " rename main.go to app.go", "  func main() {", 1)
+	indentedStyled := strings.Replace(ghost, " rename main.go to app.go", "\x1b[39m  func main() {\x1b[7m \x1b[0m", 1)
+
+	tests := []struct {
+		name       string
+		output     string
+		styled     string
+		want       agent.Recommendation
+		wantState  state.AgentState
+		wantStyled bool
+	}{
+		{name: "ghost suggestion", output: ghost, styled: ghostStyled, want: agent.RecommendSafeToRestart, wantState: state.AgentStateIdle, wantStyled: true},
+		{name: "typed draft", output: piTestDraftScreen, want: agent.RecommendUnknown, wantState: state.AgentStateUnknown},
+		{name: "indented draft", output: indented, styled: indentedStyled, want: agent.RecommendUnknown, wantState: state.AgentStateUnknown, wantStyled: true},
+		// A live turn wins before any styled capture is taken.
+		{name: "working, indicator in the top rule", output: piTestWorkingNarrowScreen, styled: ghostStyled, want: agent.RecommendDoNotInterrupt, wantState: state.AgentStateBusy},
+		{name: "working, indicator above the editor", output: piTestWorkingAboveEditorScreen, styled: ghostStyled, want: agent.RecommendDoNotInterrupt, wantState: state.AgentStateBusy},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			styledCaptures := 0
+			detectorConfig := statuspkg.DefaultConfig()
+			observer := statuspkg.NewSessionObserverWithDependencies(
+				statuspkg.NewDetectorWithConfig(detectorConfig),
+				statuspkg.DefaultSessionObserverConfig(detectorConfig),
+				statuspkg.SessionObserverDependencies{
+					CaptureStyled: func(context.Context, string) (string, error) {
+						styledCaptures++
+						return tt.styled, nil
+					},
+				},
+			)
+			pane := tmux.Pane{ID: fmt.Sprintf("%%%d", i+1), Index: i + 1, Title: fmt.Sprintf("proj__pi_%d", i+1), Type: tmux.AgentPi}
+			work := classifyCapturedPaneWork(observer, agent.NewParser(), "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, tt.output, "")
+			if work.Recommendation != string(tt.want) {
+				t.Fatalf("recommendation = %q, want %q (work=%+v)", work.Recommendation, tt.want, work)
+			}
+			if wantIdle := tt.want == agent.RecommendSafeToRestart; work.IsIdle != wantIdle || work.SafeToDispatch != wantIdle {
+				t.Errorf("is_idle = %v, safe_to_dispatch = %v, want both %v", work.IsIdle, work.SafeToDispatch, wantIdle)
+			}
+			if got := runtimeAgentState(paneAgentType(pane), work); got != tt.wantState {
+				t.Errorf("runtimeAgentState = %q, want %q", got, tt.wantState)
+			}
+			if (styledCaptures > 0) != tt.wantStyled {
+				t.Errorf("styled captures = %d, want one: %v", styledCaptures, tt.wantStyled)
+			}
+		})
+	}
+}
+
 // TestClassifyPaneWork_GenuineSpinnersStillBusy covers the other side of
 // bd-7bzre: dots_spinner no longer reads the last line of Claude and Codex
 // panes, which is always their footer, so a live turn there must read busy

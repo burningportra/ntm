@@ -2300,3 +2300,100 @@ func TestSessionObserverCASSDerivedSanitizedReplays(t *testing.T) {
 		})
 	}
 }
+
+// TestSessionObserverClearsPiGhostSuggestion is the bd-3hin5 regression at
+// the observation every dispatcher reads. A Pi editor holding only
+// pi-prompt-suggester's dim suggestion read as a draft, so the pane was never
+// safe to dispatch to. The observer takes one escape-coded capture, and only
+// of a Pi pane whose plain capture fits a ghost.
+func TestSessionObserverClearsPiGhostSuggestion(t *testing.T) {
+	t.Parallel()
+
+	rule := strings.Repeat("─", 40)
+	screen := func(editor string) string {
+		return " tell me what to change next...\n\n" + rule + "\n" + editor + "\n" + rule + "\n" +
+			"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+			"↑2.6k ↓120 R1.2k CH46.2% $0.004 0.0%/..."
+	}
+	// The editor lines as captured live with -e from Pi 1.3.0 running
+	// pi-prompt-suggester 0.3.10.
+	ghost := screen(" rename main.go to app.go")
+	ghostStyled := screen("\x1b[7m\x1b[39m \x1b[0m\x1b[38;5;244mrename main.go to app.go\x1b[39m")
+	draft := screen("fix the flaky test")
+	indented := screen("  func main() {")
+	indentedStyled := screen("\x1b[39m  func main() {\x1b[7m \x1b[0m")
+	working := strings.Replace(screen(""), "\n\n"+rule, "\n ⠧ Working\n"+rule, 1)
+
+	tests := []struct {
+		name         string
+		paneType     tmux.AgentType
+		output       string
+		styled       string
+		wantStyled   bool
+		wantState    AgentState
+		wantDispatch bool
+	}{
+		{name: "ghost suggestion", paneType: tmux.AgentPi, output: ghost, styled: ghostStyled, wantStyled: true, wantState: StateIdle, wantDispatch: true},
+		{name: "typed draft", paneType: tmux.AgentPi, output: draft, wantState: StateIdle},
+		{name: "indented draft", paneType: tmux.AgentPi, output: indented, styled: indentedStyled, wantStyled: true, wantState: StateIdle},
+		{name: "working", paneType: tmux.AgentPi, output: working, wantState: StateWorking},
+		{name: "not a pi pane", paneType: tmux.AgentClaude, output: ghost, styled: ghostStyled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pane := tmux.PaneActivity{
+				Pane:         tmux.Pane{ID: "%3", WindowIndex: 0, Index: 1, Title: "s__agent_1", Type: tt.paneType},
+				LastActivity: time.Now().Add(-time.Hour),
+			}
+			var styledCaptures atomic.Int32
+			observer := NewSessionObserverWithDependencies(NewDetector(), DefaultSessionObserverConfig(DefaultConfig()), SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					return []tmux.PaneActivity{pane}, nil
+				},
+				CapturePane: func(context.Context, string, int) (string, error) {
+					return tt.output, nil
+				},
+				CaptureStyled: func(_ context.Context, paneID string) (string, error) {
+					styledCaptures.Add(1)
+					if paneID != "%3" {
+						t.Errorf("styled capture of %q, want %%3", paneID)
+					}
+					return tt.styled, nil
+				},
+			})
+
+			observation, err := observer.Observe(context.Background(), "s")
+			if err != nil {
+				t.Fatalf("Observe() error = %v", err)
+			}
+			observed, ok := observation.PaneByID("%3")
+			if !ok {
+				t.Fatal("observation missing pane")
+			}
+			// Output another collector captured is read the same way.
+			reused := observer.ObservePaneCapture("s", pane, tt.output, nil)
+
+			wantCaptures := int32(0)
+			if tt.wantStyled {
+				wantCaptures = 2
+			}
+			if got := styledCaptures.Load(); got != wantCaptures {
+				t.Errorf("styled captures = %d, want %d", got, wantCaptures)
+			}
+			if tt.paneType != tmux.AgentPi {
+				return
+			}
+			for _, got := range []PaneObservation{observed, reused} {
+				if got.Current.Status.State != tt.wantState || got.SafeToDispatch() != tt.wantDispatch {
+					t.Errorf("state = %q, safe_to_dispatch = %v (confidence %.2f), want %q, %v",
+						got.Current.Status.State, got.SafeToDispatch(), got.Current.Confidence, tt.wantState, tt.wantDispatch)
+				}
+				unchanged := got.RawOutput == truncateOutput(tt.output, defaultObservationMaxBytes)
+				if tt.wantDispatch == unchanged || (tt.wantDispatch && strings.Contains(got.RawOutput, "rename")) {
+					t.Errorf("raw output unchanged = %v, want %v:\n%s", unchanged, !tt.wantDispatch, got.RawOutput)
+				}
+			}
+		})
+	}
+}

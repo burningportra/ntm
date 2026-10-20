@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -121,5 +122,40 @@ func TestCaptureForCheckpoint(t *testing.T) {
 
 	if !strings.Contains(output, "CHECKPOINT_TEST") {
 		t.Errorf("CaptureForCheckpoint should capture checkpoint output")
+	}
+}
+
+// TestCaptureVisibleStyledContext checks that the styled capture keeps the
+// 256-color escape pi-prompt-suggester draws its ghost suggestion with
+// (bd-3hin5), which the plain capture drops.
+func TestCaptureVisibleStyledContext(t *testing.T) {
+	skipIfNoTmux(t)
+
+	session := createTestSession(t)
+	panes, _ := GetPanes(session)
+	target := panes[0].ID
+
+	SendKeys(target, `printf '\033[38;5;244mGHOST_TEST\033[0m\n'`, true)
+
+	var styled string
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		var err error
+		styled, err = CaptureVisibleStyledContext(context.Background(), target)
+		if err != nil {
+			t.Fatalf("CaptureVisibleStyledContext failed: %v", err)
+		}
+		if strings.Contains(styled, "\x1b[38;5;244mGHOST_TEST") {
+			break
+		}
+	}
+	if !strings.Contains(styled, "\x1b[38;5;244mGHOST_TEST") {
+		t.Errorf("styled capture lost the color of GHOST_TEST: %q", styled)
+	}
+	plain, err := CaptureForStatusDetection(target)
+	if err != nil {
+		t.Fatalf("CaptureForStatusDetection failed: %v", err)
+	}
+	if strings.Contains(plain, "\x1b[") || !strings.Contains(plain, "GHOST_TEST") {
+		t.Errorf("plain capture = %q, want GHOST_TEST without escapes", plain)
 	}
 }

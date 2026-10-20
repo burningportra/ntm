@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Dicklesworthstone/ntm/internal/util"
 )
@@ -492,6 +494,159 @@ func piStatusShowing(lines []string, top int) bool {
 		}
 	}
 	return false
+}
+
+// piGhostSuggestionColor is the foreground pi-prompt-suggester (0.3.10)
+// draws its ghost suggestion in: 256-color grey 244, written as
+// "\x1b[38;5;244m" and reported back that way by tmux capture-pane -e. Pi's
+// themes use true color, and text typed into the editor is drawn in the
+// default foreground.
+const piGhostSuggestionColor = "38;5;244"
+
+// PiEditorMayHoldGhostSuggestion reports whether a plain capture of a Pi pane
+// fits the ghost suggestion pi-prompt-suggester draws in an empty editor after
+// a turn: no live turn, and the editor's first line holds text after the
+// cursor cell an empty editor starts with. Plain text cannot tell the
+// suggestion from a draft, so a caller that gets true takes an escape-coded
+// capture for PiClearGhostSuggestion. A draft typed from column 0 returns
+// false and costs no capture.
+func PiEditorMayHoldGhostSuggestion(output string) bool {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	top, bottom, ok := piEditorBox(lines)
+	if !ok || bottom-top < 2 || piStatusShowing(lines, top) || !piPlainRuleRe.MatchString(lines[top]) {
+		return false
+	}
+	first := lines[top+1]
+	return strings.HasPrefix(first, " ") && strings.TrimSpace(first) != ""
+}
+
+// PiClearGhostSuggestion returns output, a plain capture of a Pi pane, with
+// the lines inside its editor blanked when styled, an escape-coded capture of
+// the pane's visible screen, shows every character in the editor drawn in the
+// ghost suggestion's color. The ghost shows only in an empty editor and goes
+// away on the first keystroke, so such an editor is an empty one. ok is false
+// and output comes back unchanged when the editor holds text in any other
+// color, when either capture shows a live turn, or when the captures disagree
+// about the editor's text because the screen changed between them.
+func PiClearGhostSuggestion(output, styled string) (string, bool) {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	top, bottom, ok := piEditorBox(lines)
+	if !ok || piStatusShowing(lines, top) || !piPlainRuleRe.MatchString(lines[top]) {
+		return output, false
+	}
+	styledLines := strings.Split(styled, "\n")
+	styledText := strings.Split(stripANSICodes(styled), "\n")
+	styledTop, styledBottom, ok := piEditorBox(styledText)
+	if !ok || len(styledText) != len(styledLines) || styledBottom-styledTop != bottom-top || piStatusShowing(styledText, styledTop) {
+		return output, false
+	}
+	for i := top; i <= bottom; i++ {
+		if strings.TrimRight(lines[i], " \t") != strings.TrimRight(styledText[styledTop+i-top], " \t") {
+			return output, false
+		}
+	}
+	if !piEditorTextIsGhost(styledLines[:styledBottom], styledTop) {
+		return output, false
+	}
+	outputLines := strings.Split(output, "\n")
+	if len(outputLines) != len(lines) {
+		return output, false
+	}
+	for i := top + 1; i < bottom; i++ {
+		outputLines[i] = ""
+	}
+	return strings.Join(outputLines, "\n"), true
+}
+
+// piEditorTextIsGhost reports whether the editor lines of an escape-coded
+// capture, lines[top+1:], hold text and all of it is in
+// piGhostSuggestionColor. Colors are tracked from the first line, because
+// tmux emits only changes and carries them across lines: the second line of
+// a wrapped suggestion starts with no escape at all.
+func piEditorTextIsGhost(lines []string, top int) bool {
+	foreground := ""
+	sawText := false
+	for i, line := range lines {
+		for line != "" {
+			if line[0] == '\x1b' {
+				params, size, isSGR := piEscapeAt(line)
+				if isSGR {
+					foreground = piSGRForeground(foreground, params)
+				}
+				line = line[size:]
+				continue
+			}
+			r, size := utf8.DecodeRuneInString(line)
+			line = line[size:]
+			if i <= top || unicode.IsSpace(r) {
+				continue
+			}
+			if foreground != piGhostSuggestionColor {
+				return false
+			}
+			sawText = true
+		}
+	}
+	return sawText
+}
+
+// piEscapeAt measures the escape sequence at the start of s and, for an SGR
+// sequence ("\x1b[...m"), returns its parameters.
+func piEscapeAt(s string) (params string, size int, isSGR bool) {
+	if len(s) < 2 {
+		return "", len(s), false
+	}
+	switch s[1] {
+	case '[':
+		for i := 2; i < len(s); i++ {
+			if c := s[i]; c >= 0x40 && c <= 0x7e {
+				return s[2:i], i + 1, c == 'm'
+			}
+		}
+	case ']', 'P', '_', '^', 'X':
+		// OSC, DCS, APC, PM and SOS strings end at BEL or ST.
+		for i := 2; i < len(s); i++ {
+			if s[i] == '\a' {
+				return "", i + 1, false
+			}
+			if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '\\' {
+				return "", i + 2, false
+			}
+		}
+	default:
+		return "", 2, false
+	}
+	return "", len(s), false
+}
+
+// piSGRForeground applies one SGR sequence's parameters to foreground, a
+// color written as its SGR parameters ("" for the default foreground).
+func piSGRForeground(foreground, params string) string {
+	codes := strings.Split(params, ";")
+	for i := 0; i < len(codes); i++ {
+		code := codes[i]
+		switch {
+		case code == "" || code == "0" || code == "39":
+			foreground = ""
+		case code == "38" || code == "48" || code == "58":
+			// An extended color, 5;N or 2;R;G;B. Only 38 sets the foreground.
+			span := 0
+			if i+2 < len(codes) && codes[i+1] == "5" {
+				span = 2
+			} else if i+4 < len(codes) && codes[i+1] == "2" {
+				span = 4
+			}
+			if code == "38" {
+				foreground = strings.Join(codes[i:i+span+1], ";")
+			}
+			i += span
+		case strings.HasPrefix(code, "38:"):
+			foreground = strings.ReplaceAll(code, ":", ";")
+		case len(code) == 2 && (code[0] == '3' || code[0] == '9') && code[1] >= '0' && code[1] <= '7':
+			foreground = code
+		}
+	}
+	return foreground
 }
 
 // Kimi (kimi) patterns.

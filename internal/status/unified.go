@@ -539,7 +539,11 @@ func DefaultSessionObserverConfig(detectorConfig DetectorConfig) SessionObserver
 type SessionObserverDependencies struct {
 	ListPanes   func(context.Context, string) ([]tmux.PaneActivity, error)
 	CapturePane func(context.Context, string, int) (string, error)
-	Now         func() time.Time
+	// CaptureStyled captures a pane's visible screen with its escape codes.
+	// The observer calls it only for a Pi pane whose editor may hold a ghost
+	// suggestion (see clearPiGhostSuggestion).
+	CaptureStyled func(context.Context, string) (string, error)
+	Now           func() time.Time
 }
 
 // SessionObserver produces canonical session observations and retains only the
@@ -582,6 +586,9 @@ func NewSessionObserverWithDependencies(detector *UnifiedDetector, config Sessio
 	}
 	if deps.CapturePane == nil {
 		deps.CapturePane = tmux.CapturePaneOutputContext
+	}
+	if deps.CaptureStyled == nil {
+		deps.CaptureStyled = tmux.CaptureVisibleStyledContext
 	}
 	if deps.Now == nil {
 		deps.Now = time.Now
@@ -700,15 +707,45 @@ func (o *SessionObserver) Observe(ctx context.Context, session string) (SessionO
 }
 
 // ObservePaneCapture incorporates output already captured by another consumer
-// into the same last-known state machine without issuing another tmux command.
-// It is safe to call concurrently with Observe; calls are serialized so the
-// last-known cache remains race-free.
+// into the same last-known state machine. It issues no capture of its own,
+// except the one escape-coded capture clearPiGhostSuggestion takes of a Pi
+// pane whose editor may hold a ghost suggestion. It is safe to call
+// concurrently with Observe; calls are serialized so the last-known cache
+// remains race-free.
 func (o *SessionObserver) ObservePaneCapture(session string, pane tmux.PaneActivity, output string, captureErr error) PaneObservation {
+	output = truncateOutput(output, o.config.MaxCaptureBytes)
+	if captureErr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), o.config.CaptureTimeout)
+		output = o.clearPiGhostSuggestion(ctx, pane.Pane, output)
+		cancel()
+	}
 	cache := o.sessionCache(session)
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	upsertCachedTopology(cache, pane)
-	return o.buildPaneObservation(cache, pane, truncateOutput(output, o.config.MaxCaptureBytes), captureErr, o.deps.Now().UTC())
+	return o.buildPaneObservation(cache, pane, output, captureErr, o.deps.Now().UTC())
+}
+
+// clearPiGhostSuggestion returns output with the editor of a Pi pane emptied
+// when it holds nothing but a pi-prompt-suggester ghost suggestion: a dim
+// suggested prompt the extension draws in an empty editor after a turn. A
+// plain capture cannot tell it from unsent text, so the pane would read as
+// holding a draft and never be dispatched to or restarted. Only a Pi pane
+// whose plain capture fits a ghost costs the one extra capture, taken with
+// escape codes so the suggestion's color can be read. Every reader of the
+// observation, --robot-tail included, sees the emptied editor.
+func (o *SessionObserver) clearPiGhostSuggestion(ctx context.Context, pane tmux.Pane, output string) string {
+	if agent.AgentType(pane.Type).Canonical() != agent.AgentTypePi || !agent.PiEditorMayHoldGhostSuggestion(output) {
+		return output
+	}
+	styled, err := o.deps.CaptureStyled(ctx, pane.ID)
+	if err != nil {
+		return output
+	}
+	if cleared, ok := agent.PiClearGhostSuggestion(output, styled); ok {
+		return cleared
+	}
+	return output
 }
 
 func (o *SessionObserver) sessionCache(session string) *sessionObservationCache {
@@ -756,10 +793,10 @@ func (o *SessionObserver) captureAll(ctx context.Context, panes []tmux.PaneActiv
 			for index := range jobs {
 				captureCtx, cancel := context.WithTimeout(ctx, o.config.CaptureTimeout)
 				output, err := o.deps.CapturePane(captureCtx, panes[index].Pane.ID, o.config.CaptureLines)
-				cancel()
 				if err == nil {
-					output = truncateOutput(output, o.config.MaxCaptureBytes)
+					output = o.clearPiGhostSuggestion(captureCtx, panes[index].Pane, truncateOutput(output, o.config.MaxCaptureBytes))
 				}
+				cancel()
 				completed <- observationCaptureResult{index: index, output: output, err: err}
 			}
 		}()
