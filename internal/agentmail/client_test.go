@@ -1389,3 +1389,50 @@ func TestFetchInbox_UnmarshalFormats(t *testing.T) {
 		}
 	})
 }
+
+// TestDisabledClientNeverContactsServer locks bd-89xi0: a client built for an
+// [agent_mail] enabled = false configuration refuses probes, tool calls,
+// resource reads and the HTTP overseer fallback with ErrDisabled, and never
+// sends a request.
+func TestDisabledClientNeverContactsServer(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL+"/"), WithDisabled())
+	ctx := context.Background()
+
+	if c.IsAvailableContext(ctx) {
+		t.Fatal("IsAvailableContext = true, want false for a disabled client")
+	}
+	if err := c.LastAvailabilityError(); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("LastAvailabilityError = %v, want ErrDisabled", err)
+	}
+	if _, err := c.EnsureProject(ctx, "/data/projects/ntm"); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("EnsureProject error = %v, want ErrDisabled", err)
+	}
+	if _, err := c.ListProjectAgents(ctx, "/data/projects/ntm"); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("ListProjectAgents error = %v, want ErrDisabled", err)
+	}
+	if _, err := c.HealthCheck(ctx); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("HealthCheck error = %v, want ErrDisabled", err)
+	}
+	if _, err := c.SendOverseerMessage(ctx, OverseerMessageOptions{
+		ProjectKey:  "/data/projects/ntm",
+		ProjectSlug: "data-projects-ntm",
+		Recipients:  []string{"BlueLake"},
+		Subject:     "hello",
+		BodyMD:      "body",
+	}); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("SendOverseerMessage error = %v, want ErrDisabled", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("server saw %d requests, want 0", n)
+	}
+}

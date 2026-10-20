@@ -987,6 +987,9 @@ func (c *Client) SendOverseerMessage(ctx context.Context, opts OverseerMessageOp
 // `/mail/{slug}/overseer/send`. Newer deployments (the v2.13.x line
 // the #146 reporter is on) typically 404 here.
 func (c *Client) sendOverseerMessageHTTP(ctx context.Context, opts OverseerMessageOptions) (*OverseerSendResult, error) {
+	if c.disabled {
+		return nil, NewAPIError("overseer_send", 0, ErrDisabled)
+	}
 	if opts.ProjectSlug == "" {
 		return nil, NewAPIError("overseer_send", 0, fmt.Errorf("project_slug required for HTTP fallback path"))
 	}

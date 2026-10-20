@@ -432,7 +432,7 @@ func loadAuditCausalityEvents(opts CausalityOptions, since, until *time.Time) ([
 
 func loadAgentMailCausalityEvents(opts CausalityOptions, since, until *time.Time) ([]CausalityEvent, []CausalitySourceStatus, []string) {
 	project := strings.TrimSpace(opts.Project)
-	return loadAgentMailCausalityEventsWithClient(opts, since, until, agentmail.NewClient(agentmail.WithProjectKey(project)))
+	return loadAgentMailCausalityEventsWithClient(opts, since, until, newAgentMailClient(project))
 }
 
 func loadAgentMailCausalityEventsWithClient(opts CausalityOptions, since, until *time.Time, client causalityAgentMailClient) ([]CausalityEvent, []CausalitySourceStatus, []string) {

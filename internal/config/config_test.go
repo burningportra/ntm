@@ -4,16 +4,88 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/BurntSushi/toml"
 )
+
+// TestAgentMailConfigNewClient locks bd-89xi0: the shared constructor sends
+// requests to the configured url with the configured token, lets
+// AGENT_MAIL_URL and AGENT_MAIL_TOKEN override both, and makes no request at
+// all when [agent_mail] enabled = false.
+func TestAgentMailConfigNewClient(t *testing.T) {
+	type seen struct{ server, auth string }
+	var (
+		mu       sync.Mutex
+		requests []seen
+	)
+	newServer := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests = append(requests, seen{server: name, auth: r.Header.Get("Authorization")})
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+		}))
+	}
+	configured := newServer("config")
+	defer configured.Close()
+	fromEnv := newServer("env")
+	defer fromEnv.Close()
+
+	probe := func(t *testing.T, settings AgentMailConfig) []seen {
+		t.Helper()
+		mu.Lock()
+		requests = nil
+		mu.Unlock()
+		settings.NewClient("/data/projects/ntm").IsAvailableContext(context.Background())
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]seen(nil), requests...)
+	}
+	settings := AgentMailConfig{Enabled: true, URL: configured.URL, Token: "config-token"}
+
+	t.Run("config", func(t *testing.T) {
+		t.Setenv("AGENT_MAIL_URL", "")
+		t.Setenv("AGENT_MAIL_TOKEN", "")
+		got := probe(t, settings)
+		if len(got) != 1 || got[0].server != "config" || got[0].auth != "Bearer config-token" {
+			t.Fatalf("requests = %+v, want one to the configured server with the configured token", got)
+		}
+	})
+	t.Run("env overrides config", func(t *testing.T) {
+		t.Setenv("AGENT_MAIL_URL", fromEnv.URL)
+		t.Setenv("AGENT_MAIL_TOKEN", "env-token")
+		got := probe(t, settings)
+		if len(got) != 1 || got[0].server != "env" || got[0].auth != "Bearer env-token" {
+			t.Fatalf("requests = %+v, want one to the env server with the env token", got)
+		}
+	})
+	t.Run("disabled", func(t *testing.T) {
+		t.Setenv("AGENT_MAIL_URL", "")
+		t.Setenv("AGENT_MAIL_TOKEN", "")
+		disabled := settings
+		disabled.Enabled = false
+		if got := probe(t, disabled); len(got) != 0 {
+			t.Fatalf("requests = %+v, want none when Agent Mail is disabled", got)
+		}
+	})
+	t.Run("default url", func(t *testing.T) {
+		t.Setenv("AGENT_MAIL_URL", "")
+		if got := (AgentMailConfig{Enabled: true}).NewClient("").BaseURL(); got != DefaultAgentMailURL {
+			t.Fatalf("BaseURL = %q, want default %q", got, DefaultAgentMailURL)
+		}
+	})
+}
 
 func TestDefault(t *testing.T) {
 	cfg := Default()

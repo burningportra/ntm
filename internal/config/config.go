@@ -18,6 +18,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/models"
 	"github.com/Dicklesworthstone/ntm/internal/notify"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
@@ -1328,6 +1329,25 @@ func (a AgentMailConfig) SupervisorEnabledOrDefault() bool {
 		return false
 	}
 	return *a.SupervisorEnabled
+}
+
+// NewClient builds the Agent Mail client for projectKey from these settings.
+// Every surface builds its client here so the server is resolved one way:
+// AGENT_MAIL_URL and AGENT_MAIL_TOKEN override url and token, which override
+// the client defaults. When Enabled is false the client answers every call
+// with agentmail.ErrDisabled instead of contacting the server.
+func (a AgentMailConfig) NewClient(projectKey string) *agentmail.Client {
+	opts := []agentmail.Option{agentmail.WithProjectKey(projectKey)}
+	if a.URL != "" && os.Getenv("AGENT_MAIL_URL") == "" {
+		opts = append(opts, agentmail.WithBaseURL(a.URL))
+	}
+	if a.Token != "" && os.Getenv("AGENT_MAIL_TOKEN") == "" {
+		opts = append(opts, agentmail.WithToken(a.Token))
+	}
+	if !a.Enabled {
+		opts = append(opts, agentmail.WithDisabled())
+	}
+	return agentmail.NewClient(opts...)
 }
 
 // IntegrationsConfig holds external tool integration settings.

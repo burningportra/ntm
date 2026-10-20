@@ -27,6 +27,10 @@ var (
 	// expose the requested MCP capability.
 	ErrNotImplemented = errors.New("operation not supported by agent mail")
 
+	// ErrDisabled is returned by a client built with WithDisabled, which never
+	// contacts the server because the configuration turned Agent Mail off.
+	ErrDisabled = errors.New("agent mail disabled by configuration")
+
 	// ErrAgentNotRegistered is returned when trying to use an unregistered agent.
 	ErrAgentNotRegistered = errors.New("agent not registered")
 

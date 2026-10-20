@@ -50,6 +50,7 @@ type Client struct {
 	bearerToken string
 	httpClient  *http.Client
 	projectKey  string // Cached project path
+	disabled    bool   // Refuse every call without contacting the server
 	requestID   atomic.Int64
 
 	// Per-agent registration tokens. Server-side mcp-agent-mail >=2.13
@@ -162,6 +163,15 @@ func WithHTTPClient(client *http.Client) Option {
 func WithProjectKey(key string) Option {
 	return func(c *Client) {
 		c.projectKey = key
+	}
+}
+
+// WithDisabled makes the client answer every call with ErrDisabled without
+// contacting the server, for configurations that turn Agent Mail off. Its
+// availability probe reports unavailable with ErrDisabled as the reason.
+func WithDisabled() Option {
+	return func(c *Client) {
+		c.disabled = true
 	}
 }
 
@@ -563,6 +573,9 @@ func (c *Client) ping(ctx context.Context) error {
 // rpc posts one JSON-RPC request to the MCP endpoint and returns its raw
 // result. operation names the call in returned errors.
 func (c *Client) rpc(ctx context.Context, operation, method string, params interface{}) (json.RawMessage, error) {
+	if c.disabled {
+		return nil, NewAPIError(operation, 0, ErrDisabled)
+	}
 	rpcReq := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      c.requestID.Add(1),

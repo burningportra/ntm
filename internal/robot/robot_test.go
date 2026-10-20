@@ -6149,6 +6149,80 @@ func TestReadOnlyAgentMailSurfacesDoNotRegisterProject(t *testing.T) {
 	}
 }
 
+// TestRobotAgentMailClientFollowsConfig locks bd-89xi0: robot commands reach
+// the server named by [agent_mail] url with the configured token, and make no
+// Agent Mail request at all when [agent_mail] enabled = false.
+func TestRobotAgentMailClientFollowsConfig(t *testing.T) {
+	projectDir := t.TempDir()
+	var (
+		mu    sync.Mutex
+		auths []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		var req struct {
+			ID     interface{} `json:"id"`
+			Method string      `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		result := map[string]interface{}{}
+		if req.Method == "resources/read" {
+			result = map[string]interface{}{"contents": []map[string]interface{}{{"text": `{"agents":[]}`}}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": result})
+	}))
+	defer server.Close()
+
+	t.Setenv("AGENT_MAIL_URL", "")
+	t.Setenv("AGENT_MAIL_TOKEN", "")
+	t.Setenv("AGENT_MAIL_ENABLED", "")
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	t.Setenv("NTM_CONFIG", configPath)
+	writeConfig := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		mu.Lock()
+		auths = nil
+		mu.Unlock()
+	}
+
+	writeConfig(fmt.Sprintf("[agent_mail]\nurl = %q\ntoken = \"robot-token\"\n", server.URL+"/mcp/"))
+	if got := newAgentMailClient(projectDir).BaseURL(); got != server.URL+"/mcp/" {
+		t.Fatalf("robot client BaseURL = %q, want the configured %q", got, server.URL+"/mcp/")
+	}
+	if summary, _, _ := fetchAgentMailData(projectDir); summary == nil || !summary.Available {
+		t.Fatalf("snapshot mail = %+v, want the configured server reached", summary)
+	}
+	mu.Lock()
+	reached := len(auths) > 0 && auths[0] == "Bearer robot-token"
+	mu.Unlock()
+	if !reached {
+		t.Fatalf("authorization headers = %v, want requests carrying the configured token", auths)
+	}
+
+	writeConfig(fmt.Sprintf("[agent_mail]\nenabled = false\nurl = %q\n", server.URL+"/mcp/"))
+	if summary, _, _ := fetchAgentMailData(projectDir); summary != nil {
+		t.Fatalf("snapshot mail = %+v, want no Agent Mail enrichment when disabled", summary)
+	}
+	mail, err := GetMail(MailOptions{ProjectKey: projectDir})
+	if err != nil {
+		t.Fatalf("GetMail error: %v", err)
+	}
+	if mail.Available {
+		t.Fatal("GetMail Available = true, want false when Agent Mail is disabled")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) != 0 {
+		t.Fatalf("server saw %d requests with Agent Mail disabled, want 0", len(auths))
+	}
+}
+
 func TestIsAgentMailDBLockError(t *testing.T) {
 
 	tests := []struct {

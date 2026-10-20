@@ -1761,7 +1761,7 @@ func newRobotAgentMailReservationRuntime(
 	}
 	var concrete *agentmail.Client
 	if client == nil {
-		concrete = agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+		concrete = newAgentMailClient(projectKey)
 		client = concrete
 	}
 	project, err := client.EnsureProject(ctx, projectKey)

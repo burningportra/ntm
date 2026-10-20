@@ -223,7 +223,10 @@ type WorkCoordinationAdapterConfig struct {
 	ReservationExpiringWithin time.Duration
 	ConflictWindow            time.Duration
 	MailBacklogThreshold      int
-	AgentMailClient           *agentmail.Client
+	// AgentMailClient is the only Agent Mail client the adapter uses; nil
+	// leaves coordination unenriched. Callers build it from the [agent_mail]
+	// config so url, token and enabled apply here as everywhere else.
+	AgentMailClient *agentmail.Client
 }
 
 // DefaultWorkCoordinationAdapterConfig returns conservative defaults.
@@ -283,7 +286,7 @@ func (a *WorkCoordinationAdapter) Available(ctx context.Context) bool {
 	if _, err := os.Stat(filepath.Join(a.config.ProjectDir, ".beads")); err == nil {
 		return true
 	}
-	if client := a.mailClient(); client != nil && client.IsAvailableContext(ctx) {
+	if client := a.config.AgentMailClient; client != nil && client.IsAvailableContext(ctx) {
 		return true
 	}
 	if handoff, _, err := handoffReaderForProject(a.config.ProjectDir).FindLatestAny(); err == nil && handoff != nil {
@@ -368,7 +371,7 @@ func (a *WorkCoordinationAdapter) collectCoordination(ctx context.Context, now t
 		Now:                       now,
 	}
 
-	client := a.mailClient()
+	client := a.config.AgentMailClient
 	if client == nil || !client.IsAvailableContext(ctx) {
 		inputs.Reason = "agent mail unavailable"
 		return NormalizeCoordination(inputs)
@@ -403,16 +406,6 @@ func (a *WorkCoordinationAdapter) collectCoordination(ctx context.Context, now t
 	}
 
 	return NormalizeCoordination(inputs)
-}
-
-func (a *WorkCoordinationAdapter) mailClient() *agentmail.Client {
-	if a.config.AgentMailClient != nil {
-		return a.config.AgentMailClient
-	}
-	if strings.TrimSpace(a.config.ProjectDir) == "" {
-		return nil
-	}
-	return agentmail.NewClient(agentmail.WithProjectKey(a.config.ProjectDir))
 }
 
 // NewWorkSection returns an initialized work section.

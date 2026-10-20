@@ -2563,10 +2563,10 @@ func buildLiveStatus(projectDir string, cfg *config.Config, opts PaginationOptio
 		output.Summary.MailUnread += agent.PendingMail
 	}
 
+	coordinationConfig := adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir)
+	coordinationConfig.AgentMailClient = newAgentMailClient(resolvedProjectDir)
 	aggregator := adapters.NewSignalAggregator(0)
-	aggregator.RegisterAdapter(adapters.NewWorkCoordinationAdapter(
-		adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir),
-	))
+	aggregator.RegisterAdapter(adapters.NewWorkCoordinationAdapter(coordinationConfig))
 	collectCtx, cancel := context.WithTimeout(context.Background(), statusLiveCollectionLimit)
 	defer cancel()
 
@@ -2972,7 +2972,7 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
-	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+	client := newAgentMailClient(projectKey)
 	serverURL := client.BaseURL()
 
 	output := &MailOutput{
@@ -4527,7 +4527,7 @@ func splitLines(s string) []string {
 // fetchAgentMailData retrieves Agent Mail state for the project.
 // Returns the summary, raw agent list, and per-agent stats map.
 func fetchAgentMailData(projectKey string) (*SnapshotAgentMail, []agentmail.Agent, map[string]SnapshotAgentMailStats) {
-	return fetchAgentMailDataContext(context.Background(), agentmail.NewClient(agentmail.WithProjectKey(projectKey)), projectKey)
+	return fetchAgentMailDataContext(context.Background(), newAgentMailClient(projectKey), projectKey)
 }
 
 // fetchAgentMailDataContext reads Agent Mail state through client. It peeks
@@ -7740,7 +7740,7 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 
 	// One Agent Mail client serves the whole refresh, so its availability
 	// probe runs once rather than once per consumer.
-	mailClient := agentmail.NewClient(agentmail.WithProjectKey(resolvedProjectDir))
+	mailClient := newAgentMailClient(resolvedProjectDir)
 	adapterConfig := adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir)
 	adapterConfig.AgentMailClient = mailClient
 	aggregator := adapters.NewSignalAggregator(0)
@@ -7793,7 +7793,7 @@ func resolveNormalizedProjectDir(projectDir string) (string, error) {
 }
 
 func collectNormalizedTmuxProjection(projectDir string, staleAfter time.Duration) (*NormalizedSnapshot, error) {
-	mailClient := agentmail.NewClient(agentmail.WithProjectKey(projectDir))
+	mailClient := newAgentMailClient(projectDir)
 	return collectNormalizedTmuxProjectionContext(context.Background(), context.Background(), mailClient, projectDir, staleAfter)
 }
 
@@ -9428,7 +9428,7 @@ func buildCorrelationGraph() *GraphCorrelation {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	agentMailClient := agentmail.NewClient(agentmail.WithProjectKey(wd))
+	agentMailClient := newAgentMailClient(wd)
 	var agents []agentmail.Agent
 	if agentMailClient.IsAvailable() {
 		// An unregistered directory has no mail agents to correlate; the graph
@@ -10302,6 +10302,17 @@ func PrintTerse(cfg *config.Config) error {
 // would register every directory they run in.
 const agentMailProjectNotRegistered = "project not registered with Agent Mail"
 
+// newAgentMailClient builds every Agent Mail client in the robot package from
+// the merged config for projectKey, the way the cli builds its own, so the
+// [agent_mail] url, token and enabled settings apply to robot commands too.
+func newAgentMailClient(projectKey string) *agentmail.Client {
+	cfg, err := config.LoadMerged(projectKey, config.DefaultPath())
+	if err != nil {
+		cfg = config.Default()
+	}
+	return cfg.AgentMail.NewClient(projectKey)
+}
+
 func isAgentMailDBLockError(err error) bool {
 	if err == nil {
 		return false
@@ -10323,7 +10334,7 @@ func getTerseMailCount() int {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+	client := newAgentMailClient(projectKey)
 	if !client.IsAvailable() {
 		return 0
 	}
@@ -10357,7 +10368,7 @@ func getAgentMailSummary() (*AgentMailSummary, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+	client := newAgentMailClient(projectKey)
 	summary := &AgentMailSummary{
 		Available: false,
 		ServerURL: client.BaseURL(),
