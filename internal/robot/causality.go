@@ -566,11 +566,13 @@ func loadCausalityInboxResource(ctx context.Context, client causalityAgentMailCl
 		return nil, fmt.Errorf("inbox resource returned no content")
 	}
 
-	var inbox []agentmail.InboxMessage
+	var inbox struct {
+		Messages []agentmail.InboxMessage `json:"messages"`
+	}
 	if err := json.Unmarshal([]byte(response.Contents[0].Text), &inbox); err != nil {
 		return nil, fmt.Errorf("decode inbox resource messages: %w", err)
 	}
-	return inbox, nil
+	return inbox.Messages, nil
 }
 
 func loadSessionTimelineCausalityEvents(opts CausalityOptions, since, until *time.Time) ([]CausalityEvent, error) {

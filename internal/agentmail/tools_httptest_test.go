@@ -471,18 +471,18 @@ func TestListContacts(t *testing.T) {
 	}
 }
 
+// capturedRustSearchMessagesReply is the tool text of a real search_messages
+// reply from the Rust Agent Mail server (am 0.3.36). ack_required arrives as
+// the 0/1 integer stored in SQLite, not a JSON boolean; the Python server's
+// FTS query returns the same integer.
+const capturedRustSearchMessagesReply = `{"result":[{"id":54667,"subject":"[bd-0clbc] fixture B: normal, stays unread","importance":"normal","ack_required":0,"created_ts":"2026-10-20T02:21:16.648945Z","thread_id":"bd-0clbc","from":"SapphireSquirrel","to":["SapphireSquirrel"],"cc":[]},{"id":54666,"subject":"[bd-0clbc] fixture A: urgent, will be marked read","importance":"urgent","ack_required":1,"created_ts":"2026-10-20T02:21:15.751360Z","thread_id":"bd-0clbc","from":"SapphireSquirrel","to":["SapphireSquirrel"],"cc":[]}],"next_cursor":"s402d076a40000000:i54666"}`
+
 func TestSearchMessages(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
 		"search_messages": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return map[string]interface{}{
-				"result": []SearchResult{
-					{ID: 1, Subject: "Build plan", From: "BlueLake"},
-					{ID: 2, Subject: "Build update", From: "RedStone"},
-				},
-				"assistance": "use recency ranking for recent activity",
-			}, nil
+			return json.RawMessage(capturedRustSearchMessagesReply), nil
 		},
 	}))
 	defer server.Close()
@@ -490,7 +490,7 @@ func TestSearchMessages(t *testing.T) {
 	c := NewClient(WithBaseURL(server.URL + "/"))
 	results, err := c.SearchMessages(context.Background(), SearchOptions{
 		ProjectKey: "/test",
-		Query:      "build",
+		Query:      "fixture",
 		Limit:      10,
 	})
 	if err != nil {
@@ -498,6 +498,15 @@ func TestSearchMessages(t *testing.T) {
 	}
 	if len(results) != 2 {
 		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
+	if results[0].ID != 54667 || results[0].AckRequired {
+		t.Errorf("results[0] = %+v, want id 54667 with ack_required false", results[0])
+	}
+	if results[1].ID != 54666 || !results[1].AckRequired || results[1].Importance != "urgent" {
+		t.Errorf("results[1] = %+v, want urgent id 54666 with ack_required true", results[1])
+	}
+	if results[1].ThreadID == nil || *results[1].ThreadID != "bd-0clbc" || results[1].From != "SapphireSquirrel" {
+		t.Errorf("results[1] thread/from = %v/%q", results[1].ThreadID, results[1].From)
 	}
 }
 
@@ -773,19 +782,17 @@ func TestStartSession(t *testing.T) {
 	}
 }
 
+// capturedRustPrepareThreadReply is a real macro_prepare_thread reply from the
+// Rust Agent Mail server (am 0.3.36, llm_mode=false), with the two key_points
+// shortened. The summary and examples sit under "thread", not at the top level.
+const capturedRustPrepareThreadReply = `{"project":{"id":65,"slug":"volumes-1tb-projects-ntm","human_key":"/Volumes/1tb/Projects/ntm","created_at":"2026-10-19T19:40:42.553833Z"},"agent":{"id":2109,"name":"SapphireSquirrel","program":"claude-code","model":"claude-opus-5-5","task_description":"bd-0clbc: decode Agent Mail read_ts (not read_at) in ntm agentmail types","inception_ts":"2026-10-20T02:16:43.412357Z","last_active_ts":"2026-10-20T02:16:43.412357Z","project_id":65,"attachments_policy":"auto","reaper_exempt":false,"capabilities":["send_message","fetch_inbox","file_reservation_paths","acknowledge_message"]},"thread":{"thread_id":"bd-0clbc","summary":{"participants":["SapphireSquirrel"],"key_points":["**server_test.go, force-release mocks**","**mail.go contact handlers**"],"action_items":[],"total_messages":4,"open_actions":0,"done_actions":0,"mentions":[]},"examples":[{"id":54667,"from":"SapphireSquirrel","subject":"[bd-0clbc] fixture B: normal, stays unread","created_ts":"2026-10-20T02:21:16.648945Z"},{"id":54677,"from":"SapphireSquirrel","subject":"[bd-0clbc] Start: decode Agent Mail read_ts","created_ts":"2026-10-20T02:24:42.068766Z"},{"id":54688,"from":"SapphireSquirrel","subject":"[bd-0clbc] need small hunks in internal/serve/mail.go + server_test.go","created_ts":"2026-10-20T02:32:20.655288Z"}],"total_messages":4},"inbox":[{"id":54667,"project_id":65,"sender_id":2109,"thread_id":"bd-0clbc","topic":null,"subject":"[bd-0clbc] fixture B: normal, stays unread","importance":"normal","ack_required":false,"from":"SapphireSquirrel","created_ts":"2026-10-20T02:21:16.648945Z","read_ts":"2026-10-20T02:33:43.631560Z","kind":"to","attachments":[]}]}`
+
 func TestPrepareThread(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
 		"macro_prepare_thread": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return PrepareThreadResult{
-				Agent: &Agent{ID: 5, Name: "BlueLake"},
-				ThreadSummary: &ThreadSummary{
-					ThreadID:    args["thread_id"].(string),
-					KeyPoints:   []string{"point1"},
-					ActionItems: []string{"item1"},
-				},
-			}, nil
+			return json.RawMessage(capturedRustPrepareThreadReply), nil
 		},
 	}))
 	defer server.Close()
@@ -810,8 +817,20 @@ func TestPrepareThread(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.ThreadSummary.ThreadID != "TKT-99" {
-		t.Errorf("thread_id = %q, want TKT-99", result.ThreadSummary.ThreadID)
+	if result.Thread.ThreadID != "bd-0clbc" || result.Thread.TotalMessages != 4 {
+		t.Errorf("thread = %q with %d messages, want bd-0clbc with 4", result.Thread.ThreadID, result.Thread.TotalMessages)
+	}
+	if got := result.Thread.Summary.KeyPoints; len(got) != 2 || got[1] != "**mail.go contact handlers**" {
+		t.Errorf("summary key_points = %q", got)
+	}
+	if len(result.Thread.Examples) != 3 || result.Thread.Examples[2].ID != 54688 {
+		t.Errorf("examples = %+v, want 3 ending with id 54688", result.Thread.Examples)
+	}
+	if result.Agent == nil || result.Agent.Name != "SapphireSquirrel" || result.Project == nil || result.Project.Slug != "volumes-1tb-projects-ntm" {
+		t.Errorf("agent/project = %+v / %+v", result.Agent, result.Project)
+	}
+	if len(result.Inbox) != 1 || result.Inbox[0].ReadAt == nil {
+		t.Errorf("inbox = %+v, want one row with read_ts decoded", result.Inbox)
 	}
 }
 
@@ -820,10 +839,14 @@ func TestContactHandshake(t *testing.T) {
 
 	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
 		"macro_contact_handshake": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return ContactHandshakeResult{
-				Agent:         &Agent{ID: 5, Name: "BlueLake"},
-				ContactStatus: "approved",
-			}, nil
+			// Both servers nest the request_contact, respond_contact and
+			// send_message replies (Rust macros.rs HandshakeResponse,
+			// Python app.py macro_contact_handshake).
+			return json.RawMessage(`{
+				"request":{"from":"TestAgent","from_project":"/test","to":"BlueLake","to_project":"/other","status":"pending","expires_ts":"2026-10-20T04:30:00Z"},
+				"response":{"from":"TestAgent","to":"BlueLake","approved":true,"expires_ts":"2026-10-20T04:30:00Z","updated":1},
+				"welcome_message":{"deliveries":[{"project":"/test","payload":{"id":321,"project_id":1,"sender_id":2,"thread_id":null,"topic":null,"subject":"Hello!","body_md":"Hi there","importance":"normal","ack_required":false,"created_ts":"2026-10-20T02:30:00.000000Z","attachments":[],"from":"TestAgent","to":["BlueLake"],"cc":[],"bcc":[]}}],"count":1,"attachments":[],"verified_sender":false}
+			}`), nil
 		},
 	}))
 	defer server.Close()
@@ -846,8 +869,15 @@ func TestContactHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.ContactStatus != "approved" {
-		t.Errorf("status = %q, want approved", result.ContactStatus)
+	if result.Request.Status != "pending" || result.Request.ExpiresTS == nil {
+		t.Errorf("request = %+v, want pending with expires_ts", result.Request)
+	}
+	if result.Response == nil || result.Response.ExpiresTS == nil {
+		t.Errorf("response = %+v, want the respond_contact reply", result.Response)
+	}
+	if result.WelcomeMessage == nil || len(result.WelcomeMessage.Deliveries) != 1 ||
+		result.WelcomeMessage.Deliveries[0].Payload == nil || result.WelcomeMessage.Deliveries[0].Payload.Subject != "Hello!" {
+		t.Errorf("welcome_message = %+v, want one delivery with subject Hello!", result.WelcomeMessage)
 	}
 }
 
@@ -1061,9 +1091,11 @@ func TestSetContactPolicy(t *testing.T) {
 
 	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
 		"set_contact_policy": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return ContactPolicyResult{
-				AgentName: "BlueLake",
-				Policy:    args["policy"].(string),
+			// Both servers reply {agent, policy} (Rust contacts.rs
+			// SimplePolicyResponse, Python app.py set_contact_policy).
+			return map[string]interface{}{
+				"agent":  "BlueLake",
+				"policy": args["policy"],
 			}, nil
 		},
 	}))

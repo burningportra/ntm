@@ -665,7 +665,7 @@ func TestLoadAgentMailCausalityEvents_UsesReadOnlyInboxResource(t *testing.T) {
 	client := &causalityAgentMailClientStub{
 		resource: json.RawMessage(`{
 			"contents": [{
-				"text": "[{\"id\":17,\"subject\":\"[bd-vxk7r] update\",\"from\":\"BlueLake\",\"created_ts\":\"2026-08-06T05:00:00Z\",\"thread_id\":\"bd-vxk7r\",\"importance\":\"high\",\"ack_required\":true,\"kind\":\"to\"}]"
+				"text": "{\"agent\":\"Blue Lake\",\"count\":1,\"messages\":[{\"id\":17,\"project_id\":1,\"sender_id\":2,\"thread_id\":\"bd-vxk7r\",\"topic\":null,\"subject\":\"[bd-vxk7r] update\",\"importance\":\"high\",\"ack_required\":true,\"from\":\"BlueLake\",\"created_ts\":\"2026-08-06T05:00:00Z\",\"kind\":\"to\",\"attachments\":[],\"commit\":{\"authored_ts\":null,\"deletions\":0,\"diff_summary\":{\"excerpt\":[],\"hunks\":0},\"hexsha\":null,\"insertions\":0,\"summary\":\"\"}}],\"project\":\"/tmp/project with space\"}"
 			}]
 		}`),
 	}

@@ -134,7 +134,26 @@ type InboxMessage struct {
 	AckRequired bool      `json:"ack_required"`
 	Kind        string    `json:"kind"`
 	BodyMD      string    `json:"body_md,omitempty"` // Only if include_bodies=true
-	ReadAt      *FlexTime `json:"read_at,omitempty"`
+	ReadAt      *FlexTime `json:"read_ts,omitempty"` // nil means unread; see UnmarshalJSON
+}
+
+// UnmarshalJSON decodes an inbox row. The Rust Agent Mail server sends the
+// recipient's read time as read_ts and the Python server sends it as read_at,
+// so ReadAt takes whichever one is set.
+func (m *InboxMessage) UnmarshalJSON(data []byte) error {
+	type inboxMessageFields InboxMessage
+	var raw struct {
+		inboxMessageFields
+		PythonReadAt *FlexTime `json:"read_at"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = InboxMessage(raw.inboxMessageFields)
+	if m.ReadAt == nil {
+		m.ReadAt = raw.PythonReadAt
+	}
+	return nil
 }
 
 // ContactLink represents a contact relationship between agents.
@@ -346,6 +365,22 @@ type SearchResult struct {
 	From        string   `json:"from"`
 }
 
+// UnmarshalJSON decodes a search_messages row. Both servers send ack_required
+// there as the 0/1 integer stored in SQLite rather than a JSON boolean.
+func (r *SearchResult) UnmarshalJSON(data []byte) error {
+	type searchResultFields SearchResult
+	var raw struct {
+		searchResultFields
+		AckRequired int `json:"ack_required"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = SearchResult(raw.searchResultFields)
+	r.AckRequired = raw.AckRequired != 0
+	return nil
+}
+
 // OverseerMessageOptions contains options for sending a Human Overseer message.
 // Human Overseer messages bypass contact policies (the overseer agent is
 // registered with a permissive policy) and are auto-marked as high
@@ -397,10 +432,18 @@ type PrepareThreadOptions struct {
 
 // PrepareThreadResult contains the result of macro_prepare_thread.
 type PrepareThreadResult struct {
-	Agent         *Agent         `json:"agent"`
-	ThreadSummary *ThreadSummary `json:"thread_summary"`
-	Examples      []InboxMessage `json:"examples,omitempty"`
-	Inbox         []InboxMessage `json:"inbox"`
+	Project *Project       `json:"project"`
+	Agent   *Agent         `json:"agent"`
+	Thread  PreparedThread `json:"thread"`
+	Inbox   []InboxMessage `json:"inbox"`
+}
+
+// PreparedThread is the thread block of a macro_prepare_thread reply.
+type PreparedThread struct {
+	ThreadID      string         `json:"thread_id"`
+	Summary       ThreadSummary  `json:"summary"`
+	Examples      []InboxMessage `json:"examples,omitempty"` // id, from, subject, created_ts only
+	TotalMessages int            `json:"total_messages"`
 }
 
 // ContactHandshakeOptions contains options for the macro_contact_handshake call.
@@ -419,12 +462,13 @@ type ContactHandshakeOptions struct {
 	TTLSeconds      int    // TTL for contact approval
 }
 
-// ContactHandshakeResult contains the result of macro_contact_handshake.
+// ContactHandshakeResult contains the result of macro_contact_handshake: the
+// request_contact reply, the respond_contact reply when auto_accept approved
+// the request, and the send_message reply when a welcome message went out.
 type ContactHandshakeResult struct {
-	Agent         *Agent       `json:"agent,omitempty"`
-	ContactStatus string       `json:"contact_status"` // "approved", "pending", "denied"
-	Link          *ContactLink `json:"link,omitempty"`
-	WelcomeMsg    *Message     `json:"welcome_message,omitempty"`
+	Request        ContactRequestResult  `json:"request"`
+	Response       *ContactRespondResult `json:"response,omitempty"`
+	WelcomeMessage *SendResult           `json:"welcome_message,omitempty"`
 }
 
 // RequestContactOptions contains options for requesting contact with an agent.
@@ -448,7 +492,7 @@ type RespondContactOptions struct {
 
 // ContactPolicyResult contains the result of setting an agent's contact policy.
 type ContactPolicyResult struct {
-	AgentName string `json:"agent_name,omitempty"`
+	AgentName string `json:"agent,omitempty"`
 	Policy    string `json:"policy,omitempty"`
 }
 

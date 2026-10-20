@@ -1,8 +1,11 @@
 package agentmail
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -437,5 +440,118 @@ func TestFlexTimeUnmarshalJSON_BareFormatParsedAsUTC(t *testing.T) {
 	}
 	if ft.Time.Year() != 2026 || ft.Time.Month() != 3 || ft.Time.Day() != 15 {
 		t.Errorf("parsed date = %v, want 2026-03-15", ft.Time)
+	}
+}
+
+// =============================================================================
+// InboxMessage read state
+// =============================================================================
+
+// capturedRustFetchInboxResult is the JSON-RPC result of a real fetch_inbox
+// call (mark_read=false) against the Rust Agent Mail server, am 0.3.36.
+// Message 54666 had been marked read with mark_message_read; 54667 had not.
+const capturedRustFetchInboxResult = `{"content":[{"type":"text","text":"[{\"id\":54667,\"project_id\":65,\"sender_id\":2109,\"thread_id\":\"bd-0clbc\",\"topic\":null,\"subject\":\"[bd-0clbc] fixture B: normal, stays unread\",\"importance\":\"normal\",\"ack_required\":false,\"from\":\"SapphireSquirrel\",\"created_ts\":\"2026-10-20T02:21:16.648945Z\",\"kind\":\"to\",\"attachments\":[]},{\"id\":54666,\"project_id\":65,\"sender_id\":2109,\"thread_id\":\"bd-0clbc\",\"topic\":null,\"subject\":\"[bd-0clbc] fixture A: urgent, will be marked read\",\"importance\":\"urgent\",\"ack_required\":true,\"from\":\"SapphireSquirrel\",\"created_ts\":\"2026-10-20T02:21:15.751360Z\",\"read_ts\":\"2026-10-20T02:21:19.493225Z\",\"kind\":\"to\",\"attachments\":[]}]"}]}`
+
+// TestFetchInbox_CapturedRustReplyKeepsReadState replays a real server reply
+// through FetchInbox. The Rust server sends the read time as read_ts, and
+// every unread count in ntm depends on ReadAt picking it up.
+func TestFetchInbox_CapturedRustReplyKeepsReadState(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		result := json.RawMessage(`{}`)
+		if req.Method == "tools/call" {
+			result = json.RawMessage(capturedRustFetchInboxResult)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result})
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	msgs, err := c.FetchInbox(context.Background(), FetchInboxOptions{
+		ProjectKey: "/Volumes/1tb/Projects/ntm",
+		AgentName:  "SapphireSquirrel",
+		Peek:       true,
+	})
+	if err != nil {
+		t.Fatalf("FetchInbox: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("len(msgs) = %d, want 2", len(msgs))
+	}
+
+	byID := map[int]InboxMessage{}
+	for _, m := range msgs {
+		byID[m.ID] = m
+	}
+	read, unread := byID[54666], byID[54667]
+	wantReadAt := time.Date(2026, 10, 20, 2, 21, 19, 493225000, time.UTC)
+	if read.ReadAt == nil || !read.ReadAt.Time.Equal(wantReadAt) {
+		t.Errorf("message 54666 ReadAt = %v, want %v", read.ReadAt, wantReadAt)
+	}
+	if read.Importance != "urgent" || !read.AckRequired || read.ThreadID == nil || *read.ThreadID != "bd-0clbc" {
+		t.Errorf("message 54666 decoded as %+v", read)
+	}
+	if unread.ReadAt != nil {
+		t.Errorf("message 54667 ReadAt = %v, want nil (unread)", unread.ReadAt.Time)
+	}
+}
+
+// TestInboxMessageUnmarshalJSON_ReadState covers both servers' names for the
+// read time: read_ts from the Rust server and read_at from the Python server
+// (app.py _list_inbox sets read_at to an ISO time or null).
+func TestInboxMessageUnmarshalJSON_ReadState(t *testing.T) {
+	t.Parallel()
+
+	readTime := time.Date(2026, 10, 20, 2, 21, 19, 493225000, time.UTC)
+	tests := []struct {
+		name       string
+		row        string
+		wantReadAt *time.Time
+	}{
+		{
+			name:       "rust read_ts",
+			row:        `{"id":1,"subject":"s","from":"A","created_ts":"2026-10-20T02:21:15.751360Z","read_ts":"2026-10-20T02:21:19.493225Z","kind":"to"}`,
+			wantReadAt: &readTime,
+		},
+		{
+			name: "rust unread omits read_ts",
+			row:  `{"id":1,"subject":"s","from":"A","created_ts":"2026-10-20T02:21:15.751360Z","kind":"to"}`,
+		},
+		{
+			name:       "python read_at",
+			row:        `{"id":1,"project_id":2,"sender_id":3,"thread_id":null,"reply_to":null,"topic":null,"subject":"s","importance":"normal","ack_required":false,"created_ts":"2026-10-20T02:21:15.751360+00:00","attachments":[],"from":"A","kind":"to","read_at":"2026-10-20T02:21:19.493225+00:00"}`,
+			wantReadAt: &readTime,
+		},
+		{
+			name: "python unread sends null read_at",
+			row:  `{"id":1,"project_id":2,"sender_id":3,"thread_id":null,"reply_to":null,"topic":null,"subject":"s","importance":"normal","ack_required":false,"created_ts":"2026-10-20T02:21:15.751360+00:00","attachments":[],"from":"A","kind":"to","read_at":null}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var m InboxMessage
+			if err := json.Unmarshal([]byte(tt.row), &m); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if m.ID != 1 || m.From != "A" || m.Kind != "to" {
+				t.Errorf("other fields decoded as %+v", m)
+			}
+			switch {
+			case tt.wantReadAt == nil && m.ReadAt != nil:
+				t.Errorf("ReadAt = %v, want nil", m.ReadAt.Time)
+			case tt.wantReadAt != nil && (m.ReadAt == nil || !m.ReadAt.Time.Equal(*tt.wantReadAt)):
+				t.Errorf("ReadAt = %v, want %v", m.ReadAt, *tt.wantReadAt)
+			}
+		})
 	}
 }

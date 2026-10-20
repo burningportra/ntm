@@ -228,7 +228,7 @@ func TestContactHandshakeAttachesRequesterAndTargetTokens(t *testing.T) {
 			tgt, _ := args["target_registration_token"].(string)
 			requesterToken.Store(req)
 			targetToken.Store(tgt)
-			return ContactHandshakeResult{ContactStatus: "approved"}, nil
+			return ContactHandshakeResult{Request: ContactRequestResult{Status: "pending"}}, nil
 		},
 	}))
 	defer server.Close()
