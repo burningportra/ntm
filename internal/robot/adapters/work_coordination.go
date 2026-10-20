@@ -18,7 +18,6 @@ import (
 )
 
 const (
-	defaultWorkItemLimit             = 10
 	defaultThreadStaleAfter          = 24 * time.Hour
 	defaultReservationExpiringWithin = time.Hour
 	defaultConflictWindow            = 30 * time.Minute
@@ -222,8 +221,12 @@ type CoordinationInputs struct {
 // WorkCoordinationAdapterConfig controls live work and coordination
 // collection. WorkAdapter and CoordinationAdapter share it.
 type WorkCoordinationAdapterConfig struct {
-	ProjectDir                string
-	SessionName               string
+	ProjectDir  string
+	SessionName string
+	// WorkItemLimit caps the ready, blocked and in-progress lists. Zero, the
+	// default, reads them all: the runtime projection counts these rows, so
+	// a cap held --robot-status ready_work at the cap however many beads br
+	// ready listed (bd-9k16u).
 	WorkItemLimit             int
 	ThreadStaleAfter          time.Duration
 	ReservationExpiringWithin time.Duration
@@ -239,7 +242,6 @@ type WorkCoordinationAdapterConfig struct {
 func DefaultWorkCoordinationAdapterConfig(projectDir string) WorkCoordinationAdapterConfig {
 	return WorkCoordinationAdapterConfig{
 		ProjectDir:                projectDir,
-		WorkItemLimit:             defaultWorkItemLimit,
 		ThreadStaleAfter:          defaultThreadStaleAfter,
 		ReservationExpiringWithin: defaultReservationExpiringWithin,
 		ConflictWindow:            defaultConflictWindow,
@@ -276,8 +278,8 @@ func NewCoordinationAdapter(config WorkCoordinationAdapterConfig) *CoordinationA
 }
 
 func withWorkCoordinationDefaults(config WorkCoordinationAdapterConfig) WorkCoordinationAdapterConfig {
-	if config.WorkItemLimit <= 0 {
-		config.WorkItemLimit = defaultWorkItemLimit
+	if config.WorkItemLimit < 0 {
+		config.WorkItemLimit = 0
 	}
 	if config.ThreadStaleAfter <= 0 {
 		config.ThreadStaleAfter = defaultThreadStaleAfter

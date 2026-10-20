@@ -7185,24 +7185,41 @@ func TestProjectionBackedSessionsRequireEveryLiveSession(t *testing.T) {
 	}
 }
 
-// fakeBRBlockedScript answers like br on a project with one ready bead, one
-// in progress and two blocked beads, in the reply shapes br sends.
+// fakeBRBlockedScript answers like br on a project with 25 ready beads, one
+// in progress and two blocked beads, in the reply shapes br sends. Like br,
+// ready lists 20 beads unless --limit says otherwise, and 0 lists them all.
 const fakeBRBlockedScript = `#!/bin/sh
+cmd=""; limit=""; prev=""
 for arg in "$@"; do
-  case "$arg" in
-    stats) echo '{"summary":{"total_issues":4,"open_issues":3,"in_progress_issues":1,"blocked_issues":2,"ready_issues":1,"closed_issues":0}}'; exit 0 ;;
-    ready) echo '[{"id":"bd-r","title":"Ready bead","priority":1,"status":"open","issue_type":"task"}]'; exit 0 ;;
-    list) echo '[{"id":"bd-p","title":"Bead in progress","status":"in_progress","assignee":"BlueLake","updated_at":"2026-10-19T00:00:00Z"}]'; exit 0 ;;
-    blocked) echo '[{"id":"bd-b1","title":"Blocked once","priority":2,"status":"open","issue_type":"task","blocked_by":["bd-r"],"blocked_by_count":1},{"id":"bd-b2","title":"Blocked twice","priority":2,"status":"open","issue_type":"epic","blocked_by":["bd-r","bd-p"],"blocked_by_count":2}]'; exit 0 ;;
-  esac
+  if [ "$prev" = "--limit" ]; then limit="$arg"; fi
+  case "$arg" in stats|ready|list|blocked) if [ -z "$cmd" ]; then cmd="$arg"; fi ;; esac
+  prev="$arg"
 done
-exit 1
+case "$cmd" in
+  stats) echo '{"summary":{"total_issues":28,"open_issues":27,"in_progress_issues":1,"blocked_issues":2,"ready_issues":25,"closed_issues":0}}' ;;
+  ready)
+    n=25; max="${limit:-20}"
+    if [ "$max" -gt 0 ] && [ "$max" -lt "$n" ]; then n="$max"; fi
+    printf '['; i=1
+    while [ "$i" -le "$n" ]; do
+      if [ "$i" -gt 1 ]; then printf ','; fi
+      printf '{"id":"bd-r%d","title":"Ready bead %d","priority":1,"status":"open","issue_type":"task"}' "$i" "$i"
+      i=$((i + 1))
+    done
+    echo ']' ;;
+  list) echo '[{"id":"bd-p","title":"Bead in progress","status":"in_progress","assignee":"BlueLake","updated_at":"2026-10-19T00:00:00Z"}]' ;;
+  blocked) echo '[{"id":"bd-b1","title":"Blocked once","priority":2,"status":"open","issue_type":"task","blocked_by":["bd-r1"],"blocked_by_count":1},{"id":"bd-b2","title":"Blocked twice","priority":2,"status":"open","issue_type":"epic","blocked_by":["bd-r1","bd-p"],"blocked_by_count":2}]' ;;
+  *) exit 1 ;;
+esac
 `
 
-// bd-9k16u: blockers reached the projection only through bv triage, which
-// seldom recommends a blocked bead, so the beads from br blocked were saved
-// as open with no blockers and --robot-status and --robot-snapshot counted
-// them as ready work: ready_work said 3 where br ready said 1.
+// bd-9k16u: --robot-status and --robot-snapshot count the projection's work
+// rows, and those rows disagreed with br ready twice over. Blockers reached
+// them only through bv triage, which seldom recommends a blocked bead, so the
+// beads from br blocked were saved as open with no blockers and counted as
+// ready; and the ready rows stopped at ten, below br ready's own 20, so no
+// count above ten was possible. On this project ready_work said 12 where br
+// ready said 25.
 func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 	projectDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(projectDir, ".beads"), 0o755); err != nil {
@@ -7223,7 +7240,7 @@ func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect work: %v", err)
 	}
-	const brReady = 1
+	const brReady = 25
 
 	store := newTestAttentionStore(t)
 	now := time.Now().UTC()
@@ -7249,8 +7266,13 @@ func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 		t.Fatalf("ListFreshRuntimeWork: %v", err)
 	}
 	work := snapshotWorkFromRuntime(rows, 0)
-	if work.Summary.Ready != brReady || work.Summary.Blocked != 2 || len(work.Ready) != brReady || work.Ready[0].ID != "bd-r" {
-		t.Fatalf("snapshot work summary = %+v, ready = %+v; want only bd-r ready and two blocked", work.Summary, work.Ready)
+	if work.Summary.Ready != brReady || work.Summary.Blocked != 2 || len(work.Ready) != brReady {
+		t.Fatalf("snapshot work summary = %+v with %d ready items; want %d ready and two blocked", work.Summary, len(work.Ready), brReady)
+	}
+	for _, item := range work.Ready {
+		if !strings.HasPrefix(item.ID, "bd-r") {
+			t.Fatalf("ready items = %+v, want only br ready's beads", work.Ready)
+		}
 	}
 	beads, err := snapshotBeadsSummaryFromRuntime(store, projectDir, 0)
 	if err != nil {

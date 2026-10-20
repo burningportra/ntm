@@ -3005,11 +3005,17 @@ func GetReadyPreview(dir string, limit int) []BeadPreview {
 	return previews
 }
 
-// GetReadyPreviewContext returns ready beads and preserves command, parse, and
-// cancellation failures so callers can distinguish checked-empty from unknown.
+// GetReadyPreviewContext returns up to limit ready beads, or every ready bead
+// when limit is zero, and preserves command, parse, and cancellation failures
+// so callers can distinguish checked-empty from unknown.
 func GetReadyPreviewContext(ctx context.Context, dir string, limit int) ([]BeadPreview, error) {
+	if limit < 0 {
+		return nil, fmt.Errorf("ready limit must not be negative: %d", limit)
+	}
 	previews := make([]BeadPreview, 0)
-	output, err := RunBdContext(ctx, dir, "ready", "--json")
+	// br ready lists 20 beads unless told otherwise, and 0 is its unlimited
+	// mode, so forward the limit rather than trimming br's default.
+	output, err := RunBdContext(ctx, dir, "ready", "--json", "--limit", strconv.Itoa(limit))
 	if err != nil {
 		return nil, fmt.Errorf("list ready beads: %w", err)
 	}
@@ -3027,9 +3033,8 @@ func GetReadyPreviewContext(ctx context.Context, dir string, limit int) ([]BeadP
 		return nil, fmt.Errorf("parse ready beads: %w", err)
 	}
 
-	// Take up to limit items
 	for i, issue := range issues {
-		if i >= limit {
+		if limit > 0 && i >= limit {
 			break
 		}
 		previews = append(previews, BeadPreview{
@@ -3156,11 +3161,16 @@ func GetBlockedList(dir string, limit int) []BeadPreview {
 	return items
 }
 
-// GetBlockedListContext returns blocked beads without erasing command, parse,
-// or cancellation failures.
+// GetBlockedListContext returns up to limit blocked beads, or every blocked
+// bead when limit is zero, without erasing command, parse, or cancellation
+// failures.
 func GetBlockedListContext(ctx context.Context, dir string, limit int) ([]BeadPreview, error) {
+	if limit < 0 {
+		return nil, fmt.Errorf("blocked limit must not be negative: %d", limit)
+	}
 	items := make([]BeadPreview, 0)
-	output, err := RunBdContext(ctx, dir, "blocked", "--json")
+	// br blocked lists 50 beads unless told otherwise; 0 is its unlimited mode.
+	output, err := RunBdContext(ctx, dir, "blocked", "--json", "--limit", strconv.Itoa(limit))
 	if err != nil {
 		return nil, fmt.Errorf("list blocked beads: %w", err)
 	}
@@ -3175,9 +3185,8 @@ func GetBlockedListContext(ctx context.Context, dir string, limit int) ([]BeadPr
 		return nil, fmt.Errorf("parse blocked beads: %w", err)
 	}
 
-	// Take up to limit items
 	for i, issue := range issues {
-		if i >= limit {
+		if limit > 0 && i >= limit {
 			break
 		}
 		items = append(items, BeadPreview{
