@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -387,6 +388,34 @@ func TestSnapshotSessionCountsCanonicalizesAndKeepsNewerTypes(t *testing.T) {
 	}
 	if states["idle"] != 2 || states["error"] != 2 || states["active"] != 4 {
 		t.Fatalf("states = %+v, want idle=2 error=2 active=4", states)
+	}
+}
+
+// TestMarkdownAgentCountsCoverEveryAgentType checks every launchable agent
+// type has its own markdown bucket: agy used to land in "other" and Opencode
+// was in the label table but never counted.
+func TestMarkdownAgentCountsCoverEveryAgentType(t *testing.T) {
+	for _, agentType := range agent.AgentTypes() {
+		key := markdownAgentTypeKey(string(agentType))
+		if key == "other" {
+			t.Errorf("agent type %q has no markdown count bucket", agentType)
+		}
+		if _, ok := markdownAgentTypeLabels[key]; !ok {
+			t.Errorf("agent type %q bucket %q has no label", agentType, key)
+		}
+	}
+
+	counts := countAgentsByType([]tmux.Pane{
+		{Type: tmux.AgentAntigravity},
+		{Type: tmux.AgentType("opencode")},
+		{Type: tmux.AgentOpencode},
+		{Type: tmux.AgentType("mystery")},
+	})
+	if counts["antigravity"] != 1 || counts["oc"] != 2 || counts["other"] != 1 {
+		t.Fatalf("countAgentsByType = %+v, want antigravity=1 oc=2 other=1", counts)
+	}
+	if got, want := formatMarkdownAgentTypeCounts(counts), "agy:1 oc:2 oth:1"; got != want {
+		t.Fatalf("formatMarkdownAgentTypeCounts = %q, want %q", got, want)
 	}
 }
 

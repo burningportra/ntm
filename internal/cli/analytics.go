@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 )
@@ -259,12 +261,7 @@ func updateAgentStats(breakdown map[string]AgentStats, agentType string, countDe
 }
 
 func isAnalyticsAgentType(agentType string) bool {
-	switch agentType {
-	case "claude", "codex", "gemini", "pi", "kimi", "muse", "grok", "cursor", "windsurf", "aider", "oc", "ollama":
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(agentpkg.AgentTypes(), agentpkg.AgentType(agentType).Canonical())
 }
 
 // parseTargetTypes parses the target_types string to extract agent types.

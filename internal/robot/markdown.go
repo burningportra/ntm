@@ -294,6 +294,7 @@ var markdownAgentTypeOrder = []string{
 	"pi",
 	"kimi",
 	"muse",
+	"antigravity",
 	"grok",
 	"cursor",
 	"windsurf",
@@ -305,20 +306,31 @@ var markdownAgentTypeOrder = []string{
 }
 
 var markdownAgentTypeLabels = map[string]string{
-	"claude":   "cc",
-	"codex":    "cod",
-	"gemini":   "gmi",
-	"pi":       "pi",
-	"kimi":     "kimi",
-	"muse":     "muse",
-	"grok":     "grok",
-	"cursor":   "cur",
-	"windsurf": "ws",
-	"aider":    "aid",
-	"oc":       "oc",
-	"ollama":   "oll",
-	"user":     "usr",
-	"other":    "oth",
+	"claude":      "cc",
+	"codex":       "cod",
+	"gemini":      "gmi",
+	"pi":          "pi",
+	"kimi":        "kimi",
+	"muse":        "muse",
+	"antigravity": "agy",
+	"grok":        "grok",
+	"cursor":      "cur",
+	"windsurf":    "ws",
+	"aider":       "aid",
+	"oc":          "oc",
+	"ollama":      "oll",
+	"user":        "usr",
+	"other":       "oth",
+}
+
+// markdownAgentTypeKey maps a pane or agent type to its markdown count
+// bucket: the resolved name when the tables above know it, else "other".
+func markdownAgentTypeKey(agentType string) string {
+	normalized := normalizeAgentType(agentType)
+	if _, ok := markdownAgentTypeLabels[normalized]; ok {
+		return normalized
+	}
+	return "other"
 }
 
 func formatMarkdownAgentTypeCounts(counts map[string]int) string {
@@ -347,12 +359,7 @@ func snapshotSessionCounts(agents []SnapshotAgent) (map[string]int, map[string]i
 	}
 
 	for _, agent := range agents {
-		switch normalizedType := normalizeAgentType(agent.Type); normalizedType {
-		case "claude", "codex", "gemini", "pi", "kimi", "muse", "grok", "cursor", "windsurf", "aider", "ollama", "user":
-			counts[normalizedType]++
-		default:
-			counts["other"]++
-		}
+		counts[markdownAgentTypeKey(agent.Type)]++
 
 		if normalizeAgentType(agent.Type) == "user" {
 			continue
@@ -376,12 +383,7 @@ func countAgentsByType(panes []tmux.Pane) map[string]int {
 	}
 
 	for _, pane := range panes {
-		switch normalizedType := normalizeAgentType(string(pane.Type)); normalizedType {
-		case "claude", "codex", "gemini", "pi", "kimi", "muse", "grok", "cursor", "windsurf", "aider", "ollama", "user":
-			counts[normalizedType]++
-		default:
-			counts["other"]++
-		}
+		counts[markdownAgentTypeKey(string(pane.Type))]++
 	}
 
 	return counts

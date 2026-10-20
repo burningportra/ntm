@@ -135,7 +135,15 @@ func TestNormalizeEnsembleAgentType(t *testing.T) {
 		{"ws", "windsurf"},
 		{"aider", "aider"},
 		{"ollama", "ollama"},
+		{"pi", "pi"},
+		{"kimi", "kimi"},
+		{"moonshot", "kimi"},
+		{"muse", "muse"},
+		{"muse-code", "muse"},
+		{"opencode", "oc"},
+		{"grok", "grok"},
 		{"unknown", ""},
+		{"user", ""},
 		{"", ""},
 	}
 

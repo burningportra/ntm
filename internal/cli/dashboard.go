@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard"
@@ -343,47 +344,23 @@ func runDashboardPlain(w io.Writer, errW io.Writer, session string) error {
 	return nil
 }
 
+// dashboardPaneTypeSummary counts panes per agent type for the debug view,
+// such as "Claude=1 Codex=0 ... User=1 Other=0", in agent.AgentTypes order.
 func dashboardPaneTypeSummary(panes []tmux.Pane) string {
-	counts := map[string]int{
-		"claude":   0,
-		"codex":    0,
-		"gemini":   0,
-		"pi":       0,
-		"muse":     0,
-		"grok":     0,
-		"cursor":   0,
-		"windsurf": 0,
-		"aider":    0,
-		"oc":       0,
-		"ollama":   0,
-		"user":     0,
-		"other":    0,
-	}
-
+	counts := make(map[agentpkg.AgentType]int, len(panes))
 	for _, pane := range panes {
-		switch normalizedType := normalizeAgentType(string(pane.Type)); normalizedType {
-		case "claude", "codex", "gemini", "pi", "kimi", "muse", "grok", "cursor", "windsurf", "aider", "oc", "ollama", "user":
-			counts[normalizedType]++
-		default:
-			counts["other"]++
-		}
+		counts[agentpkg.AgentType(pane.Type).Canonical()]++
 	}
 
-	return fmt.Sprintf(
-		"Claude=%d Codex=%d Gemini=%d Muse=%d Grok=%d Cursor=%d Windsurf=%d Aider=%d Opencode=%d Ollama=%d User=%d Other=%d",
-		counts["claude"],
-		counts["codex"],
-		counts["gemini"],
-		counts["muse"],
-		counts["grok"],
-		counts["cursor"],
-		counts["windsurf"],
-		counts["aider"],
-		counts["oc"],
-		counts["ollama"],
-		counts["user"],
-		counts["other"],
-	)
+	types := agentpkg.AgentTypes()
+	parts := make([]string, 0, len(types)+2)
+	other := len(panes) - counts[agentpkg.AgentTypeUser]
+	for _, t := range types {
+		parts = append(parts, fmt.Sprintf("%s=%d", agentTypeShortName(t), counts[t]))
+		other -= counts[t]
+	}
+	parts = append(parts, fmt.Sprintf("User=%d", counts[agentpkg.AgentTypeUser]), fmt.Sprintf("Other=%d", other))
+	return strings.Join(parts, " ")
 }
 
 func runDashboard(ctx context.Context, w io.Writer, errW io.Writer, session string, debug bool, popup bool, attentionCursor int64, inferredFlag bool) error {

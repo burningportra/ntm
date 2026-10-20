@@ -104,6 +104,11 @@ func TestParseTargetTypes(t *testing.T) {
 		{"xai_grok_build", []string{"grok"}},
 		{"cc,cod", []string{"claude", "codex"}},
 		{"cc,muse", []string{"claude", "muse"}},
+		// agy sends used to drop out of analytics because the hand list
+		// had no "antigravity" entry.
+		{"agy", []string{"antigravity"}},
+		{"moonshot,opencode,agy", []string{"kimi", "oc", "antigravity"}},
+		{"bogus,user", []string{}},
 		{"all", []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "grok"}},
 		{"agents", []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "grok"}},
 		{"", []string{}},

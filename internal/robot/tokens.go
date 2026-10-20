@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	tokenpkg "github.com/Dicklesworthstone/ntm/internal/tokens"
 )
@@ -482,12 +484,7 @@ func aggregateTokenStats(eventList []events.Event, days int, since, groupBy stri
 }
 
 func isTrackedAgentType(agentType string) bool {
-	switch agentType {
-	case "claude", "codex", "gemini", "pi", "kimi", "muse", "grok", "cursor", "windsurf", "aider", "oc", "ollama":
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(agent.AgentTypes(), agent.AgentType(agentType).Canonical())
 }
 
 // parseAgentTypes extracts agent type names from target_types string

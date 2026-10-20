@@ -13,6 +13,7 @@ import (
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -62,13 +63,17 @@ func newPersonasListCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&filterAgent, "agent", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, cursor, windsurf|ws, aider, ollama)")
+	cmd.Flags().StringVar(&filterAgent, "agent", "", "Filter by agent type alias ("+agentTypeChoices()+")")
 	cmd.Flags().StringVar(&filterTag, "tag", "", "Filter by tag")
 
 	return cmd
 }
 
 func runPersonasList(filterAgent, filterTag string) error {
+	if _, err := normalizeAgentTypeFilter(filterAgent); err != nil {
+		return err
+	}
+
 	// Get project directory (current working directory)
 	cwd, _ := os.Getwd()
 
@@ -182,32 +187,19 @@ func matchesPersonaAgentFilter(agentType, filter string) bool {
 	return normalizePersonaAgentType(agentType) == normalizePersonaAgentType(filter)
 }
 
+// personaAgentPresentation shares the icon and color `ntm status` gives each
+// agent type and labels the type with its canonical short form.
 func personaAgentPresentation(agentType string, th theme.Theme, ic icons.IconSet) (string, lipgloss.Color, string) {
-	canonical := normalizePersonaAgentType(agentType)
-	switch canonical {
-	case "cc":
-		return ic.Claude, th.Claude, "cc"
-	case "cod":
-		return ic.Codex, th.Codex, "cod"
-	case "gmi":
-		return ic.Gemini, th.Gemini, "gmi"
-	case "cursor":
-		return ic.Cursor, th.Cursor, "cursor"
-	case "windsurf":
-		return ic.Windsurf, th.Windsurf, "windsurf"
-	case "aider":
-		return ic.Aider, th.Aider, "aider"
-	case "ollama":
-		return ic.Ollama, th.Ollama, "ollama"
-	case "user":
-		return ic.User, th.User, "user"
-	default:
-		label := strings.TrimSpace(agentType)
+	canonical := agentpkg.AgentType(agentType).Canonical()
+	colorKey, icon := sessionPanePresentation(tmux.Pane{Type: canonical}, th, ic)
+	label := string(canonical)
+	if !canonical.IsValid() {
+		label = strings.TrimSpace(agentType)
 		if label == "" {
 			label = "unknown"
 		}
-		return ic.Robot, th.Overlay, label
 	}
+	return icon, lipgloss.Color(colorKey), label
 }
 
 func normalizePersonaAgentType(agentType string) string {

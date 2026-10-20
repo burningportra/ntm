@@ -43,6 +43,52 @@ func TestValidateAgentSpec(t *testing.T) {
 	}
 }
 
+// TestRecipeAgentTypeAcceptsEveryAgentType covers the types the old recipe
+// list rejected (pi, kimi, muse, opencode) and their aliases, and checks an
+// unknown type still fails with the valid list in the error.
+func TestRecipeAgentTypeAcceptsEveryAgentType(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{"pi", "pi"},
+		{"pi-coding-agent", "pi"},
+		{"kimi", "kimi"},
+		{"moonshot", "kimi"},
+		{"k2", "kimi"},
+		{"muse", "muse"},
+		{"muse-code", "muse"},
+		{"opencode", "oc"},
+		{"oc", "oc"},
+		{"agy", "agy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			if err := ValidateAgentSpec(AgentSpec{Type: tt.raw, Count: 1}); err != nil {
+				t.Fatalf("ValidateAgentSpec(%q): %v", tt.raw, err)
+			}
+			spec := AgentSpec{Type: tt.raw, Count: 1}
+			if err := normalizeRecipeAgentSpec(&spec); err != nil {
+				t.Fatalf("normalizeRecipeAgentSpec(%q): %v", tt.raw, err)
+			}
+			if spec.Type != tt.want {
+				t.Fatalf("normalized type = %q, want %q", spec.Type, tt.want)
+			}
+		})
+	}
+
+	err := ValidateAgentSpec(AgentSpec{Type: "bogus", Count: 1})
+	if err == nil {
+		t.Fatal("ValidateAgentSpec(bogus) returned nil, want error")
+	}
+	for _, want := range []string{`"bogus"`, "muse", "kimi", "pi", "oc"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("ValidateAgentSpec(bogus) error %q does not mention %q", err, want)
+		}
+	}
+}
+
 func TestRecipeHelpers(t *testing.T) {
 	t.Parallel()
 	r := Recipe{

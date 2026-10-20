@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -244,8 +246,11 @@ func parseAgentID(id string) (string, int, error) {
 	}
 
 	agentType := tmux.AgentType(matches[1]).Canonical()
-	if !supportsProfileSwitchAgentType(agentType) {
-		return "", 0, fmt.Errorf("invalid agent ID %q (unsupported agent type %q)", id, matches[1])
+	if !slices.Contains(agentpkg.AgentTypes(), agentType) {
+		return "", 0, fmt.Errorf("invalid agent ID %q (unsupported agent type %q; want one of %s)", id, matches[1], agentTypeChoices())
+	}
+	if err := agentType.ValidateAutomatedPromptDelivery(); err != nil {
+		return "", 0, fmt.Errorf("invalid agent ID %q: %w", id, err)
 	}
 
 	return string(agentType), index, nil
@@ -266,13 +271,12 @@ func findPaneByAgentID(panes []tmux.Pane, session, agentType string, agentIndex 
 	return nil, "", fmt.Errorf("no pane found for agent %s_%d in session %s", agentType, agentIndex, session)
 }
 
+// supportsProfileSwitchAgentType accepts every agent type that can take the
+// transition prompt, which leaves out Grok Build until its prompt delivery
+// exists.
 func supportsProfileSwitchAgentType(agentType tmux.AgentType) bool {
-	switch agentType.Canonical() {
-	case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentPi, tmux.AgentKimi, tmux.AgentMuse, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
-		return true
-	default:
-		return false
-	}
+	canonical := agentType.Canonical()
+	return slices.Contains(agentpkg.AgentTypes(), canonical) && canonical.ValidateAutomatedPromptDelivery() == nil
 }
 
 func paneMatchesAgentID(pane tmux.Pane, session string, agentType tmux.AgentType, agentIndex int) (bool, string) {

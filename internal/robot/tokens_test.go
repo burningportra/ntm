@@ -52,6 +52,21 @@ func TestParseAgentTypes_Muse(t *testing.T) {
 	}
 }
 
+// TestParseAgentTypes_EveryAgentType checks --robot-tokens keeps agy targets,
+// which the old hand list dropped, and still skips non-agent targets.
+func TestParseAgentTypes_EveryAgentType(t *testing.T) {
+	got := parseAgentTypes("agy,moonshot,opencode,pi,user,bogus")
+	want := []string{"antigravity", "kimi", "oc", "pi"}
+	if len(got) != len(want) {
+		t.Fatalf("parseAgentTypes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("parseAgentTypes = %v, want %v", got, want)
+		}
+	}
+}
+
 // =============================================================================
 // splitJSONLines tests
 // =============================================================================

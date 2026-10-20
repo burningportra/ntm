@@ -232,6 +232,59 @@ func TestFormatAgentTypeCanonicalizesAliases(t *testing.T) {
 	}
 }
 
+// TestPersonaAgentPresentationCoversEveryAgentType checks the personas table
+// labels and colors the newer agent types like `ntm status` does instead of
+// falling through to the unknown-agent style.
+func TestPersonaAgentPresentationCoversEveryAgentType(t *testing.T) {
+	th := theme.CatppuccinMocha
+	ic := icons.ASCII
+	tests := []struct {
+		agentType string
+		wantLabel string
+		wantColor string
+	}{
+		{"pi", "pi", string(th.Mauve)},
+		{"kimi", "kimi", string(th.Sapphire)},
+		{"moonshot", "kimi", string(th.Sapphire)},
+		{"muse-code", "muse", string(th.Sky)},
+		{"opencode", "oc", string(th.Opencode)},
+		{"agy", "agy", string(th.Lavender)},
+		{"grok", "grok", string(th.Pink)},
+		{"mystery", "mystery", string(th.Overlay)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.agentType, func(t *testing.T) {
+			_, color, label := personaAgentPresentation(tt.agentType, th, ic)
+			if label != tt.wantLabel || string(color) != tt.wantColor {
+				t.Fatalf("personaAgentPresentation(%q) = label %q color %q, want label %q color %q", tt.agentType, label, color, tt.wantLabel, tt.wantColor)
+			}
+		})
+	}
+}
+
+// TestRunPersonasListRejectsUnknownAgentFilter checks `ntm personas list
+// --agent` names the valid types for a bogus filter instead of printing an
+// empty table, and accepts the newer types.
+func TestRunPersonasListRejectsUnknownAgentFilter(t *testing.T) {
+	err := runPersonasList("bogus", "")
+	if err == nil {
+		t.Fatal(`runPersonasList("bogus") returned nil, want error`)
+	}
+	for _, want := range []string{`"bogus"`, "muse", "kimi", "pi", "opencode|oc"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("runPersonasList(bogus) error %q does not mention %q", err, want)
+		}
+	}
+	for _, filter := range []string{"muse", "kimi", "pi", "opencode"} {
+		if !matchesPersonaAgentFilter(filter, filter) {
+			t.Errorf("matchesPersonaAgentFilter(%q, %q) = false, want true", filter, filter)
+		}
+	}
+	if !matchesPersonaAgentFilter("moonshot", "kimi") {
+		t.Error(`matchesPersonaAgentFilter("moonshot", "kimi") = false, want true`)
+	}
+}
+
 func TestDetermineSourceUsesUserConfigFallbackPath(t *testing.T) {
 	tmpDir := t.TempDir()
 	projectDir := filepath.Join(tmpDir, "project")

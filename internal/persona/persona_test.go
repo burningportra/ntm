@@ -156,11 +156,42 @@ func TestPersonaValidation(t *testing.T) {
 	}
 }
 
+// TestPersonaValidationAcceptsEveryAgentType covers the agent types the old
+// hand-maintained list rejected (pi, kimi, muse) plus opencode and their
+// aliases, and checks a bogus type still fails with the valid list in the error.
+func TestPersonaValidationAcceptsEveryAgentType(t *testing.T) {
+	for _, agentType := range []string{"pi", "pi-coding-agent", "kimi", "moonshot", "k2", "muse", "muse-code", "opencode", "oc", "agy", "grok"} {
+		t.Run(agentType, func(t *testing.T) {
+			p := Persona{Name: "test", AgentType: agentType}
+			if err := p.Validate(); err != nil {
+				t.Fatalf("Validate() with agent_type %q: %v", agentType, err)
+			}
+		})
+	}
+
+	p := Persona{Name: "test", AgentType: "bogus"}
+	err := p.Validate()
+	if err == nil {
+		t.Fatal("Validate() with agent_type \"bogus\" returned nil, want error")
+	}
+	for _, want := range []string{`"bogus"`, "muse", "kimi", "pi", "oc"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate() error %q does not mention %q", err, want)
+		}
+	}
+}
+
 func TestAgentTypeFlag(t *testing.T) {
 	tests := []struct {
 		agentType string
 		want      string
 	}{
+		{"pi", "pi"},
+		{"kimi", "kimi"},
+		{"moonshot", "kimi"},
+		{"muse", "muse"},
+		{"muse-code", "muse"},
+		{"agy", "agy"},
 		{"claude", "cc"},
 		{"Claude", "cc"},
 		{"cc", "cc"},

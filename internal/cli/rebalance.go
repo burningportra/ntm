@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -152,7 +153,7 @@ Examples:
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show suggestions without prompting for confirmation")
 	cmd.Flags().BoolVar(&apply, "apply", false, "Prompt for confirmation before applying")
-	cmd.Flags().StringVar(&filter, "filter", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, antigravity|agy, cursor, windsurf|ws, aider, ollama)")
+	cmd.Flags().StringVar(&filter, "filter", "", "Filter by agent type alias ("+agentTypeChoices()+")")
 	cmd.Flags().Float64Var(&threshold, "threshold", 0.0, "Only suggest if imbalance score exceeds threshold")
 	cmd.Flags().StringVar(&formatOut, "format", "", "Output format: json for robot mode")
 
@@ -455,7 +456,7 @@ func normalizeAgentTypeFilter(filter string) (string, error) {
 	}
 	normalized := normalizeAgentTypeLike(trimmed)
 	if normalized == "" {
-		return "", fmt.Errorf("invalid agent filter %q: must be one of claude|cc, codex|cod, gemini|gmi, antigravity|agy, cursor, windsurf|ws, aider, ollama", filter)
+		return "", fmt.Errorf("invalid agent filter %q: must be one of %s", filter, agentTypeChoices())
 	}
 	return normalized, nil
 }
@@ -465,26 +466,36 @@ func normalizeAgentTypeLike(value string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if canonical := agentpkg.AgentType(trimmed).Canonical(); isSupportedWorkAgentType(canonical) {
+	if canonical := agentpkg.AgentType(trimmed).Canonical(); slices.Contains(agentpkg.AgentTypes(), canonical) {
 		return string(canonical)
 	}
 	if head, _, ok := strings.Cut(trimmed, "_"); ok {
-		if canonical := agentpkg.AgentType(head).Canonical(); isSupportedWorkAgentType(canonical) {
+		if canonical := agentpkg.AgentType(head).Canonical(); slices.Contains(agentpkg.AgentTypes(), canonical) {
 			return string(canonical)
 		}
 	}
 	return ""
 }
 
-func isSupportedWorkAgentType(agentType agentpkg.AgentType) bool {
-	switch agentType {
-	case agentpkg.AgentTypeClaudeCode, agentpkg.AgentTypeCodex, agentpkg.AgentTypeGemini,
-		agentpkg.AgentTypeAntigravity, agentpkg.AgentTypeCursor, agentpkg.AgentTypeWindsurf,
-		agentpkg.AgentTypeAider, agentpkg.AgentTypeOpencode, agentpkg.AgentTypeOllama:
-		return true
-	default:
-		return false
+// agentTypeShortName is an agent type's name without its product suffix
+// ("Claude" for Claude Code, "Cursor" for Cursor Agent).
+func agentTypeShortName(t agentpkg.AgentType) string {
+	return strings.Fields(t.DisplayName())[0]
+}
+
+// agentTypeChoices lists every agent type for help and error text, pairing
+// the full name with the short form where they differ ("claude|cc").
+func agentTypeChoices() string {
+	types := agentpkg.AgentTypes()
+	choices := make([]string, 0, len(types))
+	for _, t := range types {
+		choice := strings.ToLower(agentTypeShortName(t))
+		if choice != string(t) {
+			choice += "|" + string(t)
+		}
+		choices = append(choices, choice)
 	}
+	return strings.Join(choices, ", ")
 }
 
 func calculateImbalanceScore(workloads []RebalanceWorkload) float64 {

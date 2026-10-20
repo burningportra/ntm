@@ -5,6 +5,7 @@ package agent
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"time"
 )
@@ -169,14 +170,32 @@ func (t AgentType) ProfileName() string {
 	}
 }
 
-// IsValid returns true if this is a known agent type.
-func (t AgentType) IsValid() bool {
-	switch t.Canonical() {
-	case AgentTypeClaudeCode, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeKimi, AgentTypeMuse, AgentTypeAntigravity, AgentTypeGrok, AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeUser:
-		return true
-	default:
-		return false
+// AgentTypes returns every coding agent type ntm can launch, in canonical
+// short form and display order. It leaves out the user pane and unknown.
+// Validate user-supplied agent types against this list (after Canonical) and
+// build help text from it, so a new agent type reaches every caller at once.
+func AgentTypes() []AgentType {
+	return []AgentType{
+		AgentTypeClaudeCode,
+		AgentTypeCodex,
+		AgentTypeGemini,
+		AgentTypePi,
+		AgentTypeKimi,
+		AgentTypeMuse,
+		AgentTypeAntigravity,
+		AgentTypeGrok,
+		AgentTypeCursor,
+		AgentTypeWindsurf,
+		AgentTypeAider,
+		AgentTypeOpencode,
+		AgentTypeOllama,
 	}
+}
+
+// IsValid returns true if this is a known agent type or the user pane.
+func (t AgentType) IsValid() bool {
+	canonical := t.Canonical()
+	return canonical == AgentTypeUser || slices.Contains(AgentTypes(), canonical)
 }
 
 // ValidateAutomatedRelaunch fails closed for agent types whose interactive

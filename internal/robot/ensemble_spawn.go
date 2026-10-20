@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -547,9 +548,9 @@ func normalizeExplicitModeSpecs(specs []string, catalog *ensemble.ModeCatalog, a
 		if modeRef == "" {
 			return nil, fmt.Errorf("modes[%d]: empty mode reference", i)
 		}
-		agentType := normalizeEnsembleAgentType(parts[1])
-		if agentType == "" {
-			return nil, fmt.Errorf("modes[%d]: invalid agent type %q", i, strings.TrimSpace(parts[1]))
+		agentType, err := ensembleAgentType(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("modes[%d]: %w", i, err)
 		}
 		modeRefs = append(modeRefs, modeRef)
 		agentTypes = append(agentTypes, agentType)
@@ -601,9 +602,9 @@ func parseEnsembleAgentMix(value string) (map[string]int, error) {
 		if len(kv) != 2 {
 			return nil, fmt.Errorf("agents entry %q must be type=count", part)
 		}
-		agentType := normalizeEnsembleAgentType(kv[0])
-		if agentType == "" {
-			return nil, fmt.Errorf("agents entry %q has invalid agent type", part)
+		agentType, err := ensembleAgentType(kv[0])
+		if err != nil {
+			return nil, fmt.Errorf("agents entry %q: %w", part, err)
 		}
 		count, err := strconv.Atoi(strings.TrimSpace(kv[1]))
 		if err != nil {
@@ -620,31 +621,26 @@ func parseEnsembleAgentMix(value string) (map[string]int, error) {
 	return mix, nil
 }
 
+// normalizeEnsembleAgentType resolves an agent alias to its canonical short
+// form, or "" when it names no agent ntm launches.
 func normalizeEnsembleAgentType(value string) string {
-	switch agent.AgentType(value).Canonical() {
-	case agent.AgentTypeClaudeCode:
-		return "cc"
-	case agent.AgentTypeCodex:
-		return "cod"
-	case agent.AgentTypeGemini:
-		return "gmi"
-	case agent.AgentTypePi:
-		return "pi"
-	case agent.AgentTypeKimi:
-		return "kimi"
-	case agent.AgentTypeMuse:
-		return "muse"
-	case agent.AgentTypeAntigravity:
-		return "agy"
-	case agent.AgentTypeCursor:
-		return "cursor"
-	case agent.AgentTypeWindsurf:
-		return "windsurf"
-	case agent.AgentTypeAider:
-		return "aider"
-	case agent.AgentTypeOllama:
-		return "ollama"
-	default:
+	canonical := agent.AgentType(value).Canonical()
+	if !slices.Contains(agent.AgentTypes(), canonical) {
 		return ""
 	}
+	return string(canonical)
+}
+
+// ensembleAgentType resolves an ensemble agent alias and rejects agent types
+// that can't take the injected mode prompt every ensemble pane receives, so
+// the request fails before any pane is created.
+func ensembleAgentType(value string) (string, error) {
+	agentType := normalizeEnsembleAgentType(value)
+	if agentType == "" {
+		return "", fmt.Errorf("invalid agent type %q (valid types: %v)", strings.TrimSpace(value), agent.AgentTypes())
+	}
+	if err := agent.AgentType(agentType).ValidateAutomatedPromptDelivery(); err != nil {
+		return "", err
+	}
+	return agentType, nil
 }

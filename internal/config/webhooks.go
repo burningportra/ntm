@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -107,7 +108,7 @@ func (c *WebhookConfig) ValidateConfig() error {
 
 	for _, t := range c.Filter.AgentType {
 		if !isValidWebhookAgentType(t) {
-			return fmt.Errorf("invalid filter.agent_type %q (supported: claude, codex, gemini, pi, kimi, muse, cursor, windsurf, aider, ollama)", strings.TrimSpace(t))
+			return fmt.Errorf("invalid filter.agent_type %q (supported: %v)", strings.TrimSpace(t), agent.AgentTypes())
 		}
 	}
 
@@ -385,21 +386,7 @@ func isValidWebhookFormatter(format string) bool {
 	}
 }
 func isValidWebhookAgentType(agentType string) bool {
-	switch agent.AgentType(agentType).Canonical() {
-	case agent.AgentTypeClaudeCode,
-		agent.AgentTypeCodex,
-		agent.AgentTypeGemini,
-		agent.AgentTypePi,
-		agent.AgentTypeKimi,
-		agent.AgentTypeMuse,
-		agent.AgentTypeCursor,
-		agent.AgentTypeWindsurf,
-		agent.AgentTypeAider,
-		agent.AgentTypeOllama:
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(agent.AgentTypes(), agent.AgentType(agentType).Canonical())
 }
 
 func isValidWebhookSeverity(severity string) bool {

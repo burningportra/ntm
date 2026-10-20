@@ -92,6 +92,11 @@ func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (
 		return string(th.Codex), ic.AgentIcon(string(agentpkg.AgentTypeCodex))
 	case agentpkg.AgentTypeGemini:
 		return string(th.Gemini), ic.AgentIcon(string(agentpkg.AgentTypeGemini))
+	case agentpkg.AgentTypePi:
+		// Pi and Kimi use the accents output.AgentBadge gives them.
+		return string(th.Mauve), ic.AgentIcon(string(agentpkg.AgentTypePi))
+	case agentpkg.AgentTypeKimi:
+		return string(th.Sapphire), ic.AgentIcon(string(agentpkg.AgentTypeKimi))
 	case agentpkg.AgentTypeAntigravity:
 		// agy (Antigravity) gets the lavender accent (matching the semantic
 		// theme palette); AgentIcon maps antigravity → the Gemini glyph.
@@ -108,12 +113,90 @@ func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (
 		return string(th.Windsurf), ic.AgentIcon(string(agentpkg.AgentTypeWindsurf))
 	case agentpkg.AgentTypeAider:
 		return string(th.Aider), ic.AgentIcon(string(agentpkg.AgentTypeAider))
+	case agentpkg.AgentTypeOpencode:
+		return string(th.Opencode), ic.AgentIcon(string(agentpkg.AgentTypeOpencode))
 	case agentpkg.AgentTypeOllama:
 		return string(th.Ollama), ic.AgentIcon(string(agentpkg.AgentTypeOllama))
 	case agentpkg.AgentTypeUser:
 		return string(th.User), ic.AgentIcon(string(agentpkg.AgentTypeUser))
 	default:
 		return string(th.Overlay), ic.AgentIcon(string(agentpkg.AgentTypeUnknown))
+	}
+}
+
+// listAgentsSummary renders the wide `ntm list` AGENTS column, such as
+// "2 CC, 1 Pi", or "-" when the session has no panes to count.
+func listAgentsSummary(counts *output.AgentCountsResponse) string {
+	if counts == nil {
+		return "-"
+	}
+	var parts []string
+	for _, entry := range []struct {
+		count int
+		label string
+	}{
+		{counts.Claude, "CC"},
+		{counts.Codex, "COD"},
+		{counts.Gemini, "GMI"},
+		{counts.Pi, "Pi"},
+		{counts.Kimi, "Kimi"},
+		{counts.Antigravity, "AGY"},
+		{counts.Grok, "Grok"},
+		{counts.Muse, "Muse"},
+		{counts.Ollama, "OLL"},
+		{counts.Cursor, "CUR"},
+		{counts.Windsurf, "WND"},
+		{counts.Aider, "AID"},
+		{counts.Opencode, "OC"},
+		{counts.User, "Usr"},
+		{counts.Other, "Oth"},
+	} {
+		if entry.count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", entry.count, entry.label))
+		}
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// writeStatusAgentSummary prints the `ntm status` Agents rows, one per agent
+// type with panes, or "No agents running" when only user panes exist.
+func writeStatusAgentSummary(w io.Writer, counts output.AgentCountsResponse, th theme.Theme, ic icons.IconSet, color func(interface{}) string, reset string) {
+	text := color(th.Text)
+	for _, row := range []struct {
+		count     int
+		name      string
+		agentType agentpkg.AgentType
+		unit      string
+	}{
+		{counts.Claude, "Claude", agentpkg.AgentTypeClaudeCode, "instance(s)"},
+		{counts.Codex, "Codex", agentpkg.AgentTypeCodex, "instance(s)"},
+		{counts.Gemini, "Gemini", agentpkg.AgentTypeGemini, "instance(s)"},
+		{counts.Pi, "Pi", agentpkg.AgentTypePi, "instance(s)"},
+		{counts.Kimi, "Kimi", agentpkg.AgentTypeKimi, "instance(s)"},
+		{counts.Antigravity, "Antigravity", agentpkg.AgentTypeAntigravity, "instance(s)"},
+		{counts.Grok, "Grok", agentpkg.AgentTypeGrok, "instance(s)"},
+		{counts.Muse, "Muse", agentpkg.AgentTypeMuse, "instance(s)"},
+		{counts.Ollama, "Ollama", agentpkg.AgentTypeOllama, "instance(s)"},
+		{counts.Cursor, "Cursor", agentpkg.AgentTypeCursor, "instance(s)"},
+		{counts.Windsurf, "Windsurf", agentpkg.AgentTypeWindsurf, "instance(s)"},
+		{counts.Aider, "Aider", agentpkg.AgentTypeAider, "instance(s)"},
+		{counts.Opencode, "Opencode", agentpkg.AgentTypeOpencode, "instance(s)"},
+		{counts.User, "User", agentpkg.AgentTypeUser, "pane(s)"},
+		{counts.Other, "Other", agentpkg.AgentTypeUnknown, "pane(s)"},
+	} {
+		if row.count == 0 {
+			continue
+		}
+		colorKey, icon := sessionPanePresentation(tmux.Pane{Type: row.agentType}, th, ic)
+		pad := strings.Repeat(" ", max(1, 8-len(row.name)))
+		fmt.Fprintf(w, "    %s%s %s%s%s%s%d %s%s\n", color(colorKey), icon, row.name, reset, pad, text, row.count, row.unit, reset)
+	}
+
+	if counts.Total-counts.User == 0 {
+		fmt.Fprintf(w, "    %sNo agents running%s\n", color(th.Overlay), reset)
 	}
 }
 
@@ -446,50 +529,7 @@ func runList(tags []string, project ...string) error {
 				attached = "attached"
 			}
 
-			// Fetch agents summary
-			agents := "-"
-			if s.AgentCounts != nil {
-				var parts []string
-				if s.AgentCounts.Claude > 0 {
-					parts = append(parts, fmt.Sprintf("%d CC", s.AgentCounts.Claude))
-				}
-				if s.AgentCounts.Codex > 0 {
-					parts = append(parts, fmt.Sprintf("%d COD", s.AgentCounts.Codex))
-				}
-				if s.AgentCounts.Gemini > 0 {
-					parts = append(parts, fmt.Sprintf("%d GMI", s.AgentCounts.Gemini))
-				}
-				if s.AgentCounts.Antigravity > 0 {
-					parts = append(parts, fmt.Sprintf("%d AGY", s.AgentCounts.Antigravity))
-				}
-				if s.AgentCounts.Grok > 0 {
-					parts = append(parts, fmt.Sprintf("%d Grok", s.AgentCounts.Grok))
-				}
-				if s.AgentCounts.Muse > 0 {
-					parts = append(parts, fmt.Sprintf("%d Muse", s.AgentCounts.Muse))
-				}
-				if s.AgentCounts.Ollama > 0 {
-					parts = append(parts, fmt.Sprintf("%d OLL", s.AgentCounts.Ollama))
-				}
-				if s.AgentCounts.Cursor > 0 {
-					parts = append(parts, fmt.Sprintf("%d CUR", s.AgentCounts.Cursor))
-				}
-				if s.AgentCounts.Windsurf > 0 {
-					parts = append(parts, fmt.Sprintf("%d WND", s.AgentCounts.Windsurf))
-				}
-				if s.AgentCounts.Aider > 0 {
-					parts = append(parts, fmt.Sprintf("%d AID", s.AgentCounts.Aider))
-				}
-				if s.AgentCounts.User > 0 {
-					parts = append(parts, fmt.Sprintf("%d Usr", s.AgentCounts.User))
-				}
-				if s.AgentCounts.Other > 0 {
-					parts = append(parts, fmt.Sprintf("%d Oth", s.AgentCounts.Other))
-				}
-				if len(parts) > 0 {
-					agents = strings.Join(parts, ", ")
-				}
-			}
+			agents := listAgentsSummary(s.AgentCounts)
 
 			if hasLabels {
 				labelDisplay := "-"
@@ -1073,18 +1113,6 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 	for _, p := range panes {
 		incrementAgentCounts(&counts, p.Type)
 	}
-	ccCount := counts.Claude
-	codCount := counts.Codex
-	gmiCount := counts.Gemini
-	agyCount := counts.Antigravity
-	grokCount := counts.Grok
-	museCount := counts.Muse
-	ollamaCount := counts.Ollama
-	cursorCount := counts.Cursor
-	windsurfCount := counts.Windsurf
-	aiderCount := counts.Aider
-	userCount := counts.User
-	otherCount := counts.Other
 
 	// Estimate context usage per pane (best-effort)
 	contextByPaneID := make(map[string]paneContextUsage)
@@ -1132,7 +1160,6 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 	codex := color(t.Codex)
 	gemini := color(t.Gemini)
 	antigravity := color(t.Lavender)
-	ollama := color(t.Ollama)
 
 	ic := icons.Current()
 
@@ -1361,56 +1388,7 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 
 	// Agent summary with icons
 	fmt.Fprintf(w, "  %sAgents%s\n", bold, reset)
-
-	if ccCount > 0 {
-		fmt.Fprintf(w, "    %s%s Claude%s  %s%d instance(s)%s\n", claude, ic.Claude, reset, text, ccCount, reset)
-	}
-	if codCount > 0 {
-		fmt.Fprintf(w, "    %s%s Codex%s   %s%d instance(s)%s\n", codex, ic.Codex, reset, text, codCount, reset)
-	}
-	if gmiCount > 0 {
-		fmt.Fprintf(w, "    %s%s Gemini%s  %s%d instance(s)%s\n", gemini, ic.Gemini, reset, text, gmiCount, reset)
-	}
-	if agyCount > 0 {
-		agyColorKey, agyIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentAntigravity}, t, ic)
-		fmt.Fprintf(w, "    %s%s Antigravity%s %s%d instance(s)%s\n", color(agyColorKey), agyIcon, reset, text, agyCount, reset)
-	}
-	if grokCount > 0 {
-		grokColorKey, grokIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentGrok}, t, ic)
-		fmt.Fprintf(w, "    %s%s Grok%s    %s%d instance(s)%s\n", color(grokColorKey), grokIcon, reset, text, grokCount, reset)
-	}
-	if museCount > 0 {
-		museColorKey, museIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentMuse}, t, ic)
-		fmt.Fprintf(w, "    %s%s Muse%s    %s%d instance(s)%s\n", color(museColorKey), museIcon, reset, text, museCount, reset)
-	}
-	if ollamaCount > 0 {
-		fmt.Fprintf(w, "    %s%s Ollama%s %s%d instance(s)%s\n", ollama, ic.Ollama, reset, text, ollamaCount, reset)
-	}
-	if cursorCount > 0 {
-		cursorColorKey, cursorIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentCursor}, t, ic)
-		fmt.Fprintf(w, "    %s%s Cursor%s  %s%d instance(s)%s\n", color(cursorColorKey), cursorIcon, reset, text, cursorCount, reset)
-	}
-	if windsurfCount > 0 {
-		windsurfColorKey, windsurfIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentWindsurf}, t, ic)
-		fmt.Fprintf(w, "    %s%s Windsurf%s %s%d instance(s)%s\n", color(windsurfColorKey), windsurfIcon, reset, text, windsurfCount, reset)
-	}
-	if aiderCount > 0 {
-		aiderColorKey, aiderIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentAider}, t, ic)
-		fmt.Fprintf(w, "    %s%s Aider%s   %s%d instance(s)%s\n", color(aiderColorKey), aiderIcon, reset, text, aiderCount, reset)
-	}
-	if userCount > 0 {
-		userColorKey, userIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentUser}, t, ic)
-		fmt.Fprintf(w, "    %s%s User%s    %s%d pane(s)%s\n", color(userColorKey), userIcon, reset, text, userCount, reset)
-	}
-	if otherCount > 0 {
-		otherColorKey, otherIcon := sessionPanePresentation(tmux.Pane{Type: tmux.AgentUnknown}, t, ic)
-		fmt.Fprintf(w, "    %s%s Other%s   %s%d pane(s)%s\n", color(otherColorKey), otherIcon, reset, text, otherCount, reset)
-	}
-
-	totalAgents := ccCount + codCount + gmiCount + agyCount + grokCount + museCount + ollamaCount + cursorCount + windsurfCount + aiderCount + otherCount
-	if totalAgents == 0 {
-		fmt.Fprintf(w, "    %sNo agents running%s\n", overlay, reset)
-	}
+	writeStatusAgentSummary(w, counts, t, ic, color, reset)
 
 	fmt.Fprintln(w)
 

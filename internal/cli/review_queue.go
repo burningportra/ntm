@@ -108,7 +108,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&filter, "filter", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, cursor, windsurf|ws, aider, ollama)")
+	cmd.Flags().StringVar(&filter, "filter", "", "Filter by agent type alias ("+agentTypeChoices()+")")
 	cmd.Flags().DurationVar(&idleThreshold, "idle-threshold", 2*time.Minute, "Minimum idle time to consider an agent idle")
 	cmd.Flags().BoolVar(&send, "send", false, "Prompt for confirmation then send review prompts")
 	cmd.Flags().StringVar(&formatOut, "format", "", "Output format: json for robot mode")

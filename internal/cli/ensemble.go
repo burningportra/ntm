@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,29 +73,14 @@ type ensembleStatusOutput struct {
 	Contributions  *ensemble.ContributionReport `json:"contributions,omitempty" yaml:"contributions,omitempty"`
 }
 
+// normalizeEnsembleAgentType resolves an agent alias to its canonical short
+// form, or "" when it names no agent ntm launches.
 func normalizeEnsembleAgentType(value string) string {
-	switch agentpkg.AgentType(value).Canonical() {
-	case agentpkg.AgentTypeClaudeCode:
-		return "cc"
-	case agentpkg.AgentTypeCodex:
-		return "cod"
-	case agentpkg.AgentTypeGemini:
-		return "gmi"
-	case agentpkg.AgentTypeAntigravity:
-		return "agy"
-	case agentpkg.AgentTypeCursor:
-		return "cursor"
-	case agentpkg.AgentTypeWindsurf:
-		return "windsurf"
-	case agentpkg.AgentTypeAider:
-		return "aider"
-	case agentpkg.AgentTypeOpencode:
-		return "oc"
-	case agentpkg.AgentTypeOllama:
-		return "ollama"
-	default:
+	canonical := agentpkg.AgentType(value).Canonical()
+	if !slices.Contains(agentpkg.AgentTypes(), canonical) {
 		return ""
 	}
+	return string(canonical)
 }
 
 func newEnsembleCmd() *cobra.Command {

@@ -186,6 +186,53 @@ func TestParseAgentID(t *testing.T) {
 	}
 }
 
+// TestParseAgentIDAcceptsEveryAgentType covers `ntm personas switch`: the
+// agy IDs the old list rejected, the newer types and their aliases, a bogus
+// type that must still fail with the valid list, and Grok, which fails with
+// its prompt-delivery hint because the switch sends a transition prompt.
+func TestParseAgentIDAcceptsEveryAgentType(t *testing.T) {
+	tests := []struct {
+		input    string
+		wantType string
+	}{
+		{"agy_1", "agy"},
+		{"antigravity_2", "agy"},
+		{"pi_1", "pi"},
+		{"pi-coding-agent_1", "pi"},
+		{"kimi_1", "kimi"},
+		{"moonshot_3", "kimi"},
+		{"muse_1", "muse"},
+		{"muse-code_2", "muse"},
+		{"oc_1", "oc"},
+		{"opencode_1", "oc"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			agentType, _, err := parseAgentID(tt.input)
+			if err != nil {
+				t.Fatalf("parseAgentID(%q): %v", tt.input, err)
+			}
+			if agentType != tt.wantType {
+				t.Fatalf("parseAgentID(%q) type = %q, want %q", tt.input, agentType, tt.wantType)
+			}
+		})
+	}
+
+	_, _, err := parseAgentID("bogus_1")
+	if err == nil {
+		t.Fatal(`parseAgentID("bogus_1") returned nil, want error`)
+	}
+	for _, want := range []string{`"bogus"`, "muse", "kimi", "pi", "opencode|oc"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("parseAgentID(bogus_1) error %q does not mention %q", err, want)
+		}
+	}
+
+	if _, _, err := parseAgentID("grok_1"); err == nil || !strings.Contains(err.Error(), "Grok Build prompt delivery") {
+		t.Fatalf("parseAgentID(grok_1) error = %v, want the Grok prompt-delivery hint", err)
+	}
+}
+
 func TestFindPaneByAgentID(t *testing.T) {
 	session := "myproject"
 	panes := []tmux.Pane{

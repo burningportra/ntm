@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
@@ -349,6 +350,74 @@ func TestNormalizeAgentTypeFilter(t *testing.T) {
 				t.Errorf("normalizeAgentTypeFilter(%q) = %q, want %q", tt.filter, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestNormalizeAgentTypeFilterAcceptsEveryAgentType covers the rebalance and
+// review-queue --filter flag: every type the agent parser accepts, aliases
+// included, resolves, and a bogus filter fails with the full list.
+func TestNormalizeAgentTypeFilterAcceptsEveryAgentType(t *testing.T) {
+	tests := []struct {
+		filter string
+		want   string
+	}{
+		{"pi", "pi"},
+		{"pi-coding-agent", "pi"},
+		{"kimi", "kimi"},
+		{"moonshot", "kimi"},
+		{"muse", "muse"},
+		{"muse-code", "muse"},
+		{"opencode", "oc"},
+		{"oc", "oc"},
+		{"grok", "grok"},
+		{"agy", "agy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.filter, func(t *testing.T) {
+			got, err := normalizeAgentTypeFilter(tt.filter)
+			if err != nil {
+				t.Fatalf("normalizeAgentTypeFilter(%q): %v", tt.filter, err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeAgentTypeFilter(%q) = %q, want %q", tt.filter, got, tt.want)
+			}
+		})
+	}
+
+	// Pane-derived agent names like "muse_2" match a muse filter.
+	if !matchesRebalanceFilter("muse_2", "muse") {
+		t.Error(`matchesRebalanceFilter("muse_2", "muse") = false, want true`)
+	}
+	if matchesRebalanceFilter("kimi", "pi") {
+		t.Error(`matchesRebalanceFilter("kimi", "pi") = true, want false`)
+	}
+
+	_, err := normalizeAgentTypeFilter("bogus")
+	if err == nil {
+		t.Fatal(`normalizeAgentTypeFilter("bogus") returned nil, want error`)
+	}
+	for _, want := range []string{`"bogus"`, "muse", "kimi", "pi", "opencode|oc", "claude|cc"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("normalizeAgentTypeFilter(bogus) error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestAgentTypeChoicesRoundTrip checks every name the help text offers parses
+// back to the type it labels, so the rendered list can't advertise a name the
+// filters would reject.
+func TestAgentTypeChoicesRoundTrip(t *testing.T) {
+	choices := strings.Split(agentTypeChoices(), ", ")
+	types := agentpkg.AgentTypes()
+	if len(choices) != len(types) {
+		t.Fatalf("agentTypeChoices() = %q, want one entry per agent type %v", agentTypeChoices(), types)
+	}
+	for i, choice := range choices {
+		for _, name := range strings.Split(choice, "|") {
+			if got := agentpkg.AgentType(name).Canonical(); got != types[i] {
+				t.Errorf("choice %q: %q resolves to %q, want %q", choice, name, got, types[i])
+			}
+		}
 	}
 }
 

@@ -141,6 +141,10 @@ func TestAgentType_IsValid(t *testing.T) {
 		{AgentTypeCursor, true},
 		{AgentTypeWindsurf, true},
 		{AgentTypeAider, true},
+		{AgentTypePi, true},
+		{AgentTypeAntigravity, true},
+		{AgentTypeOpencode, true},
+		{AgentType("opencode"), true},
 		{AgentTypeUser, true},
 		{AgentType("codex"), true},
 		{AgentType(" gemini "), true},
@@ -153,6 +157,50 @@ func TestAgentType_IsValid(t *testing.T) {
 		if got := tt.at.IsValid(); got != tt.want {
 			t.Errorf("AgentType(%q).IsValid() = %v, want %v", tt.at, got, tt.want)
 		}
+	}
+}
+
+// TestAgentTypesListsEveryLaunchableAgent pins the canonical list that
+// validation and help text derive from: each entry is its own canonical form,
+// has a real display name, and the user pane and unknown stay out.
+func TestAgentTypesListsEveryLaunchableAgent(t *testing.T) {
+	t.Parallel()
+
+	want := []AgentType{
+		AgentTypeClaudeCode, AgentTypeCodex, AgentTypeGemini, AgentTypePi, AgentTypeKimi, AgentTypeMuse,
+		AgentTypeAntigravity, AgentTypeGrok, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider,
+		AgentTypeOpencode, AgentTypeOllama,
+	}
+	got := AgentTypes()
+	if len(got) != len(want) {
+		t.Fatalf("AgentTypes() = %v, want %v", got, want)
+	}
+	for i, at := range got {
+		if at != want[i] {
+			t.Fatalf("AgentTypes()[%d] = %q, want %q (full list %v)", i, at, want[i], got)
+		}
+		if at.Canonical() != at {
+			t.Errorf("AgentTypes()[%d] = %q is not canonical (Canonical() = %q)", i, at, at.Canonical())
+		}
+		if !at.IsValid() {
+			t.Errorf("AgentTypes()[%d] = %q is not IsValid()", i, at)
+		}
+		if at.DisplayName() == "Unknown" {
+			t.Errorf("AgentTypes()[%d] = %q has no display name", i, at)
+		}
+	}
+	for _, excluded := range []AgentType{AgentTypeUser, AgentTypeUnknown} {
+		for _, at := range got {
+			if at == excluded {
+				t.Errorf("AgentTypes() includes %q", excluded)
+			}
+		}
+	}
+
+	// Callers get a fresh slice, so one caller can't edit another's list.
+	got[0] = "mutated"
+	if AgentTypes()[0] != AgentTypeClaudeCode {
+		t.Fatal("AgentTypes() returned a shared slice")
 	}
 }
 

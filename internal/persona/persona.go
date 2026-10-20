@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -84,30 +85,11 @@ func (s *PersonaSet) Validate() error {
 // AgentTypeFlag returns the NTM flag for this persona's agent type.
 // e.g., "claude" -> "cc", "openai-codex" -> "cod", "google-gemini" -> "gmi"
 func (p *Persona) AgentTypeFlag() string {
-	switch agentpkg.AgentType(p.AgentType).Canonical() {
-	case agentpkg.AgentTypeClaudeCode:
-		return "cc"
-	case agentpkg.AgentTypeCodex:
-		return "cod"
-	case agentpkg.AgentTypeGemini:
-		return "gmi"
-	case agentpkg.AgentTypeAntigravity:
-		return "agy"
-	case agentpkg.AgentTypeGrok:
-		return "grok"
-	case agentpkg.AgentTypeCursor:
-		return "cursor"
-	case agentpkg.AgentTypeWindsurf:
-		return "windsurf"
-	case agentpkg.AgentTypeAider:
-		return "aider"
-	case agentpkg.AgentTypeOpencode:
-		return "oc"
-	case agentpkg.AgentTypeOllama:
-		return "ollama"
-	default:
+	canonical := agentpkg.AgentType(p.AgentType).Canonical()
+	if !slices.Contains(agentpkg.AgentTypes(), canonical) {
 		return "cc" // Default to Claude
 	}
+	return string(canonical)
 }
 
 // Validate checks if the persona configuration is valid.
@@ -124,13 +106,8 @@ func (p *Persona) Validate() error {
 
 	if strings.TrimSpace(p.AgentType) != "" {
 		// Validate agent type aliases against the shared canonical resolver.
-		switch agentpkg.AgentType(p.AgentType).Canonical() {
-		case agentpkg.AgentTypeClaudeCode, agentpkg.AgentTypeCodex, agentpkg.AgentTypeGemini,
-			agentpkg.AgentTypeAntigravity, agentpkg.AgentTypeGrok, agentpkg.AgentTypeCursor, agentpkg.AgentTypeWindsurf,
-			agentpkg.AgentTypeAider, agentpkg.AgentTypeOpencode, agentpkg.AgentTypeOllama:
-			// valid
-		default:
-			return fmt.Errorf("persona %q: invalid agent_type %q", p.Name, p.AgentType)
+		if !slices.Contains(agentpkg.AgentTypes(), agentpkg.AgentType(p.AgentType).Canonical()) {
+			return fmt.Errorf("persona %q: invalid agent_type %q (valid types: %v)", p.Name, p.AgentType, agentpkg.AgentTypes())
 		}
 	}
 

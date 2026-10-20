@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -309,28 +310,11 @@ func normalizeRecipeAgentSpec(spec *AgentSpec) error {
 }
 
 func normalizeRecipeAgentType(raw string) (string, error) {
-	switch agentpkg.AgentType(raw).Canonical() {
-	case agentpkg.AgentTypeClaudeCode:
-		return string(agentpkg.AgentTypeClaudeCode), nil
-	case agentpkg.AgentTypeCodex:
-		return string(agentpkg.AgentTypeCodex), nil
-	case agentpkg.AgentTypeGemini:
-		return string(agentpkg.AgentTypeGemini), nil
-	case agentpkg.AgentTypeAntigravity:
-		return string(agentpkg.AgentTypeAntigravity), nil
-	case agentpkg.AgentTypeGrok:
-		return string(agentpkg.AgentTypeGrok), nil
-	case agentpkg.AgentTypeCursor:
-		return string(agentpkg.AgentTypeCursor), nil
-	case agentpkg.AgentTypeWindsurf:
-		return string(agentpkg.AgentTypeWindsurf), nil
-	case agentpkg.AgentTypeAider:
-		return string(agentpkg.AgentTypeAider), nil
-	case agentpkg.AgentTypeOllama:
-		return string(agentpkg.AgentTypeOllama), nil
-	default:
-		return "", fmt.Errorf("unsupported recipe agent type %q", strings.TrimSpace(raw))
+	canonical := agentpkg.AgentType(raw).Canonical()
+	if !slices.Contains(agentpkg.AgentTypes(), canonical) {
+		return "", fmt.Errorf("unsupported recipe agent type %q (valid types: %v)", strings.TrimSpace(raw), agentpkg.AgentTypes())
 	}
+	return string(canonical), nil
 }
 
 // Validate validates a recipe.

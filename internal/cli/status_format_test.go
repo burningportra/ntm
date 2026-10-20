@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/models"
+	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -205,6 +208,9 @@ func TestSessionPanePresentationCanonicalizesAliases(t *testing.T) {
 		{name: "ollama", agentType: tmux.AgentOllama, wantColor: string(th.Ollama), wantIcon: ic.Ollama},
 		{name: "user", agentType: tmux.AgentUser, wantColor: string(th.User), wantIcon: ic.Terminal},
 		{name: "unknown", agentType: tmux.AgentType("mystery"), wantColor: string(th.Overlay), wantIcon: ic.Robot},
+		{name: "pi", agentType: tmux.AgentPi, wantColor: string(th.Mauve), wantIcon: ic.Robot},
+		{name: "kimi alias", agentType: tmux.AgentType("moonshot"), wantColor: string(th.Sapphire), wantIcon: ic.Robot},
+		{name: "opencode alias", agentType: tmux.AgentType("opencode"), wantColor: string(th.Opencode), wantIcon: ic.Robot},
 	}
 
 	for _, tc := range tests {
@@ -218,6 +224,50 @@ func TestSessionPanePresentationCanonicalizesAliases(t *testing.T) {
 				t.Fatalf("sessionPanePresentation(%q) icon = %q, want %q", tc.agentType, gotIcon, tc.wantIcon)
 			}
 		})
+	}
+}
+
+// TestStatusAgentSummaryShowsEveryAgentType checks `ntm status` prints a row
+// for Pi, Kimi and Opencode panes and counts a session of only those as
+// running agents instead of "No agents running".
+func TestStatusAgentSummaryShowsEveryAgentType(t *testing.T) {
+	counts := output.AgentCountsResponse{}
+	for _, paneType := range []tmux.AgentType{tmux.AgentPi, tmux.AgentKimi, tmux.AgentType("moonshot"), tmux.AgentOpencode} {
+		incrementAgentCounts(&counts, paneType)
+	}
+
+	var buf bytes.Buffer
+	plain := func(interface{}) string { return "" }
+	writeStatusAgentSummary(&buf, counts, theme.CatppuccinMocha, icons.ASCII, plain, "")
+	got := buf.String()
+	for _, want := range []string{"Pi      1 instance(s)", "Kimi    2 instance(s)", "Opencode 1 instance(s)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status agent summary missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "No agents running") {
+		t.Errorf("status agent summary reports no agents for a Pi/Kimi/Opencode session:\n%s", got)
+	}
+
+	buf.Reset()
+	writeStatusAgentSummary(&buf, output.AgentCountsResponse{User: 1, Total: 1}, theme.CatppuccinMocha, icons.ASCII, plain, "")
+	if !strings.Contains(buf.String(), "No agents running") {
+		t.Errorf("user-only session should report no agents running:\n%s", buf.String())
+	}
+}
+
+// TestListAgentsSummaryShowsEveryAgentType checks the wide `ntm list` AGENTS
+// column counts Pi, Kimi and Opencode panes.
+func TestListAgentsSummaryShowsEveryAgentType(t *testing.T) {
+	counts := &output.AgentCountsResponse{Claude: 2, Pi: 1, Kimi: 1, Muse: 1, Opencode: 3}
+	if got, want := listAgentsSummary(counts), "2 CC, 1 Pi, 1 Kimi, 1 Muse, 3 OC"; got != want {
+		t.Fatalf("listAgentsSummary() = %q, want %q", got, want)
+	}
+	if got := listAgentsSummary(&output.AgentCountsResponse{}); got != "-" {
+		t.Fatalf("listAgentsSummary(empty) = %q, want -", got)
+	}
+	if got := listAgentsSummary(nil); got != "-" {
+		t.Fatalf("listAgentsSummary(nil) = %q, want -", got)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
 	"github.com/Dicklesworthstone/ntm/internal/output"
@@ -512,7 +513,12 @@ func parseAgentMix(value string) (map[string]int, error) {
 		}
 		agentType := normalizeEnsembleAgentType(kv[0])
 		if agentType == "" {
-			return nil, fmt.Errorf("agent-mix entry %q has invalid agent type", part)
+			return nil, fmt.Errorf("agent-mix entry %q has invalid agent type (want one of %s)", part, agentTypeChoices())
+		}
+		// Every ensemble pane gets its mode prompt injected, so reject types
+		// that can't take automated prompts before any pane is created.
+		if err := agentpkg.AgentType(agentType).ValidateAutomatedPromptDelivery(); err != nil {
+			return nil, fmt.Errorf("agent-mix entry %q: %w", part, err)
 		}
 		count, err := strconv.Atoi(strings.TrimSpace(kv[1]))
 		if err != nil {

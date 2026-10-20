@@ -85,6 +85,32 @@ webhooks:
 	}
 }
 
+// TestParseWebhookConfig_AgentTypeFilterUsesCanonicalList checks a webhook
+// filter accepts the agent types the old list rejected and that a bogus type
+// still fails with the supported list in the error.
+func TestParseWebhookConfig_AgentTypeFilterUsesCanonicalList(t *testing.T) {
+	content := `
+webhooks:
+  - name: newer-agents
+    url: https://example.com/hook
+    filter:
+      agent_type: [agy, grok, opencode, pi, kimi, muse]
+`
+	if _, err := ParseWebhookConfig([]byte(content)); err != nil {
+		t.Fatalf("ParseWebhookConfig with newer agent types: %v", err)
+	}
+
+	_, err := ParseWebhookConfig([]byte(strings.Replace(content, "agy,", "bogus,", 1)))
+	if err == nil {
+		t.Fatal("ParseWebhookConfig with agent_type bogus returned nil, want error")
+	}
+	for _, want := range []string{`"bogus"`, "agy", "grok", "oc", "muse"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("ParseWebhookConfig(bogus) error %q does not mention %q", err, want)
+		}
+	}
+}
+
 func TestParseWebhookConfig_MissingEnvVar(t *testing.T) {
 	content := `
 webhooks:
@@ -269,6 +295,16 @@ func TestIsValidWebhookAgentType(t *testing.T) {
 		{"google-gemini", true},
 		{"muse", true},
 		{"muse-code", true},
+		{"pi", true},
+		{"kimi", true},
+		{"moonshot", true},
+		// agy, grok and opencode were missing from the old hand list.
+		{"agy", true},
+		{"antigravity", true},
+		{"grok", true},
+		{"opencode", true},
+		{"oc", true},
+		{"user", false},
 		{"", false},
 		{"python", false},
 		{"claude2", false},
