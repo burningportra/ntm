@@ -697,6 +697,16 @@ func paneWorkStatusFromObservation(observation statuspkg.PaneObservation) PaneWo
 // observation. liveBusy reports whether the live-window THINKING override
 // (#133) fired for this pane; it pins the working verdict so the idle arm can
 // never talk a mid-tool-call pane back down to idle.
+//
+// A turn that is live but failing, such as one retrying a 429 or a 5xx,
+// should read RATE_LIMITED_WAIT or ERROR_STATE. The canonical detector
+// decides that, because it is where each agent's recognizers for the current
+// turn live: it observes such a turn as an error (bd-obwha, for opencode),
+// and that state falls through below, leaving the parser's failure verdict
+// in place. A canonical working observation therefore outranks the parser's
+// rate-limit and error flags, which for most agents are substring matches
+// over the last 10 to 50 lines and cannot tell a failing request from error
+// text in tool output.
 func applyCanonicalWorkSafety(workStatus *PaneWorkStatus, observation statuspkg.PaneObservation, liveBusy bool) {
 	if workStatus == nil {
 		return

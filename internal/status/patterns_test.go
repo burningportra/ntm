@@ -72,6 +72,9 @@ func TestIsPromptLine(t *testing.T) {
 		// means it exited (bd-q9cli).
 		{name: "shell prompt for opencode means exited", line: "user@host:~$", agentType: "oc", expected: false},
 		{name: "shell prompt for opencode alias means exited", line: "$", agentType: "opencode", expected: false},
+		// Pi draws no shell-like prompt either (bd-obwha).
+		{name: "shell prompt for pi means exited", line: "user@host:~$", agentType: "pi", expected: false},
+		{name: "shell prompt for pi alias means exited", line: "%", agentType: "pi-coding-agent", expected: false},
 
 		// Gemini prompts
 		{name: "gemini prompt", line: "gemini>", agentType: "gmi", expected: true},
@@ -671,6 +674,59 @@ func TestOpencodeIdleAgreesWithUnifiedDetector(t *testing.T) {
 			}
 			if parsed.IsWorking != (tt.wantState == StateWorking) {
 				t.Errorf("parser IsWorking = %v, want %v", parsed.IsWorking, tt.wantState == StateWorking)
+			}
+		})
+	}
+}
+
+// TestOpencodeFailingTurnReadsAsError is the bd-obwha regression: the
+// opencode arm of determineStateAt read a turn that an error ended (a bad
+// key, an exhausted quota, a context overflow) as idle, so the observer
+// offered the pane new work its provider would refuse again, and read a turn
+// stuck retrying a 429 or 5xx as working. The notice above the last turn
+// decides; notices above earlier turns do not count. The captures are
+// opencode 2.0.28 screens from the agent package's testdata.
+func TestOpencodeFailingTurnReadsAsError(t *testing.T) {
+	t.Parallel()
+
+	d := NewDetector()
+	observedAt := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		file      string
+		wantState AgentState
+		wantError ErrorType
+	}{
+		{"oc_rate_limit_retry.txt", StateError, ErrorRateLimit},
+		{"oc_rate_limit_retry_narrow.txt", StateError, ErrorRateLimit},
+		{"oc_rate_limit_retry_styled.txt", StateError, ErrorRateLimit},
+		{"oc_server_error_retry.txt", StateError, ErrorGeneric},
+		{"oc_quota_error.txt", StateError, ErrorRateLimit},
+		{"oc_auth_error.txt", StateError, ErrorGeneric},
+		{"oc_context_error.txt", StateError, ErrorGeneric},
+		{"oc_context_error_styled.txt", StateError, ErrorGeneric},
+		{"oc_idle_after_errors.txt", StateIdle, ErrorNone},
+		{"oc_idle_retry_interrupted.txt", StateIdle, ErrorNone},
+		{"oc_working_after_retry.txt", StateWorking, ErrorNone},
+		{"oc_compacting.txt", StateWorking, ErrorNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("..", "agent", "testdata", tt.file))
+			if err != nil {
+				t.Fatalf("read capture: %v", err)
+			}
+			output := strings.TrimSpace(string(raw))
+			for _, activity := range []time.Time{observedAt, observedAt.Add(-time.Hour)} {
+				state, errType := d.determineStateAt(output, "oc", activity, observedAt)
+				if state != tt.wantState || errType != tt.wantError {
+					t.Errorf("determineStateAt() = %v/%q, want %v/%q", state, errType, tt.wantState, tt.wantError)
+				}
+				confidence := observationConfidence(AgentStatus{AgentType: "oc", State: state}, output)
+				dispatchable := state == StateIdle && ObservationConfidenceIsActionable(confidence)
+				if want := tt.wantState == StateIdle; dispatchable != want {
+					t.Errorf("unified dispatchable = %v (state %v, confidence %.2f), want %v", dispatchable, state, confidence, want)
+				}
 			}
 		})
 	}

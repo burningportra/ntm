@@ -781,6 +781,9 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	liveMatches := sc.patternLibrary.Match(liveContent, sc.agentType)
 	effectiveMatches := filterThinkingToLive(matches, liveMatches)
 	effectiveMatches = filterErrorToLiveWhenIdle(effectiveMatches, liveMatches)
+	if normalizeAgentType(sc.agentType) == "oc" {
+		effectiveMatches = opencodeFailureMatches(effectiveMatches, content)
+	}
 
 	// Calculate proposed state and confidence
 	proposedState, confidence, trigger := sc.classifyState(velocity, effectiveMatches)
@@ -821,10 +824,33 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 // indicate API rate-limiting. Keeping this as a set allows O(1) lookup when
 // scanning pattern matches from the classifier.
 var rateLimitPatternNames = map[string]bool{
-	"rate_limit_text":   true,
-	"http_429":          true,
-	"too_many_requests": true,
-	"quota_exceeded":    true,
+	"rate_limit_text":      true,
+	"http_429":             true,
+	"too_many_requests":    true,
+	"quota_exceeded":       true,
+	"oc_rate_limit_notice": true,
+}
+
+// opencodeFailureMatches replaces the error-category matches for an opencode
+// pane with the notice above its last turn (bd-obwha): a retry warning while
+// the turn runs, or the error that ended it. That notice can sit any
+// distance above the prompt box, which stays at the bottom of the pane, so
+// the regex patterns missed it once it was out of the live tail, and read
+// error text in a reply or in an earlier turn as current.
+func opencodeFailureMatches(matches []PatternMatch, content string) []PatternMatch {
+	out := make([]PatternMatch, 0, len(matches)+1)
+	for _, m := range matches {
+		if m.Category != CategoryError {
+			out = append(out, m)
+		}
+	}
+	switch {
+	case agent.OpencodeRateLimited(content):
+		out = append(out, PatternMatch{Pattern: "oc_rate_limit_notice", State: StateError, Category: CategoryError})
+	case agent.OpencodeErrorShowing(content):
+		out = append(out, PatternMatch{Pattern: "oc_error_notice", State: StateError, Category: CategoryError})
+	}
+	return out
 }
 
 // isRateLimitPatternMatch returns true if any PatternMatch corresponds to a

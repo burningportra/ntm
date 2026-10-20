@@ -589,6 +589,89 @@ func TestClassifyPaneWork_PiPanes(t *testing.T) {
 	}
 }
 
+// TestClassifyPaneWork_OpencodeFailingTurns is the bd-obwha regression at the
+// verdicts --robot-is-working, smart restart, the state surfaces and
+// --robot-activity give. opencode retries a 429 or 5xx with its progress bar
+// up, and the canonical observation read that as working, which
+// applyCanonicalWorkSafety turned into DO_NOT_INTERRUPT over the parser's
+// rate-limit and error verdicts. A turn that an error ended read idle and
+// safe to dispatch, and --robot-activity read the notice only when it sat in
+// the last 15 lines. The captures are opencode 2.0.28 screens from the agent
+// package's testdata; the shifted one moves the quota error out of those 15
+// lines, as in a fresh session whose transcript is short.
+func TestClassifyPaneWork_OpencodeFailingTurns(t *testing.T) {
+	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
+	parser := agent.NewParser()
+	tests := []struct {
+		file         string
+		shift        int // blank lines added between the last turn's header and the prompt box
+		want         agent.Recommendation
+		wantWorking  bool
+		wantState    state.AgentState
+		wantActivity AgentState
+	}{
+		{file: "oc_rate_limit_retry.txt", want: agent.RecommendRateLimitedWait, wantState: state.AgentStateError, wantActivity: StateError},
+		{file: "oc_rate_limit_retry_narrow.txt", want: agent.RecommendRateLimitedWait, wantState: state.AgentStateError, wantActivity: StateError},
+		{file: "oc_server_error_retry.txt", want: agent.RecommendErrorState, wantWorking: true, wantState: state.AgentStateError, wantActivity: StateError},
+		{file: "oc_quota_error.txt", want: agent.RecommendRateLimitedWait, wantState: state.AgentStateError, wantActivity: StateError},
+		{file: "oc_quota_error.txt", shift: 12, want: agent.RecommendRateLimitedWait, wantState: state.AgentStateError, wantActivity: StateError},
+		{file: "oc_auth_error.txt", want: agent.RecommendErrorState, wantState: state.AgentStateError, wantActivity: StateError},
+		{file: "oc_context_error.txt", want: agent.RecommendErrorState, wantState: state.AgentStateError, wantActivity: StateError},
+		// Notices above earlier turns do not hold the pane up.
+		{file: "oc_idle_after_errors.txt", want: agent.RecommendSafeToRestart, wantState: state.AgentStateIdle, wantActivity: StateWaiting},
+		{file: "oc_idle_retry_interrupted.txt", want: agent.RecommendSafeToRestart, wantState: state.AgentStateIdle, wantActivity: StateWaiting},
+		{file: "oc_working_after_retry.txt", want: agent.RecommendDoNotInterrupt, wantWorking: true, wantState: state.AgentStateBusy, wantActivity: StateThinking},
+	}
+	for i, tt := range tests {
+		t.Run(fmt.Sprintf("%s/shift%d", tt.file, tt.shift), func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("..", "agent", "testdata", tt.file))
+			if err != nil {
+				t.Fatalf("read capture: %v", err)
+			}
+			output := strings.TrimSpace(string(raw))
+			if tt.shift > 0 {
+				const header = "     Build · Fake Model · 38ms\n"
+				if !strings.Contains(output, header) {
+					t.Fatalf("fixture does not contain %q", header)
+				}
+				output = strings.Replace(output, header, header+strings.Repeat("\n", tt.shift), 1)
+			}
+			pane := tmux.Pane{ID: fmt.Sprintf("%%%d", i+1), Index: i + 1, Title: fmt.Sprintf("proj__oc_%d", i+1), Type: tmux.AgentOpencode}
+			work := classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, output, "")
+			if work.Recommendation != string(tt.want) {
+				t.Fatalf("recommendation = %q, want %q (work=%+v)", work.Recommendation, tt.want, work)
+			}
+			if work.IsWorking != tt.wantWorking {
+				t.Errorf("is_working = %v, want %v", work.IsWorking, tt.wantWorking)
+			}
+			if wantLimited := tt.want == agent.RecommendRateLimitedWait; work.IsRateLimited != wantLimited {
+				t.Errorf("is_rate_limited = %v, want %v", work.IsRateLimited, wantLimited)
+			}
+			if wantIdle := tt.want == agent.RecommendSafeToRestart; work.SafeToDispatch != wantIdle {
+				t.Errorf("safe_to_dispatch = %v, want %v (observation %s)", work.SafeToDispatch, wantIdle, work.ObservationState)
+			}
+			if got := runtimeAgentState(paneAgentType(pane), work); got != tt.wantState {
+				t.Errorf("runtimeAgentState = %q, want %q", got, tt.wantState)
+			}
+
+			classifier := NewStateClassifier(pane.ID, &ClassifierConfig{AgentType: "oc", HysteresisDuration: 0})
+			if _, err := classifier.ClassifyWithOutput(output); err != nil {
+				t.Fatalf("baseline: %v", err)
+			}
+			activity, err := classifier.ClassifyWithOutput(output)
+			if err != nil {
+				t.Fatalf("ClassifyWithOutput: %v", err)
+			}
+			if activity.State != tt.wantActivity {
+				t.Errorf("activity state = %q, want %q (patterns %v)", activity.State, tt.wantActivity, activity.DetectedPatterns)
+			}
+			if activity.RateLimited != work.IsRateLimited {
+				t.Errorf("activity rate_limited = %v, want %v", activity.RateLimited, work.IsRateLimited)
+			}
+		})
+	}
+}
+
 // TestClassifyPaneWork_PiGhostSuggestion is the bd-3hin5 regression at the
 // verdict --robot-is-working, smart restart and dispatch read. A Pi editor
 // holding only pi-prompt-suggester's dim suggestion read UNKNOWN and not safe

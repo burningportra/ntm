@@ -190,8 +190,21 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 	// opencode likewise: the progress bar below its prompt box is the only
 	// live-turn marker, and a box with no bar is waiting for input. A draft
 	// in the box is idle here but not an idle prompt, so
-	// observationConfidence keeps it from being dispatched to.
+	// observationConfidence keeps it from being dispatched to. The notice
+	// above the last turn decides first: opencode keeps the bar up while it
+	// retries a 429 or 5xx without end, and an error that ended the turn
+	// leaves an empty box that new work would only fail in again. Neither
+	// is work or a pane waiting for input, so both read as an error, which
+	// also keeps --robot-is-working's rate-limit and error verdicts from
+	// being overridden as live work. Notices above earlier turns do not
+	// count.
 	if agentType == string(agent.AgentTypeOpencode) {
+		if agent.OpencodeRateLimited(output) {
+			return StateError, ErrorRateLimit
+		}
+		if agent.OpencodeErrorShowing(output) {
+			return StateError, ErrorGeneric
+		}
 		if agent.OpencodeActivelyWorking(output) {
 			return StateWorking, ErrorNone
 		}

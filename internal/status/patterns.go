@@ -141,6 +141,7 @@ var knownAgentTypes = map[string]bool{
 	"cod":      true, // Codex uses "codex>" prompt
 	"gmi":      true, // Gemini uses "gemini>" prompt
 	"oc":       true, // opencode's prompt is a box, matched by agent.OpencodeIdlePromptShowing
+	"pi":       true, // Pi's prompt is an editor box, matched by agent.PiIdlePromptShowing
 	"cursor":   true,
 	"windsurf": true,
 	"aider":    true,
