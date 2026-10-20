@@ -156,14 +156,13 @@ func (m *InboxMessage) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// ContactLink represents a contact relationship between agents.
+// ContactLink is one row of a list_contacts reply: the listed agent's contact
+// link with the agent named in To, whichever side requested it.
 type ContactLink struct {
-	FromAgent string    `json:"from_agent,omitempty"`
-	ToAgent   string    `json:"to_agent,omitempty"`
-	To        string    `json:"to,omitempty"`
+	To        string    `json:"to"`
+	ToProject string    `json:"to_project,omitempty"` // Python server only
 	Status    string    `json:"status,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
-	Approved  bool      `json:"approved,omitempty"`
 	UpdatedTS *FlexTime `json:"updated_ts,omitempty"`
 	ExpiresTS *FlexTime `json:"expires_ts,omitempty"`
 }
@@ -366,7 +365,8 @@ type SearchResult struct {
 }
 
 // UnmarshalJSON decodes a search_messages row. Both servers send ack_required
-// there as the 0/1 integer stored in SQLite rather than a JSON boolean.
+// there as the 0/1 integer stored in SQLite rather than a JSON boolean, and
+// MarshalJSON writes it the same way.
 func (r *SearchResult) UnmarshalJSON(data []byte) error {
 	type searchResultFields SearchResult
 	var raw struct {
@@ -379,6 +379,19 @@ func (r *SearchResult) UnmarshalJSON(data []byte) error {
 	*r = SearchResult(raw.searchResultFields)
 	r.AckRequired = raw.AckRequired != 0
 	return nil
+}
+
+// MarshalJSON writes r as a search_messages row, with ack_required as 0 or 1.
+func (r SearchResult) MarshalJSON() ([]byte, error) {
+	type searchResultFields SearchResult
+	row := struct {
+		searchResultFields
+		AckRequired int `json:"ack_required"`
+	}{searchResultFields: searchResultFields(r)}
+	if r.AckRequired {
+		row.AckRequired = 1
+	}
+	return json.Marshal(row)
 }
 
 // OverseerMessageOptions contains options for sending a Human Overseer message.
@@ -551,10 +564,62 @@ type ForceReleaseOptions struct {
 }
 
 // ForceReleaseResult contains the result of a force-release operation.
+// UnmarshalJSON fills it from the server's reply, and MarshalJSON writes that
+// same shape, so a stub server returning a ForceReleaseResult answers the way
+// Agent Mail does.
 type ForceReleaseResult struct {
-	Success        bool      `json:"success"`
-	ReleasedAt     *FlexTime `json:"released_at,omitempty"`
-	PreviousHolder string    `json:"previous_holder,omitempty"`
-	PathPattern    string    `json:"path_pattern,omitempty"`
-	Notified       bool      `json:"notified,omitempty"`
+	Success        bool // the call released the reservation
+	ReleasedAt     *FlexTime
+	PreviousHolder string
+	PathPattern    string
+	Notified       bool // the previous holder was sent a notice
+}
+
+// UnmarshalJSON decodes a force_release_file_reservation reply. Both servers
+// reply {released, released_at, reservation: {agent, path_pattern, notified,
+// ...}}, answer an already-released id with {released: 0, already_released:
+// true} and no reservation, and refuse a live reservation with a tool error.
+func (r *ForceReleaseResult) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Released    int       `json:"released"`
+		ReleasedAt  *FlexTime `json:"released_at"`
+		Reservation struct {
+			Agent       string `json:"agent"`
+			PathPattern string `json:"path_pattern"`
+			Notified    bool   `json:"notified"`
+		} `json:"reservation"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = ForceReleaseResult{
+		Success:        raw.Released > 0,
+		ReleasedAt:     raw.ReleasedAt,
+		PreviousHolder: raw.Reservation.Agent,
+		PathPattern:    raw.Reservation.PathPattern,
+		Notified:       raw.Reservation.Notified,
+	}
+	return nil
+}
+
+// MarshalJSON writes r in the force_release_file_reservation reply shape.
+func (r ForceReleaseResult) MarshalJSON() ([]byte, error) {
+	type reservation struct {
+		Agent       string `json:"agent"`
+		PathPattern string `json:"path_pattern"`
+		Notified    bool   `json:"notified"`
+	}
+	reply := struct {
+		Released        int          `json:"released"`
+		ReleasedAt      *FlexTime    `json:"released_at,omitempty"`
+		AlreadyReleased bool         `json:"already_released,omitempty"`
+		Reservation     *reservation `json:"reservation,omitempty"`
+	}{ReleasedAt: r.ReleasedAt}
+	if r.Success {
+		reply.Released = 1
+		reply.Reservation = &reservation{Agent: r.PreviousHolder, PathPattern: r.PathPattern, Notified: r.Notified}
+	} else {
+		reply.AlreadyReleased = true
+	}
+	return json.Marshal(reply)
 }

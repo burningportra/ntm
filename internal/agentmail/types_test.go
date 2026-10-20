@@ -555,3 +555,69 @@ func TestInboxMessageUnmarshalJSON_ReadState(t *testing.T) {
 		})
 	}
 }
+
+// TestCustomCodecsWriteTheServerShape checks that the types with a custom
+// decoder also encode to the reply shape the servers send, so a stub server
+// that returns one of them is decoded the way a real reply is.
+func TestCustomCodecsWriteTheServerShape(t *testing.T) {
+	t.Parallel()
+
+	released := ForceReleaseResult{
+		Success:        true,
+		ReleasedAt:     &FlexTime{Time: time.Date(2026, 10, 20, 2, 50, 0, 0, time.UTC)},
+		PreviousHolder: "BlueLake",
+		PathPattern:    "a/*",
+		Notified:       true,
+	}
+	data, err := json.Marshal(released)
+	if err != nil {
+		t.Fatalf("Marshal ForceReleaseResult: %v", err)
+	}
+	var wire struct {
+		Released    int `json:"released"`
+		Reservation struct {
+			Agent       string `json:"agent"`
+			PathPattern string `json:"path_pattern"`
+			Notified    bool   `json:"notified"`
+		} `json:"reservation"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatalf("Unmarshal wire: %v", err)
+	}
+	if wire.Released != 1 || wire.Reservation.Agent != "BlueLake" || wire.Reservation.PathPattern != "a/*" || !wire.Reservation.Notified {
+		t.Errorf("force-release wire = %s", data)
+	}
+	var back ForceReleaseResult
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("Unmarshal ForceReleaseResult: %v", err)
+	}
+	if back.Success != released.Success || back.PreviousHolder != released.PreviousHolder ||
+		back.PathPattern != released.PathPattern || back.Notified != released.Notified ||
+		back.ReleasedAt == nil || !back.ReleasedAt.Time.Equal(released.ReleasedAt.Time) {
+		t.Errorf("force-release round trip = %+v, want %+v", back, released)
+	}
+
+	data, err = json.Marshal(ForceReleaseResult{})
+	if err != nil {
+		t.Fatalf("Marshal empty ForceReleaseResult: %v", err)
+	}
+	if err := json.Unmarshal(data, &back); err != nil || back.Success {
+		t.Errorf("already-released round trip = %+v (err %v) from %s, want Success false", back, err, data)
+	}
+
+	row := SearchResult{ID: 7, Subject: "s", AckRequired: true, From: "BlueLake"}
+	data, err = json.Marshal(row)
+	if err != nil {
+		t.Fatalf("Marshal SearchResult: %v", err)
+	}
+	var ack struct {
+		AckRequired json.RawMessage `json:"ack_required"`
+	}
+	if err := json.Unmarshal(data, &ack); err != nil || string(ack.AckRequired) != "1" {
+		t.Errorf("search row ack_required = %s (err %v), want 1", ack.AckRequired, err)
+	}
+	var backRow SearchResult
+	if err := json.Unmarshal(data, &backRow); err != nil || !backRow.AckRequired || backRow.ID != 7 || backRow.From != "BlueLake" {
+		t.Errorf("search round trip = %+v (err %v), want %+v", backRow, err, row)
+	}
+}

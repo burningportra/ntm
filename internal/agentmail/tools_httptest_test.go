@@ -367,14 +367,14 @@ func TestRequestContact(t *testing.T) {
 
 	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
 		"request_contact": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return ContactRequestResult{
-				Status: "pending",
-				Link: &ContactLink{
-					FromAgent: "TestAgent",
-					ToAgent:   "BlueLake",
-					Status:    "pending",
-				},
-				ExpiresTS: &expiresAt,
+			// Both servers reply with the link's fields at the top level.
+			return map[string]interface{}{
+				"from":         "TestAgent",
+				"from_project": "/test",
+				"to":           "BlueLake",
+				"to_project":   "/other",
+				"status":       "pending",
+				"expires_ts":   expiresAt,
 			}, nil
 		},
 	}))
@@ -395,8 +395,8 @@ func TestRequestContact(t *testing.T) {
 	if result.Status != "pending" {
 		t.Errorf("status = %q, want pending", result.Status)
 	}
-	if result.Link == nil || result.Link.ToAgent != "BlueLake" {
-		t.Fatalf("unexpected link = %#v", result.Link)
+	if result.From != "TestAgent" || result.To != "BlueLake" || result.ToProject != "/other" {
+		t.Fatalf("link fields = %+v", *result)
 	}
 	if result.ExpiresTS == nil || *result.ExpiresTS != expiresAt {
 		t.Fatalf("expires_ts = %#v, want %q", result.ExpiresTS, expiresAt)
@@ -410,14 +410,13 @@ func TestRespondContact(t *testing.T) {
 
 	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
 		"respond_contact": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return ContactRespondResult{
-				Status: "approved",
-				Link: &ContactLink{
-					FromAgent: "TestAgent",
-					ToAgent:   "BlueLake",
-					Status:    "approved",
-				},
-				ExpiresTS: &expiresAt,
+			// Both servers reply {from, to, approved, expires_ts, updated}.
+			return map[string]interface{}{
+				"from":       "TestAgent",
+				"to":         "BlueLake",
+				"approved":   true,
+				"expires_ts": expiresAt,
+				"updated":    1,
 			}, nil
 		},
 	}))
@@ -434,11 +433,8 @@ func TestRespondContact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Status != "approved" {
-		t.Fatalf("status = %q, want approved", result.Status)
-	}
-	if result.Link == nil || result.Link.ToAgent != "BlueLake" {
-		t.Fatalf("unexpected link = %#v", result.Link)
+	if !result.Approved || result.Updated != 1 || result.From != "TestAgent" || result.To != "BlueLake" {
+		t.Fatalf("result = %+v, want TestAgent->BlueLake approved with 1 link updated", *result)
 	}
 	if result.ExpiresTS == nil || *result.ExpiresTS != expiresAt {
 		t.Fatalf("expires_ts = %#v, want %q", result.ExpiresTS, expiresAt)
@@ -450,24 +446,23 @@ func TestListContacts(t *testing.T) {
 
 	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
 		"list_contacts": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return []ContactLink{
-				{FromAgent: "TestAgent", ToAgent: "BlueLake", Status: "approved"},
-				{FromAgent: "TestAgent", ToAgent: "RedStone", Status: "pending"},
-			}, nil
+			// Captured from the Rust server (am 0.3.36): the counterparty
+			// is always in "to".
+			return json.RawMessage(`[{"to":"OliveSpire","status":"approved","reason":"auto-handshake by send_message","updated_ts":"2026-10-20T02:24:41.114375Z","expires_ts":"2026-10-21T02:24:41.114375Z"},{"to":"CrimsonDune","status":"approved","reason":"auto-handshake by send_message","updated_ts":"2026-10-20T02:32:19.964488Z","expires_ts":"2026-10-21T02:32:19.964488Z"}]`), nil
 		},
 	}))
 	defer server.Close()
 
 	c := NewClient(WithBaseURL(server.URL + "/"))
-	contacts, err := c.ListContacts(context.Background(), "/test", "TestAgent")
+	contacts, err := c.ListContacts(context.Background(), "/test", "SapphireSquirrel")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(contacts) != 2 {
 		t.Fatalf("len(contacts) = %d, want 2", len(contacts))
 	}
-	if contacts[0].ToAgent != "BlueLake" {
-		t.Errorf("contacts[0].ToAgent = %q, want BlueLake", contacts[0].ToAgent)
+	if contacts[1].To != "CrimsonDune" || contacts[1].Status != "approved" || contacts[1].ExpiresTS == nil {
+		t.Errorf("contacts[1] = %+v, want approved link to CrimsonDune with expires_ts", contacts[1])
 	}
 }
 
@@ -872,8 +867,8 @@ func TestContactHandshake(t *testing.T) {
 	if result.Request.Status != "pending" || result.Request.ExpiresTS == nil {
 		t.Errorf("request = %+v, want pending with expires_ts", result.Request)
 	}
-	if result.Response == nil || result.Response.ExpiresTS == nil {
-		t.Errorf("response = %+v, want the respond_contact reply", result.Response)
+	if result.Response == nil || !result.Response.Approved || result.Response.ExpiresTS == nil {
+		t.Errorf("response = %+v, want the approving respond_contact reply", result.Response)
 	}
 	if result.WelcomeMessage == nil || len(result.WelcomeMessage.Deliveries) != 1 ||
 		result.WelcomeMessage.Deliveries[0].Payload == nil || result.WelcomeMessage.Deliveries[0].Payload.Subject != "Hello!" {
@@ -1194,34 +1189,62 @@ func TestReservationPatternsOverlapKeepsQualifiedWildcardsWithinOneDirectory(t *
 func TestForceReleaseReservation(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
-		"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			return ForceReleaseResult{
+	// Real replies from the Rust server (am 0.3.36) to force-releasing an
+	// expired reservation twice; the Python server builds the same shape. A
+	// refused release comes back as a tool error instead.
+	releasedAt := &FlexTime{Time: time.Date(2026, 10, 20, 2, 54, 51, 367874000, time.UTC)}
+	tests := []struct {
+		name  string
+		reply string
+		want  ForceReleaseResult
+	}{
+		{
+			name:  "released",
+			reply: `{"released":1,"released_at":"2026-10-20T02:54:51.367874Z","reservation":{"id":14493,"agent":"SapphireSquirrel","path_pattern":"scratch-bd-0clbc-force-release-probe/*","exclusive":true,"reason":"bd-0clbc live force-release reply capture (nonexistent path)","created_ts":"2026-10-20T02:49:44.568450Z","expires_ts":"2026-10-20T02:50:44.568450Z","released_ts":"2026-10-20T02:54:51.367874Z","stale_reasons":["agent_inactive>1800s","mail_activity_recent","path_pattern_unmatched"],"last_agent_activity_ts":"2026-10-20T02:16:43.412357Z","last_mail_activity_ts":"2026-10-20T02:50:15.124522Z","last_filesystem_activity_ts":null,"last_git_activity_ts":null,"notified":false}}`,
+			want: ForceReleaseResult{
 				Success:        true,
-				PreviousHolder: "BlueLake",
-				PathPattern:    "a/*",
-				Notified:       true,
-			}, nil
+				ReleasedAt:     releasedAt,
+				PreviousHolder: "SapphireSquirrel",
+				PathPattern:    "scratch-bd-0clbc-force-release-probe/*",
+			},
 		},
-	}))
-	defer server.Close()
+		{
+			name:  "already released",
+			reply: `{"released":0,"released_at":"2026-10-20T02:54:51.367874Z","already_released":true}`,
+			want:  ForceReleaseResult{ReleasedAt: releasedAt},
+		},
+	}
 
-	c := NewClient(WithBaseURL(server.URL + "/"))
-	result, err := c.ForceReleaseReservation(context.Background(), ForceReleaseOptions{
-		ProjectKey:     "/test",
-		AgentName:      "TestAgent",
-		ReservationID:  1,
-		Note:           "stale lock",
-		NotifyPrevious: true,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !result.Success {
-		t.Error("expected success=true")
-	}
-	if result.PreviousHolder != "BlueLake" {
-		t.Errorf("previous holder = %q, want BlueLake", result.PreviousHolder)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+				"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+					return json.RawMessage(tt.reply), nil
+				},
+			}))
+			defer server.Close()
+
+			c := NewClient(WithBaseURL(server.URL + "/"))
+			result, err := c.ForceReleaseReservation(context.Background(), ForceReleaseOptions{
+				ProjectKey:     "/test",
+				AgentName:      "TestAgent",
+				ReservationID:  1,
+				Note:           "stale lock",
+				NotifyPrevious: true,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Success != tt.want.Success || result.PreviousHolder != tt.want.PreviousHolder ||
+				result.PathPattern != tt.want.PathPattern || result.Notified != tt.want.Notified {
+				t.Errorf("result = %+v, want %+v", *result, tt.want)
+			}
+			if result.ReleasedAt == nil || !result.ReleasedAt.Time.Equal(tt.want.ReleasedAt.Time) {
+				t.Errorf("released_at = %v, want %v", result.ReleasedAt, tt.want.ReleasedAt.Time)
+			}
+		})
 	}
 }
 

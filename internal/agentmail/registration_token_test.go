@@ -184,7 +184,7 @@ func TestContactToolsAttachCorrectRegistrationToken(t *testing.T) {
 		"respond_contact": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
 			tok, _ := args["registration_token"].(string)
 			respondToken.Store(tok)
-			return ContactRespondResult{Status: "approved"}, nil
+			return ContactRespondResult{From: "GreenCastle", To: "BlueLake", Approved: true, Updated: 1}, nil
 		},
 	}))
 	defer server.Close()

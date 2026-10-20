@@ -1735,19 +1735,19 @@ func TestHandleMailInbox_PeeksWithoutMarkingRead(t *testing.T) {
 	}
 }
 
-func TestHandleRequestContact_ReturnsLinkAndExpiry(t *testing.T) {
+func TestHandleRequestContact_ReturnsStatusAndExpiry(t *testing.T) {
 
 	expiresAt := "2026-03-22T12:34:56Z"
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
 		"request_contact": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
-			return agentmail.ContactRequestResult{
-				Status: "pending",
-				Link: &agentmail.ContactLink{
-					FromAgent: "BlueLake",
-					ToAgent:   "RedStone",
-					Status:    "pending",
-				},
-				ExpiresTS: &expiresAt,
+			// Both servers reply with the link's fields at the top level.
+			return map[string]interface{}{
+				"from":         "BlueLake",
+				"from_project": "/tmp/project",
+				"to":           "RedStone",
+				"to_project":   "/tmp/project",
+				"status":       "pending",
+				"expires_ts":   expiresAt,
 			}, nil
 		},
 	})
@@ -1775,12 +1775,8 @@ func TestHandleRequestContact_ReturnsLinkAndExpiry(t *testing.T) {
 	if resp["expires_ts"] != expiresAt {
 		t.Fatalf("expires_ts = %v, want %s", resp["expires_ts"], expiresAt)
 	}
-	link, ok := resp["link"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("link = %#v, want object", resp["link"])
-	}
-	if link["from_agent"] != "BlueLake" || link["to_agent"] != "RedStone" {
-		t.Fatalf("unexpected link payload: %#v", link)
+	if resp["from_agent"] != "BlueLake" || resp["to_agent"] != "RedStone" {
+		t.Fatalf("from/to = %v/%v, want BlueLake/RedStone", resp["from_agent"], resp["to_agent"])
 	}
 }
 
@@ -1869,19 +1865,18 @@ func TestHandleRespondContact_NotImplemented(t *testing.T) {
 	}
 }
 
-func TestHandleRespondContact_ReturnsStatus(t *testing.T) {
+func TestHandleRespondContact_ReturnsExpiry(t *testing.T) {
 
 	expiresAt := "2026-03-23T00:00:00Z"
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
 		"respond_contact": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
-			return agentmail.ContactRespondResult{
-				Status: "approved",
-				Link: &agentmail.ContactLink{
-					FromAgent: "RedStone",
-					ToAgent:   "BlueLake",
-					Status:    "approved",
-				},
-				ExpiresTS: &expiresAt,
+			// Both servers reply {from, to, approved, expires_ts, updated}.
+			return map[string]interface{}{
+				"from":       "RedStone",
+				"to":         "BlueLake",
+				"approved":   true,
+				"expires_ts": expiresAt,
+				"updated":    1,
 			}, nil
 		},
 	})
@@ -1903,18 +1898,11 @@ func TestHandleRespondContact_ReturnsStatus(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp["status"] != "approved" {
-		t.Fatalf("status = %v, want approved", resp["status"])
+	if resp["accepted"] != true {
+		t.Fatalf("accepted = %v, want true", resp["accepted"])
 	}
 	if resp["expires_ts"] != expiresAt {
 		t.Fatalf("expires_ts = %v, want %s", resp["expires_ts"], expiresAt)
-	}
-	link, ok := resp["link"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("link = %#v, want object", resp["link"])
-	}
-	if link["from_agent"] != "RedStone" || link["to_agent"] != "BlueLake" {
-		t.Fatalf("unexpected link payload: %#v", link)
 	}
 }
 
@@ -1954,19 +1942,18 @@ func TestHandleRespondContact_NotFound(t *testing.T) {
 func TestHandleForceReleaseReservation_ReturnsMCPResultFields(t *testing.T) {
 
 	releasedAt := "2026-03-23T01:02:03Z"
-	releasedTime, err := time.Parse(time.RFC3339, releasedAt)
-	if err != nil {
-		t.Fatalf("parse released_at: %v", err)
-	}
-	releasedFlexTime := agentmail.FlexTime{Time: releasedTime}
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
 		"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
-			return agentmail.ForceReleaseResult{
-				Success:        true,
-				ReleasedAt:     &releasedFlexTime,
-				PreviousHolder: "BlueLake",
-				PathPattern:    "internal/serve/*",
-				Notified:       false,
+			// The servers nest the released reservation's holder and pattern.
+			return map[string]interface{}{
+				"released":    1,
+				"released_at": releasedAt,
+				"reservation": map[string]interface{}{
+					"id":           17,
+					"agent":        "BlueLake",
+					"path_pattern": "internal/serve/*",
+					"notified":     false,
+				},
 			}, nil
 		},
 	})
@@ -2012,11 +1999,12 @@ func TestHandleForceReleaseReservation_DeniedReturnsConflict(t *testing.T) {
 
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
 		"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
-			return agentmail.ForceReleaseResult{
-				Success:        false,
-				PreviousHolder: "BlueLake",
-				PathPattern:    "internal/serve/*",
-				Notified:       false,
+			// The servers release nothing and send no reservation block for
+			// an id that was already released.
+			return map[string]interface{}{
+				"released":         0,
+				"released_at":      "2026-03-23T01:02:03Z",
+				"already_released": true,
 			}, nil
 		},
 	})
@@ -2043,12 +2031,6 @@ func TestHandleForceReleaseReservation_DeniedReturnsConflict(t *testing.T) {
 	}
 	if resp.ErrorCode != ErrCodeConflict {
 		t.Fatalf("error_code = %q, want %q", resp.ErrorCode, ErrCodeConflict)
-	}
-	if resp.Details["previous_holder"] != "BlueLake" {
-		t.Fatalf("previous_holder = %#v, want BlueLake", resp.Details["previous_holder"])
-	}
-	if resp.Details["path_pattern"] != "internal/serve/*" {
-		t.Fatalf("path_pattern = %#v, want internal/serve/*", resp.Details["path_pattern"])
 	}
 }
 

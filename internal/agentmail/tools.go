@@ -363,16 +363,21 @@ func (c *Client) AcknowledgeMessage(ctx context.Context, projectKey, agentName s
 
 // ContactRequestResult contains the result of a contact request.
 type ContactRequestResult struct {
-	Status    string       `json:"status"` // "pending", "approved", etc.
-	Link      *ContactLink `json:"link,omitempty"`
-	ExpiresTS *string      `json:"expires_ts,omitempty"`
+	From        string  `json:"from"`
+	FromProject string  `json:"from_project,omitempty"`
+	To          string  `json:"to"`
+	ToProject   string  `json:"to_project,omitempty"`
+	Status      string  `json:"status"` // "pending", "approved", etc.
+	ExpiresTS   *string `json:"expires_ts,omitempty"`
 }
 
 // ContactRespondResult contains the result of responding to a contact request.
 type ContactRespondResult struct {
-	Status    string       `json:"status,omitempty"`
-	Link      *ContactLink `json:"link,omitempty"`
-	ExpiresTS *string      `json:"expires_ts,omitempty"`
+	From      string  `json:"from"`
+	To        string  `json:"to"`
+	Approved  bool    `json:"approved"`
+	ExpiresTS *string `json:"expires_ts,omitempty"`
+	Updated   int     `json:"updated"` // contact links the response changed
 }
 
 // RequestContact requests contact approval from another agent.

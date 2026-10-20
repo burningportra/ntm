@@ -604,11 +604,15 @@ func TestHandleConflictAction_ForceRegistersDashboardAgent(t *testing.T) {
 			if args["agent_name"] != "sess_dashboard" {
 				t.Fatalf("force_release agent_name = %#v, want sess_dashboard", args["agent_name"])
 			}
-			result = agentmail.ForceReleaseResult{
-				Success:        true,
-				PreviousHolder: "holder-a",
-				PathPattern:    "internal/robot/attention_feed.go",
-				Notified:       true,
+			result = map[string]any{
+				"released":    1,
+				"released_at": "2026-10-20T02:50:00.000000Z",
+				"reservation": map[string]any{
+					"id":           42,
+					"agent":        "holder-a",
+					"path_pattern": "internal/robot/attention_feed.go",
+					"notified":     true,
+				},
 			}
 		default:
 			w.WriteHeader(http.StatusBadRequest)

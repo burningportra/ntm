@@ -1278,9 +1278,6 @@ func (s *Server) handleRequestContact(w http.ResponseWriter, r *http.Request) {
 		"to_agent":   req.ToAgent,
 		"status":     result.Status,
 	}
-	if result.Link != nil {
-		response["link"] = result.Link
-	}
 	if result.ExpiresTS != nil {
 		response["expires_ts"] = *result.ExpiresTS
 	}
@@ -1334,16 +1331,8 @@ func (s *Server) handleRespondContact(w http.ResponseWriter, r *http.Request) {
 		"from_agent": req.FromAgent,
 		"accepted":   req.Accept,
 	}
-	if result != nil {
-		if result.Status != "" {
-			response["status"] = result.Status
-		}
-		if result.Link != nil {
-			response["link"] = result.Link
-		}
-		if result.ExpiresTS != nil {
-			response["expires_ts"] = *result.ExpiresTS
-		}
+	if result != nil && result.ExpiresTS != nil {
+		response["expires_ts"] = *result.ExpiresTS
 	}
 
 	writeSuccessResponse(w, http.StatusOK, response, reqID)
