@@ -40,6 +40,9 @@ type WorkSection struct {
 	Graph      *WorkGraph   `json:"graph,omitempty"`
 	Available  bool         `json:"available"`
 	Reason     string       `json:"reason,omitempty"`
+	// Stale says the section holds the last good work collection, because no
+	// refresh has read the work source since.
+	Stale bool `json:"stale,omitempty"`
 }
 
 // WorkItem is a normalized bead record suitable for robot surfaces.

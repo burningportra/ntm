@@ -194,8 +194,9 @@ func (r *RuntimeAgent) IsFresh() bool {
 
 // RuntimeWork is a cached projection of bead/work state.
 type RuntimeWork struct {
-	// Identity
-	BeadID string `json:"bead_id"`
+	// Identity: a bead within the project root its work was collected from.
+	ProjectDir string `json:"project_dir"`
+	BeadID     string `json:"bead_id"`
 
 	// Content
 	Title           string `json:"title"`

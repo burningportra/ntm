@@ -2186,7 +2186,12 @@ func GetInspectWork(opts InspectWorkOptions) (*InspectWorkOutput, error) {
 		return output, nil
 	}
 
-	work, err := store.GetRuntimeWork(strings.TrimSpace(opts.BeadID))
+	projectDir, err := resolveNormalizedProjectDir("")
+	if err != nil {
+		output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Failed to resolve the project whose work projection to read")
+		return output, nil
+	}
+	work, err := store.GetRuntimeWork(projectDir, strings.TrimSpace(opts.BeadID))
 	if err != nil {
 		output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Failed to load work projection")
 		return output, nil

@@ -1625,10 +1625,15 @@ func TestGetInspectWorkUsesProjectionStore(t *testing.T) {
 		_ = store.Close()
 	})
 
+	projectDir, err := resolveNormalizedProjectDir("")
+	if err != nil {
+		t.Fatalf("resolveNormalizedProjectDir: %v", err)
+	}
 	now := time.Now().UTC()
 	staleAfter := now.Add(time.Hour)
 	score := 0.91
 	if err := store.UpsertRuntimeWork(&state.RuntimeWork{
+		ProjectDir:     projectDir,
 		BeadID:         "bd-j9jo3.6.6",
 		Title:          "Inspect surfaces",
 		Status:         "open",

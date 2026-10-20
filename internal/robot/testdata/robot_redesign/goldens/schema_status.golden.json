@@ -224,6 +224,10 @@
             "description": "Reason",
             "type": "string"
           },
+          "stale": {
+            "description": "Stale",
+            "type": "boolean"
+          },
           "total": {
             "description": "Total",
             "type": "integer"
@@ -980,6 +984,10 @@
           "total_sessions": {
             "description": "Total sessions",
             "type": "integer"
+          },
+          "work_stale": {
+            "description": "Work stale",
+            "type": "boolean"
           }
         },
         "required": [

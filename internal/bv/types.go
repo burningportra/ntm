@@ -129,6 +129,9 @@ type BeadsSummary struct {
 	Closed         int              `json:"closed,omitempty"`
 	ReadyPreview   []BeadPreview    `json:"ready_preview,omitempty"`
 	InProgressList []BeadInProgress `json:"in_progress_list,omitempty"`
+	// Stale says the counts come from the last good work collection, because
+	// no refresh has read the work source since.
+	Stale bool `json:"stale,omitempty"`
 }
 
 // BeadPreview is a minimal bead representation for ready items

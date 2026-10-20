@@ -2100,6 +2100,7 @@ func newTestAttentionStore(t *testing.T) *state.Store {
 }
 
 func TestPersistNormalizedProjection_ReplacesRows(t *testing.T) {
+	const projectDir = "/tmp/proj"
 	store := newTestAttentionStore(t)
 	firstCollectedAt := time.Now().UTC()
 	staleWindow := 10 * time.Minute
@@ -2148,6 +2149,7 @@ func TestPersistNormalizedProjection_ReplacesRows(t *testing.T) {
 	first := &adapters.AggregatedSignals{
 		CollectedAt: firstCollectedAt,
 		Work: &adapters.WorkSection{
+			Available: true,
 			Ready: []adapters.WorkItem{
 				{
 					ID:              "bd-1",
@@ -2248,13 +2250,13 @@ func TestPersistNormalizedProjection_ReplacesRows(t *testing.T) {
 		},
 	}
 
-	if err := persistNormalizedProjection(store, first, firstTmuxSnapshot, staleWindow); err != nil {
+	if err := persistNormalizedProjection(store, projectDir, first, firstTmuxSnapshot, staleWindow); err != nil {
 		t.Fatalf("persistNormalizedProjection(first) error: %v", err)
 	}
 
-	workRows, err := store.ListFreshRuntimeWork("", 0)
+	workRows, err := store.ListRuntimeWork(projectDir)
 	if err != nil {
-		t.Fatalf("ListFreshRuntimeWork() error: %v", err)
+		t.Fatalf("ListRuntimeWork() error: %v", err)
 	}
 	if len(workRows) != 3 {
 		t.Fatalf("runtime work row count = %d, want 3", len(workRows))
@@ -2425,6 +2427,7 @@ func TestPersistNormalizedProjection_ReplacesRows(t *testing.T) {
 	second := &adapters.AggregatedSignals{
 		CollectedAt: secondCollectedAt,
 		Work: &adapters.WorkSection{
+			Available: true,
 			Ready: []adapters.WorkItem{
 				{ID: "bd-4", Title: "Fresh replacement bead", Priority: 1, Type: "task"},
 			},
@@ -2446,13 +2449,13 @@ func TestPersistNormalizedProjection_ReplacesRows(t *testing.T) {
 		},
 	}
 
-	if err := persistNormalizedProjection(store, second, secondTmuxSnapshot, staleWindow); err != nil {
+	if err := persistNormalizedProjection(store, projectDir, second, secondTmuxSnapshot, staleWindow); err != nil {
 		t.Fatalf("persistNormalizedProjection(second) error: %v", err)
 	}
 
-	workRows, err = store.ListFreshRuntimeWork("", 0)
+	workRows, err = store.ListRuntimeWork(projectDir)
 	if err != nil {
-		t.Fatalf("ListFreshRuntimeWork(second) error: %v", err)
+		t.Fatalf("ListRuntimeWork(second) error: %v", err)
 	}
 	if len(workRows) != 1 || workRows[0].BeadID != "bd-4" {
 		t.Fatalf("unexpected runtime work rows after replacement: %+v", workRows)
@@ -5209,7 +5212,7 @@ func TestPersistNormalizedProjectionKeepsHandoffWhenCoordinationUnavailable(t *t
 			},
 		},
 	}
-	if err := persistNormalizedProjection(store, seeded, nil, staleWindow); err != nil {
+	if err := persistNormalizedProjection(store, "/tmp/proj", seeded, nil, staleWindow); err != nil {
 		t.Fatalf("persistNormalizedProjection(seed) error: %v", err)
 	}
 	if row, err := store.GetRuntimeHandoff(); err != nil || row == nil {
@@ -5226,7 +5229,7 @@ func TestPersistNormalizedProjectionKeepsHandoffWhenCoordinationUnavailable(t *t
 				CollectedAt:  time.Now().UTC(),
 				Coordination: section,
 			}
-			if err := persistNormalizedProjection(store, degraded, nil, staleWindow); err != nil {
+			if err := persistNormalizedProjection(store, "/tmp/proj", degraded, nil, staleWindow); err != nil {
 				t.Fatalf("persistNormalizedProjection(degraded) error: %v", err)
 			}
 			row, err := store.GetRuntimeHandoff()
@@ -5248,7 +5251,7 @@ func TestPersistNormalizedProjectionKeepsHandoffWhenCoordinationUnavailable(t *t
 		CollectedAt:  time.Now().UTC(),
 		Coordination: &adapters.CoordinationSection{Available: true},
 	}
-	if err := persistNormalizedProjection(store, authoritative, nil, staleWindow); err != nil {
+	if err := persistNormalizedProjection(store, "/tmp/proj", authoritative, nil, staleWindow); err != nil {
 		t.Fatalf("persistNormalizedProjection(authoritative) error: %v", err)
 	}
 	row, err := store.GetRuntimeHandoff()

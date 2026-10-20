@@ -3047,7 +3047,12 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertRuntimeAgent(alpha:%%2): %v", err)
 	}
+	projectDir, err := resolveNormalizedProjectDir("")
+	if err != nil {
+		t.Fatalf("resolveNormalizedProjectDir: %v", err)
+	}
 	if err := store.UpsertRuntimeWork(&state.RuntimeWork{
+		ProjectDir:     projectDir,
 		BeadID:         "bd-ready",
 		Title:          "Ready bead",
 		Status:         "open",
@@ -3058,6 +3063,7 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 		t.Fatalf("UpsertRuntimeWork ready: %v", err)
 	}
 	if err := store.UpsertRuntimeWork(&state.RuntimeWork{
+		ProjectDir:  projectDir,
 		BeadID:      "bd-active",
 		Title:       "Active bead",
 		Status:      "in_progress",
@@ -3761,6 +3767,7 @@ func TestSnapshotBeadsSummaryFromRuntime(t *testing.T) {
 		},
 	} {
 		item := item
+		item.ProjectDir = tmpDir
 		if err := store.UpsertRuntimeWork(&item); err != nil {
 			t.Fatalf("UpsertRuntimeWork(%s): %v", item.BeadID, err)
 		}
@@ -7170,7 +7177,7 @@ func TestProjectionBackedSessionsRequireEveryLiveSession(t *testing.T) {
 	live := []tmux.Session{{Name: "alpha"}, {Name: "beta"}}
 	listProjectionLiveSessions = func() ([]tmux.Session, error) { return live, nil }
 
-	if output, err := buildProjectionBackedStatus(store, config.Default(), PaginationOptions{}); err == nil {
+	if output, err := buildProjectionBackedStatus(store, config.Default(), t.TempDir(), PaginationOptions{}); err == nil {
 		t.Fatalf("status answered from a projection missing live session beta: %+v", output.Sessions)
 	}
 	if sessions, err := buildProjectionBackedSnapshotSessions(store, live); err == nil {
@@ -7244,7 +7251,7 @@ func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 
 	store := newTestAttentionStore(t)
 	now := time.Now().UTC()
-	for _, row := range buildRuntimeWorkRows(batch.Work, now, now.Add(time.Hour)) {
+	for _, row := range buildRuntimeWorkRows(projectDir, batch.Work, now, now.Add(time.Hour)) {
 		if err := store.UpsertRuntimeWork(row); err != nil {
 			t.Fatalf("UpsertRuntimeWork(%s): %v", row.BeadID, err)
 		}
@@ -7253,7 +7260,7 @@ func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
 	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
 
-	status, err := buildProjectionBackedStatus(store, config.Default(), PaginationOptions{})
+	status, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
 	if err != nil {
 		t.Fatalf("buildProjectionBackedStatus: %v", err)
 	}
@@ -7261,9 +7268,9 @@ func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 		t.Fatalf("status ready_work = %d, in_progress = %d; want %d and 1 as br reports", status.Summary.ReadyWork, status.Summary.InProgress, brReady)
 	}
 
-	rows, err := store.ListFreshRuntimeWork("", 0)
+	rows, err := store.ListRuntimeWork(projectDir)
 	if err != nil {
-		t.Fatalf("ListFreshRuntimeWork: %v", err)
+		t.Fatalf("ListRuntimeWork: %v", err)
 	}
 	work := snapshotWorkFromRuntime(rows, 0)
 	if work.Summary.Ready != brReady || work.Summary.Blocked != 2 || len(work.Ready) != brReady {
@@ -7284,6 +7291,132 @@ func TestProjectionReadyWorkMatchesBRReady(t *testing.T) {
 	for _, row := range rows {
 		if want := map[string]int{"bd-b1": 1, "bd-b2": 2}[row.BeadID]; row.BlockedByCount != want {
 			t.Fatalf("%s blocked_by_count = %d, want %d", row.BeadID, row.BlockedByCount, want)
+		}
+	}
+}
+
+// installFakeWorkTools puts br and bv scripts first on PATH for one project.
+func installFakeWorkTools(t *testing.T, br string) {
+	t.Helper()
+	binDir := t.TempDir()
+	for name, script := range map[string]string{"br": br, "bv": "#!/bin/sh\nexit 1\n"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o700); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// collectWorkSignals runs the work source the way a refresh does, under budget.
+func collectWorkSignals(t *testing.T, projectDir string, budget time.Duration) *adapters.AggregatedSignals {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	aggregator := adapters.NewSignalAggregator(0)
+	aggregator.RegisterAdapter(adapters.NewWorkAdapter(adapters.DefaultWorkCoordinationAdapterConfig(projectDir)))
+	signals, err := aggregator.Collect(ctx)
+	if err != nil {
+		t.Fatalf("collect work signals: %v", err)
+	}
+	return signals
+}
+
+// A work source that misses its refresh budget reports nothing, which means
+// "unknown", not "no work". The refresh deleted every work row on such a tick,
+// so status read ready_work 0 / in_progress 0 until br answered in time again
+// (bd-o3oq3).
+func TestWorkSourceMissKeepsLastGoodWorkRows(t *testing.T) {
+	projectDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(projectDir, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	store := newTestAttentionStore(t)
+	oldListLive := listProjectionLiveSessions
+	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
+	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
+
+	status := func() StatusSummary {
+		t.Helper()
+		output, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
+		if err != nil {
+			t.Fatalf("buildProjectionBackedStatus: %v", err)
+		}
+		return output.Summary
+	}
+
+	installFakeWorkTools(t, fakeBRBlockedScript)
+	if err := persistNormalizedProjection(store, projectDir, collectWorkSignals(t, projectDir, 10*time.Second), nil, time.Hour); err != nil {
+		t.Fatalf("persist good collection: %v", err)
+	}
+
+	installFakeWorkTools(t, "#!/bin/sh\nexec sleep 1\n")
+	missed := collectWorkSignals(t, projectDir, 300*time.Millisecond)
+	if missed.Work != nil && missed.Work.Available {
+		t.Fatalf("slow br answered within the budget: %+v", missed.Work)
+	}
+	if err := persistNormalizedProjection(store, projectDir, missed, nil, time.Hour); err != nil {
+		t.Fatalf("persist missed collection: %v", err)
+	}
+
+	if got := status(); got.ReadyWork != 25 || got.InProgress != 1 || !got.WorkStale {
+		t.Fatalf("after a missed work collection status ready_work = %d, in_progress = %d, work_stale = %v; want the last good 25 and 1, marked stale", got.ReadyWork, got.InProgress, got.WorkStale)
+	}
+	rows, err := store.ListRuntimeWork(projectDir)
+	if err != nil {
+		t.Fatalf("ListRuntimeWork: %v", err)
+	}
+	if work := snapshotWorkFromRuntime(rows, 0); work.Summary.Ready != 25 || work.Summary.InProgress != 1 || !work.Stale {
+		t.Fatalf("snapshot work after a miss = %+v, stale = %v; want the last good 25 ready and 1 in progress, marked stale", work.Summary, work.Stale)
+	}
+	beads, err := snapshotBeadsSummaryFromRuntime(store, projectDir, 0)
+	if err != nil {
+		t.Fatalf("snapshotBeadsSummaryFromRuntime: %v", err)
+	}
+	if beads.Ready != 25 || beads.InProgress != 1 || !beads.Stale {
+		t.Fatalf("snapshot beads summary after a miss: ready = %d, in_progress = %d, stale = %v; want 25, 1, stale", beads.Ready, beads.InProgress, beads.Stale)
+	}
+
+	installFakeWorkTools(t, fakeBRBlockedScript)
+	if err := persistNormalizedProjection(store, projectDir, collectWorkSignals(t, projectDir, 10*time.Second), nil, time.Hour); err != nil {
+		t.Fatalf("persist recovered collection: %v", err)
+	}
+	if got := status(); got.ReadyWork != 25 || got.InProgress != 1 || got.WorkStale {
+		t.Fatalf("after br answered again status ready_work = %d, in_progress = %d, work_stale = %v; want 25 and 1, fresh", got.ReadyWork, got.InProgress, got.WorkStale)
+	}
+}
+
+// Every project shares one state store, so a refresh in one project must
+// neither replace nor be counted in another project's work rows (bd-o3oq3).
+func TestWorkRowsAreScopedByProject(t *testing.T) {
+	store := newTestAttentionStore(t)
+	oldListLive := listProjectionLiveSessions
+	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
+	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
+	// Status counts alerts with bv and br, so keep them off the real repo.
+	installFakeWorkTools(t, fakeBRBlockedScript)
+
+	readyWork := func(ids ...string) *adapters.AggregatedSignals {
+		work := adapters.NewWorkSection()
+		work.Available = true
+		for _, id := range ids {
+			work.Ready = append(work.Ready, adapters.WorkItem{ID: id, Title: id})
+		}
+		return &adapters.AggregatedSignals{CollectedAt: time.Now().UTC(), Work: work}
+	}
+	if err := persistNormalizedProjection(store, "/proj/a", readyWork("bd-1", "bd-2"), nil, time.Hour); err != nil {
+		t.Fatalf("persist project a: %v", err)
+	}
+	if err := persistNormalizedProjection(store, "/proj/b", readyWork("bd-1"), nil, time.Hour); err != nil {
+		t.Fatalf("persist project b: %v", err)
+	}
+
+	for projectDir, want := range map[string]int{"/proj/a": 2, "/proj/b": 1} {
+		output, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
+		if err != nil {
+			t.Fatalf("buildProjectionBackedStatus(%s): %v", projectDir, err)
+		}
+		if output.Summary.ReadyWork != want {
+			t.Fatalf("%s ready_work = %d, want %d", projectDir, output.Summary.ReadyWork, want)
 		}
 	}
 }

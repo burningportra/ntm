@@ -675,18 +675,13 @@ func (tx *Tx) DeleteRuntimeAgent(id string) error {
 // Runtime Work Operations
 // =============================================================================
 
-// UpsertRuntimeWork inserts or updates a runtime work projection.
-func (s *Store) UpsertRuntimeWork(work *RuntimeWork) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	_, err := s.db.Exec(`
+const upsertRuntimeWorkSQL = `
 		INSERT INTO runtime_work (
-			bead_id, title, title_disclosure, status, priority, bead_type, assignee, claimed_at,
+			project_dir, bead_id, title, title_disclosure, status, priority, bead_type, assignee, claimed_at,
 			blocked_by_count, unblocks_count, labels, score, score_reason,
 			collected_at, stale_after
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(bead_id) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_dir, bead_id) DO UPDATE SET
 			title = excluded.title,
 			title_disclosure = excluded.title_disclosure,
 			status = excluded.status,
@@ -700,35 +695,50 @@ func (s *Store) UpsertRuntimeWork(work *RuntimeWork) error {
 			score = excluded.score,
 			score_reason = excluded.score_reason,
 			collected_at = excluded.collected_at,
-			stale_after = excluded.stale_after`,
-		work.BeadID, work.Title, nullableString(work.TitleDisclosure), work.Status, work.Priority, work.BeadType,
+			stale_after = excluded.stale_after`
+
+func upsertRuntimeWorkArgs(work *RuntimeWork) []interface{} {
+	return []interface{}{
+		work.ProjectDir, work.BeadID, work.Title, nullableString(work.TitleDisclosure), work.Status, work.Priority, work.BeadType,
 		nullableString(work.Assignee), work.ClaimedAt, work.BlockedByCount, work.UnblocksCount,
 		nullableString(work.Labels), work.Score, nullableString(work.ScoreReason),
 		work.CollectedAt, work.StaleAfter,
+	}
+}
+
+const selectRuntimeWorkSQL = `
+		SELECT project_dir, bead_id, title, COALESCE(title_disclosure, ''), status, priority, bead_type, COALESCE(assignee, ''),
+			claimed_at, blocked_by_count, unblocks_count, COALESCE(labels, ''),
+			score, COALESCE(score_reason, ''), collected_at, stale_after
+		FROM runtime_work`
+
+func scanRuntimeWork(row interface{ Scan(...any) error }, work *RuntimeWork) error {
+	return row.Scan(
+		&work.ProjectDir, &work.BeadID, &work.Title, &work.TitleDisclosure, &work.Status, &work.Priority, &work.BeadType,
+		&work.Assignee, &work.ClaimedAt, &work.BlockedByCount, &work.UnblocksCount,
+		&work.Labels, &work.Score, &work.ScoreReason, &work.CollectedAt, &work.StaleAfter,
 	)
-	if err != nil {
+}
+
+// UpsertRuntimeWork inserts or updates a runtime work projection.
+func (s *Store) UpsertRuntimeWork(work *RuntimeWork) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.db.Exec(upsertRuntimeWorkSQL, upsertRuntimeWorkArgs(work)...); err != nil {
 		return fmt.Errorf("upsert runtime work: %w", err)
 	}
 	return nil
 }
 
-// GetRuntimeWork retrieves a runtime work projection by bead ID.
-func (s *Store) GetRuntimeWork(beadID string) (*RuntimeWork, error) {
+// GetRuntimeWork retrieves one project's work projection for a bead, fresh or stale.
+func (s *Store) GetRuntimeWork(projectDir, beadID string) (*RuntimeWork, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	work := &RuntimeWork{}
-	err := s.db.QueryRow(`
-		SELECT bead_id, title, COALESCE(title_disclosure, ''), status, priority, bead_type, COALESCE(assignee, ''),
-			claimed_at, blocked_by_count, unblocks_count, COALESCE(labels, ''),
-			score, COALESCE(score_reason, ''), collected_at, stale_after
-		FROM runtime_work
-		WHERE bead_id = ?`, beadID,
-	).Scan(
-		&work.BeadID, &work.Title, &work.TitleDisclosure, &work.Status, &work.Priority, &work.BeadType,
-		&work.Assignee, &work.ClaimedAt, &work.BlockedByCount, &work.UnblocksCount,
-		&work.Labels, &work.Score, &work.ScoreReason, &work.CollectedAt, &work.StaleAfter,
-	)
+	err := scanRuntimeWork(s.db.QueryRow(selectRuntimeWorkSQL+`
+		WHERE project_dir = ? AND bead_id = ?`, projectDir, beadID), work)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -738,30 +748,16 @@ func (s *Store) GetRuntimeWork(beadID string) (*RuntimeWork, error) {
 	return work, nil
 }
 
-// ListFreshRuntimeWork returns fresh runtime work projections, optionally filtered by status.
-func (s *Store) ListFreshRuntimeWork(status string, limit int) ([]RuntimeWork, error) {
+// ListRuntimeWork returns every work projection row for a project, fresh or
+// stale. A stale row is the last good collection of that bead; callers check
+// IsFresh to say so.
+func (s *Store) ListRuntimeWork(projectDir string) ([]RuntimeWork, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if limit <= 0 {
-		limit = -1
-	}
-
-	query := `
-		SELECT bead_id, title, COALESCE(title_disclosure, ''), status, priority, bead_type, COALESCE(assignee, ''),
-			claimed_at, blocked_by_count, unblocks_count, COALESCE(labels, ''),
-			score, COALESCE(score_reason, ''), collected_at, stale_after
-		FROM runtime_work
-		WHERE stale_after > datetime('now')`
-	args := []interface{}{}
-	if status != "" {
-		query += ` AND status = ?`
-		args = append(args, status)
-	}
-	query += ` ORDER BY priority ASC, COALESCE(score, -1) DESC, bead_id ASC LIMIT ?`
-	args = append(args, limit)
-
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(selectRuntimeWorkSQL+`
+		WHERE project_dir = ?
+		ORDER BY priority ASC, COALESCE(score, -1) DESC, bead_id ASC`, projectDir)
 	if err != nil {
 		return nil, fmt.Errorf("list runtime work: %w", err)
 	}
@@ -770,11 +766,7 @@ func (s *Store) ListFreshRuntimeWork(status string, limit int) ([]RuntimeWork, e
 	var items []RuntimeWork
 	for rows.Next() {
 		var work RuntimeWork
-		if err := rows.Scan(
-			&work.BeadID, &work.Title, &work.TitleDisclosure, &work.Status, &work.Priority, &work.BeadType,
-			&work.Assignee, &work.ClaimedAt, &work.BlockedByCount, &work.UnblocksCount,
-			&work.Labels, &work.Score, &work.ScoreReason, &work.CollectedAt, &work.StaleAfter,
-		); err != nil {
+		if err := scanRuntimeWork(rows, &work); err != nil {
 			return nil, fmt.Errorf("scan runtime work: %w", err)
 		}
 		items = append(items, work)
@@ -782,57 +774,29 @@ func (s *Store) ListFreshRuntimeWork(status string, limit int) ([]RuntimeWork, e
 	return items, rows.Err()
 }
 
-// DeleteRuntimeWork removes a runtime work projection.
-func (s *Store) DeleteRuntimeWork(beadID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	_, err := s.db.Exec("DELETE FROM runtime_work WHERE bead_id = ?", beadID)
-	if err != nil {
-		return fmt.Errorf("delete runtime work: %w", err)
-	}
-	return nil
-}
-
 // UpsertRuntimeWork inserts or updates a runtime work projection in an existing transaction.
 func (tx *Tx) UpsertRuntimeWork(work *RuntimeWork) error {
-	_, err := tx.tx.Exec(`
-		INSERT INTO runtime_work (
-			bead_id, title, title_disclosure, status, priority, bead_type, assignee, claimed_at,
-			blocked_by_count, unblocks_count, labels, score, score_reason,
-			collected_at, stale_after
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(bead_id) DO UPDATE SET
-			title = excluded.title,
-			title_disclosure = excluded.title_disclosure,
-			status = excluded.status,
-			priority = excluded.priority,
-			bead_type = excluded.bead_type,
-			assignee = excluded.assignee,
-			claimed_at = excluded.claimed_at,
-			blocked_by_count = excluded.blocked_by_count,
-			unblocks_count = excluded.unblocks_count,
-			labels = excluded.labels,
-			score = excluded.score,
-			score_reason = excluded.score_reason,
-			collected_at = excluded.collected_at,
-			stale_after = excluded.stale_after`,
-		work.BeadID, work.Title, nullableString(work.TitleDisclosure), work.Status, work.Priority, work.BeadType,
-		nullableString(work.Assignee), work.ClaimedAt, work.BlockedByCount, work.UnblocksCount,
-		nullableString(work.Labels), work.Score, nullableString(work.ScoreReason),
-		work.CollectedAt, work.StaleAfter,
-	)
-	if err != nil {
+	if _, err := tx.tx.Exec(upsertRuntimeWorkSQL, upsertRuntimeWorkArgs(work)...); err != nil {
 		return fmt.Errorf("upsert runtime work: %w", err)
 	}
 	return nil
 }
 
-// DeleteRuntimeWork removes a runtime work projection in an existing transaction.
-func (tx *Tx) DeleteRuntimeWork(beadID string) error {
-	_, err := tx.tx.Exec("DELETE FROM runtime_work WHERE bead_id = ?", beadID)
+// DeleteRuntimeWork removes one project's work projection for a bead in an existing transaction.
+func (tx *Tx) DeleteRuntimeWork(projectDir, beadID string) error {
+	_, err := tx.tx.Exec("DELETE FROM runtime_work WHERE project_dir = ? AND bead_id = ?", projectDir, beadID)
 	if err != nil {
 		return fmt.Errorf("delete runtime work: %w", err)
+	}
+	return nil
+}
+
+// ExpireRuntimeWork marks a project's work rows stale as of at, keeping them
+// as the last good collection, when a refresh could not read the work source.
+func (tx *Tx) ExpireRuntimeWork(projectDir string, at time.Time) error {
+	_, err := tx.tx.Exec("UPDATE runtime_work SET stale_after = ? WHERE project_dir = ? AND stale_after > ?", at, projectDir, at)
+	if err != nil {
+		return fmt.Errorf("expire runtime work: %w", err)
 	}
 	return nil
 }

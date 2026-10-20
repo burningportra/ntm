@@ -1850,6 +1850,9 @@ type StatusSummary struct {
 	AlertsActive int            `json:"alerts_active"`
 	MailUnread   int            `json:"mail_unread"`
 	MailUrgent   int            `json:"mail_urgent"`
+	// WorkStale says ReadyWork and InProgress count the last good work
+	// collection, because no refresh has read the work source since.
+	WorkStale bool `json:"work_stale,omitempty"`
 }
 
 // newStatusSummary returns an empty summary whose count maps are ready to
@@ -2264,9 +2267,10 @@ func GetStatusWithOptions(opts PaginationOptions) (*StatusOutput, error) {
 	}
 
 	if store := currentProjectionStore(); store != nil {
-		output, err := buildProjectionBackedStatus(store, cfg, opts)
-		if err == nil {
-			return output, nil
+		if projectDir, err := resolveNormalizedProjectDir(""); err == nil {
+			if output, err := buildProjectionBackedStatus(store, cfg, projectDir, opts); err == nil {
+				return output, nil
+			}
 		}
 	}
 
@@ -2430,7 +2434,9 @@ func populateSnapshotFeedMetadata(output *SnapshotOutput, feed *AttentionFeed) {
 	output.AttentionSummary = buildSnapshotAttentionSummary(feed)
 }
 
-func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, opts PaginationOptions) (*StatusOutput, error) {
+// buildProjectionBackedStatus reads status from the projection store, counting
+// the work rows collected for projectDir.
+func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, projectDir string, opts PaginationOptions) (*StatusOutput, error) {
 	output := newStatusOutput(cfg)
 
 	sessions, err := store.GetFreshRuntimeSessions()
@@ -2451,7 +2457,7 @@ func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, opts Pa
 		agentsBySession[sess.Name] = agents
 	}
 
-	workRows, err := store.ListFreshRuntimeWork("", 0)
+	workRows, err := store.ListRuntimeWork(projectDir)
 	if err != nil {
 		return nil, fmt.Errorf("status work: %w", err)
 	}
@@ -2498,6 +2504,9 @@ func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, opts Pa
 	}
 
 	for _, item := range workRows {
+		if !item.IsFresh() {
+			output.Summary.WorkStale = true
+		}
 		switch item.Status {
 		case "in_progress":
 			output.Summary.InProgress++
@@ -5128,7 +5137,7 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 		output.Alerts = append(output.Alerts, fmt.Sprintf("failed to list active incidents: %v", err))
 	}
 	if store := currentProjectionStore(); store != nil {
-		if workRows, err := store.ListFreshRuntimeWork("", 0); err == nil {
+		if workRows, err := store.ListRuntimeWork(projectKey); err == nil {
 			output.Work = snapshotWorkFromRuntime(workRows, BeadLimit)
 		}
 		if rows, err := store.GetAllSourceHealth(); err == nil {
@@ -5167,7 +5176,7 @@ func buildProjectionBackedSnapshot(
 		return nil, err
 	}
 	output.Sessions = sessions
-	if workRows, err := store.ListFreshRuntimeWork("", 0); err == nil {
+	if workRows, err := store.ListRuntimeWork(projectKey); err == nil {
 		output.Work = snapshotWorkFromRuntime(workRows, BeadLimit)
 	}
 	if rows, err := store.GetAllSourceHealth(); err == nil {
@@ -5454,6 +5463,9 @@ func snapshotWorkFromRuntime(rows []state.RuntimeWork, limit int) *adapters.Work
 	}
 
 	for _, row := range rows {
+		if !row.IsFresh() {
+			section.Stale = true
+		}
 		section.Summary.Total++
 		item := snapshotWorkItemFromRuntime(row)
 		switch row.Status {
@@ -5636,7 +5648,7 @@ func snapshotBeadsSummaryFromRuntime(store *state.Store, projectKey string, limi
 		limit = 0
 	}
 
-	rows, err := store.ListFreshRuntimeWork("", 0)
+	rows, err := store.ListRuntimeWork(strings.TrimSpace(projectKey))
 	if err != nil {
 		return nil, fmt.Errorf("snapshot beads summary: %w", err)
 	}
@@ -5648,6 +5660,9 @@ func snapshotBeadsSummaryFromRuntime(store *state.Store, projectKey string, limi
 		InProgressList: []bv.BeadInProgress{},
 	}
 	for _, row := range rows {
+		if !row.IsFresh() {
+			summary.Stale = true
+		}
 		summary.Total++
 		switch row.Status {
 		case "open":
@@ -7802,7 +7817,7 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 		return fmt.Errorf("collect tmux projection: %w", tmuxErr)
 	}
 
-	if err := persistNormalizedProjection(store, signals, tmuxSnapshot, normalizedProjectionStaleAfter); err != nil {
+	if err := persistNormalizedProjection(store, resolvedProjectDir, signals, tmuxSnapshot, normalizedProjectionStaleAfter); err != nil {
 		return err
 	}
 
@@ -8087,7 +8102,9 @@ func captureNormalizedTmuxPanes(
 	return captured, nil
 }
 
-func persistNormalizedProjection(store *state.Store, signals *adapters.AggregatedSignals, tmuxSnapshot *NormalizedSnapshot, staleAfter time.Duration) error {
+// persistNormalizedProjection writes one refresh into the store. Work rows
+// belong to projectDir, the project root the work was collected from.
+func persistNormalizedProjection(store *state.Store, projectDir string, signals *adapters.AggregatedSignals, tmuxSnapshot *NormalizedSnapshot, staleAfter time.Duration) error {
 	if store == nil || signals == nil {
 		return nil
 	}
@@ -8101,7 +8118,11 @@ func persistNormalizedProjection(store *state.Store, signals *adapters.Aggregate
 	}
 	expiresAt := collectedAt.Add(staleAfter)
 
-	workRows := buildRuntimeWorkRows(signals.Work, collectedAt, expiresAt)
+	// A work source that missed its budget or failed reports nothing, which
+	// says nothing about the project's beads, so its rows stay as the last good
+	// collection and are only marked stale.
+	workCollected := signals.Work != nil && signals.Work.Available
+	workRows := buildRuntimeWorkRows(projectDir, signals.Work, collectedAt, expiresAt)
 	coordinationRows := buildRuntimeCoordinationRows(signals.Coordination, collectedAt, expiresAt)
 	handoffRow := buildRuntimeHandoffRow(signals.Coordination, collectedAt, expiresAt)
 	quotaRows := buildRuntimeQuotaRows(signals.Quota, collectedAt, expiresAt)
@@ -8109,7 +8130,7 @@ func persistNormalizedProjection(store *state.Store, signals *adapters.Aggregate
 	sessionRows := buildRuntimeSessionRows(tmuxSnapshot, collectedAt, expiresAt)
 	agentRows := buildRuntimeAgentRows(tmuxSnapshot, collectedAt, expiresAt)
 
-	existingWork, err := store.ListFreshRuntimeWork("", 0)
+	existingWork, err := store.ListRuntimeWork(projectDir)
 	if err != nil {
 		return fmt.Errorf("list runtime work: %w", err)
 	}
@@ -8142,13 +8163,22 @@ func persistNormalizedProjection(store *state.Store, signals *adapters.Aggregate
 	}
 
 	return store.Transaction(func(tx *state.Tx) error {
-		for _, item := range existingWork {
-			if _, ok := workRows[item.BeadID]; ok {
-				continue
+		if workCollected {
+			for _, item := range existingWork {
+				if _, ok := workRows[item.BeadID]; ok {
+					continue
+				}
+				if err := tx.DeleteRuntimeWork(projectDir, item.BeadID); err != nil {
+					return err
+				}
 			}
-			if err := tx.DeleteRuntimeWork(item.BeadID); err != nil {
-				return err
+			for _, key := range sortedMapKeys(workRows) {
+				if err := tx.UpsertRuntimeWork(workRows[key]); err != nil {
+					return err
+				}
 			}
+		} else if err := tx.ExpireRuntimeWork(projectDir, collectedAt); err != nil {
+			return err
 		}
 		for _, item := range existingCoordination {
 			if _, ok := coordinationRows[item.AgentName]; ok {
@@ -8197,11 +8227,6 @@ func persistNormalizedProjection(store *state.Store, signals *adapters.Aggregate
 			}
 		}
 
-		for _, key := range sortedMapKeys(workRows) {
-			if err := tx.UpsertRuntimeWork(workRows[key]); err != nil {
-				return err
-			}
-		}
 		for _, key := range sortedMapKeys(sessionRows) {
 			if err := tx.UpsertRuntimeSession(sessionRows[key]); err != nil {
 				return err
@@ -8481,7 +8506,7 @@ func buildRuntimeAgentRows(snapshot *NormalizedSnapshot, collectedAt, staleAfter
 	return rows
 }
 
-func buildRuntimeWorkRows(section *adapters.WorkSection, collectedAt, staleAfter time.Time) map[string]*state.RuntimeWork {
+func buildRuntimeWorkRows(projectDir string, section *adapters.WorkSection, collectedAt, staleAfter time.Time) map[string]*state.RuntimeWork {
 	rows := make(map[string]*state.RuntimeWork)
 	if section == nil {
 		return rows
@@ -8501,6 +8526,7 @@ func buildRuntimeWorkRows(section *adapters.WorkSection, collectedAt, staleAfter
 		}
 
 		row := &state.RuntimeWork{
+			ProjectDir:      projectDir,
 			BeadID:          beadID,
 			Title:           robotFirstNonEmpty(item.Title, beadID),
 			TitleDisclosure: jsonStringOrEmpty(item.TitleDisclosure),
