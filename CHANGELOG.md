@@ -13,6 +13,20 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ## [Unreleased]
 
+### Features
+
+- **Muse Code agent type.** Meta's terminal coding agent (`muse`) is a first-class agent: `--muse=N[:model[@effort]]` on spawn/add/adopt, `ntm send --muse`, `--robot-spawn --spawn-muse`, `--type=muse` across robot send/ack/interrupt, and Muse in status, list, dashboard, TUI, checkpoint restore, pipelines, swarm, coordinator and handoff. Panes launch as `muse --yolo --model 'muse-wonder-1.0'` by default (aliases `wonder`, `wonder-full`, `spark`, `spark-1.3`, `spark-1.2`) with a 1,007,997-token context window ([63c1bd6f](https://github.com/Dicklesworthstone/ntm/commit/63c1bd6f), [024443e2](https://github.com/Dicklesworthstone/ntm/commit/024443e2), [934dc84e](https://github.com/Dicklesworthstone/ntm/commit/934dc84e), [ee99cfe1](https://github.com/Dicklesworthstone/ntm/commit/ee99cfe1)).
+- **Muse-specific delivery and lifecycle.** Prompts wait a 300 ms Enter floor and paste multi-line text, because Muse turns a faster Enter into a newline; interrupts send Escape, since Ctrl+C only clears Muse's draft; restart and `--robot-exit-cli` exit Muse with Escape plus three Ctrl+Cs and relaunch the configured command so the workspace trust prompt never appears ([ff75aee1](https://github.com/Dicklesworthstone/ntm/commit/ff75aee1), [56f98c7b](https://github.com/Dicklesworthstone/ntm/commit/56f98c7b), [9d44622c](https://github.com/Dicklesworthstone/ntm/commit/9d44622c), [962bf990](https://github.com/Dicklesworthstone/ntm/commit/962bf990)).
+- **Muse state detection.** Idle, working and draft states agree across the agent parser, status detectors and robot classifier, including Muse's dim composer tips, narrow panes and long drafts, and Claude screens that quote Muse output stay Claude ([2c9a78bc](https://github.com/Dicklesworthstone/ntm/commit/2c9a78bc), [33398a6e](https://github.com/Dicklesworthstone/ntm/commit/33398a6e), [b22806ed](https://github.com/Dicklesworthstone/ntm/commit/b22806ed), [6016e2a4](https://github.com/Dicklesworthstone/ntm/commit/6016e2a4)).
+
+### Fixes
+
+- `ntm send --oc` alone no longer broadcasts to every pane ([14a4f0c8](https://github.com/Dicklesworthstone/ntm/commit/14a4f0c8)).
+- Saved-session restore splits `model@effort` and renders it through each agent's launch template instead of passing it whole to `--model` ([dd9bcc50](https://github.com/Dicklesworthstone/ntm/commit/dd9bcc50)).
+- `--robot-help`, capabilities and `config show --json` list every accepted agent type, including pi, kimi, muse, opencode and ollama ([f37e2a27](https://github.com/Dicklesworthstone/ntm/commit/f37e2a27), [8adbec20](https://github.com/Dicklesworthstone/ntm/commit/8adbec20)).
+
+### Notes
+
 - **Corrected commit provenance.** Commit `d08893d9`'s message incorrectly
   attributed the fail-closed serve safety-policy change to its completion and
   tmux diff. The actual safety-policy implementation is `dda4aae8`; history
