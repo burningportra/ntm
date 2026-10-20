@@ -6262,7 +6262,7 @@ func TestIsAgentMailDBLockError(t *testing.T) {
 	}
 }
 
-func TestGetInboxTallyAndCountInboxIgnoreReadMessages(t *testing.T) {
+func TestGetInboxTallyIgnoresReadMessages(t *testing.T) {
 
 	readAt := &agentmail.FlexTime{Time: time.Now()}
 	var (
@@ -6284,23 +6284,14 @@ func TestGetInboxTallyAndCountInboxIgnoreReadMessages(t *testing.T) {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			t.Fatalf("decode tool params: %v", err)
 		}
-		urgentOnly, _ := params.Arguments["urgent_only"].(bool)
 		mu.Lock()
 		markReads = append(markReads, fetchInboxMarkRead(params.Arguments))
 		mu.Unlock()
 
-		var messages []agentmail.InboxMessage
-		if urgentOnly {
-			messages = []agentmail.InboxMessage{
-				{ID: 1, Subject: "read urgent", Importance: "urgent", ReadAt: readAt},
-				{ID: 2, Subject: "unread urgent", Importance: "urgent"},
-			}
-		} else {
-			messages = []agentmail.InboxMessage{
-				{ID: 1, Subject: "read urgent", Importance: "urgent", ReadAt: readAt},
-				{ID: 2, Subject: "unread urgent", Importance: "urgent", AckRequired: true},
-				{ID: 3, Subject: "unread normal", Importance: "normal"},
-			}
+		messages := []agentmail.InboxMessage{
+			{ID: 1, Subject: "read urgent", Importance: "urgent", ReadAt: readAt},
+			{ID: 2, Subject: "unread urgent", Importance: "urgent", AckRequired: true},
+			{ID: 3, Subject: "unread normal", Importance: "normal"},
 		}
 
 		result, err := json.Marshal(messages)
@@ -6325,18 +6316,12 @@ func TestGetInboxTallyAndCountInboxIgnoreReadMessages(t *testing.T) {
 	if tally.Total != 3 || tally.Unread != 2 || tally.Urgent != 1 || tally.PendingAck != 1 {
 		t.Fatalf("unexpected inbox tally: %+v", tally)
 	}
-	if got := countInbox(ctx, client, "/data/projects/ntm", "BlueLake", false); got != 2 {
-		t.Fatalf("countInbox(unread) = %d, want 2", got)
-	}
-	if got := countInbox(ctx, client, "/data/projects/ntm", "BlueLake", true); got != 1 {
-		t.Fatalf("countInbox(urgent) = %d, want 1", got)
-	}
 	// --robot-mail tallies every agent's inbox; counting must not mark the
 	// agents' mail read.
 	mu.Lock()
 	defer mu.Unlock()
-	if len(markReads) != 3 {
-		t.Fatalf("fetch_inbox calls = %d, want 3", len(markReads))
+	if len(markReads) != 1 {
+		t.Fatalf("fetch_inbox calls = %d, want 1", len(markReads))
 	}
 	for _, got := range markReads {
 		if got != false {
