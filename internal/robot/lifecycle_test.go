@@ -9,18 +9,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/process"
 )
 
-// The double-Ctrl+C exit contract (ntm-3lbb): Claude Code treats the pair as
-// "exit" only when the second tap lands roughly 0.1-0.3s after the first —
-// slower reads as two separate interrupts, faster risks coalescing. Operator
-// docs used to ship three conflicting timings; this pin makes the code the
-// single source of truth. --robot-exit-cli and smart restart share the gap
-// through exit_sequences.go (bd-3sbjp).
-func TestExitDoubleCtrlCGap_WithinExitWindow(t *testing.T) {
-	if exitDoubleCtrlCGap < 100*time.Millisecond || exitDoubleCtrlCGap > 300*time.Millisecond {
-		t.Fatalf("exitDoubleCtrlCGap %v outside the empirical 100-300ms double-Ctrl+C exit window", exitDoubleCtrlCGap)
-	}
-}
-
 func TestJoinLifecycleDetail(t *testing.T) {
 	if got := joinLifecycleDetail("", "a"); got != "a" {
 		t.Fatalf("empty existing: got %q", got)

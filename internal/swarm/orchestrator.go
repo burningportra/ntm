@@ -911,8 +911,8 @@ func (o *SwarmOrchestrator) GracefulShutdown(ctx context.Context, sessionNames [
 					continue
 				}
 
-				// Send graceful exit signal based on agent type
-				if err := sendGracefulExit(client, pane); err != nil {
+				// Send the agent type's exit keys
+				if _, err := client.SendAgentExitKeys(ctx, pane.ID, pane.Type); err != nil {
 					logger.Warn("[SwarmOrchestrator] graceful_exit_failed",
 						"pane", pane.ID,
 						"agent", pane.Type,
@@ -973,41 +973,6 @@ func (o *SwarmOrchestrator) GracefulShutdown(ctx context.Context, sessionNames [
 		"duration", result.Duration)
 
 	return result, nil
-}
-
-// sendGracefulExit sends the appropriate exit signal for an agent type.
-func sendGracefulExit(client *tmux.Client, pane tmux.Pane) error {
-	agentType := string(pane.Type)
-
-	switch gracefulExitMethodForAgent(agentType) {
-	case gracefulExitDoubleInterrupt:
-		// Claude: Double Ctrl+C with 100ms gap
-		if err := client.SendKeys(pane.ID, "\x03", false); err != nil {
-			return err
-		}
-		time.Sleep(100 * time.Millisecond)
-		return client.SendKeys(pane.ID, "\x03", false)
-
-	case gracefulExitSlashExit:
-		// Codex: /exit command
-		return client.SendKeys(pane.ID, "/exit", true)
-
-	case gracefulExitEscapeInterrupt:
-		// Gemini: Escape then Ctrl+C
-		if err := client.SendKeys(pane.ID, "\x1b", false); err != nil {
-			return err
-		}
-		time.Sleep(50 * time.Millisecond)
-		return client.SendKeys(pane.ID, "\x03", false)
-
-	case gracefulExitSingleInterrupt:
-		// Just send Ctrl+C as a best effort graceful exit for these
-		return client.SendKeys(pane.ID, "\x03", false)
-
-	default:
-		// Unknown agents: try standard Ctrl+C
-		return client.SendKeys(pane.ID, "\x03", false)
-	}
 }
 
 // ShutdownFromPlan gracefully shuts down all sessions defined in a swarm plan.

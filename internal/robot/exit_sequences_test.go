@@ -205,7 +205,13 @@ func TestExitAgentPiAndKimiSendTheirExitSequences(t *testing.T) {
 // A plain double Ctrl+C on a working Muse pane interrupts the turn and then
 // clears the restored draft, so Muse only quit on the second attempt, about
 // 15 s later (bd-fkuad); Kimi has the same key model and still got the plain
-// double Ctrl+C until bd-3sbjp gave exit-cli the exit_sequences.go keys.
+// double Ctrl+C until bd-3sbjp gave exit-cli the shared exit keys.
+//
+// Codex and Gemini used to get /exit typed straight into the composer, which
+// joins a draft and submits it as a prompt (bd-7y66g). Codex now types /exit
+// only into a composer it verified empty; the fake tmux shows no composer, so
+// it falls back to a double Ctrl+C. Gemini's composer cannot be verified, so
+// it always gets the key-based exit.
 func TestSendExitChoreographyUsesEachAgentsExitSequence(t *testing.T) {
 	museKeys := func(id string) []string {
 		return []string{"send-keys -t " + id + " Escape", "send-keys -t " + id + " C-c", "send-keys -t " + id + " C-c", "send-keys -t " + id + " C-c"}
@@ -244,16 +250,18 @@ func TestSendExitChoreographyUsesEachAgentsExitSequence(t *testing.T) {
 			want: doubleCtrlC("%11"),
 		},
 		{
-			// The typed "/exit\n" ends the fake tmux's log line early,
-			// which leaves an empty line after it.
-			name: "codex gets the exit command",
+			name: "codex clears its composer and never types /exit unverified",
 			pane: tmux.Pane{ID: "%12", Type: tmux.AgentCodex, Title: "proj__cod_1"},
-			want: []string{"send-keys -t %12 -l /exit", ""},
+			want: []string{
+				"send-keys -t %12 Escape", "send-keys -t %12 Escape", "send-keys -t %12 Escape", "send-keys -t %12 C-u",
+				"capture-pane -t %12 -p -S 0",
+				"send-keys -t %12 C-c", "send-keys -t %12 C-c",
+			},
 		},
 		{
-			name: "gemini gets escape then the exit command",
+			name: "gemini gets the muse keys",
 			pane: tmux.Pane{ID: "%13", Type: tmux.AgentGemini, Title: "proj__gmi_1"},
-			want: []string{"send-keys -t %13 Escape", "send-keys -t %13 -l /exit", ""},
+			want: museKeys("%13"),
 		},
 		{
 			name: "other agents get the double ctrl-c fallback",
@@ -283,7 +291,7 @@ func TestExitAgentMuseStopsAtFirstFailedKey(t *testing.T) {
 	seq := &RestartSequence{}
 
 	err := exitAgent(t.Context(), "proj", 1, 0, "muse", seq)
-	if err == nil || !strings.Contains(err.Error(), "escape failed") {
+	if err == nil || !strings.Contains(err.Error(), "send exit key 1 (Escape)") {
 		t.Fatalf("exitAgent(muse) error = %v, want escape failure", err)
 	}
 }

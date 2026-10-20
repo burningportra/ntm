@@ -2617,6 +2617,163 @@ func InterruptKey(agentType AgentType) string {
 	return "C-c"
 }
 
+// exitDoubleCtrlCGap is the pause between the two presses of a double Ctrl+C.
+// Claude Code treats the pair as "exit" only when the second press lands
+// roughly 0.1-0.3s after the first; slower reads as two separate interrupts
+// (ntm-3lbb). Pi quits only when it lands within 500ms (bd-7po31).
+const exitDoubleCtrlCGap = 100 * time.Millisecond
+
+// SendAgentExitKeys sends the keys that quit agentType's CLI to target and
+// returns the name of the method it used, even when a key fails. It is the
+// one table of exit keys: smart restart, --robot-exit-cli, the swarm
+// auto-respawner and swarm shutdown all send them through it (bd-3sbjp,
+// bd-8ltpa).
+//   - Claude Code and Pi: double Ctrl+C, 100ms apart.
+//   - Codex: /exit, typed only into a composer verified empty, otherwise a
+//     double Ctrl+C.
+//   - Gemini, Muse and Kimi: Escape, then three Ctrl+Cs.
+//   - Any other agent: the double Ctrl+C most agent CLIs quit on.
+//
+// No exit types a slash command onto a draft: typed after one, the command
+// joins the draft and Enter submits the whole line as a prompt (bd-7y66g).
+//
+// Pi's Ctrl+C handler clears the editor and quits on a second Ctrl+C within
+// 500ms of the first, whether or not a turn is running; a single Ctrl+C only
+// clears. Verified against pi 1.3.0 in tmux (bd-7po31): the 100ms double
+// Ctrl+C quit an empty editor and one holding a draft, both with exit status
+// 0. A running turn was not tried, since that needs a model call.
+func (c *Client) SendAgentExitKeys(ctx context.Context, target string, agentType AgentType) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	switch agentType.Canonical() {
+	case AgentClaude, AgentPi:
+		return "double_ctrl_c", c.sendDoubleCtrlC(ctx, target)
+	case AgentCodex:
+		return c.sendCodexExitKeys(ctx, target)
+	case AgentGemini, AgentMuse, AgentKimi:
+		return "escape_then_triple_ctrl_c", c.sendEscapeThenTripleCtrlC(ctx, target)
+	default:
+		return "double_ctrl_c_fallback", c.sendDoubleCtrlC(ctx, target)
+	}
+}
+
+// SendAgentExitKeys sends agentType's exit keys using the default client.
+func SendAgentExitKeys(ctx context.Context, target string, agentType AgentType) (string, error) {
+	return DefaultClient.SendAgentExitKeys(ctx, target, agentType)
+}
+
+// sendExitKeys presses keys in order, waiting gaps[i] before keys[i+1].
+func (c *Client) sendExitKeys(ctx context.Context, target string, keys []string, gaps []time.Duration) error {
+	for i, key := range keys {
+		if i > 0 {
+			if err := waitForSendDelay(ctx, gaps[i-1]); err != nil {
+				return err
+			}
+		}
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, key); err != nil {
+			return fmt.Errorf("send exit key %d (%s): %w", i+1, key, err)
+		}
+	}
+	return nil
+}
+
+// sendDoubleCtrlC presses Ctrl+C twice, exitDoubleCtrlCGap apart.
+func (c *Client) sendDoubleCtrlC(ctx context.Context, target string) error {
+	return c.sendExitKeys(ctx, target, []string{"C-c", "C-c"}, []time.Duration{exitDoubleCtrlCGap})
+}
+
+// sendCodexExitKeys quits Codex with /exit when it can prove the composer
+// holds nothing else, and with a double Ctrl+C when it cannot. It runs
+// Codex's composer clear (Escape x3, then C-u) and types /exit only when the
+// composer line reads empty; it presses Enter only when the composer then
+// holds exactly "/exit". C-u kills only the cursor's line, so a multi-line
+// draft can survive it, and the line under the composer is where such a
+// draft continues. On either failure the double Ctrl+C quits without
+// submitting anything: Codex's first Ctrl+C clears the whole draft, /exit
+// included, and Ctrl+C on an empty composer quits. Verified against
+// codex-cli 0.163.0 in tmux without a model call: the clear then /exit quit
+// Codex with a one-line draft, C-u left the first line of a two-line draft,
+// and Ctrl+C then Ctrl+C quit with that line still there.
+func (c *Client) sendCodexExitKeys(ctx context.Context, target string) (string, error) {
+	const method = "clear_then_exit_command"
+	cleared, verified, err := c.ClearComposerContext(ctx, target, AgentCodex)
+	if err != nil {
+		return method, err
+	}
+	if cleared && verified {
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "-l", "/exit"); err != nil {
+			return method, fmt.Errorf("type /exit: %w", err)
+		}
+		if err := waitForSendDelay(ctx, composerClearVerifyWait); err != nil {
+			return method, err
+		}
+		capture, err := c.CapturePaneVisibleContext(ctx, target)
+		if err != nil {
+			return method, fmt.Errorf("capture pane to verify /exit: %w", err)
+		}
+		if codexComposerHoldsOnly(capture, "/exit") {
+			if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+				return method, fmt.Errorf("submit /exit: %w", err)
+			}
+			return method, nil
+		}
+	}
+	return "double_ctrl_c", c.sendDoubleCtrlC(ctx, target)
+}
+
+// codexComposerHoldsOnly reports whether a Codex capture's composer holds
+// exactly text: the bottom-most "›" line carries text, and the line below
+// it, where a multi-line draft would continue, is blank. The slash-command
+// popup renders above the composer, so it does not count.
+func codexComposerHoldsOnly(capture, text string) bool {
+	lines := strings.Split(capture, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		idx := strings.Index(lines[i], "›")
+		if idx < 0 {
+			continue
+		}
+		if strings.TrimSpace(lines[i][idx+len("›"):]) != text {
+			return false
+		}
+		return i+1 == len(lines) || strings.TrimSpace(lines[i+1]) == ""
+	}
+	return false
+}
+
+// sendEscapeThenTripleCtrlC quits Muse Code, Kimi Code and Gemini CLI. In
+// Muse a single Ctrl+C only clears the draft, and when a draft is present the
+// double Ctrl+C that quits an empty composer is spent clearing it and arming
+// "Press Ctrl-C again to quit". Verified against muse 1.4.11 (bd-3l5df):
+//   - Escape interrupts a running turn, whose prompt comes back as a draft,
+//     and does nothing at an idle composer.
+//   - The first Ctrl+C clears any draft; on an empty composer it arms quit.
+//   - The second Ctrl+C quits an empty composer, or arms quit after a draft.
+//   - The third Ctrl+C quits when the second only armed it. When Muse already
+//     quit it lands on the shell prompt, where it is harmless; the 500ms gap
+//     keeps it from reaching Muse while it tears down.
+//
+// /exit and /quit also quit an idle Muse, but typed after a draft they are
+// submitted as part of a prompt; Ctrl+D does nothing.
+//
+// Kimi Code documents the same key model (moonshotai.github.io/kimi-code,
+// keyboard reference): Escape interrupts a running turn, Ctrl+C clears a
+// draft, and on an empty input box the first Ctrl+C only arms quit and the
+// second quits. Not run against a real kimi binary (bd-7po31).
+//
+// Gemini CLI used to get Escape then /exit, but its composer has no marker
+// to verify it empty, so /exit could land on a draft (bd-7y66g). Read from
+// the gemini-cli 0.49.0 source, not run live: each Ctrl+C cancels a running
+// request and counts toward quitting, and the second counted within 3s runs
+// /quit, except that a Ctrl+C the input box takes first clears its draft and
+// is not counted. So three Ctrl+Cs quit it with or without a draft, and none
+// submits anything. The Escape leaves Gemini's shell mode.
+func (c *Client) sendEscapeThenTripleCtrlC(ctx context.Context, target string) error {
+	return c.sendExitKeys(ctx, target,
+		[]string{"Escape", "C-c", "C-c", "C-c"},
+		[]time.Duration{100 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond})
+}
+
 // SendEOF sends Ctrl+D (EOF) to a pane
 func (c *Client) SendEOF(target string) error {
 	return c.RunSilent("send-keys", "-t", target, "C-d")

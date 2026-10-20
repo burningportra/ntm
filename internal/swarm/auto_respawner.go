@@ -54,15 +54,6 @@ type RespawnResult struct {
 	RespawnedAt     time.Time     `json:"respawned_at"`
 }
 
-type gracefulExitMethod int
-
-const (
-	gracefulExitDoubleInterrupt gracefulExitMethod = iota
-	gracefulExitSlashExit
-	gracefulExitEscapeInterrupt
-	gracefulExitSingleInterrupt
-)
-
 // AutoRespawnerConfig holds configuration for the AutoRespawner.
 type AutoRespawnerConfig struct {
 	// GracefulExitDelay is how long to wait for the agent to exit gracefully.
@@ -183,6 +174,7 @@ type autoRespawnerTmux interface {
 	SendKeys(target, keys string, enter bool) error
 	CapturePaneOutput(target string, lines int) (string, error)
 	Run(args ...string) (string, error)
+	SendAgentExitKeys(ctx context.Context, target string, agentType tmux.AgentType) (string, error)
 }
 
 // NewAutoRespawner creates a new AutoRespawner with default settings.
@@ -632,74 +624,26 @@ func (r *AutoRespawner) respawn(ctx context.Context, event LimitEvent) *RespawnR
 	return result
 }
 
-// killAgent sends the appropriate kill sequence for the agent type.
+// killAgent sends the agent type's exit keys, the ones smart restart and
+// --robot-exit-cli send (tmux.SendAgentExitKeys). It used to keep its own
+// table, which gave Muse and Kimi a double Ctrl+C that only clears a draft
+// and arms quit (bd-8ltpa).
 func (r *AutoRespawner) killAgent(ctx context.Context, sessionPane, agentType string) error {
 	if err := agent.AgentType(agentType).ValidateAutomatedRelaunch(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	r.logger().Info("[AutoRespawner] killing_agent",
 		"session_pane", sessionPane,
-		"method", agentType)
+		"agent_type", agentType)
 
-	client := r.tmuxClient()
-
-	switch gracefulExitMethodForAgent(agentType) {
-	case gracefulExitDoubleInterrupt:
-		// Claude: Double Ctrl+C with 100ms gap (CRITICAL timing)
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := client.SendKeys(sessionPane, "\x03", false); err != nil {
-			return fmt.Errorf("send first ctrl-c: %w", err)
-		}
-		if !sleepWithContext(ctx, 100*time.Millisecond) {
-			return ctx.Err()
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := client.SendKeys(sessionPane, "\x03", false); err != nil {
-			return fmt.Errorf("send second ctrl-c: %w", err)
-		}
-
-	case gracefulExitSlashExit:
-		// Codex: /exit command
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := client.SendKeys(sessionPane, "/exit", true); err != nil {
-			return fmt.Errorf("send /exit: %w", err)
-		}
-
-	case gracefulExitEscapeInterrupt:
-		// Gemini: Escape then Ctrl+C
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := client.SendKeys(sessionPane, "\x1b", false); err != nil {
-			return fmt.Errorf("send escape: %w", err)
-		}
-		if !sleepWithContext(ctx, 50*time.Millisecond) {
-			return ctx.Err()
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := client.SendKeys(sessionPane, "\x03", false); err != nil {
-			return fmt.Errorf("send ctrl-c: %w", err)
-		}
-
-	case gracefulExitSingleInterrupt:
-		// Best-effort graceful exit for agents that respond to a single interrupt.
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := client.SendKeys(sessionPane, "\x03", false); err != nil {
-			return fmt.Errorf("send ctrl-c: %w", err)
-		}
+	method, err := r.tmuxClient().SendAgentExitKeys(ctx, sessionPane, tmux.AgentType(agentType))
+	if err != nil {
+		return fmt.Errorf("send %s exit keys: %w", method, err)
 	}
-
 	return nil
 }
 
@@ -1094,19 +1038,6 @@ func validateAutoRespawnAgentType(agentType string) error {
 		return err
 	}
 	return canonical.ValidateAutomatedPromptDelivery()
-}
-
-func gracefulExitMethodForAgent(agentType string) gracefulExitMethod {
-	switch normalizeAutoRespawnerAgentType(agentType) {
-	case "cod":
-		return gracefulExitSlashExit
-	case "gmi":
-		return gracefulExitEscapeInterrupt
-	case "cursor", "windsurf", "aider", "ollama":
-		return gracefulExitSingleInterrupt
-	default:
-		return gracefulExitDoubleInterrupt
-	}
 }
 
 // waitForAgentReady waits for agent startup indicators in pane output.

@@ -240,12 +240,12 @@ func waitForBareShell(ctx context.Context, session, paneID string, timeout time.
 }
 
 // sendExitChoreography sends the pane agent's exit keys, the same ones smart
-// restart sends (exit_sequences.go). It used to send every agent but Muse a
-// plain double Ctrl+C, which left a working Kimi running until the second
-// attempt: its first Ctrl+C puts the interrupted prompt back as a draft and
-// its second only clears it (bd-3sbjp).
+// restart sends (tmux.SendAgentExitKeys). It used to send every agent but
+// Muse a plain double Ctrl+C, which left a working Kimi running until the
+// second attempt: its first Ctrl+C puts the interrupted prompt back as a
+// draft and its second only clears it (bd-3sbjp).
 func sendExitChoreography(ctx context.Context, pane tmux.Pane) error {
-	_, err := sendAgentExitKeys(ctx, pane.ID, restartPaneAgentType(pane))
+	_, err := tmux.SendAgentExitKeys(ctx, pane.ID, tmux.AgentType(restartPaneAgentType(pane)))
 	return err
 }
 

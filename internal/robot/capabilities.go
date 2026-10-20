@@ -1011,7 +1011,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Name:        "exit-cli",
 			Flag:        "--robot-exit-cli",
 			Category:    "control",
-			Description: "Gracefully exit agent CLIs with each agent's exit keys, the ones smart restart sends (double Ctrl+C for Claude, Pi and agents without their own; /exit for Codex; Escape then /exit for Gemini; Escape then three Ctrl+Cs for Muse and Kimi) without destroying panes; verifies via the pane's foreground command.",
+			Description: "Gracefully exit agent CLIs with each agent's exit keys, the ones smart restart sends (double Ctrl+C for Claude, Pi and agents without their own; for Codex, /exit typed only into a composer verified empty, else a double Ctrl+C; Escape then three Ctrl+Cs for Gemini, Muse and Kimi) without destroying panes; verifies via the pane's foreground command.",
 			Parameters: []RobotParameter{
 				{Name: "session", Flag: "--robot-exit-cli", Type: "string", Required: true, Description: "Session name"},
 				{Name: "panes", Flag: "--panes", Type: "string", Required: false, Description: "Comma-separated N, W.P, or %N pane selectors (default: all agent panes)"},

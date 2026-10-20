@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -183,6 +186,25 @@ type mockTmuxClient struct {
 	captureSeq    []string
 	captureIndex  int
 	captureErr    error
+	exitKeysCalls []exitKeysCall
+	exitKeysErr   error
+	exitKeysHook  func() error
+}
+
+type exitKeysCall struct {
+	target    string
+	agentType tmux.AgentType
+}
+
+func (m *mockTmuxClient) SendAgentExitKeys(_ context.Context, target string, agentType tmux.AgentType) (string, error) {
+	m.mu.Lock()
+	m.exitKeysCalls = append(m.exitKeysCalls, exitKeysCall{target: target, agentType: agentType})
+	hook, err := m.exitKeysHook, m.exitKeysErr
+	m.mu.Unlock()
+	if hook != nil {
+		err = hook()
+	}
+	return "test_exit_keys", err
 }
 
 func (m *mockTmuxClient) recordSendKeys(paneID, text string, enter bool) {
@@ -472,104 +494,77 @@ func TestAutoRespawnerWithConfig(t *testing.T) {
 	}
 }
 
-func TestAutoRespawnerKillAgentSequences(t *testing.T) {
+// TestAutoRespawnerKillAgentSendsSharedExitKeys covers bd-8ltpa. The
+// auto-respawner kept its own exit table, which gave Muse and Kimi a double
+// Ctrl+C that only clears a draft and arms quit, and typed Codex's /exit onto
+// whatever draft was there. It now sends the keys smart restart and
+// --robot-exit-cli send. The fake tmux shows no Codex composer, so Codex gets
+// its double Ctrl+C rather than an unverified /exit.
+func TestAutoRespawnerKillAgentSendsSharedExitKeys(t *testing.T) {
+	keys := func(names ...string) []string {
+		calls := make([]string, len(names))
+		for i, name := range names {
+			calls[i] = "send-keys -t test:1.1 " + name
+		}
+		return calls
+	}
+	museKeys := keys("Escape", "C-c", "C-c", "C-c")
+	codexKeys := append(keys("Escape", "Escape", "Escape", "C-u"), "capture-pane -t test:1.1 -p -S 0")
+	codexKeys = append(codexKeys, keys("C-c", "C-c")...)
 	tests := []struct {
-		name        string
-		agentType   string
-		expectCalls []sendKeysCall
+		agentType string
+		want      []string
 	}{
-		{
-			name:      "cc_double_ctrl_c",
-			agentType: "cc",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "\x03", enter: false},
-				{paneID: "test:1.1", text: "\x03", enter: false},
-			},
-		},
-		{
-			name:      "claude_shared_alias_double_ctrl_c",
-			agentType: "claude_code",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "\x03", enter: false},
-				{paneID: "test:1.1", text: "\x03", enter: false},
-			},
-		},
-		{
-			name:      "cod_exit_command",
-			agentType: "cod",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "/exit", enter: true},
-			},
-		},
-		{
-			name:      "codex_cli_exit_command",
-			agentType: "codex-cli",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "/exit", enter: true},
-			},
-		},
-		{
-			name:      "openai_codex_exit_command",
-			agentType: "openai-codex",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "/exit", enter: true},
-			},
-		},
-		{
-			name:      "gmi_escape_ctrl_c",
-			agentType: "gmi",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "\x1b", enter: false},
-				{paneID: "test:1.1", text: "\x03", enter: false},
-			},
-		},
-		{
-			name:      "gemini_cli_escape_ctrl_c",
-			agentType: "gemini-cli",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "\x1b", enter: false},
-				{paneID: "test:1.1", text: "\x03", enter: false},
-			},
-		},
-		{
-			name:      "google_gemini_escape_ctrl_c",
-			agentType: "google-gemini",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "\x1b", enter: false},
-				{paneID: "test:1.1", text: "\x03", enter: false},
-			},
-		},
-		{
-			name:      "unknown_default_double_ctrl_c",
-			agentType: "unknown",
-			expectCalls: []sendKeysCall{
-				{paneID: "test:1.1", text: "\x03", enter: false},
-				{paneID: "test:1.1", text: "\x03", enter: false},
-			},
-		},
+		{"muse", museKeys},
+		{"muse-code", museKeys},
+		{"kimi", museKeys},
+		{"gmi", museKeys},
+		{"google-gemini", museKeys},
+		{"cc", keys("C-c", "C-c")},
+		{"claude_code", keys("C-c", "C-c")},
+		{"pi", keys("C-c", "C-c")},
+		{"cod", codexKeys},
+		{"openai-codex", codexKeys},
+		{"cursor", keys("C-c", "C-c")},
+		{"unknown", keys("C-c", "C-c")},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mock := &mockTmuxClient{}
-			r := NewAutoRespawner().WithTmuxClient(mock)
+		t.Run(tt.agentType, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "tmux.log")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + tmux.ShellQuote(logPath) + "\n"
+			if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0o700); err != nil {
+				t.Fatalf("write fake tmux: %v", err)
+			}
+			t.Setenv("NTM_TMUX_BINARY", filepath.Join(dir, "tmux"))
+			r := NewAutoRespawner().WithTmuxClient(tmux.NewClient(""))
 
-			t.Logf("[TEST] killAgent agentType=%s", tt.agentType)
 			if err := r.killAgent(context.Background(), "test:1.1", tt.agentType); err != nil {
-				t.Fatalf("killAgent failed: %v", err)
+				t.Fatalf("killAgent(%s) error = %v", tt.agentType, err)
 			}
-
-			if len(mock.sendKeysCalls) != len(tt.expectCalls) {
-				t.Fatalf("expected %d SendKeys calls, got %d", len(tt.expectCalls), len(mock.sendKeysCalls))
+			logData, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read fake tmux log: %v", err)
 			}
-
-			for i, call := range tt.expectCalls {
-				got := mock.sendKeysCalls[i]
-				if got != call {
-					t.Errorf("SendKeys call %d mismatch: got=%+v want=%+v", i, got, call)
-				}
+			if got := strings.Split(strings.TrimSpace(string(logData)), "\n"); !slices.Equal(got, tt.want) {
+				t.Fatalf("killAgent(%s) tmux calls = %q, want %q", tt.agentType, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAutoRespawnerKillAgentReportsExitKeyFailure(t *testing.T) {
+	mock := &mockTmuxClient{exitKeysErr: errors.New("tmux gone")}
+	r := NewAutoRespawner().WithTmuxClient(mock)
+
+	err := r.killAgent(context.Background(), "test:1.2", "muse")
+	if err == nil || !strings.Contains(err.Error(), "tmux gone") {
+		t.Fatalf("killAgent() error = %v, want the exit-key failure", err)
+	}
+	want := []exitKeysCall{{target: "test:1.2", agentType: "muse"}}
+	if !slices.Equal(mock.exitKeysCalls, want) {
+		t.Fatalf("SendAgentExitKeys calls = %+v, want %+v", mock.exitKeysCalls, want)
 	}
 }
 
@@ -647,9 +642,11 @@ func TestAutoRespawnerRespawnSuccessEmitsEvent(t *testing.T) {
 		t.Fatalf("expected Respawn success, got error=%q", result.Error)
 	}
 
-	// Expect kill (/exit), clear, cd, spawn (cod)
+	// Expect the exit keys, then clear, cd, spawn (cod)
+	if want := []exitKeysCall{{target: "test:1.1", agentType: "cod"}}; !slices.Equal(mock.exitKeysCalls, want) {
+		t.Fatalf("SendAgentExitKeys calls = %+v, want %+v", mock.exitKeysCalls, want)
+	}
 	want := []sendKeysCall{
-		{paneID: "test:1.1", text: "/exit", enter: true},
 		{paneID: "test:1.1", text: "clear", enter: true},
 		{paneID: "test:1.1", text: "cd '/tmp/test project'", enter: true},
 		{paneID: "test:1.1", text: "cod", enter: true},
@@ -1676,29 +1673,6 @@ func TestNormalizeAgentType(t *testing.T) {
 	}
 }
 
-func TestGracefulExitMethodForAgent(t *testing.T) {
-	tests := []struct {
-		agentType string
-		want      gracefulExitMethod
-	}{
-		{"claude-code", gracefulExitDoubleInterrupt},
-		{"codex-cli", gracefulExitSlashExit},
-		{"openai-codex", gracefulExitSlashExit},
-		{"gemini-cli", gracefulExitEscapeInterrupt},
-		{"google-gemini", gracefulExitEscapeInterrupt},
-		{"cursor", gracefulExitSingleInterrupt},
-		{"unknown", gracefulExitDoubleInterrupt},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.agentType, func(t *testing.T) {
-			if got := gracefulExitMethodForAgent(tt.agentType); got != tt.want {
-				t.Fatalf("gracefulExitMethodForAgent(%q) = %v, want %v", tt.agentType, got, tt.want)
-			}
-		})
-	}
-}
-
 // =============================================================================
 // Full Swarm Lifecycle Integration Tests (bd-2oc4s)
 // =============================================================================
@@ -2056,15 +2030,9 @@ func TestAutoRespawnerStopCancelsInFlightRespawn(t *testing.T) {
 	release := make(chan struct{})
 	mock := &mockTmuxClient{
 		captureSeq: []string{"$", ">"},
-		sendKeysHook: func(paneID, text string, enter bool) error {
-			if text == "\x1b" {
-				select {
-				case <-started:
-				default:
-					close(started)
-				}
-				<-release
-			}
+		exitKeysHook: func() error {
+			close(started)
+			<-release
 			return nil
 		},
 	}
@@ -2119,14 +2087,15 @@ func TestAutoRespawnerStopCancelsInFlightRespawn(t *testing.T) {
 	}
 
 	mock.mu.Lock()
+	exitCalls := append([]exitKeysCall(nil), mock.exitKeysCalls...)
 	calls := append([]sendKeysCall(nil), mock.sendKeysCalls...)
 	mock.mu.Unlock()
 
-	if len(calls) != 1 {
-		t.Fatalf("expected Stop to cancel in-flight respawn after first key send, got %d calls: %+v", len(calls), calls)
+	if want := []exitKeysCall{{target: "test:1.1", agentType: "gmi"}}; !slices.Equal(exitCalls, want) {
+		t.Fatalf("SendAgentExitKeys calls = %+v, want %+v", exitCalls, want)
 	}
-	if calls[0].text != "\x1b" {
-		t.Fatalf("expected only the initial Gemini escape key to be sent before cancellation, got %+v", calls[0])
+	if len(calls) != 0 {
+		t.Fatalf("expected Stop to cancel the in-flight respawn after the exit keys, got %d more key sends: %+v", len(calls), calls)
 	}
 }
 

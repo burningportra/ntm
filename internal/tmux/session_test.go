@@ -3134,6 +3134,143 @@ func TestAgentCLIDead(t *testing.T) {
 	}
 }
 
+// The double-Ctrl+C exit contract (ntm-3lbb): Claude Code treats the pair as
+// "exit" only when the second tap lands roughly 0.1-0.3s after the first —
+// slower reads as two separate interrupts, faster risks coalescing. Operator
+// docs used to ship three conflicting timings; this pin makes the code the
+// single source of truth. Every caller of SendAgentExitKeys shares the gap.
+func TestExitDoubleCtrlCGap_WithinExitWindow(t *testing.T) {
+	if exitDoubleCtrlCGap < 100*time.Millisecond || exitDoubleCtrlCGap > 300*time.Millisecond {
+		t.Fatalf("exitDoubleCtrlCGap %v outside the empirical 100-300ms double-Ctrl+C exit window", exitDoubleCtrlCGap)
+	}
+}
+
+// TestSendAgentExitKeysCodexHelper runs inside the subprocess started by
+// TestSendAgentExitKeysCodexNeverSubmitsADraft, where NTM_TMUX_BINARY points
+// at a fake tmux that serves canned Codex screens.
+func TestSendAgentExitKeysCodexHelper(t *testing.T) {
+	root := os.Getenv("NTM_TEST_CODEX_EXIT_ROOT")
+	if os.Getenv("NTM_TEST_CODEX_EXIT_HELPER") != "1" || root == "" {
+		return
+	}
+	method, err := NewClient("").SendAgentExitKeys(context.Background(), "%1", AgentType("codex"))
+	result := fmt.Sprintf("method=%s err=%v", method, err)
+	if err := os.WriteFile(filepath.Join(root, "result"), []byte(result), 0o600); err != nil {
+		t.Fatalf("write result: %v", err)
+	}
+}
+
+// TestSendAgentExitKeysCodexNeverSubmitsADraft covers bd-7y66g. Codex quit on
+// /exit typed straight into the composer, so on a pane holding a draft /exit
+// joined the draft and Enter submitted the whole line as a prompt. /exit is
+// now typed only after Codex's composer clear leaves the composer line empty,
+// and Enter is pressed only when the composer then holds exactly "/exit".
+// Otherwise the exit is a double Ctrl+C, which never submits anything.
+func TestSendAgentExitKeysCodexNeverSubmitsADraft(t *testing.T) {
+	screen := func(composer string) string {
+		return "› earlier prompt\n\n• earlier answer\n\n" + composer + "\n\n  GPT-6-Astra xhigh · ~\n  ← for agents · ? for shortcuts"
+	}
+	emptyComposer := screen("› Ask Codex to do anything")
+	exitTyped := "› /exit  exit Codex\n\n" + screen("› /exit")
+	script := `#!/bin/sh
+set -eu
+root="$NTM_TEST_CODEX_EXIT_ROOT"
+printf '%s\n' "$*" >> "$root/tmux.log"
+case "$1" in
+  send-keys)
+    for last; do :; done
+    case "$last" in
+      C-u) cp "$root/after-line-kill" "$root/screen" ;;
+      /exit) cp "$root/after-exit-typed" "$root/screen" ;;
+    esac
+    ;;
+  capture-pane)
+    cat "$root/screen"
+    ;;
+esac
+`
+	clearKeys := []string{"send-keys -t %1 Escape", "send-keys -t %1 Escape", "send-keys -t %1 Escape", "send-keys -t %1 C-u"}
+	capture := "capture-pane -t %1 -p -S 0"
+	doubleCtrlC := []string{"send-keys -t %1 C-c", "send-keys -t %1 C-c"}
+	for _, tc := range []struct {
+		name           string
+		afterLineKill  string
+		afterExitTyped string
+		wantCalls      []string
+		wantMethod     string
+	}{
+		{
+			name:           "one-line draft is cleared before /exit",
+			afterLineKill:  emptyComposer,
+			afterExitTyped: exitTyped,
+			wantCalls:      slices.Concat(clearKeys, []string{capture, "send-keys -t %1 -l /exit", capture, "send-keys -t %1 Enter"}),
+			wantMethod:     "clear_then_exit_command",
+		},
+		{
+			// C-u kills only the cursor's line of a multi-line draft.
+			name:          "draft line left after the clear",
+			afterLineKill: screen("› line one"),
+			wantCalls:     slices.Concat(clearKeys, []string{capture}, doubleCtrlC),
+			wantMethod:    "double_ctrl_c",
+		},
+		{
+			name:          "no composer on screen",
+			afterLineKill: "  Allow command?\n    1. Yes\n    2. No",
+			wantCalls:     slices.Concat(clearKeys, []string{capture}, doubleCtrlC),
+			wantMethod:    "double_ctrl_c",
+		},
+		{
+			// The cursor sat on the first line of a two-line draft, so the
+			// clear emptied that line and the draft continues below /exit.
+			name:           "draft continues under the typed /exit",
+			afterLineKill:  screen("› \n  line two"),
+			afterExitTyped: "› /exit  exit Codex\n\n" + screen("› /exit\n  line two"),
+			wantCalls:      slices.Concat(clearKeys, []string{capture, "send-keys -t %1 -l /exit", capture}, doubleCtrlC),
+			wantMethod:     "double_ctrl_c",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			for name, content := range map[string]string{
+				"tmux":             script,
+				"screen":           screen("› a pending draft"),
+				"after-line-kill":  tc.afterLineKill,
+				"after-exit-typed": tc.afterExitTyped,
+			} {
+				if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o700); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSendAgentExitKeysCodexHelper$")
+			cmd.Env = append(os.Environ(),
+				"NTM_TEST_CODEX_EXIT_HELPER=1",
+				"NTM_TEST_CODEX_EXIT_ROOT="+root,
+				"NTM_TEST_TMUX_ENV_OWNED=1",
+				"NTM_TMUX_BINARY="+filepath.Join(root, "tmux"),
+			)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("Codex exit helper failed: %v output=%s", err, output)
+			}
+			result, err := os.ReadFile(filepath.Join(root, "result"))
+			if err != nil {
+				t.Fatalf("read helper result: %v", err)
+			}
+			if want := fmt.Sprintf("method=%s err=<nil>", tc.wantMethod); string(result) != want {
+				t.Errorf("SendAgentExitKeys(codex) = %s, want %s", result, want)
+			}
+			logData, err := os.ReadFile(filepath.Join(root, "tmux.log"))
+			if err != nil {
+				t.Fatalf("read fake tmux log: %v", err)
+			}
+			if got := strings.Split(strings.TrimSpace(string(logData)), "\n"); !slices.Equal(got, tc.wantCalls) {
+				t.Errorf("tmux calls =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tc.wantCalls, "\n"))
+			}
+		})
+	}
+}
+
 // ntm-5p0b: the pre-send composer clear sequence is per-agent because the
 // same keys mean different things per TUI (double-Escape is history jump-back
 // in Claude Code; the triple-Escape ritual is codex doctrine from AP-16).
