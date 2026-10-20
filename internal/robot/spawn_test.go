@@ -3083,6 +3083,30 @@ func TestWaitForAgentsReadyRequiresLiveProcess(t *testing.T) {
 	}
 }
 
+// bd-1zadt: --spawn-wait reads each pane's readiness as the agent type it
+// launched, so a Pi pane comes up on its editor box, which carries none of
+// the indicators other agents are read by.
+func TestWaitForAgentsReadyReadsThePaneType(t *testing.T) {
+	originalLiveness := spawnPaneLiveness
+	t.Cleanup(func() { spawnPaneLiveness = originalLiveness })
+	spawnPaneLiveness = func(context.Context, string) (int, bool) { return 4242, true }
+
+	piScreen := strings.Repeat("─", 40) + "\n\n" + strings.Repeat("─", 40) + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"0.0%/1.0M (auto)  google/gemini-4-argon"
+	output := &SpawnOutput{
+		Session: "proj",
+		Agents:  []SpawnedAgent{{Pane: "0.1", Type: "pi"}},
+	}
+	capture := func(context.Context, string, int) (string, error) { return piScreen, nil }
+	if err := waitForAgentsReadyWithCapture(context.Background(), output, time.Second, capture); err != nil {
+		t.Fatalf("waitForAgentsReadyWithCapture(pi editor) = %v, want ready", err)
+	}
+	if !output.Agents[0].Ready {
+		t.Fatal("Pi pane with its editor drawn was not marked ready")
+	}
+}
+
 // ntm-cx4e: reaching a project through a symlinked alias makes NTM see one
 // path while Agent Mail canonicalizes to another, so an orchestrator that
 // trusts working_dir queries a project key holding none of its own swarm's

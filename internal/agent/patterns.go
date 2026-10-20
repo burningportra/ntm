@@ -1067,6 +1067,23 @@ var (
 	ollamaHeaderPattern = regexp.MustCompile(`(?im)(^ollama>\s*$|\bollama\s+(run|chat|serve|pull)\b|^\s*ollama\s+cli\b)`)
 )
 
+// Opencode (oc) patterns, measured against opencode 2.0.28 in tmux. Its
+// prompt is a box with a "┃" left edge and a bottom edge of "╹" and a run of
+// "▀", holding the input and a line naming the agent, model and provider
+// (here a stand-in provider), with the cwd and key hints below it:
+//
+//	┃  Ask anything… "Fix broken tests"
+//	┃
+//	┃  Build · Fake Model Fake
+//	╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+//	/…/repo:master  shift+tab agents  ctrl+p commands
+//
+// The home screen centres the box under the logo, so it can sit well above
+// the bottom of a tall pane. No opencode turn has been captured, so there is
+// no idle or working detection for it: the box only tells IsReadyOutput that
+// the TUI is up.
+var opencodePromptBoxBottomRe = regexp.MustCompile(`(?m)^[ \t]*╹▀+[ \t]*$`)
+
 // claudeLiveTailLines bounds the live-tail window scanned for Claude
 // working/idle classification. Claude Code pins its input box to the BOTTOM of
 // the screen and renders the live spinner just above it, so the most-recent
@@ -1539,23 +1556,36 @@ func GetPatternSet(agentType AgentType) *PatternSet {
 var readyWordRe = regexp.MustCompile(`\bready\b`)
 
 // readyPromptPatterns are the prompts IsReadyOutput accepts, anchored to the
-// end of a line or of the output.
+// end of a line or of the output. A shell's "$" or "%" prompt is not one: no
+// agent's prompt looks like it, and in an agent pane it means the agent never
+// started or has exited.
 var readyPromptPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?m)^\$\s*$`), // Empty Shell prompt
-	regexp.MustCompile(`(?m)^%\s*$`),  // Empty Zsh prompt
-	regexp.MustCompile(`❯\s*$`),       // Modern prompts (U+276F)
-	regexp.MustCompile(`›\s*$`),       // Codex prompt (U+203A) empty
-	regexp.MustCompile(`(?m)^›`),      // Codex prompt with hint text
-	regexp.MustCompile(`>\s*$`),       // Simple prompt at end of output
-	regexp.MustCompile(`(?m)^>\s*$`),  // Simple prompt on its own line
+	regexp.MustCompile(`❯\s*$`),      // Modern prompts (U+276F)
+	regexp.MustCompile(`›\s*$`),      // Codex prompt (U+203A) empty
+	regexp.MustCompile(`(?m)^›`),     // Codex prompt with hint text
+	regexp.MustCompile(`>\s*$`),      // Simple prompt at end of output
+	regexp.MustCompile(`(?m)^>\s*$`), // Simple prompt on its own line
 }
 
-// IsReadyOutput reports whether a freshly launched agent's pane output shows
-// its TUI up and taking input. Robot spawn, restart-pane and checkpoint
-// restore wait on it before sending an agent work. The shell prompts it
-// accepts also match a pane whose agent never started, so callers corroborate
-// it with the pane's process.
-func IsReadyOutput(output string) bool {
+// IsReadyOutput reports whether the output of a pane freshly launched as
+// agentType shows the agent's TUI up and taking input. Robot spawn,
+// restart-pane and checkpoint restore wait on it before sending an agent
+// work. Callers still corroborate it with the pane's process, since a
+// launcher can print anything before the agent starts.
+func IsReadyOutput(output string, agentType AgentType) bool {
+	switch agentType.Canonical() {
+	case AgentTypePi:
+		// Pi draws no prompt glyph: its prompt is the editor box above the
+		// footer, the box its idle detection (PiIdlePromptShowing) reads
+		// too. None of the indicators below appear on a Pi screen, apart
+		// from an extension status that happens to say "ready".
+		return PiEditorShowing(output)
+	case AgentTypeOpencode:
+		// opencode draws none either: its prompt is the box above its key
+		// hints (opencodePromptBoxBottomRe).
+		return opencodePromptBoxBottomRe.MatchString(stripANSICodes(output))
+	}
+
 	lower := strings.ToLower(output)
 
 	// Common ready indicators (case-insensitive)

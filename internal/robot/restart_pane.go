@@ -1904,7 +1904,7 @@ func waitForPaneAgentReadyWithContext(
 		if cancelErr := restartPaneCancellationError(ctx, captureErr); cancelErr != nil {
 			return false, cancelErr
 		}
-		if captureErr == nil && agent.IsReadyOutput(captured) {
+		if captureErr == nil && agent.IsReadyOutput(captured, agent.AgentType(agentType)) {
 			ready = true
 		}
 		if ready && shellPID > 0 && !hasChildAlive(shellPID) {

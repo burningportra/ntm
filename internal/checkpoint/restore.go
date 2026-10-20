@@ -529,7 +529,7 @@ func (l *restoredLaunch) poll(ops restoredPaneOps) bool {
 	case state.gone:
 		l.err = errors.New("pane closed while its agent was starting")
 		return true
-	case state.ready():
+	case state.ready(agent.AgentType(l.pane.AgentType)):
 		return true
 	case state.dead || (l.started && tmux.PaneCommandIsShell(state.command)):
 		if l.attempts < restoreLaunchAttempts {
@@ -583,13 +583,13 @@ func (s restoredPaneState) agentRunning() bool {
 	return !s.gone && !s.dead && s.command != "" && !tmux.PaneCommandIsShell(s.command)
 }
 
-// ready reports whether the pane's agent is up: its output passes
-// agent.IsReadyOutput, the check robot spawn and restart-pane wait on, while
-// a non-shell process runs in the pane. A shell prompt passes the text check
-// too, so the process corroborates it as spawn's and restart-pane's process
-// checks do.
-func (s restoredPaneState) ready() bool {
-	return s.agentRunning() && agent.IsReadyOutput(s.output)
+// ready reports whether the pane's agent, launched as agentType, is up: its
+// output passes agent.IsReadyOutput, the check robot spawn and restart-pane
+// wait on, while a non-shell process runs in the pane. A launcher's own
+// output can pass the text check, so the process corroborates it as spawn's
+// and restart-pane's process checks do.
+func (s restoredPaneState) ready(agentType agent.AgentType) bool {
+	return s.agentRunning() && agent.IsReadyOutput(s.output, agentType)
 }
 
 // failure describes a launch that failed outright.
@@ -756,7 +756,7 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int, readyDeadline tim
 			content = truncateToLines(content, maxLines)
 		}
 
-		if err := waitForRestoredAgentReady(targetPane.ID, readyDeadline, readyTimeout, restoreAgentReadyPollInterval, observeRestoredPane); err != nil {
+		if err := waitForRestoredAgentReady(targetPane.ID, agent.AgentType(paneState.AgentType), readyDeadline, readyTimeout, restoreAgentReadyPollInterval, observeRestoredPane); err != nil {
 			failures = append(failures, fmt.Errorf("%s: %w; context not injected", label, err))
 			continue
 		}
@@ -770,14 +770,16 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int, readyDeadline tim
 	return failures
 }
 
-// waitForRestoredAgentReady polls a relaunched pane until its agent is up
-// (restoredPaneState.ready, the check relaunch waits on) or deadline, timeout
-// after the restore's relaunch began, passes. It returns nil once the agent
-// is up, and otherwise why it is not. A dead or closed pane cannot come up,
-// so it stops there at once. The pane is checked at least once, so a ready
-// pane still gets its context after another pane used up the deadline.
+// waitForRestoredAgentReady polls a pane relaunched as agentType until its
+// agent is up (restoredPaneState.ready, the check relaunch waits on) or
+// deadline, timeout after the restore's relaunch began, passes. It returns
+// nil once the agent is up, and otherwise why it is not. A dead or closed
+// pane cannot come up, so it stops there at once. The pane is checked at
+// least once, so a ready pane still gets its context after another pane used
+// up the deadline.
 func waitForRestoredAgentReady(
 	paneID string,
+	agentType agent.AgentType,
 	deadline time.Time,
 	timeout time.Duration,
 	pollInterval time.Duration,
@@ -788,7 +790,7 @@ func waitForRestoredAgentReady(
 		switch {
 		case err != nil:
 			// A failed look is retried until the deadline.
-		case state.ready():
+		case state.ready(agentType):
 			return nil
 		case state.gone:
 			return errors.New("pane closed")

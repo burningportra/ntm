@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/util"
@@ -822,58 +825,265 @@ func TestAllPatternsCompile(t *testing.T) {
 
 func TestIsReadyOutput(t *testing.T) {
 	tests := []struct {
-		name   string
-		output string
-		want   bool
+		name      string
+		agentType AgentType
+		output    string
+		want      bool
 	}{
 		// Claude indicators
-		{"claude_prompt_lowercase", "claude>", true},
-		{"claude_prompt_spaced", "claude > ", true},
-		{"claude_code_version", "Claude Code v1.2.3", true},
-		{"claude_welcome", "Welcome back!", true},
-		{"claude_bypass_permissions", "Bypass permissions: enabled", true},
-		{"claude_try_example", "Try \"help me with X\"", true},
+		{"claude_prompt_lowercase", AgentTypeClaudeCode, "claude>", true},
+		{"claude_prompt_spaced", AgentTypeClaudeCode, "claude > ", true},
+		{"claude_code_version", AgentTypeClaudeCode, "Claude Code v1.2.3", true},
+		{"claude_welcome", AgentTypeClaudeCode, "Welcome back!", true},
+		{"claude_bypass_permissions", AgentTypeClaudeCode, "Bypass permissions: enabled", true},
+		{"claude_try_example", AgentTypeClaudeCode, "Try \"help me with X\"", true},
+		{"claude_composer", AgentTypeClaudeCode, "❯ ", true},
 
 		// Codex indicators
-		{"codex_prompt", "codex>", true},
-		{"codex_context_left", "42% context left · ? for shortcuts", true},
-		{"codex_chevron_prompt", "› Write tests for @filename", true},
-		{"codex_ready", "Ready for input", true},
+		{"codex_prompt", AgentTypeCodex, "codex>", true},
+		{"codex_context_left", AgentTypeCodex, "42% context left · ? for shortcuts", true},
+		{"codex_chevron_prompt", AgentTypeCodex, "› Write tests for @filename", true},
+		{"codex_ready", AgentTypeCodex, "Ready for input", true},
 
 		// Gemini indicators
-		{"gemini_prompt", "gemini>", true},
-		{"gemini_help", "How can I help you today?", true},
+		{"gemini_prompt", AgentTypeGemini, "gemini>", true},
+		{"gemini_help", AgentTypeGemini, "How can I help you today?", true},
 
 		// Muse indicators: the last line is the status bar, not a prompt.
-		{"muse_idle_screen", museIdleScreen, true},
-		{"muse_status_bar_only", "◆ echo: done\n\n❯ draft\n" + museCaptureRule + "\n  muse-wonder-1.0 · /path/to/repo · YOLO", true},
-		{"muse_command_echo_only", "% muse --yolo --model 'muse-wonder-1.0'", false},
+		{"muse_idle_screen", AgentTypeMuse, museIdleScreen, true},
+		{"muse_status_bar_only", AgentTypeMuse, "◆ echo: done\n\n❯ draft\n" + museCaptureRule + "\n  muse-wonder-1.0 · /path/to/repo · YOLO", true},
+		{"muse_command_echo_only", AgentTypeMuse, "% muse --yolo --model 'muse-wonder-1.0'", false},
 
-		// Generic shell prompts
-		{"shell_dollar", "$ ", true},
-		{"shell_percent", "% ", true},
-		{"shell_arrow", "❯ ", true},
-		{"shell_simple", "> ", true},
-		{"python_repl", ">>> ", true},
+		// Simple prompts
+		{"aider_prompt", AgentTypeAider, "> ", true},
+		{"ollama_repl", AgentTypeOllama, ">>> ", true},
 
 		// "ready" must match as a word: as a bare substring it also hit
 		// "already".
-		{"ready_word", "agent ready for input\n", true},
-		{"already_up_to_date", "Already up to date.\n", false},
+		{"ready_word", AgentTypeKimi, "agent ready for input\n", true},
+		{"already_up_to_date", AgentTypeKimi, "Already up to date.\n", false},
+
+		// Pi reads only its editor box: a draft or a prompt-suggester ghost
+		// in it still takes input, while a live turn, a screen with no
+		// editor and another agent's screen do not.
+		{"pi_draft", AgentTypePi, piDraftScreen, true},
+		{"pi_ghost_suggestion", AgentTypePi, piGhostScreen, true},
+		{"pi_working", AgentTypePi, piWorkingNarrowScreen, false},
+		{"pi_no_editor", AgentTypePi, "/repo (main)\n0.0%/1.0M (auto)  model", false},
+		{"pi_ready_word_without_editor", AgentTypePi, "🧠 ws · ready ○ 🐴 ponytail: ⚡ FULL", false},
+		{"pi_codex_screen", AgentTypePi, "› Ask Codex to do anything", false},
+
+		// opencode reads only its prompt box; the logo's "▀" runs are not it.
+		{"opencode_logo_only", AgentTypeOpencode, strings.SplitN(opencodeReadyNarrowScreen, "\n\n\n", 2)[0], false},
+		{"opencode_ansi_colored", AgentTypeOpencode, "\x1b[38;5;240m  ╹" + strings.Repeat("▀", 20) + "\x1b[0m\n  shift+tab agents", true},
+		{"opencode_codex_screen", AgentTypeOpencode, "› Ask Codex to do anything", false},
 
 		// Not ready states
-		{"loading", "Loading...", false},
-		{"empty", "", false},
-		{"garbage", "xyzabc123", false},
-		{"partial_prompt", "claud", false},
+		{"loading", AgentTypeClaudeCode, "Loading...", false},
+		{"empty", AgentTypeClaudeCode, "", false},
+		{"garbage", AgentTypeClaudeCode, "xyzabc123", false},
+		{"partial_prompt", AgentTypeClaudeCode, "claud", false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IsReadyOutput(tc.output); got != tc.want {
-				t.Errorf("IsReadyOutput(%q) = %v, want %v", tc.output, got, tc.want)
+			if got := IsReadyOutput(tc.output, tc.agentType); got != tc.want {
+				t.Errorf("IsReadyOutput(%q, %s) = %v, want %v", tc.output, tc.agentType, got, tc.want)
 			}
 		})
+	}
+}
+
+// Live captures of freshly launched agents, trimmed the way tmux.Client
+// returns them. No prompt was sent to any of them.
+var (
+	// opencode 2.0.28 in a 60x20 and a 100x30 tmux pane, run with its HOME and
+	// XDG directories in a scratch dir and only a stand-in provider at
+	// 127.0.0.1:9, so no real provider was reachable. The home screen centres
+	// the prompt box under the logo.
+	opencodeReadyNarrowScreen = "▄\n" +
+		"           █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n" +
+		"           █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n" +
+		"           ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n\n" +
+		"  ┃\n" +
+		"  ┃  Ask anything… \"Fix broken tests\"\n" +
+		"  ┃\n" +
+		"  ┃  Build · Fake Model Fake\n" +
+		"  ╹" + strings.Repeat("▀", 55) + "\n" +
+		"  /…/bd-1zadt/ws:master  shift+tab agents  ctrl+p commands"
+	opencodeReadyWideScreen = "▄\n" +
+		"                               █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n" +
+		"                               █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n" +
+		"                               ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n\n" +
+		"             ┃\n" +
+		"             ┃  Ask anything… \"Fix broken tests\"\n" +
+		"             ┃\n" +
+		"             ┃  Build · Fake Model Fake\n" +
+		"             ╹" + strings.Repeat("▀", 74) + "\n" +
+		"             /…/c63d7f…/scratchpad/bd-1zadt/ws:master  shift+tab agents  ctrl+p commands" +
+		strings.Repeat("\n", 8) + strings.Repeat(" ", 92) + "2.0.28"
+
+	// `pi --offline --no-session --no-extensions` (Pi 1.3.0) in a 40x20 pane.
+	// Pi prints its skill-loading warnings into the transcript above the
+	// empty editor.
+	piReadyNoExtensionsScreen = "description: Diagnosis loop for hard\n" +
+		"bugs and performance regressions. Use\n" +
+		"when…\n" +
+		"             ^\n\n\n\n" +
+		piRule40 + "\n\n" + piRule40 + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+		"0.0%/1.0M (auto)  google/gemini-4-argon"
+
+	// `pi --offline --no-session` in an 80x24 pane with the operator's
+	// extensions, whose status line ends the screen.
+	piReadyExtensionsScreen = " Ponytail loaded: full\n\n" +
+		strings.Repeat("─", 80) + "\n\n" + strings.Repeat("─", 80) + "\n" +
+		"/private/tmp/claude-501/-Volumes-1tb-Projects-ntm/c63d7fe8-3892-44e4-9065-cee...\n" +
+		"0.0%/1.0M (auto)                (vercel-ai-gateway) google/gemini-4-argon • high\n" +
+		"🧠 ws · ready ○ 🐴 ponytail: ⚡ FULL"
+
+	// `muse --provider echo --yolo` (Muse Code 1.4.11) in a 100x30 pane.
+	museReadyScreen = "Muse Code 1.4.11\n\n" +
+		"  Skills: 276 loaded · 40 warnings · 76 details hidden (ctrl+o to expand)\n\n" +
+		"── Voice input (alt(option)+v to start) " + strings.Repeat("─", 60) + "\n" +
+		"❯\n" +
+		strings.Repeat("─", 100) + "\n" +
+		"  echo · /p/t/c/-/c/s/bd-1zadt/ws · YOLO"
+
+	// The bottom of an idle Codex pane in a 150-column tmux pane, read with
+	// capture-pane; the transcript line, cwd and thread title are replaced.
+	codexReadyScreen = "• Committed the fix; the retry tests pass.\n\n\n" +
+		"› Ask Codex to do anything\n\n" +
+		"  GPT-5.6-Sol max · ~/proj · Fix the flaky retry test · Main [default]\n" +
+		"  ? for shortcuts" + strings.Repeat(" ", 105) + "⚠ 5 warnings · f2 to view"
+
+	// The bottom of an idle Claude Code 2.1 pane in a 91-column tmux pane,
+	// read with capture-pane; the tip text is replaced.
+	claudeReadyScreen = "✦ Heads up · Settings now sync across your devices.\n" +
+		"  1: Learn more   2: Knew this already   0: Dismiss\n" +
+		strings.Repeat(" ", 51) + "✔ Update installed · Restart to update\n" +
+		strings.Repeat("─", 91) + "\n" +
+		"❯\n" +
+		strings.Repeat("─", 91) + "\n" +
+		"  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage"
+)
+
+// readinessIdleScreens returns, for each launchable agent type, the idle
+// screens readiness must accept: live captures where a free stand-in or an
+// already-running pane allowed one, and otherwise the screens the repo's
+// per-type idle detection is tested on.
+func readinessIdleScreens(t *testing.T) map[AgentType]map[string]string {
+	t.Helper()
+	testdata := func(name string) string {
+		raw, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return strings.TrimSpace(stripCaptureHeader(string(raw)))
+	}
+	return map[AgentType]map[string]string{
+		AgentTypeClaudeCode: {
+			"live 2.1 pane":                  claudeReadyScreen,
+			"testdata claude_idle_completed": testdata("claude_idle_completed.txt"),
+		},
+		AgentTypeCodex: {
+			"live pane":         codexReadyScreen,
+			"testdata cod_idle": testdata("cod_idle.txt"),
+		},
+		AgentTypeGemini: {
+			"testdata gmi_idle": testdata("gmi_idle.txt"),
+		},
+		AgentTypePi: {
+			"live fresh, no extensions":      piReadyNoExtensionsScreen,
+			"live fresh, extensions":         piReadyExtensionsScreen,
+			"captured fresh":                 piIdleFreshScreen,
+			"captured after a turn":          piIdleNarrowScreen,
+			"captured after a turn, wide":    piIdleWideScreen,
+			"captured, extension status cut": piIdleExtensionStatusScreen,
+		},
+		AgentTypeKimi: {
+			"parser fixture": "Kimi Code CLI\nDone.\nkimi> ",
+		},
+		AgentTypeMuse: {
+			"live fresh":    museReadyScreen,
+			"captured tip":  museLiveTipScreen,
+			"captured idle": museIdleScreen,
+		},
+		// Antigravity's idle detection is Gemini's (gmiIdlePatterns), and no
+		// agy screen has been captured.
+		AgentTypeAntigravity: {
+			"gemini testdata gmi_idle": testdata("gmi_idle.txt"),
+		},
+		AgentTypeCursor: {
+			"parser fixture": "Done editing.\ncursor> ",
+		},
+		AgentTypeWindsurf: {
+			"parser fixture": "Completed task.\nwindsurf> ",
+		},
+		AgentTypeAider: {
+			"parser fixture": "Changes applied.\naider> ",
+		},
+		AgentTypeOpencode: {
+			"live fresh, 60 columns":  opencodeReadyNarrowScreen,
+			"live fresh, 100 columns": opencodeReadyWideScreen,
+		},
+		AgentTypeOllama: {
+			"parser fixture": "Done.\n> ",
+		},
+	}
+}
+
+// readinessNoIdleScreen names the launchable agent types with no idle screen
+// in the repo or from a free stand-in, and why.
+var readinessNoIdleScreen = map[AgentType]string{
+	AgentTypeGrok: "Grok Build has no idle detection and no captured screen, and launching it needs a paid provider",
+}
+
+// TestIsReadyOutput_EveryAgentTypeIdleScreen is the bd-1zadt regression:
+// restore, robot spawn --spawn-wait and context injection wait on
+// IsReadyOutput, so a launchable type whose idle screen it did not recognise
+// waited out the whole deadline and was reported as not ready.
+func TestIsReadyOutput_EveryAgentTypeIdleScreen(t *testing.T) {
+	screens := readinessIdleScreens(t)
+	for _, agentType := range AgentTypes() {
+		cases, ok := screens[agentType]
+		if !ok {
+			if reason, known := readinessNoIdleScreen[agentType]; known {
+				t.Logf("%s: no idle screen: %s", agentType, reason)
+				continue
+			}
+			t.Errorf("%s: no idle screen to check readiness against", agentType)
+			continue
+		}
+		for name, screen := range cases {
+			t.Run(string(agentType)+"/"+name, func(t *testing.T) {
+				if !IsReadyOutput(screen, agentType) {
+					t.Errorf("IsReadyOutput(%s idle screen) = false, want true:\n%s", agentType, screen)
+				}
+			})
+		}
+	}
+}
+
+// TestIsReadyOutput_ShellOutputNeverReady keeps what a pane shows before its
+// agent's TUI is up, or after the agent exited, from counting as ready for
+// any agent type.
+func TestIsReadyOutput_ShellOutputNeverReady(t *testing.T) {
+	notReady := map[string]string{
+		"git pull":      "$ git pull\nAlready up to date.\n",
+		"bare $ prompt": "$ ",
+		"bare % prompt": "% ",
+		"launcher":      "Loading...",
+		"empty":         "",
+	}
+	for _, agentType := range AgentTypes() {
+		for name, screen := range notReady {
+			t.Run(string(agentType)+"/"+name, func(t *testing.T) {
+				if IsReadyOutput(screen, agentType) {
+					t.Errorf("IsReadyOutput(%q) for %s = true, want false", screen, agentType)
+				}
+			})
+		}
 	}
 }
 

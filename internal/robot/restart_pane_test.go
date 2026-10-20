@@ -891,6 +891,25 @@ func TestRespawnRestartPaneTargetsContextReportsMutationWhenCommandReturnsCancel
 	}
 }
 
+// bd-1zadt: restart-pane reads readiness as the pane's agent type, so a
+// restarted opencode pane comes up on its prompt box, which carries none of
+// the indicators other agents are read by.
+func TestRestartPaneReadinessReadsThePaneType(t *testing.T) {
+	opencodeScreen := "  ┃  Ask anything… \"Fix broken tests\"\n" +
+		"  ┃\n" +
+		"  ┃  Build · Fake Model Fake\n" +
+		"  ╹" + strings.Repeat("▀", 55) + "\n" +
+		"  /…/repo:master  shift+tab agents  ctrl+p commands"
+	ready, err := waitForPaneAgentReadyWithContext(
+		t.Context(), "%7", 1234, "opencode", time.Second, time.Millisecond,
+		func(context.Context, string, int) (string, error) { return opencodeScreen, nil },
+		func(int) bool { return true },
+	)
+	if err != nil || !ready {
+		t.Fatalf("readiness of an opencode prompt box = %t, %v; want ready", ready, err)
+	}
+}
+
 func TestRestartPaneReadinessAndDelayHonorCancellation(t *testing.T) {
 	t.Run("readiness capture", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())

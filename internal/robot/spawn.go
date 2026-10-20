@@ -1207,7 +1207,7 @@ func waitForAgentsReadyWithCapture(
 			// Text alone reports a bare shell prompt as ready, so a spawn whose
 			// agent CLI is missing from PATH used to return ready:true with
 			// nothing running at all.
-			ready := agentpkg.IsReadyOutput(captured)
+			ready := agentpkg.IsReadyOutput(captured, agentpkg.AgentType(output.Agents[i].Type))
 			if ready {
 				if shellPID, childAlive := spawnPaneLiveness(readyCtx, target); shellPID > 0 && !childAlive {
 					ready = false

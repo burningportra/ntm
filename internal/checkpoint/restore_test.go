@@ -881,10 +881,19 @@ func waitForRestoreInput(path, want string, timeout time.Duration) string {
 	return got
 }
 
+// restoreTestPiScreen is a fresh Pi 1.3.0 screen (`pi --offline --no-session
+// --no-extensions` in a 40-column pane): an empty editor above the footer,
+// with no prompt glyph, banner or "ready" status.
+var restoreTestPiScreen = strings.Repeat("─", 40) + "\n\n" + strings.Repeat("─", 40) + "\n" +
+	"/private/tmp/claude-501/-Volumes-1tb-...\n" +
+	"0.0%/1.0M (auto)  google/gemini-4-argon"
+
 func TestWaitForRestoredAgentReady(t *testing.T) {
 	const museScreen = "Muse Code 1.4.11\n\n❯\n  muse-wonder-1.0 · /repo · YOLO"
 	tests := []struct {
 		name string
+		// agentType is the type the pane was relaunched as; Muse when empty.
+		agentType agent.AgentType
 		// screens are the observed outputs in order; the last one repeats.
 		screens  []string
 		command  string
@@ -904,9 +913,17 @@ func TestWaitForRestoredAgentReady(t *testing.T) {
 		{name: "dead pane keeps its agent's screen and name, and stops the wait", screens: []string{museScreen}, command: "muse-bin-1.4.11", dead: true, deadline: 5 * time.Second, want: "agent exited", maxObservations: 1},
 		{name: "closed pane stops the wait", screens: []string{""}, gone: true, deadline: 5 * time.Second, want: "pane closed", maxObservations: 1},
 		{name: "checked once after the deadline", screens: []string{museScreen}, command: "muse-bin-1.4.11", deadline: -time.Second, minObservations: 1},
+		// bd-1zadt: Pi's screen carries none of the generic indicators, so
+		// only its own editor recognizer sees it come up.
+		{name: "pi ready once its editor draws", agentType: agent.AgentTypePi, screens: []string{"", restoreTestPiScreen}, command: "node", deadline: 2 * time.Second, minObservations: 2},
+		{name: "pi shell prompt is not ready", agentType: agent.AgentTypePi, screens: []string{"$ "}, command: "node", deadline: 50 * time.Millisecond, want: "agent not ready within 50ms"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			agentType := tc.agentType
+			if agentType == "" {
+				agentType = agent.AgentTypeMuse
+			}
 			observations := 0
 			observe := func(paneID string) (restoredPaneState, error) {
 				if paneID != "%7" {
@@ -917,7 +934,7 @@ func TestWaitForRestoredAgentReady(t *testing.T) {
 				return restoredPaneState{gone: tc.gone, dead: tc.dead, command: tc.command, output: screen}, nil
 			}
 
-			err := waitForRestoredAgentReady("%7", time.Now().Add(tc.deadline), max(tc.deadline, 0), time.Millisecond, observe)
+			err := waitForRestoredAgentReady("%7", agentType, time.Now().Add(tc.deadline), max(tc.deadline, 0), time.Millisecond, observe)
 			got := ""
 			if err != nil {
 				got = err.Error()
@@ -1074,6 +1091,26 @@ func TestRelaunchRestoredPanes(t *testing.T) {
 				t.Errorf("outcome = %q, want %q", gotErr, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestRelaunchRestoredPanes_ReadsReadinessAsThePaneType is the bd-1zadt
+// regression: a restored Pi pane waited out the whole deadline and was
+// reported as started but not ready, because its idle screen matched none of
+// the indicators the readiness check knew without the pane's type.
+func TestRelaunchRestoredPanes_ReadsReadinessAsThePaneType(t *testing.T) {
+	ops := restoredPaneOps{
+		respawn: func(string, string) error { return nil },
+		observe: func(string) (restoredPaneState, error) {
+			return restoredPaneState{command: "node", output: restoreTestPiScreen}, nil
+		},
+	}
+	launch := &restoredLaunch{pane: PaneState{AgentType: "pi"}, paneID: "%3", command: "pi"}
+
+	relaunchRestoredPanes([]*restoredLaunch{launch}, time.Now().Add(time.Second), time.Second, time.Millisecond, ops)
+
+	if launch.err != nil || launch.attempts != 1 {
+		t.Fatalf("relaunch err = %v after %d launches, want the Pi pane up after one", launch.err, launch.attempts)
 	}
 }
 
