@@ -595,16 +595,18 @@ type interruptKey struct {
 }
 
 // interruptKeyForAgent returns the key that stops a running turn in a pane of
-// agentType. Muse Code stops a turn on Escape. Its Ctrl+C acts on the composer
-// first: with a draft there it only clears the draft, and with queued input it
-// submits that input as a steer, so in both cases the turn keeps running.
-// Escape stops the turn either way and leaves a draft in place. Verified
-// against muse 1.4.11 with the echo provider.
+// agentType, the one tmux.InterruptKey picks. Muse Code stops a turn on
+// Escape. Its Ctrl+C acts on the composer first: with a draft there it only
+// clears the draft, and with queued input it submits that input as a steer,
+// so in both cases the turn keeps running. Escape stops the turn either way
+// and leaves a draft in place. Verified against muse 1.4.11 with the echo
+// provider.
 func interruptKeyForAgent(agentType tmux.AgentType) interruptKey {
-	if agentType.Canonical() == tmux.AgentMuse {
-		return interruptKey{tmuxKey: "Escape", label: "Escape"}
+	key := tmux.InterruptKey(agentType)
+	if key == "C-c" {
+		return interruptKey{tmuxKey: key, label: "Ctrl+C"}
 	}
-	return interruptKey{tmuxKey: "C-c", label: "Ctrl+C"}
+	return interruptKey{tmuxKey: key, label: key}
 }
 
 // sendCtrlCToPane sends one Ctrl+C to target.

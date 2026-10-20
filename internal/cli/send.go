@@ -2500,7 +2500,7 @@ func runInterrupt(session string, tags []string) error {
 			if err := tmux.SendKeyName(p.ID, key); err != nil {
 				return fmt.Errorf("interrupting pane %d: %w", p.Index, err)
 			}
-			if key == museInterruptKey {
+			if key == "Escape" {
 				escape++
 			} else {
 				ctrlC++
@@ -2517,18 +2517,11 @@ func runInterrupt(session string, tags []string) error {
 	return nil
 }
 
-// museInterruptKey stops a running Muse Code turn. Ctrl+C in Muse only clears
-// the composer draft while the turn keeps running, and on an idle composer it
-// arms quit, so a second Ctrl+C would exit Muse.
-const museInterruptKey = "Escape"
-
 // interruptKeyForPane returns the tmux key name that stops a pane's running
-// turn: Escape for Muse Code, Ctrl+C for every other agent.
+// turn (tmux.InterruptKey): Escape for Muse Code, Ctrl+C for every other
+// agent.
 func interruptKeyForPane(pane tmux.Pane) string {
-	if tmux.AgentType(pane.Type).Canonical() == tmux.AgentMuse {
-		return museInterruptKey
-	}
-	return "C-c"
+	return tmux.InterruptKey(pane.Type)
 }
 
 // buildInterruptResponse constructs the response for session interrupt.
