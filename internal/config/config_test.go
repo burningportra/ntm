@@ -624,6 +624,124 @@ func TestGetModelName(t *testing.T) {
 	}
 }
 
+func TestValidateModel(t *testing.T) {
+	models := DefaultModels()
+	accept := []struct{ agentType, model string }{
+		{"cc", ""},
+		{"cc", "opus"},
+		{"claude", "OPUS"},
+		{"cc", "claude-opus-4-8"},
+		{"cc", "claude-opus-4-1"},
+		{"cc", "us.anthropic.claude-opus-4-1-20250805-v1:0"},
+		{"cc", "fable"},
+		{"cc", "opusplan"},
+		{"cod", "gpt5"},
+		{"cod", "gpt-5.5"},
+		{"cod", "o4-mini"},
+		{"gmi", "gemini-2.5-pro"},
+		{"gmi", "flash-lite"},
+		{"muse", "spark-1.2"},
+		{"muse", "muse-spark-1.2"},
+		{"muse-code", "WONDER"},
+		{"oc", "flash"},
+		{"oc", "openrouter/anthropic/claude-sonnet-4.5"},
+		// Types whose model namespace NTM cannot know stay open.
+		{"pi", "sonnet-ish"},
+		{"kimi", "my-kimi-model"},
+		{"grok", "account-current"},
+		{"agy", "Gemini 3.1 Pro (High)"},
+		{"ollama", "mistral"},
+		{"cursor", "anything"},
+		{"hermes", "plugin-model"},
+	}
+	for _, tc := range accept {
+		if err := models.ValidateModel(tc.agentType, tc.model); err != nil {
+			t.Errorf("ValidateModel(%q, %q) = %v, want nil", tc.agentType, tc.model, err)
+		}
+	}
+
+	reject := []struct{ agentType, model, want string }{
+		{"muse", "bogusalias", `unknown muse model "bogusalias"`},
+		{"cc", "sonet", `did you mean "sonnet"?`},
+		{"cc", "nonexistent-model", "[models.claude]"},
+		{"cod", "gtp-5.5", `unknown codex model "gtp-5.5"`},
+		{"gmi", "invalid-gem", `unknown gemini model "invalid-gem"`},
+		{"oc", "flahs", `did you mean "flash"?`},
+		{"oc", "deepseek-v4", "provider/model id"},
+	}
+	for _, tc := range reject {
+		err := models.ValidateModel(tc.agentType, tc.model)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("ValidateModel(%q, %q) = %v, want an error containing %q", tc.agentType, tc.model, err, tc.want)
+		}
+	}
+
+	var nilModels *ModelsConfig
+	if err := nilModels.ValidateModel("muse", "bogusalias"); err != nil {
+		t.Errorf("nil ModelsConfig validated a model: %v", err)
+	}
+}
+
+// A user's [models.*] table is the escape hatch for names the family rule
+// does not know, and replacing a table keeps the built-in family.
+func TestValidateModelHonorsConfiguredAliases(t *testing.T) {
+	models := DefaultModels()
+	models.Muse = map[string]string{"local-qwen": "qwen3-coder"}
+	models.Claude = map[string]string{"big": "claude-opus-4-8"}
+
+	for _, tc := range []struct{ agentType, model string }{
+		{"muse", "local-qwen"},
+		{"muse", "qwen3-coder"},
+		{"muse", "muse-wonder-1.0"},
+		{"cc", "big"},
+		{"cc", "claude-sonnet-4-6"},
+	} {
+		if err := models.ValidateModel(tc.agentType, tc.model); err != nil {
+			t.Errorf("ValidateModel(%q, %q) = %v, want nil", tc.agentType, tc.model, err)
+		}
+	}
+	if err := models.ValidateModel("muse", "spark"); err == nil || !strings.Contains(err.Error(), "local-qwen") {
+		t.Errorf("ValidateModel(muse, spark) after replacing the alias table = %v, want an error listing local-qwen", err)
+	}
+}
+
+func TestValidateReasoningEffort(t *testing.T) {
+	accept := []struct{ agentType, effort string }{
+		{"cc", ""},
+		{"gmi", ""},
+		{"cc", "xhigh"},
+		{"claude", "max"},
+		{"cod", "minimal"},
+		{"codex", "persistent"},
+		{"muse", "ultra"},
+		{"muse", "none"},
+		{"grok", "deep"},
+		{"hermes", "turbo"},
+	}
+	for _, tc := range accept {
+		if err := ValidateReasoningEffort(tc.agentType, tc.effort); err != nil {
+			t.Errorf("ValidateReasoningEffort(%q, %q) = %v, want nil", tc.agentType, tc.effort, err)
+		}
+	}
+
+	reject := []struct{ agentType, effort, want string }{
+		{"cc", "ultra", "valid: low, medium, high, xhigh, max"},
+		{"cc", "High", `did you mean "high"?`},
+		{"cod", "hgih", `unknown codex reasoning effort "hgih" (did you mean "high"?)`},
+		{"muse", "persistent", "valid: none, minimal, low, medium, high, xhigh, max, ultra"},
+		{"gmi", "high", "gemini has no reasoning-effort flag"},
+		{"oc", "high", "opencode has no reasoning-effort flag"},
+		{"agy", "high", "antigravity has no reasoning-effort flag"},
+		{"kimi", "low", "kimi has no reasoning-effort flag"},
+	}
+	for _, tc := range reject {
+		err := ValidateReasoningEffort(tc.agentType, tc.effort)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("ValidateReasoningEffort(%q, %q) = %v, want an error containing %q", tc.agentType, tc.effort, err, tc.want)
+		}
+	}
+}
+
 func TestLoadPaletteFromMarkdown(t *testing.T) {
 	content := `# Comment
 ## Quick Actions

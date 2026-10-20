@@ -3,10 +3,10 @@ package cli
 import (
 	"fmt"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
 )
@@ -294,68 +294,23 @@ func resolveAgentModel(agentType AgentType, modelSpec string, pluginMap map[stri
 	return resolved
 }
 
-// ValidateModelAlias checks if a model alias exists in config
-func ValidateModelAlias(agentType AgentType, alias string) error {
-	if cfg == nil || alias == "" {
-		return nil // Can't validate without config, or nothing to validate
+// validateAgentSpecs checks every explicit model and reasoning effort in specs
+// against what its agent accepts (bd-i2pkl), so `ntm spawn` and `ntm add` exit
+// with a clear error before any session or pane exists instead of launching an
+// agent that dies on `--model bogusalias`. It runs once the config is loaded,
+// because model aliases come from [models.*]; see config.ValidateModel and
+// config.ValidateReasoningEffort for the rules and the types left open.
+func validateAgentSpecs(specs AgentSpecs) error {
+	for _, spec := range specs {
+		err := config.ValidateReasoningEffort(string(spec.Type), spec.ReasoningEffort)
+		if err == nil && cfg != nil {
+			err = cfg.Models.ValidateModel(string(spec.Type), spec.Model)
+		}
+		if err != nil {
+			return markCLIInvalidInput(fmt.Errorf("--%s=%s: %w", spec.Type, (&AgentSpecs{spec}).String(), err))
+		}
 	}
-
-	var aliases map[string]string
-	switch agentType {
-	case AgentTypeClaude:
-		aliases = cfg.Models.Claude
-	case AgentTypeCodex:
-		aliases = cfg.Models.Codex
-	case AgentTypeGemini:
-		aliases = cfg.Models.Gemini
-	case AgentTypePi:
-		aliases = cfg.Models.Pi
-	case AgentTypeKimi:
-		aliases = cfg.Models.Kimi
-	case AgentTypeMuse:
-		aliases = cfg.Models.Muse
-	case AgentTypeGrok:
-		// Grok Build's available model IDs are account- and release-dependent.
-		// Known aliases still resolve through Models.Grok, but an exact model ID
-		// must remain valid without NTM shipping a stale allowlist.
-		return nil
-	case AgentTypeAntigravity:
-		// agy's model is hard-pinned to "Gemini 3.1 Pro (High)" (see
-		// config.AntigravityRequiredModel), so there is no per-user alias map to
-		// validate against. Any requested alias is ignored rather than rejected:
-		// spawn.go warns and proceeds with the pinned model, so validation must
-		// not hard-fail here. Return nil unconditionally.
-		return nil
-	case AgentTypeOllama:
-		aliases = cfg.Models.Ollama
-	case AgentTypeCursor:
-		aliases = cfg.Models.Cursor
-	case AgentTypeWindsurf:
-		aliases = cfg.Models.Windsurf
-	case AgentTypeAider:
-		aliases = cfg.Models.Aider
-	case AgentTypeOpencode:
-		aliases = cfg.Models.Opencode
-	}
-
-	if aliases == nil {
-		return nil // No aliases configured
-	}
-
-	// Check if it's a known alias
-	if _, ok := aliases[strings.ToLower(alias)]; ok {
-		return nil
-	}
-
-	// List available aliases for error message
-	var available []string
-	for k := range aliases {
-		available = append(available, k)
-	}
-	sort.Strings(available)
-
-	return fmt.Errorf("unknown model alias %q for %s (available: %s)",
-		alias, agentType, strings.Join(available, ", "))
+	return nil
 }
 
 // AgentSpecsValue creates a flag value that accumulates into the given slice

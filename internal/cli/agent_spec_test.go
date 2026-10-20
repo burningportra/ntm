@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
@@ -175,7 +178,7 @@ func TestAgentSpecs_Flatten_Empty(t *testing.T) {
 }
 
 // =============================================================================
-// ResolveModel / ValidateModelAlias
+// ResolveModel
 // =============================================================================
 
 func TestResolveModel_Passthrough(t *testing.T) {
@@ -245,15 +248,6 @@ func TestResolveAgentModel_Precedence(t *testing.T) {
 	}
 }
 
-func TestValidateModelAlias_EmptyAlias(t *testing.T) {
-
-	// Empty alias should always be valid (nothing to validate)
-	err := ValidateModelAlias(AgentTypeClaude, "")
-	if err != nil {
-		t.Errorf("ValidateModelAlias(empty) returned error: %v", err)
-	}
-}
-
 // =============================================================================
 // ParseAgentSpec (extended)
 // =============================================================================
@@ -308,108 +302,142 @@ func TestParseAgentSpec_InvalidFormats(t *testing.T) {
 }
 
 // =============================================================================
-// ValidateModelAlias (with config)
+// validateAgentSpecs (bd-i2pkl)
 // =============================================================================
 
-func TestValidateModelAlias_KnownAlias(t *testing.T) {
+// parseSpecFlags parses spawn-style agent flags exactly as `ntm spawn` does
+// and returns the accumulated specs.
+func parseSpecFlags(t *testing.T, args ...string) AgentSpecs {
+	t.Helper()
+	var specs AgentSpecs
+	fs := pflag.NewFlagSet("spawn", pflag.ContinueOnError)
+	for _, agentType := range []AgentType{AgentTypeClaude, AgentTypeCodex, AgentTypeGemini, AgentTypeMuse, AgentTypeOpencode, AgentTypeGrok, AgentTypeKimi, AgentTypeCursor} {
+		fs.Var(NewAgentSpecsValue(agentType, &specs), string(agentType), "")
+	}
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse %v: %v", args, err)
+	}
+	return specs
+}
+
+func TestValidateAgentSpecsAcceptsAliasesAndFullModelIDs(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
 	cfg = config.Default()
 
-	// "opus" is a known Claude alias
-	err := ValidateModelAlias(AgentTypeClaude, "opus")
-	if err != nil {
-		t.Errorf("ValidateModelAlias(claude, opus) returned error: %v", err)
-	}
-
-	// "gpt5" is a known Codex alias
-	err = ValidateModelAlias(AgentTypeCodex, "gpt5")
-	if err != nil {
-		t.Errorf("ValidateModelAlias(codex, gpt5) returned error: %v", err)
-	}
-
-	// "pro" is a known Gemini alias
-	err = ValidateModelAlias(AgentTypeGemini, "pro")
-	if err != nil {
-		t.Errorf("ValidateModelAlias(gemini, pro) returned error: %v", err)
+	for _, args := range [][]string{
+		{"--muse=1:spark", "--cc=2:opus", "--cod=1:gpt5", "--gmi=1:pro", "--oc=1:flash"}, // configured aliases
+		{"--cc=1:claude-opus-4-1", "--cod=1:gpt-5.5", "--muse=1:muse-spark-1.2"},         // full model ids, not aliases
+		{"--cc=1:fable", "--cod=1:o4-mini", "--gmi=1:gemini-2.5-pro"},                    // CLI-native alias, new family members
+		{"--oc=1:openrouter/anthropic/claude-sonnet-4.5", "--kimi=1:my-kimi-model", "--grok=1:account-current"},
+		{"--cc=1:opus@max", "--cod=1:gpt-5.5:minimal", "--muse=1:wonder-full@xhigh", "--grok=1:account-current:deep"},
+		{"--cc=3", "--muse=2"}, // bare counts carry no model or effort
+	} {
+		if err := validateAgentSpecs(parseSpecFlags(t, args...)); err != nil {
+			t.Errorf("validateAgentSpecs(%v) = %v, want nil", args, err)
+		}
 	}
 }
 
-func TestValidateModelAlias_UnknownAlias(t *testing.T) {
+func TestValidateAgentSpecsRejectsUnknownModelWithSuggestion(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
 	cfg = config.Default()
 
-	err := ValidateModelAlias(AgentTypeClaude, "nonexistent-model")
+	err := validateAgentSpecs(parseSpecFlags(t, "--cc=1:opus", "--cc=2:sonet"))
 	if err == nil {
-		t.Error("expected error for unknown Claude alias")
+		t.Fatal("--cc=2:sonet passed validation, want an unknown-model error")
 	}
-	if !strings.Contains(err.Error(), "unknown model alias") {
-		t.Errorf("error should mention 'unknown model alias': %v", err)
+	for _, want := range []string{"--cc=2:sonet", `unknown claude model "sonet"`, `did you mean "sonnet"?`, "[models.claude]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
 	}
-	if !strings.Contains(err.Error(), "opus") {
-		t.Errorf("error should list available aliases including 'opus': %v", err)
+	// --json callers get INVALID_FLAG, not INTERNAL_ERROR.
+	if code, _ := classifyRobotExecuteError(err); code != robot.ErrCodeInvalidFlag {
+		t.Errorf("error code = %q, want %q", code, robot.ErrCodeInvalidFlag)
 	}
-}
 
-func TestValidateModelAlias_UnknownAliasCodex(t *testing.T) {
-	oldCfg := cfg
-	defer func() { cfg = oldCfg }()
-	cfg = config.Default()
-
-	err := ValidateModelAlias(AgentTypeCodex, "does-not-exist")
+	err = validateAgentSpecs(parseSpecFlags(t, "--muse=1:bogusalias"))
 	if err == nil {
-		t.Error("expected error for unknown Codex alias")
+		t.Fatal("--muse=1:bogusalias passed validation, want an unknown-model error")
 	}
-	if !strings.Contains(err.Error(), "does-not-exist") {
-		t.Errorf("error should reference the alias: %v", err)
+	for _, want := range []string{`unknown muse model "bogusalias"`, "spark-1.2", `"muse-wonder-1.0"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "did you mean") {
+		t.Errorf("error %q suggests a name for an input that is not close to any", err)
 	}
 }
 
-func TestValidateModelAlias_UnknownAliasGemini(t *testing.T) {
+func TestValidateAgentSpecsRejectsBadEffort(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
 	cfg = config.Default()
 
-	err := ValidateModelAlias(AgentTypeGemini, "invalid-gem")
+	err := validateAgentSpecs(parseSpecFlags(t, "--cod=1:gpt-5.5@hgih"))
 	if err == nil {
-		t.Error("expected error for unknown Gemini alias")
+		t.Fatal("--cod=1:gpt-5.5@hgih passed validation, want an unknown-effort error")
+	}
+	for _, want := range []string{`unknown codex reasoning effort "hgih"`, `did you mean "high"?`, "xhigh"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+
+	// claude --effort has no "ultra" tier even though codex and muse do.
+	if err := validateAgentSpecs(parseSpecFlags(t, "--cc=1:opus:ultra")); err == nil || !strings.Contains(err.Error(), "low, medium, high, xhigh, max") {
+		t.Errorf("--cc=1:opus:ultra error = %v, want the claude effort list", err)
 	}
 }
 
-func TestValidateModelAlias_NoAliasesConfigured(t *testing.T) {
+func TestValidateAgentSpecsRejectsEffortForAgentWithoutEffortFlag(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
 	cfg = config.Default()
-	// Clear aliases to simulate no aliases configured
-	cfg.Models.Claude = nil
 
-	err := ValidateModelAlias(AgentTypeClaude, "some-alias")
-	if err != nil {
-		t.Errorf("expected nil error when no aliases configured, got: %v", err)
+	for _, arg := range []string{"--gmi=1:pro:high", "--oc=1:flash:high", "--kimi=1:k2:high", "--cursor=1:gpt-5:high"} {
+		err := validateAgentSpecs(parseSpecFlags(t, arg))
+		if err == nil || !strings.Contains(err.Error(), "has no reasoning-effort flag") {
+			t.Errorf("validateAgentSpecs(%s) = %v, want a no-effort-flag error", arg, err)
+		}
 	}
 }
 
-func TestValidateModelAlias_NilConfig(t *testing.T) {
+// Without a loaded config, aliases are unknown, so only efforts are checked.
+func TestValidateAgentSpecsNilConfigSkipsModelCheck(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
 	cfg = nil
 
-	err := ValidateModelAlias(AgentTypeClaude, "opus")
-	if err != nil {
-		t.Errorf("expected nil error with nil config, got: %v", err)
+	if err := validateAgentSpecs(parseSpecFlags(t, "--muse=1:bogusalias")); err != nil {
+		t.Errorf("model check ran without a config: %v", err)
+	}
+	if err := validateAgentSpecs(parseSpecFlags(t, "--muse=1:spark@hgih")); err == nil {
+		t.Error("effort check skipped without a config")
 	}
 }
 
-func TestValidateModelAlias_UnknownAgentType(t *testing.T) {
+// `ntm spawn` and `ntm add` must reject a bad spec before doing anything
+// else, so no session, worktree or pane exists when the error comes back.
+func TestSpawnAndAddRejectBadSpecsBeforeAnyWork(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
 	cfg = config.Default()
 
-	// Unknown agent type has no aliases → should return nil
-	err := ValidateModelAlias(AgentTypeCursor, "some-model")
-	if err != nil {
-		t.Errorf("expected nil for unknown agent type (no aliases), got: %v", err)
+	for name, newCmd := range map[string]func() *cobra.Command{"spawn": newSpawnCmd, "add": newAddCmd} {
+		for _, spec := range []string{"--muse=1:bogusalias", "--cc=1:opus:ultra"} {
+			cmd := newCmd()
+			cmd.SetArgs([]string{"bd-i2pkl-never-created", spec})
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), spec) {
+				t.Errorf("ntm %s %s returned %v, want the spec validation error", name, spec, err)
+			}
+		}
 	}
 }
 
@@ -451,11 +479,11 @@ func TestResolveModel_WithConfig(t *testing.T) {
 	}
 }
 
-func TestValidateModelAliasAcceptsDynamicGrokModel(t *testing.T) {
+func TestValidateAgentSpecsAcceptsDynamicGrokModel(t *testing.T) {
 	oldCfg := cfg
 	defer func() { cfg = oldCfg }()
 	cfg = config.Default()
-	if err := ValidateModelAlias(AgentTypeGrok, "account-current"); err != nil {
+	if err := validateAgentSpecs(AgentSpecs{{Type: AgentTypeGrok, Count: 1, Model: "account-current"}}); err != nil {
 		t.Fatalf("dynamic Grok model ID rejected: %v", err)
 	}
 }
@@ -786,11 +814,11 @@ func TestMuseAgentSpecResolvesModelAliases(t *testing.T) {
 		}
 	}
 
-	if err := ValidateModelAlias(AgentTypeMuse, "spark-1.2"); err != nil {
-		t.Errorf("ValidateModelAlias(muse, spark-1.2): %v", err)
+	if err := validateAgentSpecs(specs); err != nil {
+		t.Errorf("validateAgentSpecs(%v): %v", specs, err)
 	}
-	if err := ValidateModelAlias(AgentTypeMuse, "nonexistent"); err == nil {
-		t.Error("ValidateModelAlias(muse, nonexistent) accepted an unknown alias")
+	if err := validateAgentSpecs(AgentSpecs{{Type: AgentTypeMuse, Count: 1, Model: "nonexistent"}}); err == nil {
+		t.Error("validateAgentSpecs accepted the unknown muse model \"nonexistent\"")
 	}
 
 	// A zero or negative count is a usage error, not a request for no panes.

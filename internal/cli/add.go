@@ -276,6 +276,9 @@ func newAddCmd() *cobra.Command {
 			if err := config.ValidateProjectName(sessionName); err != nil {
 				return err
 			}
+			if err := validateAgentSpecs(agentSpecs); err != nil {
+				return err
+			}
 
 			// Apply and validate optional label (bd-1933u)
 			if label != "" {

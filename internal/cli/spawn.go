@@ -1726,6 +1726,9 @@ Examples:
 			if err := config.ValidateProjectName(sessionName); err != nil {
 				return err
 			}
+			if err := validateAgentSpecs(agentSpecs); err != nil {
+				return err
+			}
 
 			// Apply goal label to session name (bd-1933u)
 			if label != "" {

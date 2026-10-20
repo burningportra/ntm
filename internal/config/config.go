@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2070,6 +2071,161 @@ func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 
 	// Return the alias as-is (assume it's a full model name).
 	return alias
+}
+
+// cliModelAliases lists the model names an agent CLI resolves on its own, with
+// no [models.*] entry needed: Claude Code's alias list (`claude --help` names
+// fable, opus and sonnet; the CLI also takes default, best, haiku, opusplan)
+// and Gemini CLI's auto/pro/flash/flash-lite aliases.
+var cliModelAliases = map[string][]string{
+	"claude": {"best", "default", "fable", "haiku", "opus", "opusplan", "sonnet"},
+	"gemini": {"auto", "flash", "flash-lite", "pro"},
+}
+
+// ValidateModel reports whether an explicit model names something the agent's
+// CLI can run, so a typo such as `--muse=1:bogusalias` fails before any pane
+// exists rather than when the agent starts (bd-i2pkl). A model passes when it
+// is a [models.<type>] alias, one of the CLI's own aliases, a model id the
+// config already names for the type (an alias target or the default), or a
+// full id in the same family as one of those ids. The family is the leading
+// name of a known id ("claude" in claude-opus-4-8, "gpt" in gpt-5.6-sol, "o"
+// in o3) and may appear anywhere in the requested id, so new releases like
+// claude-opus-4-1 or gpt-5.5 and provider-prefixed ids like
+// us.anthropic.claude-opus-4-1 pass without an NTM update. Opencode takes
+// provider/model ids, so any id containing '/' passes there.
+//
+// The other types stay open because NTM cannot know their model namespace: pi
+// matches model patterns fuzzily, kimi model names come from kimi's own
+// config, grok models depend on the account, agy is pinned, and ollama,
+// cursor, windsurf, aider and plugin agents take open-ended catalogs.
+func (m *ModelsConfig) ValidateModel(agentType, model string) error {
+	model = strings.TrimSpace(model)
+	if m == nil || model == "" {
+		return nil
+	}
+	kind := canonicalModelLookupAgentType(agentType)
+	switch kind {
+	case "claude", "codex", "gemini", "muse", "opencode":
+	default:
+		return nil
+	}
+
+	lower := strings.ToLower(model)
+	aliases := m.AliasesFor(kind)
+	if _, ok := aliases[lower]; ok || slices.Contains(cliModelAliases[kind], lower) {
+		return nil
+	}
+
+	// Known ids come from the built-in defaults as well as the loaded config,
+	// so a config that replaces an alias table still keeps the type's family.
+	defaults := DefaultModels()
+	var ids []string
+	for _, source := range []*ModelsConfig{m, &defaults} {
+		ids = append(ids, strings.ToLower(strings.TrimSpace(source.GetModelName(kind, ""))))
+		for _, target := range source.AliasesFor(kind) {
+			ids = append(ids, strings.ToLower(strings.TrimSpace(target)))
+		}
+	}
+	slices.Sort(ids)
+	ids = slices.DeleteFunc(slices.Compact(ids), func(id string) bool { return id == "" })
+	if slices.Contains(ids, lower) {
+		return nil
+	}
+	if kind == "opencode" {
+		if strings.Contains(model, "/") {
+			return nil
+		}
+	} else {
+		requested := modelNameTokens(lower)
+		for _, id := range ids {
+			if tokens := modelNameTokens(id); len(tokens) > 0 && strings.HasPrefix(id, tokens[0]) && slices.Contains(requested, tokens[0]) {
+				return nil
+			}
+		}
+	}
+
+	names := make([]string, 0, len(aliases)+len(cliModelAliases[kind]))
+	for alias := range aliases {
+		names = append(names, alias)
+	}
+	names = append(names, cliModelAliases[kind]...)
+	slices.Sort(names)
+	names = slices.Compact(names)
+	example := m.GetModelName(kind, "")
+	if example == "" && len(ids) > 0 {
+		example = ids[0]
+	}
+
+	var msg strings.Builder
+	fmt.Fprintf(&msg, "unknown %s model %q", kind, model)
+	if suggestion := closestName(lower, slices.Concat(names, ids)); suggestion != "" {
+		fmt.Fprintf(&msg, " (did you mean %q?)", suggestion)
+	}
+	idKind := "a full model id"
+	if kind == "opencode" {
+		idKind = "a provider/model id"
+	}
+	if len(names) > 0 {
+		fmt.Fprintf(&msg, ": use an alias (%s) or %s", strings.Join(names, ", "), idKind)
+	} else {
+		fmt.Fprintf(&msg, ": use %s", idKind)
+	}
+	if example != "" {
+		fmt.Fprintf(&msg, " such as %q", example)
+	}
+	fmt.Fprintf(&msg, ", or add the name under [models.%s] in config.toml", kind)
+	return fmt.Errorf("%s", msg.String())
+}
+
+// modelNameTokens splits a model id into its runs of ASCII letters, the name
+// parts that identify a model family ("us.anthropic.claude-opus-4-1" yields
+// us, anthropic, claude, opus).
+func modelNameTokens(id string) []string {
+	return strings.FieldsFunc(id, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z')
+	})
+}
+
+// closestName returns the candidate nearest to input by edit distance when it
+// is close enough to read as a typo of it (at most two edits, or a third of the
+// input's length for longer names), and "" otherwise.
+func closestName(input string, candidates []string) string {
+	limit := len(input) / 3
+	if limit < 2 {
+		limit = 2
+	}
+	best, bestDist := "", limit+1
+	for _, candidate := range candidates {
+		if d := editDistance(input, strings.ToLower(candidate)); d < bestDist || (d == bestDist && candidate < best) {
+			best, bestDist = candidate, d
+		}
+	}
+	if bestDist > limit {
+		return ""
+	}
+	return best
+}
+
+// editDistance is the Levenshtein distance between two strings.
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	curr := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		curr[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			curr[j] = min(prev[j]+1, curr[j-1]+1, prev[j-1]+cost)
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(rb)]
 }
 
 // IsPersonaName checks if the given name is a known persona by searching
@@ -4256,7 +4412,7 @@ func Print(cfg *Config, w io.Writer) error {
 
 	// Write Codex model aliases
 	fmt.Fprintln(w, "[models.codex]")
-	fmt.Fprintln(w, "# Codex model aliases (e.g., --cod=2:max)")
+	fmt.Fprintln(w, "# Codex model aliases (e.g., --cod=2:gpt5)")
 	for _, alias := range sortedStringMapKeys(cfg.Models.Codex) {
 		fullName := cfg.Models.Codex[alias]
 		fmt.Fprintf(w, "%q = %q\n", alias, fullName)

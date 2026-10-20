@@ -8,11 +8,14 @@ import (
 	"os/exec"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"text/template"
 	"text/template/parse"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 // AgentTemplateVars contains variables available for agent command templates
@@ -292,6 +295,51 @@ func agentTypeConsumesReasoningEffort(agentType string) bool {
 	default:
 		return false
 	}
+}
+
+// reasoningEffortLevels lists the values each effort-consuming agent's launch
+// flag accepts: claude --effort (`claude --help`), codex
+// model_reasoning_effort (the Codex CLI's ReasoningEffort enum), and muse
+// --reasoning-effort (`muse --help`). Grok is absent on purpose, since its
+// --effort also takes per-model menu ids that only Grok can judge.
+var reasoningEffortLevels = map[agent.AgentType][]string{
+	agent.AgentTypeClaudeCode: {"low", "medium", "high", "xhigh", "max"},
+	agent.AgentTypeCodex:      {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "persistent"},
+	agent.AgentTypeMuse:       {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"},
+}
+
+// ValidateReasoningEffort checks an explicit reasoning effort from an agent
+// spec against what agentType's launch flag accepts, so a typo fails before
+// any pane exists rather than when the agent starts (bd-i2pkl). A built-in
+// type with no effort flag rejects any effort instead of dropping it at
+// launch. Plugin types pass because their own command template decides
+// whether it uses the effort. Persona efforts do not come through here: they
+// apply to whatever type the persona lands on, which is why
+// GenerateAgentCommand drops them quietly for types like opencode.
+func ValidateReasoningEffort(agentType, effort string) error {
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		return nil
+	}
+	canonical := agent.AgentType(agentType).Canonical()
+	kind := canonicalModelLookupAgentType(agentType)
+	if !agentTypeConsumesReasoningEffort(string(canonical)) {
+		if !canonical.IsValid() {
+			return nil
+		}
+		return fmt.Errorf("%s has no reasoning-effort flag, so effort %q would be ignored; efforts apply to claude (cc), codex (cod), grok and muse", kind, effort)
+	}
+	levels, ok := reasoningEffortLevels[canonical]
+	if !ok || slices.Contains(levels, effort) {
+		return nil
+	}
+	var msg strings.Builder
+	fmt.Fprintf(&msg, "unknown %s reasoning effort %q", kind, effort)
+	if suggestion := closestName(strings.ToLower(effort), levels); suggestion != "" {
+		fmt.Fprintf(&msg, " (did you mean %q?)", suggestion)
+	}
+	fmt.Fprintf(&msg, "; valid: %s", strings.Join(levels, ", "))
+	return fmt.Errorf("%s", msg.String())
 }
 
 // GenerateAgentCommand renders an agent command template with the given variables.
