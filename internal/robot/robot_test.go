@@ -6262,71 +6262,58 @@ func TestIsAgentMailDBLockError(t *testing.T) {
 	}
 }
 
-func TestGetInboxTallyIgnoresReadMessages(t *testing.T) {
-
+func TestTallyInboxIgnoresReadMessages(t *testing.T) {
 	readAt := &agentmail.FlexTime{Time: time.Now()}
-	var (
-		mu        sync.Mutex
-		markReads []interface{}
-	)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			JSONRPC string          `json:"jsonrpc"`
-			ID      interface{}     `json:"id"`
-			Method  string          `json:"method"`
-			Params  json.RawMessage `json:"params"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-
-		var params agentmail.ToolCallParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			t.Fatalf("decode tool params: %v", err)
-		}
-		mu.Lock()
-		markReads = append(markReads, fetchInboxMarkRead(params.Arguments))
-		mu.Unlock()
-
-		messages := []agentmail.InboxMessage{
-			{ID: 1, Subject: "read urgent", Importance: "urgent", ReadAt: readAt},
-			{ID: 2, Subject: "unread urgent", Importance: "urgent", AckRequired: true},
-			{ID: 3, Subject: "unread normal", Importance: "normal"},
-		}
-
-		result, err := json.Marshal(messages)
-		if err != nil {
-			t.Fatalf("marshal result: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result:  result,
-		}); err != nil {
-			t.Fatalf("encode response: %v", err)
-		}
-	}))
-	defer server.Close()
-
-	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
-	ctx := context.Background()
-
-	tally := getInboxTally(ctx, client, "/data/projects/ntm", "BlueLake", 10)
-	if tally.Total != 3 || tally.Unread != 2 || tally.Urgent != 1 || tally.PendingAck != 1 {
+	tally := tallyInbox([]agentmail.InboxMessage{
+		{ID: 1, Subject: "read urgent", Importance: "urgent", ReadAt: readAt},
+		{ID: 2, Subject: "unread urgent", Importance: "urgent", AckRequired: true},
+		{ID: 3, Subject: "unread normal", Importance: "normal"},
+	})
+	if tally != (inboxTally{Total: 3, Unread: 2, Urgent: 1, PendingAck: 1}) {
 		t.Fatalf("unexpected inbox tally: %+v", tally)
+	}
+}
+
+// bd-7x7t7: an inbox that failed to load was tallied as empty with no
+// warning, so --robot-mail totals swung between runs under server load.
+func TestGetMailNamesAgentsWhoseInboxWasNotRead(t *testing.T) {
+	healthy := make([]string, 2*agentmail.InboxPeekConcurrency)
+	for i := range healthy {
+		healthy[i] = fmt.Sprintf("Agent%02d", i)
+	}
+	server, peeked := newSlowInboxMailServer(t, append([]string{"Broken"}, healthy...), 20*time.Millisecond)
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	mail, err := GetMail(MailOptions{ProjectKey: t.TempDir()})
+	if err != nil {
+		t.Fatalf("GetMail: %v", err)
+	}
+	want := AgentMailMessageCounts{Total: len(healthy), Unread: len(healthy)}
+	if mail.Messages != want {
+		t.Fatalf("messages = %+v, want %+v from the inboxes that were read", mail.Messages, want)
+	}
+	if len(mail.Agents) != len(healthy)+1 {
+		t.Fatalf("agents = %d, want every agent but the overseer (%d)", len(mail.Agents), len(healthy)+1)
+	}
+	for _, agent := range mail.Agents {
+		switch {
+		case agent.AgentName == "Broken" && agent.InboxError == "":
+			t.Fatalf("Broken = %+v, want inbox_error", agent)
+		case agent.AgentName != "Broken" && (agent.InboxError != "" || agent.UnreadCount != 1):
+			t.Fatalf("%s = %+v, want its one unread message", agent.AgentName, agent)
+		}
+	}
+	warned := false
+	for _, warning := range mail.Warnings {
+		warned = warned || (strings.Contains(warning, fmt.Sprintf("1 of %d agents", len(healthy)+1)) && strings.HasSuffix(warning, ": Broken"))
+	}
+	if !warned {
+		t.Fatalf("warnings = %q, want one naming Broken as not read", mail.Warnings)
 	}
 	// --robot-mail tallies every agent's inbox; counting must not mark the
 	// agents' mail read.
-	mu.Lock()
-	defer mu.Unlock()
-	if len(markReads) != 1 {
-		t.Fatalf("fetch_inbox calls = %d, want 1", len(markReads))
-	}
-	for _, got := range markReads {
-		if got != false {
-			t.Fatalf("fetch_inbox mark_read = %v, want false on every call", markReads)
-		}
+	if got := peeked.Load(); got != int64(len(healthy)+1) {
+		t.Fatalf("peeked fetch_inbox calls = %d, want %d", got, len(healthy)+1)
 	}
 }
 

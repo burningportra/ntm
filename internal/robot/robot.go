@@ -3004,22 +3004,47 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 		return output, nil
 	}
 
-	agentByName := make(map[string]agentmail.Agent, len(agents))
-	inboxByName := make(map[string]inboxTally, len(agents))
+	// The reservation listing and the inbox reads are independent calls.
+	var reservations []agentmail.FileReservation
+	var reservationsErr error
+	reservationsDone := make(chan struct{})
+	go func() {
+		defer close(reservationsDone)
+		reservations, reservationsErr = client.ListReservations(ctx, projectKey, "", true)
+	}()
 
-	// Gather per-agent mail counts (best-effort).
+	agentByName := make(map[string]agentmail.Agent, len(agents))
 	for _, a := range agents {
-		if a.Name == "HumanOverseer" {
+		agentByName[a.Name] = a
+	}
+
+	// An inbox that could not be read stays out of the totals and is named,
+	// so the totals no longer swing with the server's load while reading as
+	// complete (bd-7x7t7).
+	names := mailAgentNames(agents)
+	peeks := client.PeekInboxes(ctx, agentmail.FetchInboxOptions{
+		ProjectKey: projectKey,
+		Limit:      50,
+	}, names)
+	inboxByName := make(map[string]inboxTally, len(names))
+	var notRead []string
+	for _, name := range names {
+		peek := peeks[name]
+		if peek.Err != nil {
+			inboxByName[name] = inboxTally{Error: fmt.Sprintf("inbox not read: %v", peek.Err)}
+			notRead = append(notRead, name)
 			continue
 		}
-		agentByName[a.Name] = a
-		tally := getInboxTally(ctx, client, projectKey, a.Name, 50)
-		inboxByName[a.Name] = tally
+		tally := tallyInbox(peek.Messages)
+		inboxByName[name] = tally
 
 		output.Messages.Total += tally.Total
 		output.Messages.Unread += tally.Unread
 		output.Messages.Urgent += tally.Urgent
 		output.Messages.PendingAck += tally.PendingAck
+	}
+	if len(notRead) > 0 {
+		output.Warnings = append(output.Warnings, fmt.Sprintf("inbox not read for %d of %d agents, so messages leaves them out: %s", len(notRead), len(names), strings.Join(notRead, ", ")))
 	}
 
 	// Best-effort pane mapping when a session is provided and tmux is available.
@@ -3048,6 +3073,7 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 						entry.Model = a.Model
 						entry.UnreadCount = tally.Unread
 						entry.UrgentCount = tally.Urgent
+						entry.InboxError = tally.Error
 						entry.LastActiveTs = a.LastActiveTS.Time
 					}
 					output.Agents = append(output.Agents, entry)
@@ -3069,6 +3095,7 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 				Model:        a.Model,
 				UnreadCount:  tally.Unread,
 				UrgentCount:  tally.Urgent,
+				InboxError:   tally.Error,
 				LastActiveTs: a.LastActiveTS.Time,
 			})
 		}
@@ -3088,17 +3115,18 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 				Model:        a.Model,
 				UnreadCount:  tally.Unread,
 				UrgentCount:  tally.Urgent,
+				InboxError:   tally.Error,
 				LastActiveTs: a.LastActiveTS.Time,
 			})
 		}
 	}
 
-	reservations, err := client.ListReservations(ctx, projectKey, "", true)
-	if err == nil {
+	<-reservationsDone
+	if reservationsErr == nil {
 		output.FileReservations = summarizeReservations(reservations)
 		output.Conflicts = detectReservationConflicts(reservations)
 	} else {
-		output.Warnings = append(output.Warnings, fmt.Sprintf("list_reservations failed: %v", err))
+		output.Warnings = append(output.Warnings, fmt.Sprintf("list_reservations failed: %v", reservationsErr))
 	}
 
 	return output, nil
@@ -3119,12 +3147,15 @@ func PrintMail(sessionName, projectKey string) error {
 
 // AgentMailAgent is a per-agent view for --robot-mail.
 type AgentMailAgent struct {
-	Pane         string    `json:"pane,omitempty"`
-	AgentName    string    `json:"agent_name,omitempty"`
-	Program      string    `json:"program,omitempty"`
-	Model        string    `json:"model,omitempty"`
-	UnreadCount  int       `json:"unread_count,omitempty"`
-	UrgentCount  int       `json:"urgent_count,omitempty"`
+	Pane        string `json:"pane,omitempty"`
+	AgentName   string `json:"agent_name,omitempty"`
+	Program     string `json:"program,omitempty"`
+	Model       string `json:"model,omitempty"`
+	UnreadCount int    `json:"unread_count,omitempty"`
+	UrgentCount int    `json:"urgent_count,omitempty"`
+	// InboxError says why the agent's inbox was not read; its counts are
+	// then unknown and left out of messages.
+	InboxError   string    `json:"inbox_error,omitempty"`
 	LastActiveTs time.Time `json:"last_active_ts,omitempty"`
 }
 
@@ -3154,22 +3185,11 @@ type inboxTally struct {
 	Unread     int
 	Urgent     int
 	PendingAck int
+	// Error says why the inbox was not read, leaving the counts unknown.
+	Error string
 }
 
-func getInboxTally(ctx context.Context, client *agentmail.Client, projectKey, agentName string, limit int) inboxTally {
-	opts := agentmail.FetchInboxOptions{
-		ProjectKey:    projectKey,
-		AgentName:     agentName,
-		UrgentOnly:    false,
-		Limit:         limit,
-		IncludeBodies: false,
-		Peek:          true,
-	}
-	msgs, err := client.FetchInbox(ctx, opts)
-	if err != nil {
-		return inboxTally{}
-	}
-
+func tallyInbox(msgs []agentmail.InboxMessage) inboxTally {
 	tally := inboxTally{Total: len(msgs)}
 	for _, msg := range msgs {
 		if msg.AckRequired {
