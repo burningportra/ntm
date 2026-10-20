@@ -112,15 +112,18 @@ type Project struct {
 
 // FileReservation represents a file path reservation (advisory lock).
 type FileReservation struct {
-	ID          int       `json:"id"`
-	PathPattern string    `json:"path_pattern"` // Path or glob pattern
-	AgentName   string    `json:"agent_name"`
-	ProjectID   int       `json:"project_id"`
-	Exclusive   bool      `json:"exclusive"` // Exclusive or shared
-	Reason      string    `json:"reason"`
-	ExpiresTS   FlexTime  `json:"expires_ts"`
-	CreatedTS   FlexTime  `json:"created_ts"`
-	ReleasedTS  *FlexTime `json:"released_ts,omitempty"`
+	ID          int    `json:"id"`
+	PathPattern string `json:"path_pattern"` // Path or glob pattern
+	AgentName   string `json:"agent_name"`
+	// ProjectID and CreatedTS are absent when the server did not send them:
+	// neither server puts them in a file_reservation_paths grant, and the
+	// Rust server's reservation listing has no project_id.
+	ProjectID  int       `json:"project_id,omitempty"`
+	Exclusive  bool      `json:"exclusive"` // Exclusive or shared
+	Reason     string    `json:"reason"`
+	ExpiresTS  FlexTime  `json:"expires_ts"`
+	CreatedTS  FlexTime  `json:"created_ts,omitzero"`
+	ReleasedTS *FlexTime `json:"released_ts,omitempty"`
 }
 
 // InboxMessage represents a message in an agent's inbox.

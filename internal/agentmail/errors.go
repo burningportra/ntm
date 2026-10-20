@@ -221,6 +221,15 @@ func classifyServerError(errType, message string) error {
 	return nil
 }
 
+// rejectsArgument reports whether err is the Python server refusing a call
+// because the tool has no parameter called name. Its pydantic report puts the
+// argument on a line of its own with the reason indented below it:
+// "1 validation error for call[fetch_inbox]\nmark_read\n  Unexpected keyword
+// argument [type=unexpected_keyword_argument, ...]".
+func rejectsArgument(err error, name string) bool {
+	return IsInvalidRequest(err) && strings.Contains(err.Error(), "\n"+name+"\n  Unexpected keyword argument")
+}
+
 // stripPythonErrorPrefix drops the wrapping the Python server's MCP framework
 // puts before a refusal: "Error calling tool '<name>': " on a tool error and
 // "Error reading resource from template '<uri>': " on a resource error. The

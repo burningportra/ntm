@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -443,29 +447,89 @@ func TestRespondContact(t *testing.T) {
 	}
 }
 
+// TestListContacts replays list_contacts replies both servers sent live. The
+// counterparty is always in "to". The Rust server (am 0.3.36) returns the list
+// as the result text; the Python server (mcp_agent_mail 0.3.4) also returns it
+// as structured content wrapped in {"result": [...]}, the form the client
+// reads first.
 func TestListContacts(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
-		"list_contacts": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			// Captured from the Rust server (am 0.3.36): the counterparty
-			// is always in "to".
-			return json.RawMessage(`[{"to":"OliveSpire","status":"approved","reason":"auto-handshake by send_message","updated_ts":"2026-10-20T02:24:41.114375Z","expires_ts":"2026-10-21T02:24:41.114375Z"},{"to":"CrimsonDune","status":"approved","reason":"auto-handshake by send_message","updated_ts":"2026-10-20T02:32:19.964488Z","expires_ts":"2026-10-21T02:32:19.964488Z"}]`), nil
+	tests := []struct {
+		name     string
+		body     string
+		wantTo   []string
+		wantLast ContactLink
+	}{
+		{
+			name:   "rust",
+			body:   mcpTextReply(`[{"to":"OliveSpire","status":"approved","reason":"auto-handshake by send_message","updated_ts":"2026-10-20T02:24:41.114375Z","expires_ts":"2026-10-21T02:24:41.114375Z"},{"to":"CrimsonDune","status":"approved","reason":"auto-handshake by send_message","updated_ts":"2026-10-20T02:32:19.964488Z","expires_ts":"2026-10-21T02:32:19.964488Z"}]`),
+			wantTo: []string{"OliveSpire", "CrimsonDune"},
+			wantLast: ContactLink{To: "CrimsonDune", Status: "approved", Reason: "auto-handshake by send_message",
+				ExpiresTS: &FlexTime{Time: time.Date(2026, 10, 21, 2, 32, 19, 964488000, time.UTC)}},
 		},
-	}))
-	defer server.Close()
+		{
+			name:   "rust, none",
+			body:   mcpTextReply(`[]`),
+			wantTo: []string{},
+		},
+		{
+			name:   "python",
+			body:   `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[{\"to\":\"GreenCastle\",\"to_project\":\"/p\",\"status\":\"approved\",\"is_expired\":false,\"allows_messaging\":true,\"reason\":\"seed\",\"updated_ts\":\"2026-10-20T05:07:25.637121+00:00\",\"expires_ts\":\"2026-11-19T05:07:25.637121+00:00\"}]"}],"structuredContent":{"result":[{"to":"GreenCastle","to_project":"/p","status":"approved","is_expired":false,"allows_messaging":true,"reason":"seed","updated_ts":"2026-10-20T05:07:25.637121+00:00","expires_ts":"2026-11-19T05:07:25.637121+00:00"}]},"isError":false}}`,
+			wantTo: []string{"GreenCastle"},
+			wantLast: ContactLink{To: "GreenCastle", ToProject: "/p", Status: "approved", Reason: "seed",
+				ExpiresTS: &FlexTime{Time: time.Date(2026, 11, 19, 5, 7, 25, 637121000, time.UTC)}},
+		},
+		{
+			name:   "python, none",
+			body:   `{"jsonrpc":"2.0","id":1,"result":{"content":[],"structuredContent":{"result":[]},"isError":false}}`,
+			wantTo: []string{},
+		},
+	}
 
-	c := NewClient(WithBaseURL(server.URL + "/"))
-	contacts, err := c.ListContacts(context.Background(), "/test", "SapphireSquirrel")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			c := NewClient(WithBaseURL(server.URL + "/"))
+			contacts, err := c.ListContacts(context.Background(), "/p", "BlueLake")
+			if err != nil {
+				t.Fatalf("ListContacts: %v", err)
+			}
+			gotTo := []string{}
+			for _, contact := range contacts {
+				gotTo = append(gotTo, contact.To)
+			}
+			if strings.Join(gotTo, ",") != strings.Join(tt.wantTo, ",") {
+				t.Fatalf("contacts to %v, want %v", gotTo, tt.wantTo)
+			}
+			if len(contacts) == 0 {
+				return
+			}
+			last := contacts[len(contacts)-1]
+			if last.To != tt.wantLast.To || last.ToProject != tt.wantLast.ToProject || last.Status != tt.wantLast.Status ||
+				last.Reason != tt.wantLast.Reason || last.ExpiresTS == nil || !last.ExpiresTS.Equal(tt.wantLast.ExpiresTS.Time) {
+				t.Errorf("last contact = %+v, want %+v", last, tt.wantLast)
+			}
+		})
 	}
-	if len(contacts) != 2 {
-		t.Fatalf("len(contacts) = %d, want 2", len(contacts))
-	}
-	if contacts[1].To != "CrimsonDune" || contacts[1].Status != "approved" || contacts[1].ExpiresTS == nil {
-		t.Errorf("contacts[1] = %+v, want approved link to CrimsonDune with expires_ts", contacts[1])
-	}
+}
+
+// mcpTextReply wraps a tool's result text in the JSON-RPC envelope the Rust
+// server sends: one text content block and no structured content.
+func mcpTextReply(text string) string {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"result":  map[string]interface{}{"content": []map[string]string{{"type": "text", "text": text}}},
+	})
+	return string(body)
 }
 
 // capturedRustSearchMessagesReply is the tool text of a real search_messages
@@ -1392,6 +1456,373 @@ func TestServerRefusalsLeftUnclassified(t *testing.T) {
 		if !strings.HasPrefix(err.Error(), "tool error: ") {
 			t.Errorf("classifyToolErrorText(%q) = %q, want a plain tool error", text, err.Error())
 		}
+	}
+}
+
+// pythonToolReplay stands in for one agent-scoped tool of the Python server
+// (mcp_agent_mail 0.3.4), built from its app.py and the replies it sent live.
+// Like the real server it validates the arguments before the tool runs, so a
+// call carrying an argument the tool does not take gets pydantic's report;
+// the tool then authenticates agent_name and refuses a call without the
+// agent's registration_token or with a wrong one; any other call gets reply.
+// It records the arguments of every call.
+type pythonToolReplay struct {
+	tool   string
+	params []string // the tool's parameters, from its signature in app.py
+	issued string   // the registration_token the agent was issued
+	reply  string   // the JSON-RPC body sent to an authenticated call
+
+	mu    sync.Mutex
+	calls []map[string]interface{}
+}
+
+func (p *pythonToolReplay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Method string `json:"method"`
+		Params struct {
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
+		} `json:"params"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Method != "tools/call" || req.Params.Name != p.tool {
+		http.Error(w, "unexpected request", http.StatusBadRequest)
+		return
+	}
+	args := req.Params.Arguments
+	p.mu.Lock()
+	p.calls = append(p.calls, args)
+	p.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	names := make([]string, 0, len(args))
+	for name := range args {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !slices.Contains(p.params, name) {
+			_, _ = w.Write([]byte(mcpToolError(fmt.Sprintf("1 validation error for call[%s]\n%s\n  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=%s, input_type=%s]\n    For further information visit https://errors.pydantic.dev/2.12/v/unexpected_keyword_argument",
+				p.tool, name, pythonRepr(args[name]), pythonTypeName(args[name])))))
+			return
+		}
+	}
+	agent, _ := args["agent_name"].(string)
+	switch presented, _ := args["registration_token"].(string); {
+	case presented == "":
+		_, _ = w.Write([]byte(mcpToolError(fmt.Sprintf("Error calling tool '%s': %s requires registration_token for agent '%s', unless this MCP session has already authenticated as that agent.", p.tool, p.tool, agent))))
+	case presented != p.issued:
+		_, _ = w.Write([]byte(mcpToolError(fmt.Sprintf("Error calling tool '%s': Invalid registration_token for agent '%s'.", p.tool, agent))))
+	default:
+		_, _ = w.Write([]byte(p.reply))
+	}
+}
+
+// argsOfCalls returns the arguments of each call the replay got, in order.
+func (p *pythonToolReplay) argsOfCalls() []map[string]interface{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]map[string]interface{}(nil), p.calls...)
+}
+
+// mcpToolError wraps text in the JSON-RPC envelope both servers send for a
+// tool error.
+func mcpToolError(text string) string {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"result":  map[string]interface{}{"content": []map[string]string{{"type": "text", "text": text}}, "isError": true},
+	})
+	return string(body)
+}
+
+// pythonRepr and pythonTypeName render a JSON argument the way pydantic's
+// report names it.
+func pythonRepr(value interface{}) string {
+	switch v := value.(type) {
+	case bool:
+		if v {
+			return "True"
+		}
+		return "False"
+	case string:
+		return "'" + v + "'"
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func pythonTypeName(value interface{}) string {
+	switch value.(type) {
+	case bool:
+		return "bool"
+	case string:
+		return "str"
+	case float64:
+		return "int"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
+}
+
+// Replies the Python server sent live to calls carrying a valid
+// registration_token; the project path is shortened to /p.
+const (
+	capturedPythonFetchInboxReply    = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[{\"id\":2,\"project_id\":1,\"sender_id\":1,\"thread_id\":\"SEED-1\",\"reply_to\":null,\"topic\":null,\"subject\":\"seed subject\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-10-20T05:07:25.671399+00:00\",\"attachments\":[],\"from\":\"BlueLake\",\"kind\":\"to\",\"read_at\":null}]"}],"structuredContent":{"result":[{"id":2,"project_id":1,"sender_id":1,"thread_id":"SEED-1","reply_to":null,"topic":null,"subject":"seed subject","importance":"normal","ack_required":false,"created_ts":"2026-10-20T05:07:25.671399+00:00","attachments":[],"from":"BlueLake","kind":"to","read_at":null}]},"isError":false}}`
+	capturedPythonWhoisReply         = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"id\":2,\"name\":\"GreenCastle\",\"program\":\"probe\",\"model\":\"probe\",\"task_description\":\"bd-m0gm2 seed\",\"inception_ts\":\"2026-10-20T05:07:25.327443+00:00\",\"last_active_ts\":\"2026-10-20T05:24:42.232976+00:00\",\"project_id\":1,\"attachments_policy\":\"auto\",\"recent_commits\":[]}"}],"structuredContent":{"id":2,"name":"GreenCastle","program":"probe","model":"probe","task_description":"bd-m0gm2 seed","inception_ts":"2026-10-20T05:07:25.327443+00:00","last_active_ts":"2026-10-20T05:24:42.232976+00:00","project_id":1,"attachments_policy":"auto","recent_commits":[]},"isError":false}}`
+	capturedPythonActiveForceReply   = `{"jsonrpc":"2.0","id":38,"result":{"content":[{"type":"text","text":"Error calling tool 'force_release_file_reservation': Reservation still shows recent activity; refusing forced release."}],"isError":true}}`
+	capturedPythonReservationReply   = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"granted\":[{\"id\":4,\"path_pattern\":\"probe/c.txt\",\"exclusive\":true,\"reason\":\"bd-q7kzm capture\",\"expires_ts\":\"2026-10-20T05:26:42.061712+00:00\",\"reused\":false}],\"conflicts\":[],\"warnings\":[\"enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate.\"]}"}],"structuredContent":{"granted":[{"id":4,"path_pattern":"probe/c.txt","exclusive":true,"reason":"bd-q7kzm capture","expires_ts":"2026-10-20T05:26:42.061712+00:00","reused":false}],"conflicts":[],"warnings":["enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate."]},"isError":false}}`
+	capturedRustReservationGrantText = `{"granted":[{"id":14598,"path_pattern":"scratch-bd-m0gm2-probe/does-not-exist.txt","exclusive":true,"reason":"bd-m0gm2 live probe (nonexistent path)","expires_ts":"2026-10-20T04:48:02.649015Z"}],"conflicts":[]}`
+)
+
+// TestPeekInboxes_PythonServer: the Python server's fetch_inbox takes no
+// mark_read and refuses a call that sends it, but never changes read state,
+// so a peek there retries without the flag. The Rust server needs the flag,
+// so it goes out first on every peek.
+func TestPeekInboxes_PythonServer(t *testing.T) {
+	t.Parallel()
+
+	newReplay := func() *pythonToolReplay {
+		return &pythonToolReplay{
+			tool:   "fetch_inbox",
+			params: []string{"project_key", "agent_name", "limit", "urgent_only", "include_bodies", "since_ts", "topic", "unread_only", "registration_token", "format"},
+			issued: "TOK-GREEN",
+			reply:  capturedPythonFetchInboxReply,
+		}
+	}
+
+	t.Run("peek", func(t *testing.T) {
+		t.Parallel()
+		replay := newReplay()
+		server := httptest.NewServer(replay)
+		defer server.Close()
+
+		c := NewClient(WithBaseURL(server.URL + "/"))
+		c.SetRegistrationToken("/p", "GreenCastle", "TOK-GREEN")
+		peek := c.PeekInboxes(context.Background(), FetchInboxOptions{ProjectKey: "/p", Limit: 1}, []string{"GreenCastle"})["GreenCastle"]
+		if peek.Err != nil {
+			t.Fatalf("peek: %v", peek.Err)
+		}
+		if len(peek.Messages) != 1 || peek.Messages[0].ID != 2 || peek.Messages[0].From != "BlueLake" || peek.Messages[0].ReadAt != nil {
+			t.Fatalf("messages = %+v, want unread message 2 from BlueLake", peek.Messages)
+		}
+		calls := replay.argsOfCalls()
+		if len(calls) != 2 {
+			t.Fatalf("calls = %v, want the refused call with mark_read and one without", calls)
+		}
+		if markRead, set := calls[0]["mark_read"]; !set || markRead != false {
+			t.Errorf("first call mark_read = %v (set=%t), want false", markRead, set)
+		}
+		// The replay refuses a call without the issued token, so the
+		// messages above already show the retry carried it.
+		if _, set := calls[1]["mark_read"]; set {
+			t.Errorf("retry still sends mark_read: %v", calls[1])
+		}
+	})
+
+	t.Run("read sends no mark_read, so no retry", func(t *testing.T) {
+		t.Parallel()
+		replay := newReplay()
+		server := httptest.NewServer(replay)
+		defer server.Close()
+
+		c := NewClient(WithBaseURL(server.URL + "/"))
+		c.SetRegistrationToken("/p", "GreenCastle", "TOK-GREEN")
+		if _, err := c.FetchInbox(context.Background(), FetchInboxOptions{ProjectKey: "/p", AgentName: "GreenCastle"}); err != nil {
+			t.Fatalf("FetchInbox: %v", err)
+		}
+		if calls := replay.argsOfCalls(); len(calls) != 1 {
+			t.Errorf("calls = %v, want one", calls)
+		}
+	})
+
+	t.Run("the retry's own refusal is the error", func(t *testing.T) {
+		t.Parallel()
+		replay := newReplay()
+		server := httptest.NewServer(replay)
+		defer server.Close()
+
+		c := NewClient(WithBaseURL(server.URL + "/"))
+		peek := c.PeekInboxes(context.Background(), FetchInboxOptions{ProjectKey: "/p"}, []string{"GreenCastle"})["GreenCastle"]
+		if !errors.Is(peek.Err, ErrUnauthorized) {
+			t.Fatalf("peek without a token: err = %v, want ErrUnauthorized", peek.Err)
+		}
+		if calls := replay.argsOfCalls(); len(calls) != 2 {
+			t.Errorf("calls = %v, want two", calls)
+		}
+	})
+}
+
+func TestRejectsArgument(t *testing.T) {
+	t.Parallel()
+
+	markRead := classifyToolErrorText("1 validation error for call[fetch_inbox]\nmark_read\n  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=False, input_type=bool]\n    For further information visit https://errors.pydantic.dev/2.12/v/unexpected_keyword_argument")
+	tests := []struct {
+		name string
+		err  error
+		arg  string
+		want bool
+	}{
+		{name: "the named argument", err: NewAPIError("fetch_inbox", 0, markRead), arg: "mark_read", want: true},
+		{name: "another argument", err: NewAPIError("fetch_inbox", 0, markRead), arg: "limit", want: false},
+		{name: "a wrong value, not an unknown argument", err: classifyToolErrorText("1 validation error for call[fetch_inbox]\nmark_read\n  Input should be a valid boolean [type=bool_type, input_value='x', input_type=str]"), arg: "mark_read", want: false},
+		{name: "another refusal naming it", err: fmt.Errorf("%w: mark_read is off", ErrUnauthorized), arg: "mark_read", want: false},
+		{name: "no error", err: nil, arg: "mark_read", want: false},
+	}
+	for _, tt := range tests {
+		if got := rejectsArgument(tt.err, tt.arg); got != tt.want {
+			t.Errorf("%s: rejectsArgument(%v, %q) = %t, want %t", tt.name, tt.err, tt.arg, got, tt.want)
+		}
+	}
+}
+
+// TestWhois_PythonServerNeedsRegistrationToken: the Python server refuses
+// whois without the looked-up agent's registration_token.
+func TestWhois_PythonServerNeedsRegistrationToken(t *testing.T) {
+	t.Parallel()
+
+	replay := &pythonToolReplay{
+		tool:   "whois",
+		params: []string{"project_key", "agent_name", "registration_token", "include_recent_commits", "commit_limit", "format"},
+		issued: "TOK-GREEN",
+		reply:  capturedPythonWhoisReply,
+	}
+	server := httptest.NewServer(replay)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	c.SetRegistrationToken("/p", "GreenCastle", "TOK-GREEN")
+	agent, err := c.Whois(context.Background(), "/p", "GreenCastle", false)
+	if err != nil {
+		t.Fatalf("Whois: %v", err)
+	}
+	if agent.Name != "GreenCastle" || agent.ID != 2 || agent.ProjectID != 1 || agent.Program != "probe" {
+		t.Errorf("agent = %+v, want GreenCastle (id 2, project 1)", agent)
+	}
+}
+
+// TestForceReleaseReservation_PythonServerNeedsRegistrationToken: the Python
+// server authenticates the releasing agent before it weighs the reservation,
+// so without the token serve never learns the reservation is still active.
+func TestForceReleaseReservation_PythonServerNeedsRegistrationToken(t *testing.T) {
+	t.Parallel()
+
+	replay := &pythonToolReplay{
+		tool:   "force_release_file_reservation",
+		params: []string{"project_key", "agent_name", "file_reservation_id", "notify_previous", "note", "registration_token", "format"},
+		issued: "TOK-RED",
+		reply:  capturedPythonActiveForceReply,
+	}
+	server := httptest.NewServer(replay)
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	c.SetRegistrationToken("/p", "RedStone", "TOK-RED")
+	_, err := c.ForceReleaseReservation(context.Background(), ForceReleaseOptions{
+		ProjectKey: "/p", AgentName: "RedStone", ReservationID: 1, Note: "stale", NotifyPrevious: true,
+	})
+	if !errors.Is(err, ErrReservationConflict) {
+		t.Fatalf("err = %v, want the server's still-active refusal (ErrReservationConflict)", err)
+	}
+}
+
+// TestReservePaths_ReplayedGrants: neither server names the holder, the
+// project or a creation time in a grant, since every grant goes to the agent
+// the call named. The holder is filled in from the call; the project and
+// creation time are left out of the JSON rather than sent as 0 and year 1.
+func TestReservePaths_ReplayedGrants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		handler   http.Handler
+		agent     string
+		wantID    int
+		wantAgent string
+		wantPath  string
+		wantUntil time.Time
+	}{
+		{
+			name: "rust",
+			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(mcpTextReply(capturedRustReservationGrantText)))
+			}),
+			agent:     "RoseRiver",
+			wantID:    14598,
+			wantAgent: "RoseRiver",
+			wantPath:  "scratch-bd-m0gm2-probe/does-not-exist.txt",
+			wantUntil: time.Date(2026, 10, 20, 4, 48, 2, 649015000, time.UTC),
+		},
+		{
+			name: "python",
+			handler: &pythonToolReplay{
+				tool:   "file_reservation_paths",
+				params: []string{"project_key", "agent_name", "paths", "ttl_seconds", "exclusive", "reason", "registration_token", "format"},
+				issued: "TOK-RED",
+				reply:  capturedPythonReservationReply,
+			},
+			agent:     "RedStone",
+			wantID:    4,
+			wantAgent: "RedStone",
+			wantPath:  "probe/c.txt",
+			wantUntil: time.Date(2026, 10, 20, 5, 26, 42, 61712000, time.UTC),
+		},
+		{
+			// No server sends one today; a holder a grant does name is kept,
+			// so a receipt check can still catch a grant for someone else.
+			name: "a grant naming its holder",
+			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(mcpTextReply(`{"granted":[{"id":7,"agent_name":"OtherAgent","path_pattern":"a.txt","exclusive":true,"reason":"r","expires_ts":"2026-10-20T04:48:02Z"}],"conflicts":[]}`)))
+			}),
+			agent:     "RoseRiver",
+			wantID:    7,
+			wantAgent: "OtherAgent",
+			wantPath:  "a.txt",
+			wantUntil: time.Date(2026, 10, 20, 4, 48, 2, 0, time.UTC),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(tt.handler)
+			defer server.Close()
+
+			c := NewClient(WithBaseURL(server.URL + "/"))
+			c.SetRegistrationToken("/p", "RedStone", "TOK-RED")
+			result, err := c.ReservePaths(context.Background(), FileReservationOptions{
+				ProjectKey: "/p", AgentName: tt.agent, Paths: []string{tt.wantPath}, TTLSeconds: 120, Exclusive: true, Reason: "probe",
+			})
+			if err != nil {
+				t.Fatalf("ReservePaths: %v", err)
+			}
+			if len(result.Granted) != 1 {
+				t.Fatalf("granted = %+v, want one", result.Granted)
+			}
+			granted := result.Granted[0]
+			if granted.ID != tt.wantID || granted.AgentName != tt.wantAgent || granted.PathPattern != tt.wantPath ||
+				!granted.Exclusive || !granted.ExpiresTS.Equal(tt.wantUntil) {
+				t.Errorf("granted = %+v, want id %d held by %s on %s until %s", granted, tt.wantID, tt.wantAgent, tt.wantPath, tt.wantUntil)
+			}
+
+			encoded, err := json.Marshal(granted)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var fields map[string]interface{}
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			for _, absent := range []string{"project_id", "created_ts"} {
+				if value, present := fields[absent]; present {
+					t.Errorf("granted JSON carries %s = %v, which the server never sent: %s", absent, value, encoded)
+				}
+			}
+			if fields["agent_name"] != tt.wantAgent {
+				t.Errorf("granted JSON agent_name = %v, want %s", fields["agent_name"], tt.wantAgent)
+			}
+		})
 	}
 }
 

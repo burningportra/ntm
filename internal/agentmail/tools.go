@@ -171,6 +171,9 @@ func (c *Client) Whois(ctx context.Context, projectKey, agentName string, includ
 		"include_recent_commits": includeRecentCommits,
 	}
 
+	// The Python server refuses whois without the looked-up agent's
+	// registration token; the Rust server ignores it.
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "whois", args)
 	if err != nil {
 		return nil, err
@@ -285,6 +288,16 @@ func (c *Client) FetchInbox(ctx context.Context, opts FetchInboxOptions) ([]Inbo
 
 	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "fetch_inbox", args)
+	if err != nil && opts.Peek && rejectsArgument(err, "mark_read") {
+		// The Python server's fetch_inbox has no mark_read parameter and
+		// refuses the call, but it never changes read state, so the same call
+		// without the flag is still a peek. The Rust server marks what it
+		// returns read unless told not to, so every peek sends the flag first
+		// instead of this client remembering to leave it out: a client
+		// outlives the server behind its URL (serve keeps one for its life).
+		delete(args, "mark_read")
+		result, err = c.callTool(ctx, "fetch_inbox", args)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -455,6 +468,15 @@ func (c *Client) ListContacts(ctx context.Context, projectKey, agentName string)
 		return nil, err
 	}
 
+	// The Python server wraps the list as {"result": [...]}; the Rust server
+	// returns the list itself.
+	var wrapper struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(result, &wrapper); err == nil && len(wrapper.Result) > 0 {
+		result = wrapper.Result
+	}
+
 	var contacts []ContactLink
 	if err := json.Unmarshal(result, &contacts); err != nil {
 		return nil, NewAPIError("list_contacts", 0, err)
@@ -574,6 +596,15 @@ func (c *Client) ReservePaths(ctx context.Context, opts FileReservationOptions) 
 	var reservationResult ReservationResult
 	if err := json.Unmarshal(result, &reservationResult); err != nil {
 		return nil, NewAPIError("file_reservation_paths", 0, err)
+	}
+
+	// Neither server names the holder in a grant ({id, path_pattern,
+	// exclusive, reason, expires_ts}), because every grant goes to the agent
+	// the call named. A grant that does name a holder keeps it.
+	for i := range reservationResult.Granted {
+		if reservationResult.Granted[i].AgentName == "" {
+			reservationResult.Granted[i].AgentName = opts.AgentName
+		}
 	}
 
 	// Check for conflicts
@@ -1422,6 +1453,7 @@ func (c *Client) ForceReleaseReservation(ctx context.Context, opts ForceReleaseO
 	}
 	args["notify_previous"] = opts.NotifyPrevious
 
+	c.attachRegistrationToken(args)
 	result, err := c.callTool(ctx, "force_release_file_reservation", args)
 	if err != nil {
 		return nil, err
