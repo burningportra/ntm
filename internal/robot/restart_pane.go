@@ -193,8 +193,9 @@ func parseRestartLaunchOverride(model, args string) (restartLaunchOverride, erro
 // restartOverrideAppendFlags composes the per-agent-type flags that carry a
 // model/effort override when the configured relaunch command does not render
 // them itself. Appending after the configured args relies on last-flag-wins
-// parsing, which claude, codex, gemini, and muse all honor. Agent types without
-// a known model flag reject the override loudly instead of dropping it.
+// parsing, which claude, codex, gemini, muse, and pi all honor (kimi is assumed
+// to; it was not run). Agent types without a known model flag reject the
+// override loudly instead of dropping it.
 func restartOverrideAppendFlags(resolvedType string, override restartLaunchOverride, needModel, needEffort bool) (string, error) {
 	var flags strings.Builder
 	switch resolvedType {
@@ -227,9 +228,18 @@ func restartOverrideAppendFlags(resolvedType string, override restartLaunchOverr
 		if needEffort && override.Effort != "" {
 			flags.WriteString(" --reasoning-effort " + tmux.ShellQuote(override.Effort))
 		}
+	case "pi", "kimi":
+		// The --model flag their launch templates render. Neither template
+		// renders an effort, and spawn rejects one for these types.
+		if override.Effort != "" {
+			return "", fmt.Errorf("agent type %q has no reasoning-effort flag; use a model-only override", resolvedType)
+		}
+		if needModel && override.Model != "" {
+			flags.WriteString(" --model " + tmux.ShellQuote(override.Model))
+		}
 	default:
 		if override.Model != "" || override.Effort != "" {
-			return "", fmt.Errorf("agent type %q does not support a restart model override; supported: claude, codex, gemini, muse", resolvedType)
+			return "", fmt.Errorf("agent type %q does not support a restart model override; supported: claude, codex, gemini, muse, pi, kimi", resolvedType)
 		}
 	}
 	return flags.String(), nil
@@ -401,7 +411,7 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 				return output, nil
 			}
 			if _, err := restartOverrideAppendFlags(resolvedType, launchOverride, true, true); err != nil {
-				output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Use --restart-model only with claude, codex, gemini, or muse panes")
+				output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Use --restart-model only with claude, codex, gemini, muse, pi, or kimi panes")
 				return output, nil
 			}
 		}
@@ -1627,6 +1637,19 @@ func restartAgentLaunchCommandWithOverride(cfg *config.Config, agentType, varian
 			tmpl = cfg.Agents.Muse
 			if strings.TrimSpace(tmpl) == "" {
 				tmpl = config.DefaultAgentTemplates().Muse
+			}
+		case "pi":
+			// Pi and Kimi have no shell alias either, so fall back to the
+			// default template (which renders the pane's model) when
+			// [agents] pi / [agents] kimi is unset.
+			tmpl = cfg.Agents.Pi
+			if strings.TrimSpace(tmpl) == "" {
+				tmpl = config.DefaultAgentTemplates().Pi
+			}
+		case "kimi":
+			tmpl = cfg.Agents.Kimi
+			if strings.TrimSpace(tmpl) == "" {
+				tmpl = config.DefaultAgentTemplates().Kimi
 			}
 		case "ollama":
 			tmpl = cfg.Agents.Ollama

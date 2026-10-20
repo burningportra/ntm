@@ -83,8 +83,8 @@ type SmartRestartOptions struct {
 	promptDispatch smartRestartPromptDispatcher
 	executor       smartRestartExecutor
 
-	// Config supplies the relaunch command for Muse panes; nil loads the
-	// merged config the way --robot-restart-pane does.
+	// Config supplies the relaunch command for Muse, Pi and Kimi panes; nil
+	// loads the merged config the way --robot-restart-pane does.
 	Config *config.Config
 }
 
@@ -904,7 +904,8 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 	}
 
 	// Step 4: Launch new agent using the canonical agent alias/command name
-	// (for Muse, its configured command; see smartRestartLaunchCommand).
+	// (for Muse, Pi and Kimi, the configured command; see
+	// smartRestartLaunchCommand).
 	alias := restartLaunchAlias(agentType)
 	launchCmd := smartRestartLaunchCommand(opts, agentType)
 	if err := ctx.Err(); err != nil {
@@ -1360,6 +1361,8 @@ func restartCanonicalAgentType(agentType string) agent.AgentType {
 		agent.AgentTypeAntigravity,
 		agent.AgentTypeGrok,
 		agent.AgentTypeMuse,
+		agent.AgentTypePi,
+		agent.AgentTypeKimi,
 		agent.AgentTypeCursor,
 		agent.AgentTypeWindsurf,
 		agent.AgentTypeAider,
@@ -1386,12 +1389,16 @@ func restartLaunchAlias(agentType string) string {
 
 // smartRestartLaunchCommand returns the command smart restart types to
 // relaunch an agent. Most agents relaunch through their launch alias (cc, cod
-// and gmi are shell aliases that carry the configured flags). Muse has no such
-// alias, and a bare `muse` stops at "Do you trust this workspace?" in an
-// untrusted directory, so a Muse pane relaunches with its configured command,
-// the same one --robot-restart-pane uses (bd-3l5df).
+// and gmi are shell aliases that carry the configured flags). Muse, Pi and
+// Kimi have no such alias, so their panes relaunch with the configured
+// command, the same one --robot-restart-pane uses: a bare `muse` stops at "Do
+// you trust this workspace?" in an untrusted directory (bd-3l5df), and a bare
+// `pi` or `kimi` drops the [agents] flags and model the pane was spawned with
+// (bd-7po31).
 func smartRestartLaunchCommand(opts SmartRestartOptions, agentType string) string {
-	if restartCanonicalAgentType(agentType) != agent.AgentTypeMuse {
+	switch restartCanonicalAgentType(agentType) {
+	case agent.AgentTypeMuse, agent.AgentTypePi, agent.AgentTypeKimi:
+	default:
 		return restartLaunchAlias(agentType)
 	}
 	cfg := opts.Config

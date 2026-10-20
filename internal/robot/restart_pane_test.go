@@ -1402,6 +1402,8 @@ func TestRestartAgentLaunchCommandNilConfigFallsBackToAlias(t *testing.T) {
 		{"codex", "cod"},
 		{"gemini", "gmi"},
 		{"antigravity", "agy"},
+		{"pi", "pi"},
+		{"kimi", "kimi"},
 	}
 
 	for _, tt := range tests {
@@ -1487,6 +1489,43 @@ func TestRestartAgentLaunchCommandMuseUsesConfiguredCommand(t *testing.T) {
 			cfg.Agents.Muse = tt.override
 			if got := restartAgentLaunchCommand(cfg, "muse", tt.variant); got != tt.want {
 				t.Errorf("restartAgentLaunchCommand(cfg, muse, %q) = %q, want %q", tt.variant, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRestartAgentLaunchCommandPiAndKimiUseConfiguredCommand(t *testing.T) {
+	// bd-7po31: restart-pane relaunched Pi and Kimi panes as `cc`. They have
+	// no shell alias, so a restart renders [agents] pi / [agents] kimi, or the
+	// default template when it is unset, as spawn does.
+	tests := []struct {
+		name      string
+		agentType string
+		override  string
+		variant   string
+		want      string
+	}{
+		{"pi unset uses default template", "pi", "", "", "pi"},
+		{"pi model pin from variant", "pi", "", "sonnet", "pi --model 'anthropic/claude-sonnet-4-6'"},
+		{"pi agents override", "pi", "sh -c 'echo PI-LAUNCH; exec cat'", "", "sh -c 'echo PI-LAUNCH; exec cat'"},
+		{"pi alias resolves", "pi-coding-agent", "", "", "pi"},
+		{"kimi unset uses default template", "kimi", "", "", "kimi --model 'kimi-k2'"},
+		{"kimi model pin from variant", "kimi", "", "k2-0905", "kimi --model 'kimi-k2-0905'"},
+		{"kimi agents override", "kimi", "sh -c 'echo KIMI-LAUNCH; exec cat'", "", "sh -c 'echo KIMI-LAUNCH; exec cat'"},
+		{"kimi alias resolves", "moonshot", "", "", "kimi --model 'kimi-k2'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Agents.Pi = ""
+			cfg.Agents.Kimi = ""
+			if ResolveAgentType(tt.agentType) == "pi" {
+				cfg.Agents.Pi = tt.override
+			} else {
+				cfg.Agents.Kimi = tt.override
+			}
+			if got := restartAgentLaunchCommand(cfg, tt.agentType, tt.variant); got != tt.want {
+				t.Errorf("restartAgentLaunchCommand(cfg, %q, %q) = %q, want %q", tt.agentType, tt.variant, got, tt.want)
 			}
 		})
 	}
@@ -1686,10 +1725,50 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 		codexCmd  string
 		claudeCmd string
 		museCmd   string
+		piCmd     string
+		kimiCmd   string
 		override  restartLaunchOverride
 		want      []string // substrings expected in the composed command
 		wantErr   string
 	}{
+		{
+			name:      "pi legacy config appends --model",
+			agentType: "pi",
+			piCmd:     "pi --offline",
+			override:  restartLaunchOverride{Model: "anthropic/claude-opus-4-6"},
+			want:      []string{"pi --offline --model 'anthropic/claude-opus-4-6'"},
+		},
+		{
+			name:      "pi default template renders the model override itself",
+			agentType: "pi",
+			override:  restartLaunchOverride{Model: "anthropic/claude-opus-4-6"},
+			want:      []string{"pi --model 'anthropic/claude-opus-4-6'"},
+		},
+		{
+			name:      "pi rejects effort override",
+			agentType: "pi",
+			override:  restartLaunchOverride{Model: "anthropic/claude-opus-4-6", Effort: "high"},
+			wantErr:   "no reasoning-effort flag",
+		},
+		{
+			name:      "kimi legacy config appends --model",
+			agentType: "kimi",
+			kimiCmd:   "kimi --yolo",
+			override:  restartLaunchOverride{Model: "kimi-k2-0905"},
+			want:      []string{"kimi --yolo --model 'kimi-k2-0905'"},
+		},
+		{
+			name:      "kimi default template renders the model override itself",
+			agentType: "kimi",
+			override:  restartLaunchOverride{Model: "kimi-k2-0905"},
+			want:      []string{"kimi --model 'kimi-k2-0905'"},
+		},
+		{
+			name:      "kimi rejects effort override",
+			agentType: "kimi",
+			override:  restartLaunchOverride{Model: "kimi-k2-0905", Effort: "high"},
+			wantErr:   "no reasoning-effort flag",
+		},
 		{
 			name:      "muse legacy config appends --model/--reasoning-effort",
 			agentType: "muse",
@@ -1758,6 +1837,8 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 			cfg.Agents.Codex = tc.codexCmd
 			cfg.Agents.Claude = tc.claudeCmd
 			cfg.Agents.Muse = tc.museCmd
+			cfg.Agents.Pi = tc.piCmd
+			cfg.Agents.Kimi = tc.kimiCmd
 			got, err := restartAgentLaunchCommandWithOverride(cfg, tc.agentType, "", tc.override)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -1775,7 +1856,7 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 			}
 			// A template that renders the model itself must not get a second
 			// --model appended.
-			if tc.agentType == "muse" && strings.Count(got, "--model") != 1 {
+			if (tc.agentType == "muse" || tc.agentType == "pi" || tc.agentType == "kimi") && strings.Count(got, "--model") != 1 {
 				t.Errorf("command %q carries %d --model flags, want 1", got, strings.Count(got, "--model"))
 			}
 			// last-flag-wins: the override model must come after the configured one.

@@ -997,7 +997,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 				{Name: "dry-run", Flag: "--dry-run", Type: "bool", Required: false, Description: "Preview restart targets without executing"},
 				{Name: "restart-bead", Flag: "--restart-bead", Type: "string", Required: false, Description: "Bead id to assign after the restart and use for the synthesized prompt"},
 				{Name: "restart-prompt", Flag: "--restart-prompt", Type: "string", Required: false, Description: "Explicit prompt to send after restart; overrides the bead template"},
-				{Name: "restart-model", Flag: "--restart-model", Type: "string", Required: false, Description: "Relaunch with a model override using the spawn variant grammar (model or model@effort); claude/codex/gemini/muse panes only, validated before any respawn"},
+				{Name: "restart-model", Flag: "--restart-model", Type: "string", Required: false, Description: "Relaunch with a model override using the spawn variant grammar (model or model@effort); claude/codex/gemini/muse/pi/kimi panes only (gemini, pi and kimi: model only), validated before any respawn"},
 				{Name: "restart-agent-args", Flag: "--restart-agent-args", Type: "string", Required: false, Description: "Raw arguments appended to the relaunch command after configured args (last-flag-wins)"},
 			},
 			Examples: []string{

@@ -1170,6 +1170,11 @@ func TestRestartCanonicalAgentType(t *testing.T) {
 		{"grok-build", "grok"},
 		{"muse", "muse"},
 		{"muse-code", "muse"},
+		{"pi", "pi"},
+		{"pi-coding-agent", "pi"},
+		{"kimi", "kimi"},
+		{"kimi-code", "kimi"},
+		{"moonshot", "kimi"},
 		{"opencode", "oc"},
 		{"ws", "windsurf"},
 		{"ollama", "ollama"},
@@ -1202,6 +1207,10 @@ func TestRestartLaunchAlias(t *testing.T) {
 		{"muse", "muse"},
 		{"muse-code", "muse"},
 		{"meta-muse", "muse"},
+		{"pi", "pi"},
+		{"pi_coding_agent", "pi"},
+		{"kimi", "kimi"},
+		{"kimi-cli", "kimi"},
 		{"opencode", "oc"},
 		{"ws", "windsurf"},
 		{"aider", "aider"},
@@ -1220,14 +1229,20 @@ func TestRestartLaunchAlias(t *testing.T) {
 	}
 }
 
-func TestExecuteRestartLaunchesMuseWithConfiguredCommand(t *testing.T) {
+func TestExecuteRestartLaunchesAliaslessAgentsWithConfiguredCommand(t *testing.T) {
 	// bd-3l5df: Muse has no shell alias carrying its flags, so smart restart
 	// types the configured Muse command; a bare `muse` would stop at the
-	// workspace trust prompt. Other agents keep their launch alias.
-	echoCfg := config.Default()
-	echoCfg.Agents.Muse = "muse --provider echo --yolo"
+	// workspace trust prompt. bd-7po31: Pi and Kimi have no shell alias
+	// either, and before they were restart types at all they relaunched as
+	// `cc`. Agents with a flag-carrying alias (cc, cod, gmi) keep it.
+	overrideCfg := config.Default()
+	overrideCfg.Agents.Muse = "muse --provider echo --yolo"
+	overrideCfg.Agents.Pi = "sh -c 'echo PI-LAUNCH; exec cat'"
+	overrideCfg.Agents.Kimi = "sh -c 'echo KIMI-LAUNCH; exec cat'"
 	unsetCfg := config.Default()
 	unsetCfg.Agents.Muse = ""
+	unsetCfg.Agents.Pi = ""
+	unsetCfg.Agents.Kimi = ""
 
 	tests := []struct {
 		name      string
@@ -1235,9 +1250,13 @@ func TestExecuteRestartLaunchesMuseWithConfiguredCommand(t *testing.T) {
 		cfg       *config.Config
 		want      string
 	}{
-		{"muse override", "muse", echoCfg, "0.2:muse --provider echo --yolo\n"},
+		{"muse override", "muse", overrideCfg, "0.2:muse --provider echo --yolo\n"},
 		{"muse default template", "muse", unsetCfg, "0.2:muse --yolo --model 'muse-wonder-1.0'\n"},
-		{"claude keeps alias", "cc", echoCfg, "0.2:cc\n"},
+		{"pi override", "pi", overrideCfg, "0.2:sh -c 'echo PI-LAUNCH; exec cat'\n"},
+		{"pi default template", "pi", unsetCfg, "0.2:pi\n"},
+		{"kimi override", "kimi", overrideCfg, "0.2:sh -c 'echo KIMI-LAUNCH; exec cat'\n"},
+		{"kimi default template", "kimi-code", unsetCfg, "0.2:kimi --model 'kimi-k2'\n"},
+		{"claude keeps alias", "cc", overrideCfg, "0.2:cc\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

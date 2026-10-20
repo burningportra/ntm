@@ -18,9 +18,11 @@ import (
 //
 // Each AI coding agent has different exit methods:
 // - Claude Code (cc): Double Ctrl+C with CRITICAL 0.1s timing
+// - Pi: the same double Ctrl+C (Pi quits on a second Ctrl+C within 500ms)
 // - Codex (cod): /exit command
 // - Gemini (gmi): Escape (exit shell mode if active) then /exit
-// - Muse: Escape, then three Ctrl+Cs (the last one 500ms after the second)
+// - Muse and Kimi: Escape, then three Ctrl+Cs (the last one 500ms after the
+//   second)
 // - Unknown: Try Ctrl+C as fallback
 
 // exitAgent exits the current agent using the appropriate method. win is the
@@ -30,12 +32,16 @@ func exitAgent(ctx context.Context, session string, win, pane int, agentType str
 	switch restartCanonicalAgentType(agentType) {
 	case "cc":
 		return exitClaudeCode(ctx, session, win, pane, seq)
+	case "pi":
+		return exitPi(ctx, session, win, pane, seq)
 	case "cod":
 		return exitCodex(ctx, session, win, pane, seq)
 	case "gmi":
 		return exitGemini(ctx, session, win, pane, seq)
 	case "muse":
 		return exitMuse(ctx, session, win, pane, seq)
+	case "kimi":
+		return exitKimi(ctx, session, win, pane, seq)
 	default:
 		return exitUnknown(ctx, session, win, pane, seq)
 	}
@@ -62,6 +68,16 @@ func exitClaudeCode(ctx context.Context, session string, win, pane int, seq *Res
 	}
 
 	return nil
+}
+
+// exitPi exits Pi with Claude's double Ctrl+C. Pi's Ctrl+C handler clears the
+// editor and quits on a second Ctrl+C within 500ms of the first, and its
+// source binds it whether or not a turn is running; a single Ctrl+C only
+// clears. Verified against pi 1.3.0 in tmux (bd-7po31): the 100ms double
+// Ctrl+C quit an empty editor and one holding a draft, both with exit status
+// 0. A running turn was not tried, since that needs a model call.
+func exitPi(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
+	return exitClaudeCode(ctx, session, win, pane, seq)
 }
 
 // exitCodex exits Codex CLI with /exit command.
@@ -112,6 +128,17 @@ func exitGemini(ctx context.Context, session string, win, pane int, seq *Restart
 // /exit and /quit also quit an idle Muse, but typed after a draft they are
 // submitted as part of a prompt; Ctrl+D does nothing.
 func exitMuse(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
+	seq.ExitMethod = "escape_then_triple_ctrl_c"
+	return sendMuseExitKeys(ctx, formatTargetWin(session, win, pane))
+}
+
+// exitKimi exits Kimi Code with exitMuse's keys. Kimi Code documents the same
+// key model (moonshotai.github.io/kimi-code, keyboard reference): Escape
+// interrupts a running turn, Ctrl+C clears a draft, and on an empty input box
+// the first Ctrl+C only arms quit and the second quits. So a draft takes three
+// Ctrl+Cs, and when two were enough the third lands on the shell prompt. Not
+// run against a real kimi binary (bd-7po31).
+func exitKimi(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
 	seq.ExitMethod = "escape_then_triple_ctrl_c"
 	return sendMuseExitKeys(ctx, formatTargetWin(session, win, pane))
 }

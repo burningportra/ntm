@@ -119,6 +119,77 @@ func TestExitAgentMuseSendsVerifiedSequence(t *testing.T) {
 	}
 }
 
+// TestExitAgentPiAndKimiSendTheirExitSequences covers bd-7po31. Pi and Kimi
+// were not restart types, so smart restart exited both with the unknown-agent
+// single Ctrl+C, which only clears Pi's editor and only arms Kimi's quit.
+func TestExitAgentPiAndKimiSendTheirExitSequences(t *testing.T) {
+	for _, tc := range []struct {
+		agentType  string
+		wantKeys   []string
+		wantMethod string
+		// minGaps are the least time before each key after the first;
+		// maxGap bounds every gap when a CLI only honors a quick second press.
+		minGaps []time.Duration
+		maxGap  time.Duration
+	}{
+		{
+			// Pi quits on a second Ctrl+C within 500ms of the first, with or
+			// without a draft (verified against pi 1.3.0), so the gap must
+			// stay well under 500ms.
+			agentType:  "pi",
+			wantKeys:   []string{"C-c", "C-c"},
+			wantMethod: "double_ctrl_c",
+			minGaps:    []time.Duration{100 * time.Millisecond},
+			maxGap:     450 * time.Millisecond,
+		},
+		{
+			// Kimi Code documents Muse's key model: Escape interrupts a turn,
+			// Ctrl+C clears a draft, and a second Ctrl+C on an empty input box
+			// quits.
+			agentType:  "kimi",
+			wantKeys:   []string{"Escape", "C-c", "C-c", "C-c"},
+			wantMethod: "escape_then_triple_ctrl_c",
+			minGaps:    []time.Duration{100 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond},
+		},
+	} {
+		t.Run(tc.agentType, func(t *testing.T) {
+			calls := useTimedTmuxBinary(t)
+			seq := &RestartSequence{}
+
+			if err := exitAgent(t.Context(), "proj", 3, 2, tc.agentType, seq); err != nil {
+				t.Fatalf("exitAgent(%s) error = %v", tc.agentType, err)
+			}
+
+			want := make([]string, len(tc.wantKeys))
+			for i, key := range tc.wantKeys {
+				want[i] = "send-keys -t proj:3.2 " + key
+			}
+			got := drainTmuxCalls(calls)
+			gotArgs := make([]string, len(got))
+			for i, call := range got {
+				gotArgs[i] = call.args
+			}
+			if !slices.Equal(gotArgs, want) {
+				t.Fatalf("exitAgent(%s) tmux calls = %q, want %q", tc.agentType, gotArgs, want)
+			}
+			if seq.ExitMethod != tc.wantMethod {
+				t.Errorf("ExitMethod = %q, want %q", seq.ExitMethod, tc.wantMethod)
+			}
+
+			const slack = 50 * time.Millisecond
+			for i, minGap := range tc.minGaps {
+				gap := got[i+1].at.Sub(got[i].at)
+				if gap < minGap-slack {
+					t.Errorf("gap before tmux call %d (%q) = %s, want at least %s", i+1, got[i+1].args, gap, minGap)
+				}
+				if tc.maxGap > 0 && gap > tc.maxGap {
+					t.Errorf("gap before tmux call %d (%q) = %s, want at most %s", i+1, got[i+1].args, gap, tc.maxGap)
+				}
+			}
+		})
+	}
+}
+
 // TestSendExitChoreographyUsesMuseExitSequence covers --robot-exit-cli. A
 // plain double Ctrl+C on a working Muse pane interrupts the turn and then
 // clears the restored draft, so Muse only quit on the second attempt, about

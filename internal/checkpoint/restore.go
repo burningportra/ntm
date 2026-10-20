@@ -426,12 +426,17 @@ func waitForPaneCommand(paneID, expected string, timeout time.Duration) error {
 
 // paneCommandMatches reports whether tmux's pane_current_command shows the
 // launched command. The `muse` launcher execs a versioned muse-bin-* binary,
-// so a pane started with `muse` reports that binary rather than `muse`.
+// so a pane started with `muse` reports that binary rather than `muse`. An
+// agent that is a script reports its runtime instead: tmux on macOS shows
+// `node` for a running `pi`.
 func paneCommandMatches(current, expected string) bool {
 	if current == expected {
 		return true
 	}
-	return expected == "muse" && looksLikeMuseBinary(current)
+	if expected == "muse" && looksLikeMuseBinary(current) {
+		return true
+	}
+	return looksLikeAgentRuntime(current)
 }
 
 func currentPaneCommand(paneID string) (string, error) {
@@ -968,9 +973,11 @@ func restorableAgentCommand(pane PaneState) string {
 
 	// A Muse pane records either the `muse` launcher or the binary it execs;
 	// neither name carries --yolo, so both relaunch through the default below.
+	// A pane recorded as its runtime (`node` for Pi) relaunches the agent too,
+	// since replaying the runtime's name opens its REPL.
 	command := strings.TrimSpace(pane.Command)
 	bareMuseLauncher := agentType == agent.AgentTypeMuse && strings.EqualFold(command, "muse")
-	if command != "" && !looksLikeShellCommand(command) && !looksLikeMuseBinary(command) && !bareMuseLauncher {
+	if command != "" && !looksLikeShellCommand(command) && !looksLikeMuseBinary(command) && !bareMuseLauncher && !looksLikeAgentRuntime(command) {
 		return command
 	}
 
@@ -987,6 +994,10 @@ func restorableAgentCommand(pane PaneState) string {
 		// trust), and runs with approvals on where it has been trusted.
 		// --yolo, as in the spawn template, avoids both.
 		return "muse --yolo"
+	case agent.AgentTypePi:
+		return "pi"
+	case agent.AgentTypeKimi:
+		return "kimi"
 	case agent.AgentTypeAntigravity:
 		// agy's launch binary is "agy" (distinct from the gemini CLI).
 		return "agy"
@@ -1017,6 +1028,26 @@ func looksLikeMuseBinary(command string) bool {
 	}
 	name := strings.ToLower(filepath.Base(fields[0]))
 	return name == "muse-bin" || strings.HasPrefix(name, "muse-bin-")
+}
+
+// looksLikeAgentRuntime reports whether command is an interpreter that a
+// script-based agent CLI runs under. pane_current_command names only the
+// foreground process, so tmux on macOS records `node` for a running Pi (and
+// for Kimi Code installed from npm) and a Python version for the legacy
+// Python kimi-cli. No agent launches as the bare runtime; a runtime with
+// arguments (`node agent.js`) is a real launch command and does not match.
+func looksLikeAgentRuntime(command string) bool {
+	fields := strings.Fields(command)
+	if len(fields) != 1 {
+		return false
+	}
+	name := strings.ToLower(filepath.Base(fields[0]))
+	switch name {
+	case "node", "bun", "deno", "python", "python3":
+		return true
+	default:
+		return strings.HasPrefix(name, "python3.")
+	}
 }
 
 func looksLikeShellCommand(command string) bool {

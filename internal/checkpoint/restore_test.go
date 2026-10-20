@@ -1117,6 +1117,59 @@ func TestRestorableAgentCommand(t *testing.T) {
 			pane: PaneState{AgentType: "muse", Command: "muse --yolo --model muse-spark-1.3"},
 			want: "muse --yolo --model muse-spark-1.3",
 		},
+		// bd-7po31: Pi and Kimi had no fallback, so a pane recorded at a
+		// shell was skipped. Pi is a Node script, so tmux on macOS records
+		// `node` for a running Pi pane; relaunching that opened a Node REPL.
+		{
+			name: "pi pane recorded at a shell relaunches pi",
+			pane: PaneState{AgentType: "pi", Command: "zsh"},
+			want: "pi",
+		},
+		{
+			name: "pi alias without a command relaunches pi",
+			pane: PaneState{AgentType: "pi-coding-agent"},
+			want: "pi",
+		},
+		{
+			name: "pi pane recorded as its node runtime relaunches pi",
+			pane: PaneState{AgentType: "pi", Command: "node"},
+			want: "pi",
+		},
+		{
+			name: "pi pane with a custom launch command keeps it",
+			pane: PaneState{AgentType: "pi", Command: "pi --model anthropic/claude-sonnet-4-6"},
+			want: "pi --model anthropic/claude-sonnet-4-6",
+		},
+		{
+			name: "kimi pane recorded at a shell relaunches kimi",
+			pane: PaneState{AgentType: "kimi", Command: "bash"},
+			want: "kimi",
+		},
+		{
+			name: "kimi alias without a command relaunches kimi",
+			pane: PaneState{AgentType: "kimi-code"},
+			want: "kimi",
+		},
+		{
+			name: "kimi pane recorded as its node runtime relaunches kimi",
+			pane: PaneState{AgentType: "kimi", Command: "node"},
+			want: "kimi",
+		},
+		{
+			name: "legacy kimi pane recorded as its python runtime relaunches kimi",
+			pane: PaneState{AgentType: "kimi", Command: "python3.13"},
+			want: "kimi",
+		},
+		{
+			name: "claude pane recorded as its node runtime relaunches claude",
+			pane: PaneState{AgentType: "cc", Command: "node"},
+			want: "claude",
+		},
+		{
+			name: "runtime with a script argument is a real launch command",
+			pane: PaneState{AgentType: "pi", Command: "node /opt/pi/cli.js --offline"},
+			want: "node /opt/pi/cli.js --offline",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1210,6 +1263,12 @@ func TestPaneCommandMatches(t *testing.T) {
 		{name: "muse not started yet", current: "zsh", expected: "muse", want: false},
 		{name: "muse binary does not satisfy another agent", current: "muse-bin-1.4.11", expected: "claude", want: false},
 		{name: "unrelated muse-prefixed command", current: "museum", expected: "muse", want: false},
+		{name: "pi runs under its node runtime", current: "node", expected: "pi", want: true},
+		{name: "pi launcher script still running before exec", current: "sh", expected: "pi", want: false},
+		{name: "kimi runs under its node runtime", current: "node", expected: "kimi", want: true},
+		{name: "legacy kimi runs under python", current: "python3.13", expected: "kimi", want: true},
+		{name: "kimi native binary", current: "kimi", expected: "kimi", want: true},
+		{name: "pi not started yet", current: "zsh", expected: "pi", want: false},
 	}
 
 	for _, tt := range tests {
