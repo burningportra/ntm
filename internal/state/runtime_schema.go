@@ -236,8 +236,10 @@ func (r *RuntimeWork) IsFresh() bool {
 
 // RuntimeCoordination is a cached projection of Agent Mail state.
 type RuntimeCoordination struct {
-	// Identity
-	AgentName string `json:"agent_name"`
+	// Identity: an Agent Mail agent within the project root whose inboxes
+	// were read.
+	ProjectDir string `json:"project_dir"`
+	AgentName  string `json:"agent_name"`
 
 	// Pane association
 	SessionName string `json:"session_name,omitempty"`

@@ -2265,7 +2265,12 @@ func GetInspectCoordination(opts InspectCoordinationOptions) (*InspectCoordinati
 		return output, nil
 	}
 
-	coord, err := store.GetRuntimeCoordination(strings.TrimSpace(opts.AgentName))
+	projectDir, err := resolveNormalizedProjectDir("")
+	if err != nil {
+		output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Failed to resolve the project whose coordination projection to read")
+		return output, nil
+	}
+	coord, err := store.GetRuntimeCoordination(projectDir, strings.TrimSpace(opts.AgentName))
 	if err != nil {
 		output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Failed to load coordination projection")
 		return output, nil

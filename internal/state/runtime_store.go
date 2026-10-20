@@ -805,19 +805,14 @@ func (tx *Tx) ExpireRuntimeWork(projectDir string, at time.Time) error {
 // Runtime Coordination Operations
 // =============================================================================
 
-// UpsertRuntimeCoordination inserts or updates a runtime coordination projection.
-func (s *Store) UpsertRuntimeCoordination(coord *RuntimeCoordination) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	_, err := s.db.Exec(`
+const upsertRuntimeCoordinationSQL = `
 		INSERT INTO runtime_coordination (
-			agent_name, session_name, pane, unread_count, pending_ack_count, urgent_count,
+			project_dir, agent_name, session_name, pane, unread_count, pending_ack_count, urgent_count,
 			last_message_subject, last_message_subject_disclosure,
 			last_message_preview, last_message_preview_disclosure,
 			last_message_at, last_sent_at, last_received_at, collected_at, stale_after
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(agent_name) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_dir, agent_name) DO UPDATE SET
 			session_name = excluded.session_name,
 			pane = excluded.pane,
 			unread_count = excluded.unread_count,
@@ -831,42 +826,57 @@ func (s *Store) UpsertRuntimeCoordination(coord *RuntimeCoordination) error {
 			last_sent_at = excluded.last_sent_at,
 			last_received_at = excluded.last_received_at,
 			collected_at = excluded.collected_at,
-			stale_after = excluded.stale_after`,
-		coord.AgentName, nullableString(coord.SessionName), nullableString(coord.Pane),
+			stale_after = excluded.stale_after`
+
+func upsertRuntimeCoordinationArgs(coord *RuntimeCoordination) []interface{} {
+	return []interface{}{
+		coord.ProjectDir, coord.AgentName, nullableString(coord.SessionName), nullableString(coord.Pane),
 		coord.UnreadCount, coord.PendingAckCount, coord.UrgentCount,
 		nullableString(coord.LastMessageSubject), nullableString(coord.LastMessageSubjectDisclosure),
 		nullableString(coord.LastMessagePreview), nullableString(coord.LastMessagePreviewDisclosure),
 		coord.LastMessageAt, coord.LastSentAt, coord.LastReceivedAt,
 		coord.CollectedAt, coord.StaleAfter,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert runtime coordination: %w", err)
 	}
-	return nil
 }
 
-// GetRuntimeCoordination retrieves a runtime coordination projection by agent name.
-func (s *Store) GetRuntimeCoordination(agentName string) (*RuntimeCoordination, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	coord := &RuntimeCoordination{}
-	err := s.db.QueryRow(`
-		SELECT agent_name, COALESCE(session_name, ''), COALESCE(pane, ''),
+const selectRuntimeCoordinationSQL = `
+		SELECT project_dir, agent_name, COALESCE(session_name, ''), COALESCE(pane, ''),
 			unread_count, pending_ack_count, urgent_count,
 			COALESCE(last_message_subject, ''), COALESCE(last_message_subject_disclosure, ''),
 			COALESCE(last_message_preview, ''), COALESCE(last_message_preview_disclosure, ''),
 			last_message_at, last_sent_at, last_received_at, collected_at, stale_after
-		FROM runtime_coordination
-		WHERE agent_name = ?`, agentName,
-	).Scan(
-		&coord.AgentName, &coord.SessionName, &coord.Pane,
+		FROM runtime_coordination`
+
+func scanRuntimeCoordination(row interface{ Scan(...any) error }, coord *RuntimeCoordination) error {
+	return row.Scan(
+		&coord.ProjectDir, &coord.AgentName, &coord.SessionName, &coord.Pane,
 		&coord.UnreadCount, &coord.PendingAckCount, &coord.UrgentCount,
 		&coord.LastMessageSubject, &coord.LastMessageSubjectDisclosure,
 		&coord.LastMessagePreview, &coord.LastMessagePreviewDisclosure,
 		&coord.LastMessageAt, &coord.LastSentAt, &coord.LastReceivedAt,
 		&coord.CollectedAt, &coord.StaleAfter,
 	)
+}
+
+// UpsertRuntimeCoordination inserts or updates a runtime coordination projection.
+func (s *Store) UpsertRuntimeCoordination(coord *RuntimeCoordination) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.db.Exec(upsertRuntimeCoordinationSQL, upsertRuntimeCoordinationArgs(coord)...); err != nil {
+		return fmt.Errorf("upsert runtime coordination: %w", err)
+	}
+	return nil
+}
+
+// GetRuntimeCoordination retrieves one project's coordination projection for an agent, fresh or stale.
+func (s *Store) GetRuntimeCoordination(projectDir, agentName string) (*RuntimeCoordination, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	coord := &RuntimeCoordination{}
+	err := scanRuntimeCoordination(s.db.QueryRow(selectRuntimeCoordinationSQL+`
+		WHERE project_dir = ? AND agent_name = ?`, projectDir, agentName), coord)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -876,27 +886,14 @@ func (s *Store) GetRuntimeCoordination(agentName string) (*RuntimeCoordination, 
 	return coord, nil
 }
 
-// ListFreshRuntimeCoordination returns fresh coordination projections, optionally filtered by session.
-func (s *Store) ListFreshRuntimeCoordination(sessionName string) ([]RuntimeCoordination, error) {
+// ListFreshRuntimeCoordination returns a project's fresh coordination projections.
+func (s *Store) ListFreshRuntimeCoordination(projectDir string) ([]RuntimeCoordination, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	query := `
-		SELECT agent_name, COALESCE(session_name, ''), COALESCE(pane, ''),
-			unread_count, pending_ack_count, urgent_count,
-			COALESCE(last_message_subject, ''), COALESCE(last_message_subject_disclosure, ''),
-			COALESCE(last_message_preview, ''), COALESCE(last_message_preview_disclosure, ''),
-			last_message_at, last_sent_at, last_received_at, collected_at, stale_after
-		FROM runtime_coordination
-		WHERE stale_after > datetime('now')`
-	args := []interface{}{}
-	if sessionName != "" {
-		query += ` AND session_name = ?`
-		args = append(args, sessionName)
-	}
-	query += ` ORDER BY urgent_count DESC, unread_count DESC, agent_name ASC`
-
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(selectRuntimeCoordinationSQL+`
+		WHERE project_dir = ? AND stale_after > datetime('now')
+		ORDER BY urgent_count DESC, unread_count DESC, agent_name ASC`, projectDir)
 	if err != nil {
 		return nil, fmt.Errorf("list runtime coordination: %w", err)
 	}
@@ -905,14 +902,7 @@ func (s *Store) ListFreshRuntimeCoordination(sessionName string) ([]RuntimeCoord
 	var items []RuntimeCoordination
 	for rows.Next() {
 		var coord RuntimeCoordination
-		if err := rows.Scan(
-			&coord.AgentName, &coord.SessionName, &coord.Pane,
-			&coord.UnreadCount, &coord.PendingAckCount, &coord.UrgentCount,
-			&coord.LastMessageSubject, &coord.LastMessageSubjectDisclosure,
-			&coord.LastMessagePreview, &coord.LastMessagePreviewDisclosure,
-			&coord.LastMessageAt, &coord.LastSentAt, &coord.LastReceivedAt,
-			&coord.CollectedAt, &coord.StaleAfter,
-		); err != nil {
+		if err := scanRuntimeCoordination(rows, &coord); err != nil {
 			return nil, fmt.Errorf("scan runtime coordination: %w", err)
 		}
 		items = append(items, coord)
@@ -920,58 +910,17 @@ func (s *Store) ListFreshRuntimeCoordination(sessionName string) ([]RuntimeCoord
 	return items, rows.Err()
 }
 
-// DeleteRuntimeCoordination removes a runtime coordination projection.
-func (s *Store) DeleteRuntimeCoordination(agentName string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	_, err := s.db.Exec("DELETE FROM runtime_coordination WHERE agent_name = ?", agentName)
-	if err != nil {
-		return fmt.Errorf("delete runtime coordination: %w", err)
-	}
-	return nil
-}
-
 // UpsertRuntimeCoordination inserts or updates a runtime coordination projection in an existing transaction.
 func (tx *Tx) UpsertRuntimeCoordination(coord *RuntimeCoordination) error {
-	_, err := tx.tx.Exec(`
-		INSERT INTO runtime_coordination (
-			agent_name, session_name, pane, unread_count, pending_ack_count, urgent_count,
-			last_message_subject, last_message_subject_disclosure,
-			last_message_preview, last_message_preview_disclosure,
-			last_message_at, last_sent_at, last_received_at, collected_at, stale_after
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(agent_name) DO UPDATE SET
-			session_name = excluded.session_name,
-			pane = excluded.pane,
-			unread_count = excluded.unread_count,
-			pending_ack_count = excluded.pending_ack_count,
-			urgent_count = excluded.urgent_count,
-			last_message_subject = excluded.last_message_subject,
-			last_message_subject_disclosure = excluded.last_message_subject_disclosure,
-			last_message_preview = excluded.last_message_preview,
-			last_message_preview_disclosure = excluded.last_message_preview_disclosure,
-			last_message_at = excluded.last_message_at,
-			last_sent_at = excluded.last_sent_at,
-			last_received_at = excluded.last_received_at,
-			collected_at = excluded.collected_at,
-			stale_after = excluded.stale_after`,
-		coord.AgentName, nullableString(coord.SessionName), nullableString(coord.Pane),
-		coord.UnreadCount, coord.PendingAckCount, coord.UrgentCount,
-		nullableString(coord.LastMessageSubject), nullableString(coord.LastMessageSubjectDisclosure),
-		nullableString(coord.LastMessagePreview), nullableString(coord.LastMessagePreviewDisclosure),
-		coord.LastMessageAt, coord.LastSentAt, coord.LastReceivedAt,
-		coord.CollectedAt, coord.StaleAfter,
-	)
-	if err != nil {
+	if _, err := tx.tx.Exec(upsertRuntimeCoordinationSQL, upsertRuntimeCoordinationArgs(coord)...); err != nil {
 		return fmt.Errorf("upsert runtime coordination: %w", err)
 	}
 	return nil
 }
 
-// DeleteRuntimeCoordination removes a runtime coordination projection in an existing transaction.
-func (tx *Tx) DeleteRuntimeCoordination(agentName string) error {
-	_, err := tx.tx.Exec("DELETE FROM runtime_coordination WHERE agent_name = ?", agentName)
+// DeleteRuntimeCoordination removes one project's coordination projection for an agent in an existing transaction.
+func (tx *Tx) DeleteRuntimeCoordination(projectDir, agentName string) error {
+	_, err := tx.tx.Exec("DELETE FROM runtime_coordination WHERE project_dir = ? AND agent_name = ?", projectDir, agentName)
 	if err != nil {
 		return fmt.Errorf("delete runtime coordination: %w", err)
 	}

@@ -2279,7 +2279,7 @@ func TestPersistNormalizedProjection_ReplacesRows(t *testing.T) {
 		t.Fatalf("bd-3 status = %q, want %q", workByID["bd-3"].Status, normalizedProjectionInProgStatus)
 	}
 
-	coordinationRows, err := store.ListFreshRuntimeCoordination("")
+	coordinationRows, err := store.ListFreshRuntimeCoordination(projectDir)
 	if err != nil {
 		t.Fatalf("ListFreshRuntimeCoordination() error: %v", err)
 	}
@@ -2461,7 +2461,7 @@ func TestPersistNormalizedProjection_ReplacesRows(t *testing.T) {
 		t.Fatalf("unexpected runtime work rows after replacement: %+v", workRows)
 	}
 
-	coordinationRows, err = store.ListFreshRuntimeCoordination("")
+	coordinationRows, err = store.ListFreshRuntimeCoordination(projectDir)
 	if err != nil {
 		t.Fatalf("ListFreshRuntimeCoordination(second) error: %v", err)
 	}

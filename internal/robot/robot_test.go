@@ -3073,6 +3073,7 @@ func TestGetStatusWithProjectionStoreUsesRuntimeProjection(t *testing.T) {
 		t.Fatalf("UpsertRuntimeWork in_progress: %v", err)
 	}
 	if err := store.UpsertRuntimeCoordination(&state.RuntimeCoordination{
+		ProjectDir:      projectDir,
 		AgentName:       "BlueLake",
 		SessionName:     "alpha",
 		UnreadCount:     3,
@@ -7418,6 +7419,122 @@ func TestWorkRowsAreScopedByProject(t *testing.T) {
 		if output.Summary.ReadyWork != want {
 			t.Fatalf("%s ready_work = %d, want %d", projectDir, output.Summary.ReadyWork, want)
 		}
+	}
+}
+
+// Every project shares one state store and Agent Mail names repeat across
+// projects, so a refresh in one project must neither replace nor be counted in
+// another project's coordination rows (bd-dh5kx).
+func TestCoordinationRowsAreScopedByProject(t *testing.T) {
+	store := newTestAttentionStore(t)
+	oldStore := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(oldStore) })
+	oldListLive := listProjectionLiveSessions
+	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
+	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
+	// Status counts alerts with bv and br, so keep them off the real repo.
+	installFakeWorkTools(t, fakeBRBlockedScript)
+
+	// Inspect reads the project of the working directory.
+	t.Chdir(t.TempDir())
+	projectA, err := resolveNormalizedProjectDir("")
+	if err != nil {
+		t.Fatalf("resolveNormalizedProjectDir: %v", err)
+	}
+	projectB := t.TempDir()
+
+	unreadMail := func(unread map[string]int) *adapters.AggregatedSignals {
+		coordination := adapters.NewCoordinationSection()
+		coordination.Available = true
+		coordination.Mail = &adapters.MailSummary{ByAgent: map[string]adapters.AgentMailStats{}}
+		for name, count := range unread {
+			coordination.Mail.ByAgent[name] = adapters.AgentMailStats{Unread: count}
+			coordination.Mail.TotalUnread += count
+		}
+		return &adapters.AggregatedSignals{CollectedAt: time.Now().UTC(), Coordination: coordination}
+	}
+	if err := persistNormalizedProjection(store, projectA, unreadMail(map[string]int{"BlueLake": 3, "GreenCastle": 2}), nil, time.Hour); err != nil {
+		t.Fatalf("persist project a: %v", err)
+	}
+	if err := persistNormalizedProjection(store, projectB, unreadMail(map[string]int{"BlueLake": 7}), nil, time.Hour); err != nil {
+		t.Fatalf("persist project b: %v", err)
+	}
+
+	for projectDir, want := range map[string]int{projectA: 5, projectB: 7} {
+		output, err := buildProjectionBackedStatus(store, config.Default(), projectDir, PaginationOptions{})
+		if err != nil {
+			t.Fatalf("buildProjectionBackedStatus(%s): %v", projectDir, err)
+		}
+		if output.Summary.MailUnread != want {
+			t.Fatalf("%s status mail_unread = %d, want %d", projectDir, output.Summary.MailUnread, want)
+		}
+		snapshot := newSnapshotOutput(config.Default())
+		applySnapshotProjectionRows(snapshot, store, projectDir)
+		if snapshot.Coordination == nil || snapshot.Coordination.MailUnread != want {
+			t.Fatalf("%s snapshot coordination = %+v, want mail_unread %d", projectDir, snapshot.Coordination, want)
+		}
+	}
+
+	inspect, err := GetInspectCoordination(InspectCoordinationOptions{AgentName: "BlueLake"})
+	if err != nil {
+		t.Fatalf("GetInspectCoordination: %v", err)
+	}
+	if !inspect.Success || inspect.Detail.Mail.Unread != 3 {
+		t.Fatalf("inspect BlueLake from project a = success %v, unread %d (%+v); want project a's 3 unread", inspect.Success, inspect.Detail.Mail.Unread, inspect.RobotResponse)
+	}
+}
+
+// With the projection refresh off, status read an unrefreshed projection or
+// fell back to the live path without saying so (bd-dh5kx). Status and
+// snapshot now carry the reason in warnings, and drop it once a refresh is
+// registered.
+func TestStatusAndSnapshotWarnWhenProjectionRefreshIsOff(t *testing.T) {
+	store := newTestAttentionStore(t)
+	oldStore := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(oldStore) })
+	oldListLive := listProjectionLiveSessions
+	t.Cleanup(func() { listProjectionLiveSessions = oldListLive })
+	listProjectionLiveSessions = func() ([]tmux.Session, error) { return nil, nil }
+	// Status counts alerts with bv and br, so keep them off the real repo.
+	installFakeWorkTools(t, fakeBRBlockedScript)
+
+	reason := "explicitly selected config /cfg/missing.toml does not exist"
+	want := "runtime projection refresh is off: " + reason
+	SetProjectionRefreshOff(reason)
+
+	status, err := buildProjectionBackedStatus(store, config.Default(), t.TempDir(), PaginationOptions{})
+	if err != nil {
+		t.Fatalf("buildProjectionBackedStatus: %v", err)
+	}
+	if len(status.Warnings) != 1 || status.Warnings[0] != want {
+		t.Fatalf("status warnings = %q, want [%q]", status.Warnings, want)
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("marshal status: %v", err)
+	}
+	if !strings.Contains(string(data), `"warnings":["runtime projection refresh is off: `) {
+		t.Fatalf("status JSON has no projection warning: %s", data)
+	}
+	if live := newStatusOutput(config.Default()); len(live.Warnings) != 1 || live.Warnings[0] != want {
+		t.Fatalf("live status warnings = %q, want [%q]", live.Warnings, want)
+	}
+	if snapshot := cloneSnapshotOutput(newSnapshotOutput(config.Default())); len(snapshot.Warnings) != 1 || snapshot.Warnings[0] != want {
+		t.Fatalf("snapshot warnings = %q, want [%q]", snapshot.Warnings, want)
+	}
+
+	SetProjectionRefresh(func() {})
+	status, err = buildProjectionBackedStatus(store, config.Default(), t.TempDir(), PaginationOptions{})
+	if err != nil {
+		t.Fatalf("buildProjectionBackedStatus after refresh registered: %v", err)
+	}
+	if status.Warnings != nil {
+		t.Fatalf("status warnings with a refresh registered = %q, want none", status.Warnings)
+	}
+	if data, err := json.Marshal(status); err != nil || strings.Contains(string(data), `"warnings"`) {
+		t.Fatalf("status JSON with a refresh registered = %s (err %v), want no warnings field", data, err)
 	}
 }
 

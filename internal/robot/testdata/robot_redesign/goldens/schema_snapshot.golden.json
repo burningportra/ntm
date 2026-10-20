@@ -2013,6 +2013,13 @@
         "description": "Version",
         "type": "string"
       },
+      "warnings": {
+        "description": "Warnings",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
       "work": {
         "$ref": "#/definitions/WorkSection",
         "description": "Work"

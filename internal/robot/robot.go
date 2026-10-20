@@ -1542,6 +1542,10 @@ var (
 	// just peeked are not read again (bd-gm0d7).
 	projectionMailProject string
 	projectionMailClient  *agentmail.Client
+	// projectionRefreshOff says why this process registered no projection
+	// refresh, so the status and snapshot read from the projection say it
+	// was not refreshed.
+	projectionRefreshOff string
 )
 
 const (
@@ -1558,6 +1562,7 @@ func SetProjectionStore(store *state.Store) {
 	defer projectionStoreMu.Unlock()
 	projectionStore = store
 	projectionRefresh = nil
+	projectionRefreshOff = ""
 	projectionMailProject = ""
 	projectionMailClient = nil
 }
@@ -1584,9 +1589,34 @@ func SetProjectionRefresh(refresh func()) {
 	projectionStoreMu.Lock()
 	defer projectionStoreMu.Unlock()
 	projectionRefresh = nil
+	projectionRefreshOff = ""
 	if refresh != nil {
 		projectionRefresh = sync.OnceFunc(refresh)
 	}
+}
+
+// SetProjectionRefreshOff records that this process will not refresh the
+// projection store, and why, dropping any registered refresh. Status and
+// snapshot then carry the reason in their warnings, because the projection
+// rows they read were not refreshed by this command and status may have
+// fallen back to a live read.
+func SetProjectionRefreshOff(reason string) {
+	projectionStoreMu.Lock()
+	defer projectionStoreMu.Unlock()
+	projectionRefresh = nil
+	projectionRefreshOff = strings.TrimSpace(reason)
+}
+
+// ProjectionRefreshWarnings returns the warnings status and snapshot carry
+// when SetProjectionRefreshOff turned the projection refresh off, or nil.
+func ProjectionRefreshWarnings() []string {
+	projectionStoreMu.RLock()
+	reason := projectionRefreshOff
+	projectionStoreMu.RUnlock()
+	if reason == "" {
+		return nil
+	}
+	return []string{"runtime projection refresh is off: " + reason}
 }
 
 // runProjectionRefresh runs the registered refresh if it has not run yet.
@@ -1711,6 +1741,7 @@ type StatusOutput struct {
 	FileChanges     []FileChangeInfo              `json:"file_changes,omitempty"`
 	Conflicts       []tracker.Conflict            `json:"conflicts,omitempty"`
 	SchedulerStats  *SchedulerStatsSummary        `json:"scheduler_stats,omitempty"`
+	Warnings        []string                      `json:"warnings,omitempty"`
 }
 
 // StatusSessionHeader is the compact session representation returned by
@@ -2323,6 +2354,7 @@ func newStatusOutput(cfg *config.Config) *StatusOutput {
 		AlertCounts:     map[string]int{},
 		Sources:         &adapters.SourceHealthSection{Sources: map[string]adapters.SourceInfo{}, Degraded: []string{}, AllFresh: true},
 		DegradedSources: []string{},
+		Warnings:        ProjectionRefreshWarnings(),
 	}
 }
 
@@ -2341,6 +2373,7 @@ func newSnapshotOutput(cfg *config.Config) *SnapshotOutput {
 		ActiveIncidents:          []SnapshotIncident{},
 		Summary:                  newStatusSummary(),
 		Alerts:                   []string{},
+		Warnings:                 ProjectionRefreshWarnings(),
 	}
 }
 
@@ -2457,7 +2490,7 @@ func populateSnapshotFeedMetadata(output *SnapshotOutput, feed *AttentionFeed) {
 }
 
 // buildProjectionBackedStatus reads status from the projection store, counting
-// the work rows collected for projectDir.
+// the work and coordination rows collected for projectDir.
 func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, projectDir string, opts PaginationOptions) (*StatusOutput, error) {
 	output := newStatusOutput(cfg)
 
@@ -2483,7 +2516,7 @@ func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, project
 	if err != nil {
 		return nil, fmt.Errorf("status work: %w", err)
 	}
-	coordinationRows, err := store.ListFreshRuntimeCoordination("")
+	coordinationRows, err := store.ListFreshRuntimeCoordination(projectDir)
 	if err != nil {
 		return nil, fmt.Errorf("status coordination: %w", err)
 	}
@@ -4758,6 +4791,7 @@ type SnapshotOutput struct {
 	AlertsDetailed           []AlertInfo                   `json:"alerts_detailed,omitempty"`   // Rich alert objects
 	AlertSummary             *AlertSummaryInfo             `json:"alert_summary,omitempty"`
 	AttentionSummary         *SnapshotAttentionSummary     `json:"attention_summary,omitempty"` // Compact feed summary for bootstrap orientation
+	Warnings                 []string                      `json:"warnings,omitempty"`
 }
 
 // NOTE: SnapshotAttentionSummary and SnapshotAttentionItem types are defined in
@@ -5161,25 +5195,32 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 		output.Alerts = append(output.Alerts, fmt.Sprintf("failed to list active incidents: %v", err))
 	}
 	if store := currentProjectionStore(); store != nil {
-		if workRows, err := store.ListRuntimeWork(projectKey); err == nil {
-			output.Work = snapshotWorkFromRuntime(workRows, BeadLimit)
-		}
-		if rows, err := store.GetAllSourceHealth(); err == nil {
-			applySnapshotSourceHealth(output, rows)
-		}
-		handoffRow, handoffErr := store.GetRuntimeHandoff()
-		if handoffErr == nil {
-			output.Handoff = statusHandoffFromRuntime(handoffRow)
-		}
-		if coordinationRows, err := store.ListFreshRuntimeCoordination(""); err == nil {
-			output.Coordination = snapshotCoordinationFromRuntime(coordinationRows, handoffRow)
-		}
-		if quotaRows, err := store.ListFreshRuntimeQuota(""); err == nil {
-			output.Quota = snapshotQuotaFromRuntime(quotaRows)
-		}
+		applySnapshotProjectionRows(output, store, projectKey)
 	}
 	snapshotFinalize(output, opts)
 	return output, nil
+}
+
+// applySnapshotProjectionRows fills the snapshot sections the projection
+// store holds, reading the work and coordination rows collected for
+// projectKey.
+func applySnapshotProjectionRows(output *SnapshotOutput, store *state.Store, projectKey string) {
+	if workRows, err := store.ListRuntimeWork(projectKey); err == nil {
+		output.Work = snapshotWorkFromRuntime(workRows, BeadLimit)
+	}
+	if rows, err := store.GetAllSourceHealth(); err == nil {
+		applySnapshotSourceHealth(output, rows)
+	}
+	handoffRow, handoffErr := store.GetRuntimeHandoff()
+	if handoffErr == nil {
+		output.Handoff = statusHandoffFromRuntime(handoffRow)
+	}
+	if coordinationRows, err := store.ListFreshRuntimeCoordination(projectKey); err == nil {
+		output.Coordination = snapshotCoordinationFromRuntime(coordinationRows, handoffRow)
+	}
+	if quotaRows, err := store.ListFreshRuntimeQuota(""); err == nil {
+		output.Quota = snapshotQuotaFromRuntime(quotaRows)
+	}
 }
 
 func buildProjectionBackedSnapshot(
@@ -5200,22 +5241,7 @@ func buildProjectionBackedSnapshot(
 		return nil, err
 	}
 	output.Sessions = sessions
-	if workRows, err := store.ListRuntimeWork(projectKey); err == nil {
-		output.Work = snapshotWorkFromRuntime(workRows, BeadLimit)
-	}
-	if rows, err := store.GetAllSourceHealth(); err == nil {
-		applySnapshotSourceHealth(output, rows)
-	}
-	handoffRow, handoffErr := store.GetRuntimeHandoff()
-	if handoffErr == nil {
-		output.Handoff = statusHandoffFromRuntime(handoffRow)
-	}
-	if coordinationRows, err := store.ListFreshRuntimeCoordination(""); err == nil {
-		output.Coordination = snapshotCoordinationFromRuntime(coordinationRows, handoffRow)
-	}
-	if quotaRows, err := store.ListFreshRuntimeQuota(""); err == nil {
-		output.Quota = snapshotQuotaFromRuntime(quotaRows)
-	}
+	applySnapshotProjectionRows(output, store, projectKey)
 	if output.AgentMail != nil && len(output.AgentMail.Agents) > 0 {
 		if paneMap, err := buildProjectionAgentMailPaneMap(store, tmuxSessions); err == nil {
 			for agentName, pane := range paneMap {
@@ -8131,8 +8157,9 @@ func captureNormalizedTmuxPanes(
 	return captured, nil
 }
 
-// persistNormalizedProjection writes one refresh into the store. Work rows
-// belong to projectDir, the project root the work was collected from.
+// persistNormalizedProjection writes one refresh into the store. Work and
+// coordination rows belong to projectDir, the project root the work and the
+// Agent Mail inboxes were read from.
 func persistNormalizedProjection(store *state.Store, projectDir string, signals *adapters.AggregatedSignals, tmuxSnapshot *NormalizedSnapshot, staleAfter time.Duration) error {
 	if store == nil || signals == nil {
 		return nil
@@ -8152,7 +8179,7 @@ func persistNormalizedProjection(store *state.Store, projectDir string, signals 
 	// collection and are only marked stale.
 	workCollected := signals.Work != nil && signals.Work.Available
 	workRows := buildRuntimeWorkRows(projectDir, signals.Work, collectedAt, expiresAt)
-	coordinationRows := buildRuntimeCoordinationRows(signals.Coordination, collectedAt, expiresAt)
+	coordinationRows := buildRuntimeCoordinationRows(projectDir, signals.Coordination, collectedAt, expiresAt)
 	handoffRow := buildRuntimeHandoffRow(signals.Coordination, collectedAt, expiresAt)
 	quotaRows := buildRuntimeQuotaRows(signals.Quota, collectedAt, expiresAt)
 	healthRows := buildSourceHealthRows(signals.Health, collectedAt)
@@ -8167,7 +8194,7 @@ func persistNormalizedProjection(store *state.Store, projectDir string, signals 
 	if err != nil {
 		return fmt.Errorf("list runtime sessions: %w", err)
 	}
-	existingCoordination, err := store.ListFreshRuntimeCoordination("")
+	existingCoordination, err := store.ListFreshRuntimeCoordination(projectDir)
 	if err != nil {
 		return fmt.Errorf("list runtime coordination: %w", err)
 	}
@@ -8213,7 +8240,7 @@ func persistNormalizedProjection(store *state.Store, projectDir string, signals 
 			if _, ok := coordinationRows[item.AgentName]; ok {
 				continue
 			}
-			if err := tx.DeleteRuntimeCoordination(item.AgentName); err != nil {
+			if err := tx.DeleteRuntimeCoordination(projectDir, item.AgentName); err != nil {
 				return err
 			}
 		}
@@ -8600,7 +8627,7 @@ func buildRuntimeWorkRows(projectDir string, section *adapters.WorkSection, coll
 	return rows
 }
 
-func buildRuntimeCoordinationRows(section *adapters.CoordinationSection, collectedAt, staleAfter time.Time) map[string]*state.RuntimeCoordination {
+func buildRuntimeCoordinationRows(projectDir string, section *adapters.CoordinationSection, collectedAt, staleAfter time.Time) map[string]*state.RuntimeCoordination {
 	rows := make(map[string]*state.RuntimeCoordination)
 	if section == nil || section.Mail == nil {
 		return rows
@@ -8617,6 +8644,7 @@ func buildRuntimeCoordinationRows(section *adapters.CoordinationSection, collect
 			agentLatestMessageAt = latestMessageAt
 		}
 		rows[trimmedName] = &state.RuntimeCoordination{
+			ProjectDir:                   projectDir,
 			AgentName:                    trimmedName,
 			SessionName:                  "",
 			Pane:                         strings.TrimSpace(stats.Pane),

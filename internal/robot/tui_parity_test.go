@@ -1698,9 +1698,14 @@ func TestGetInspectCoordinationUsesProjectionStore(t *testing.T) {
 		_ = store.Close()
 	})
 
+	projectDir, err := resolveNormalizedProjectDir("")
+	if err != nil {
+		t.Fatalf("resolveNormalizedProjectDir: %v", err)
+	}
 	now := time.Now().UTC()
 	staleAfter := now.Add(time.Hour)
 	if err := store.UpsertRuntimeCoordination(&state.RuntimeCoordination{
+		ProjectDir:                   projectDir,
 		AgentName:                    "BlueLake",
 		SessionName:                  "alpha",
 		Pane:                         "%1",

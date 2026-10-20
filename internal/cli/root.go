@@ -3180,8 +3180,13 @@ func initializeRobotPersistence(ctx context.Context) error {
 	// Assignment commands perform their own strict policy validation before
 	// consulting bv/br. Keep the persistence store available to the command, but
 	// do not let this optional refresh cross that command-specific safety boundary.
-	// Explicitly selected invalid config paths have the same ordering requirement.
-	if robotAssignmentCommandRequiresPolicyPreflight() || !selectedConfigAllowsProjectionRefresh() {
+	// Explicitly selected invalid config paths have the same ordering requirement,
+	// and since nothing else reports them, status and snapshot warn about them.
+	if robotAssignmentCommandRequiresPolicyPreflight() {
+		return nil
+	}
+	if err := selectedConfigBlocksProjectionRefresh(); err != nil {
+		robot.SetProjectionRefreshOff(err.Error())
 		return nil
 	}
 
@@ -5347,12 +5352,24 @@ func configureStartupConfigPath() {
 	startup.SetConfigPath("")
 }
 
-func selectedConfigAllowsProjectionRefresh() bool {
+// selectedConfigBlocksProjectionRefresh returns why an explicitly selected
+// config path keeps the projection refresh from running, or nil when no
+// config was selected or the selected one is a regular file.
+func selectedConfigBlocksProjectionRefresh() error {
 	if !selectedConfigIsExplicit() {
-		return true
+		return nil
 	}
-	info, err := os.Stat(selectedConfigPath())
-	return err == nil && info.Mode().IsRegular()
+	path := selectedConfigPath()
+	info, err := os.Stat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("explicitly selected config %s does not exist", path)
+	case err != nil:
+		return fmt.Errorf("explicitly selected config: %w", err)
+	case !info.Mode().IsRegular():
+		return fmt.Errorf("explicitly selected config %s is not a regular file", path)
+	}
+	return nil
 }
 
 func robotAssignmentCommandRequiresPolicyPreflight() bool {

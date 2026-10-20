@@ -6532,7 +6532,7 @@ func TestConfigureStartupConfigPathPreservesExplicitSelection(t *testing.T) {
 	})
 }
 
-func TestSelectedConfigAllowsProjectionRefresh(t *testing.T) {
+func TestSelectedConfigBlocksProjectionRefresh(t *testing.T) {
 	originalCfgFile := cfgFile
 	originalArgs := os.Args
 	t.Cleanup(func() {
@@ -6544,8 +6544,8 @@ func TestSelectedConfigAllowsProjectionRefresh(t *testing.T) {
 		cfgFile = ""
 		os.Args = []string{"ntm", "status"}
 		t.Setenv("NTM_CONFIG", "")
-		if !selectedConfigAllowsProjectionRefresh() {
-			t.Fatal("implicit default config unexpectedly blocked projection refresh")
+		if err := selectedConfigBlocksProjectionRefresh(); err != nil {
+			t.Fatalf("implicit default config unexpectedly blocked projection refresh: %v", err)
 		}
 	})
 
@@ -6557,8 +6557,8 @@ func TestSelectedConfigAllowsProjectionRefresh(t *testing.T) {
 		cfgFile = path
 		os.Args = []string{"ntm", "status"}
 		t.Setenv("NTM_CONFIG", "")
-		if !selectedConfigAllowsProjectionRefresh() {
-			t.Fatal("regular explicit config blocked projection refresh")
+		if err := selectedConfigBlocksProjectionRefresh(); err != nil {
+			t.Fatalf("regular explicit config blocked projection refresh: %v", err)
 		}
 	})
 
@@ -6566,8 +6566,9 @@ func TestSelectedConfigAllowsProjectionRefresh(t *testing.T) {
 		cfgFile = filepath.Join(t.TempDir(), "missing.toml")
 		os.Args = []string{"ntm", "status"}
 		t.Setenv("NTM_CONFIG", "")
-		if selectedConfigAllowsProjectionRefresh() {
-			t.Fatal("missing explicit config allowed projection refresh")
+		err := selectedConfigBlocksProjectionRefresh()
+		if err == nil || !strings.Contains(err.Error(), cfgFile) || !strings.Contains(err.Error(), "does not exist") {
+			t.Fatalf("missing explicit config: err = %v, want one naming %s as missing", err, cfgFile)
 		}
 	})
 
@@ -6575,17 +6576,20 @@ func TestSelectedConfigAllowsProjectionRefresh(t *testing.T) {
 		cfgFile = t.TempDir()
 		os.Args = []string{"ntm", "status"}
 		t.Setenv("NTM_CONFIG", "")
-		if selectedConfigAllowsProjectionRefresh() {
-			t.Fatal("non-regular explicit config allowed projection refresh")
+		err := selectedConfigBlocksProjectionRefresh()
+		if err == nil || !strings.Contains(err.Error(), cfgFile) || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("non-regular explicit config: err = %v, want one naming %s as not a regular file", err, cfgFile)
 		}
 	})
 
 	t.Run("missing environment selection", func(t *testing.T) {
 		cfgFile = ""
 		os.Args = []string{"ntm", "status"}
-		t.Setenv("NTM_CONFIG", filepath.Join(t.TempDir(), "missing-from-env.toml"))
-		if selectedConfigAllowsProjectionRefresh() {
-			t.Fatal("missing NTM_CONFIG selection allowed projection refresh")
+		missing := filepath.Join(t.TempDir(), "missing-from-env.toml")
+		t.Setenv("NTM_CONFIG", missing)
+		err := selectedConfigBlocksProjectionRefresh()
+		if err == nil || !strings.Contains(err.Error(), missing) || !strings.Contains(err.Error(), "does not exist") {
+			t.Fatalf("missing NTM_CONFIG selection: err = %v, want one naming %s as missing", err, missing)
 		}
 	})
 }
@@ -7874,5 +7878,46 @@ func TestInitializeRobotPersistenceDefersProjectionRefreshToFirstRead(t *testing
 	}
 	if gotBudget != robotProjectionSourceBudget {
 		t.Fatalf("refresh source budget = %v, want %v", gotBudget, robotProjectionSourceBudget)
+	}
+	if warnings := robot.ProjectionRefreshWarnings(); len(warnings) != 0 {
+		t.Fatalf("a registered refresh left projection warnings %v", warnings)
+	}
+}
+
+// bd-dh5kx: an explicit NTM_CONFIG naming a missing file turned the projection
+// refresh off without a word, so status read an unrefreshed projection or fell
+// back to the live path and nothing said why. The refresh stays off, and the
+// status and snapshot warnings now name the missing config.
+func TestInitializeRobotPersistenceWarnsWhenMissingExplicitConfigTurnsRefreshOff(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.toml")
+	t.Setenv("NTM_CONFIG", missing)
+	oldCfgFile := cfgFile
+	cfgFile = ""
+	t.Cleanup(func() { cfgFile = oldCfgFile })
+
+	calls := 0
+	oldRefresh := robotRefreshNormalizedProjection
+	robotRefreshNormalizedProjection = func(context.Context, *state.Store, string, string, time.Duration) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(func() { robotRefreshNormalizedProjection = oldRefresh })
+	prevFeed := robot.PeekAttentionFeed()
+	t.Cleanup(func() { robot.SetAttentionFeed(prevFeed) })
+
+	if err := initializeRobotPersistence(context.Background()); err != nil {
+		t.Fatalf("initializeRobotPersistence: %v", err)
+	}
+	t.Cleanup(closeRobotPersistence)
+	if _, err := robot.GetSnapshotDelta(time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("GetSnapshotDelta: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("projection refresh ran %d times under a missing explicit config, want 0", calls)
+	}
+
+	warnings := robot.ProjectionRefreshWarnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], missing) || !strings.Contains(warnings[0], "does not exist") {
+		t.Fatalf("projection warnings = %v, want one naming the missing config %s", warnings, missing)
 	}
 }
