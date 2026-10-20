@@ -2993,13 +2993,11 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 	}
 	output.Available = true
 
-	// Ensure project exists
-	if _, err := ensureProjectWithRetry(ctx, client, projectKey); err != nil {
-		output.Warnings = append(output.Warnings, fmt.Sprintf("ensure_project failed: %v", err))
+	agents, err := client.ListProjectAgents(ctx, projectKey)
+	if agentmail.IsNotFound(err) {
+		output.Warnings = append(output.Warnings, agentMailProjectNotRegistered)
 		return output, nil
 	}
-
-	agents, err := client.ListProjectAgents(ctx, projectKey)
 	if err != nil {
 		output.Warnings = append(output.Warnings, fmt.Sprintf("list_agents failed: %v", err))
 		return output, nil
@@ -4550,24 +4548,15 @@ func fetchAgentMailDataContext(parent context.Context, client *agentmail.Client,
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 
-	// Ensure project exists
-	if _, err := ensureProjectWithRetry(ctx, client, projectKey); err != nil {
-		if isAgentMailDBLockError(err) {
+	agents, err := client.ListProjectAgents(ctx, projectKey)
+	if err != nil {
+		if agentmail.IsNotFound(err) {
 			return &SnapshotAgentMail{
 				Available: true,
-				Reason:    "temporarily unavailable: Agent Mail resource busy",
+				Reason:    agentMailProjectNotRegistered,
 				Project:   projectKey,
 			}, nil, nil
 		}
-		return &SnapshotAgentMail{
-			Available: true,
-			Reason:    fmt.Sprintf("ensure_project failed: %v", err),
-			Project:   projectKey,
-		}, nil, nil
-	}
-
-	agents, err := client.ListProjectAgents(ctx, projectKey)
-	if err != nil {
 		if isAgentMailDBLockError(err) {
 			return &SnapshotAgentMail{
 				Available: true,
@@ -9442,12 +9431,12 @@ func buildCorrelationGraph() *GraphCorrelation {
 	agentMailClient := agentmail.NewClient(agentmail.WithProjectKey(wd))
 	var agents []agentmail.Agent
 	if agentMailClient.IsAvailable() {
-		if _, err := agentMailClient.EnsureProject(ctx, wd); err != nil {
-			corr.Errors = append(corr.Errors, fmt.Sprintf("agent mail ensure_project: %v", err))
-		} else if list, err := agentMailClient.ListProjectAgents(ctx, wd); err != nil {
-			corr.Errors = append(corr.Errors, fmt.Sprintf("agent mail list_agents: %v", err))
-		} else {
+		// An unregistered directory has no mail agents to correlate; the graph
+		// is read-only, so it never registers one.
+		if list, err := agentMailClient.ListProjectAgents(ctx, wd); err == nil {
 			agents = list
+		} else if !agentmail.IsNotFound(err) {
+			corr.Errors = append(corr.Errors, fmt.Sprintf("agent mail list_agents: %v", err))
 		}
 	} else {
 		corr.Errors = append(corr.Errors, "agent mail not available")
@@ -10307,41 +10296,11 @@ func PrintTerse(cfg *config.Config) error {
 	return nil
 }
 
-// ensureProjectWithRetry wraps EnsureProject with a small retry window for
-// transient SQLite lock contention on the Agent Mail server.
-func ensureProjectWithRetry(ctx context.Context, client *agentmail.Client, projectKey string) (*agentmail.Project, error) {
-	const maxAttempts = 4 // Canonical default: config.RetryConfig.DB.MaxAttempts
-	backoff := 100 * time.Millisecond
-
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		project, err := client.EnsureProject(ctx, projectKey)
-		if err == nil {
-			return project, nil
-		}
-		lastErr = err
-
-		if !isAgentMailDBLockError(err) || attempt == maxAttempts {
-			return nil, err
-		}
-
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-
-		if backoff < time.Second {
-			backoff *= 2
-		}
-	}
-
-	return nil, lastErr
-}
+// agentMailProjectNotRegistered explains the missing Agent Mail state of a
+// directory no agent has registered. Robot commands only read Agent Mail, so
+// they list an existing project's agents and never call ensure_project, which
+// would register every directory they run in.
+const agentMailProjectNotRegistered = "project not registered with Agent Mail"
 
 func isAgentMailDBLockError(err error) bool {
 	if err == nil {
@@ -10366,11 +10325,6 @@ func getTerseMailCount() int {
 
 	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
 	if !client.IsAvailable() {
-		return 0
-	}
-
-	// Ensure project exists
-	if _, err := ensureProjectWithRetry(ctx, client, projectKey); err != nil {
 		return 0
 	}
 
@@ -10414,18 +10368,9 @@ func getAgentMailSummary() (*AgentMailSummary, error) {
 	}
 	summary.Available = true
 
-	// Ensure project exists
-	if _, err := ensureProjectWithRetry(ctx, client, projectKey); err != nil {
-		if isAgentMailDBLockError(err) {
-			return summary, nil
-		}
-		summary.Error = fmt.Sprintf("ensure_project: %v", err)
-		return summary, nil
-	}
-
 	agents, err := client.ListProjectAgents(ctx, projectKey)
 	if err != nil {
-		if isAgentMailDBLockError(err) {
+		if agentmail.IsNotFound(err) || isAgentMailDBLockError(err) {
 			return summary, nil
 		}
 		summary.Error = fmt.Sprintf("list_agents: %v", err)

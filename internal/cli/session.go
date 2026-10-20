@@ -1667,9 +1667,9 @@ func fetchAgentMailStatus(projectKey string) *output.AgentMailStatus {
 		return status
 	}
 
-	// Ensure project exists
-	_, err := client.EnsureProject(ctx, projectKey)
-	if err != nil {
+	// ntm status only reads, so it looks the project up rather than calling
+	// ensure_project, which would register every directory it runs in.
+	if _, err := client.LookupProject(ctx, projectKey); err != nil {
 		return status
 	}
 	status.Connected = true

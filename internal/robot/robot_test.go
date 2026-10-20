@@ -6073,61 +6073,79 @@ func TestUpdateActivityLinesDelta(t *testing.T) {
 	}
 }
 
-func TestEnsureProjectWithRetryRetriesDatabaseLock(t *testing.T) {
+// TestReadOnlyAgentMailSurfacesDoNotRegisterProject locks bd-5g66p: the
+// snapshot and projection enrichment, --robot-mail and the correlation graph
+// only read Agent Mail, so running them from a directory never calls
+// ensure_project, and a directory no agent registered reads as not registered.
+func TestReadOnlyAgentMailSurfacesDoNotRegisterProject(t *testing.T) {
+	projectDir := t.TempDir()
+	t.Chdir(projectDir)
 
-	var calls atomic.Int32
+	var (
+		mu    sync.Mutex
+		tools []string
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		n := calls.Add(1)
-		if n <= 2 {
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Database error: Query error: database is locked"}],"isError":true}}`))
+		var req struct {
+			ID     interface{}     `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"id":1,"slug":"data-projects-ntm","human_key":"/data/projects/ntm"},"isError":false}}`))
-	}))
-	defer server.Close()
-
-	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	project, err := ensureProjectWithRetry(ctx, client, "/data/projects/ntm")
-	if err != nil {
-		t.Fatalf("ensureProjectWithRetry returned error: %v", err)
-	}
-	if project == nil {
-		t.Fatal("ensureProjectWithRetry returned nil project")
-	}
-	if project.HumanKey != "/data/projects/ntm" {
-		t.Fatalf("project.HumanKey=%q, want /data/projects/ntm", project.HumanKey)
-	}
-	if calls.Load() != 3 {
-		t.Fatalf("ensureProjectWithRetry attempts=%d, want 3", calls.Load())
-	}
-}
-
-func TestEnsureProjectWithRetryDoesNotRetryNonLockErrors(t *testing.T) {
-
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{}}
+		switch req.Method {
+		case "tools/call":
+			var params struct {
+				Name string `json:"name"`
+			}
+			_ = json.Unmarshal(req.Params, &params)
+			mu.Lock()
+			tools = append(tools, params.Name)
+			mu.Unlock()
+		case "resources/read":
+			// What the real server answers for a directory no agent registered.
+			delete(resp, "result")
+			resp["error"] = map[string]interface{}{"code": -32602, "message": "Project not found"}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		calls.Add(1)
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"permission denied"}],"isError":true}}`))
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
 
-	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	_, err := ensureProjectWithRetry(ctx, client, "/data/projects/ntm")
-	if err == nil {
-		t.Fatal("ensureProjectWithRetry returned nil error")
+	summary, agents, _ := fetchAgentMailData(projectDir)
+	if summary == nil || !summary.Available || summary.Reason != agentMailProjectNotRegistered || len(agents) != 0 {
+		t.Fatalf("snapshot mail = %+v, agents = %v; want available, %q, no agents", summary, agents, agentMailProjectNotRegistered)
 	}
-	if calls.Load() != 1 {
-		t.Fatalf("ensureProjectWithRetry attempts=%d, want 1", calls.Load())
+
+	mail, err := GetMail(MailOptions{ProjectKey: projectDir})
+	if err != nil {
+		t.Fatalf("GetMail error: %v", err)
+	}
+	warned := false
+	for _, warning := range mail.Warnings {
+		warned = warned || warning == agentMailProjectNotRegistered
+	}
+	if !mail.Available || len(mail.Agents) != 0 || !warned {
+		t.Fatalf("GetMail = %+v, want available, no agents and the %q warning", mail, agentMailProjectNotRegistered)
+	}
+
+	corr := buildCorrelationGraph()
+	for _, e := range corr.Errors {
+		if strings.Contains(e, "agent mail") {
+			t.Fatalf("correlation errors = %v, want no Agent Mail error for an unregistered project", corr.Errors)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, name := range tools {
+		if name == "ensure_project" {
+			t.Fatalf("tool calls = %v, want no ensure_project from read-only surfaces", tools)
+		}
 	}
 }
 

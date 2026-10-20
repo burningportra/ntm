@@ -2,14 +2,20 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
@@ -229,5 +235,66 @@ func TestFetchAgentMailStatusSkipsEmptyProjectKey(t *testing.T) {
 	}
 	if stub.ensureCalled != 0 {
 		t.Fatalf("expected no ensure_project call for empty project key, got %d", stub.ensureCalled)
+	}
+}
+
+// TestFetchAgentMailStatusDoesNotRegisterProject locks bd-5g66p: ntm status
+// reports a directory's Agent Mail project only when it already exists, and
+// never calls ensure_project, which would register every directory it runs in.
+func TestFetchAgentMailStatusDoesNotRegisterProject(t *testing.T) {
+	registered := t.TempDir()
+	unregistered := t.TempDir()
+
+	var (
+		mu    sync.Mutex
+		tools []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{}}
+		switch req.Method {
+		case "tools/call":
+			mu.Lock()
+			tools = append(tools, toString(params["name"]))
+			mu.Unlock()
+		case "resources/read":
+			uri := toString(params["uri"])
+			switch uri {
+			case "resource://project/" + url.PathEscape(registered):
+				resp["result"] = map[string]interface{}{"contents": []map[string]interface{}{{
+					"text": mustJSONString(t, map[string]interface{}{"id": 3, "slug": "registered", "human_key": registered}),
+				}}}
+			case "resource://file_reservations/" + url.PathEscape(registered) + "?active_only=true&format=json":
+				resp["result"] = map[string]interface{}{"contents": []map[string]interface{}{{"text": "[]"}}}
+			default:
+				delete(resp, "result")
+				resp["error"] = map[string]interface{}{"code": -32602, "message": "Project not found"}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	oldCfg := cfg
+	cfg = &config.Config{}
+	t.Cleanup(func() { cfg = oldCfg })
+
+	if status := fetchAgentMailStatus(unregistered); !status.Available || status.Connected {
+		t.Fatalf("unregistered status = %+v, want available and not connected", status)
+	}
+	if status := fetchAgentMailStatus(registered); !status.Available || !status.Connected {
+		t.Fatalf("registered status = %+v, want available and connected", status)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tools) != 0 {
+		t.Fatalf("tool calls = %v, want none (status must not call ensure_project)", tools)
 	}
 }

@@ -71,6 +71,36 @@ func (c *Client) EnsureProject(ctx context.Context, projectKey string) (*Project
 	return &project, nil
 }
 
+// LookupProject returns the existing project for projectKey without creating
+// it, so read-only callers can tell an unregistered directory from a
+// registered one without registering it. When the server has no such project
+// the error wraps ErrNotFound.
+func (c *Client) LookupProject(ctx context.Context, projectKey string) (*Project, error) {
+	uri := fmt.Sprintf("resource://project/%s", url.PathEscape(projectKey))
+	result, err := c.ReadResource(ctx, uri)
+	if err != nil {
+		return nil, err
+	}
+
+	var resourceResp struct {
+		Contents []struct {
+			Text string `json:"text"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(result, &resourceResp); err != nil {
+		return nil, NewAPIError("resource://project", 0, err)
+	}
+	if len(resourceResp.Contents) == 0 {
+		return nil, NewAPIError("resource://project", 0, fmt.Errorf("%w: project %q", ErrNotFound, projectKey))
+	}
+
+	var project Project
+	if err := json.Unmarshal([]byte(resourceResp.Contents[0].Text), &project); err != nil {
+		return nil, NewAPIError("resource://project", 0, err)
+	}
+	return &project, nil
+}
+
 // RegisterAgent registers an agent in a project.
 func (c *Client) RegisterAgent(ctx context.Context, opts RegisterAgentOptions) (*Agent, error) {
 	args := map[string]interface{}{

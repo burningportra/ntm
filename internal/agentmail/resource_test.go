@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -122,6 +124,70 @@ func TestListProjectAgents(t *testing.T) {
 	}
 	if agents[0].Name != "Agent1" {
 		t.Errorf("expected agent 1 name 'Agent1', got %s", agents[0].Name)
+	}
+}
+
+// TestLookupProjectReadsWithoutCreating locks bd-5g66p: the lookup reads the
+// project resource and never calls ensure_project, and the real server's
+// "Project not found" answer for an unregistered directory maps to
+// ErrNotFound so read-only callers can skip it.
+func TestLookupProjectReadsWithoutCreating(t *testing.T) {
+	t.Parallel()
+
+	const registered = "/data/projects/ntm"
+	var (
+		mu   sync.Mutex
+		uris []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request: %v", err)
+			return
+		}
+		if req.Method != "resources/read" {
+			t.Errorf("method = %s, want resources/read only", req.Method)
+		}
+		params, _ := req.Params.(map[string]interface{})
+		uri, _ := params["uri"].(string)
+		mu.Lock()
+		uris = append(uris, uri)
+		mu.Unlock()
+
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		if uri == "resource://project/"+url.PathEscape(registered) {
+			resp["result"] = map[string]interface{}{
+				"contents": []map[string]interface{}{{
+					"uri":  uri,
+					"text": `{"id":7,"slug":"data-projects-ntm","human_key":"/data/projects/ntm","agents":[]}`,
+				}},
+			}
+		} else {
+			// What mcp_agent_mail_rust's resolve_existing_resource_project returns.
+			resp["error"] = map[string]interface{}{"code": -32602, "message": "Project not found"}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	project, err := c.LookupProject(context.Background(), registered)
+	if err != nil {
+		t.Fatalf("LookupProject(registered) error = %v", err)
+	}
+	if project.ID != 7 || project.HumanKey != registered {
+		t.Fatalf("LookupProject(registered) = %+v, want id 7 human_key %s", project, registered)
+	}
+
+	_, err = c.LookupProject(context.Background(), "/tmp/fresh-dir")
+	if !IsNotFound(err) {
+		t.Fatalf("LookupProject(unregistered) error = %v, want ErrNotFound", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(uris) != 2 {
+		t.Fatalf("requests = %v, want two resource reads", uris)
 	}
 }
 
