@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -547,7 +548,7 @@ func TestCollectCoordinationContinuesWhenAgentListingFails(t *testing.T) {
 	defer server.Close()
 
 	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
-	adapter := NewWorkCoordinationAdapter(WorkCoordinationAdapterConfig{
+	adapter := NewCoordinationAdapter(WorkCoordinationAdapterConfig{
 		ProjectDir:      projectDir,
 		AgentMailClient: client,
 	})
@@ -617,7 +618,7 @@ func TestCollectCoordinationPeeksAtInboxes(t *testing.T) {
 	}))
 	defer server.Close()
 
-	adapter := NewWorkCoordinationAdapter(WorkCoordinationAdapterConfig{
+	adapter := NewCoordinationAdapter(WorkCoordinationAdapterConfig{
 		ProjectDir:      t.TempDir(),
 		AgentMailClient: agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/")),
 	})
@@ -638,7 +639,7 @@ func TestCollectCoordinationPeeksAtInboxes(t *testing.T) {
 	}
 }
 
-func TestWorkCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *testing.T) {
+func TestCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *testing.T) {
 	requests := make(chan struct{}, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- struct{}{}
@@ -646,7 +647,7 @@ func TestWorkCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *te
 	}))
 	defer server.Close()
 
-	adapter := NewWorkCoordinationAdapter(WorkCoordinationAdapterConfig{
+	adapter := NewCoordinationAdapter(WorkCoordinationAdapterConfig{
 		ProjectDir:      t.TempDir(),
 		AgentMailClient: agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/")),
 	})
@@ -667,7 +668,7 @@ func TestWorkCoordinationAdapterAgentMailAvailabilityHonorsCanceledContext(t *te
 	}
 }
 
-func TestWorkCoordinationAdapterCollectCancelsBlockedBVWork(t *testing.T) {
+func TestWorkAdapterCollectCancelsBlockedBVWork(t *testing.T) {
 	projectDir := t.TempDir()
 	for _, name := range []string{".git", ".beads"} {
 		if err := os.Mkdir(filepath.Join(projectDir, name), 0o755); err != nil {
@@ -682,7 +683,7 @@ func TestWorkCoordinationAdapterCollectCancelsBlockedBVWork(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	adapter := NewWorkCoordinationAdapter(DefaultWorkCoordinationAdapterConfig(projectDir))
+	adapter := NewWorkAdapter(DefaultWorkCoordinationAdapterConfig(projectDir))
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -712,6 +713,229 @@ func TestWorkCoordinationAdapterCollectCancelsBlockedBVWork(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked BV collection did not join after cancellation")
+	}
+}
+
+// fakeBRScript answers the four br reads the work source makes.
+const fakeBRScript = `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    stats) echo '{"summary":{"total_issues":3,"open_issues":2,"in_progress_issues":1,"blocked_issues":1,"ready_issues":1,"closed_issues":0}}'; exit 0 ;;
+    ready) echo '[{"id":"bd-r","title":"Ready bead","priority":1}]'; exit 0 ;;
+    list) echo '[{"id":"bd-p","title":"Bead in progress","assignee":"BlueLake","updated_at":"2026-10-19T00:00:00Z"}]'; exit 0 ;;
+    blocked) echo '[{"id":"bd-b","title":"Blocked bead"}]'; exit 0 ;;
+  esac
+done
+exit 1
+`
+
+// installFakeBeadsTools puts fake br and bv scripts first on PATH and returns
+// a project directory with an empty .beads.
+func installFakeBeadsTools(t *testing.T, brScript, bvScript string) string {
+	t.Helper()
+	projectDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(projectDir, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	binDir := t.TempDir()
+	for name, script := range map[string]string{"br": brScript, "bv": bvScript} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o700); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return projectDir
+}
+
+// newFakeAgentMail serves one agent whose inbox holds an urgent unread message.
+func newFakeAgentMail(t *testing.T) *agentmail.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		switch req.Method {
+		case "ping":
+			writeJSONRPCResult(t, w, req.ID, map[string]any{})
+		case "resources/read":
+			uri, _ := params["uri"].(string)
+			text := "[]"
+			if strings.HasPrefix(uri, "resource://agents/") {
+				text = mustJSONText(t, []agentmail.Agent{{Name: "BlueLake"}})
+			}
+			writeJSONRPCResult(t, w, req.ID, map[string]any{"contents": []map[string]string{{"text": text}}})
+		case "tools/call":
+			writeJSONRPCResult(t, w, req.ID, []map[string]any{{
+				"id":         1,
+				"subject":    "Need review",
+				"from":       "GreenStone",
+				"importance": "urgent",
+				"created_ts": "2026-10-19T00:00:00Z",
+			}})
+		default:
+			t.Errorf("unexpected method %q", req.Method)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
+}
+
+// bd-jv2dq: work and coordination were one source, and the aggregator drops
+// the batch of a source whose Collect fails, so a slow br or bv also threw
+// away the coordination section Agent Mail had answered in time.
+func TestWorkAndCoordinationSourcesDegradeIndependently(t *testing.T) {
+	blocking := "#!/bin/sh\nexec /bin/sleep 30\n"
+	projectDir := installFakeBeadsTools(t, blocking, blocking)
+	config := DefaultWorkCoordinationAdapterConfig(projectDir)
+	config.AgentMailClient = newFakeAgentMail(t)
+
+	aggregator := NewSignalAggregator(0)
+	aggregator.RegisterAdapter(NewWorkAdapter(config))
+	aggregator.RegisterAdapter(NewCoordinationAdapter(config))
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	signals, err := aggregator.Collect(ctx)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("collection took %v with a 750ms budget", elapsed)
+	}
+
+	if signals.Coordination == nil || !signals.Coordination.Available || signals.Coordination.Mail == nil {
+		t.Fatalf("coordination = %+v, want the mail Agent Mail answered", signals.Coordination)
+	}
+	if got := signals.Coordination.Mail.UrgentUnread; got != 1 {
+		t.Fatalf("urgent unread = %d, want 1", got)
+	}
+	if source := signals.Health.Sources["coordination"]; !source.Available || source.Degraded {
+		t.Fatalf("coordination health = %+v, want available", source)
+	}
+	work := signals.Health.Sources["work"]
+	if work.Available || !work.Degraded || !strings.Contains(work.LastError, "deadline") {
+		t.Fatalf("work health = %+v, want degraded by the deadline", work)
+	}
+}
+
+// bd-jv2dq: triage took longer than the whole source budget, so the work
+// section was lost even though br had answered. Triage is enrichment: the
+// section now carries br's data and returns before the deadline.
+func TestWorkAdapterReturnsBRDataWhenTriageOverrunsTheBudget(t *testing.T) {
+	projectDir := installFakeBeadsTools(t, fakeBRScript, "#!/bin/sh\nexec /bin/sleep 30\n")
+
+	aggregator := NewSignalAggregator(0)
+	aggregator.RegisterAdapter(NewWorkAdapter(DefaultWorkCoordinationAdapterConfig(projectDir)))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	signals, err := aggregator.Collect(ctx)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("work collection ran into its deadline")
+	}
+
+	work := signals.Work
+	if work == nil || !work.Available || work.Summary == nil || work.Summary.Total != 3 {
+		t.Fatalf("work = %+v, want br's summary", work)
+	}
+	if work.Triage != nil {
+		t.Fatalf("triage = %+v, want none from a bv that never answered", work.Triage)
+	}
+	if len(work.Ready) != 1 || len(work.Blocked) != 1 || len(work.InProgress) != 1 {
+		t.Fatalf("work items ready=%v blocked=%v in_progress=%v, want one of each", work.Ready, work.Blocked, work.InProgress)
+	}
+	if source := signals.Health.Sources["work"]; !source.Available || source.Degraded {
+		t.Fatalf("work health = %+v, want available", source)
+	}
+}
+
+func TestWorkAdapterUsesTriageThatIsReadyInTime(t *testing.T) {
+	triage := `{"data_hash":"abc","triage":{"quick_ref":{"actionable_count":1},"recommendations":[{"id":"bd-r","title":"Ready bead","type":"task","priority":1,"score":0.5}]}}`
+	projectDir := installFakeBeadsTools(t, fakeBRScript, "#!/bin/sh\nprintf '%s\\n' '"+triage+"'\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	batch, err := NewWorkAdapter(DefaultWorkCoordinationAdapterConfig(projectDir)).Collect(ctx)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	work := batch.Work
+	if work == nil || work.Triage == nil || work.Triage.TopRecommendation == nil || work.Triage.TopRecommendation.ID != "bd-r" {
+		t.Fatalf("work = %+v, want bv's top recommendation", work)
+	}
+	if len(work.Ready) != 1 || work.Ready[0].Score == nil {
+		t.Fatalf("ready items = %+v, want the triage score on bd-r", work.Ready)
+	}
+}
+
+// bd-jv2dq: inboxes were read one at a time, 0.5-1.2 s each on the shared
+// server, so a few dozen agents never fit the source budget.
+func TestFetchInboxesReadsConcurrentlyWithinTheBound(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	markRead := map[string]any{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		args, _ := params["arguments"].(map[string]interface{})
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		agentName, _ := args["agent_name"].(string)
+		value, set := args["mark_read"]
+		if !set {
+			value = "<unset>"
+		}
+		markRead[agentName] = value
+		mu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		writeJSONRPCResult(t, w, req.ID, []any{})
+	}))
+	defer server.Close()
+
+	agents := []agentmail.Agent{{Name: "HumanOverseer"}}
+	for i := 0; i < 3*inboxFetchConcurrency; i++ {
+		agents = append(agents, agentmail.Agent{Name: "Agent" + strconv.Itoa(i)})
+	}
+	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
+	started := time.Now()
+	inboxes := fetchInboxes(context.Background(), client, "/data/projects/ntm", agents)
+	elapsed := time.Since(started)
+
+	if len(inboxes) != 3*inboxFetchConcurrency {
+		t.Fatalf("fetched %d inboxes, want %d", len(inboxes), 3*inboxFetchConcurrency)
+	}
+	if _, ok := inboxes["HumanOverseer"]; ok {
+		t.Fatal("fetched the HumanOverseer inbox")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if maxInFlight > inboxFetchConcurrency || maxInFlight < 2 {
+		t.Fatalf("max concurrent inbox reads = %d, want 2..%d", maxInFlight, inboxFetchConcurrency)
+	}
+	if serial := time.Duration(len(inboxes)) * 50 * time.Millisecond; elapsed >= serial {
+		t.Fatalf("fan-out took %v, no faster than reading serially (%v)", elapsed, serial)
+	}
+	for agent, value := range markRead {
+		if value != false {
+			t.Fatalf("fetch_inbox for %s sent mark_read=%v, want false", agent, value)
+		}
 	}
 }
 
@@ -874,11 +1098,23 @@ func TestComputeDegradedFeatures(t *testing.T) {
 			health: &SourceHealthSection{
 				AllFresh: false,
 				Sources: map[string]SourceInfo{
-					"work_coordination": {Available: false, Degraded: true},
+					"work": {Available: false, Degraded: true},
 				},
-				Degraded: []string{"work_coordination"},
+				Degraded: []string{"work"},
 			},
-			wantFeatures: 3, // work_section, coordination_section, bead_triage
+			wantFeatures: 2, // work_section, bead_triage
+		},
+		{
+			name: "work_and_coordination_degraded",
+			health: &SourceHealthSection{
+				AllFresh: false,
+				Sources: map[string]SourceInfo{
+					"work":         {Available: false, Degraded: true},
+					"coordination": {Available: false, Degraded: true},
+				},
+				Degraded: []string{"work", "coordination"},
+			},
+			wantFeatures: 3, // work_section, bead_triage, coordination_section
 		},
 		{
 			name: "multiple_degraded_sources",

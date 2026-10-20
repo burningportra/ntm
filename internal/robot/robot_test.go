@@ -7038,8 +7038,10 @@ func TestRefreshNormalizedProjectionBoundsSlowSources(t *testing.T) {
 		}
 	}
 	binDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(binDir, "bv"), []byte("#!/bin/sh\nexec /bin/sleep 30\n"), 0o700); err != nil {
-		t.Fatalf("write blocking bv: %v", err)
+	for _, tool := range []string{"bv", "br"} {
+		if err := os.WriteFile(filepath.Join(binDir, tool), []byte("#!/bin/sh\nexec /bin/sleep 30\n"), 0o700); err != nil {
+			t.Fatalf("write blocking %s: %v", tool, err)
+		}
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	closed := httptest.NewServer(http.NotFoundHandler())
@@ -7062,15 +7064,15 @@ func TestRefreshNormalizedProjectionBoundsSlowSources(t *testing.T) {
 		t.Fatalf("GetAllSourceHealth: %v", err)
 	}
 	for _, row := range rows {
-		if row.SourceName != "work_coordination" {
+		if row.SourceName != "work" {
 			continue
 		}
 		if row.Healthy || !strings.Contains(row.LastError, "deadline") {
-			t.Fatalf("work_coordination health = %+v, want unhealthy with the deadline as its error", row)
+			t.Fatalf("work health = %+v, want unhealthy with the deadline as its error", row)
 		}
 		return
 	}
-	t.Fatalf("refresh persisted no work_coordination health row: %+v", rows)
+	t.Fatalf("refresh persisted no work health row: %+v", rows)
 }
 
 // bd-izmjq: a refresh that timed out or failed to save left no fresh session

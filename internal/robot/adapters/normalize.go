@@ -248,12 +248,13 @@ func ComputeDegradedFeatures(health *SourceHealthSection) []DegradedFeature {
 
 	// Map sources to dependent features
 	featureDeps := map[string][]string{
-		"work_coordination": {"work_section", "coordination_section", "bead_triage"},
-		"tmux":              {"session_list", "agent_detection", "pane_output"},
-		"caut":              {"quota_status", "account_rotation"},
-		"beads":             {"work_section", "bead_triage", "dependency_graph"},
-		"mail":              {"coordination_section", "agent_mail_status"},
-		"alerts":            {"alerts_section", "incident_detection"},
+		"work":         {"work_section", "bead_triage"},
+		"coordination": {"coordination_section"},
+		"tmux":         {"session_list", "agent_detection", "pane_output"},
+		"caut":         {"quota_status", "account_rotation"},
+		"beads":        {"work_section", "bead_triage", "dependency_graph"},
+		"mail":         {"coordination_section", "agent_mail_status"},
+		"alerts":       {"alerts_section", "incident_detection"},
 	}
 
 	affectedFeatures := make(map[string][]string) // feature -> affected sources
@@ -699,9 +700,10 @@ func (a *SignalAggregator) Collect(ctx context.Context) (*AggregatedSignals, err
 
 	// Collect from all adapters in parallel, capturing results for health computation
 	type adapterOutcome struct {
-		adapter SignalAdapter
-		batch   *SignalBatch
-		err     error
+		adapter   SignalAdapter
+		batch     *SignalBatch
+		err       error
+		available bool
 	}
 
 	outcomes := make([]adapterOutcome, len(adapters))
@@ -712,7 +714,11 @@ func (a *SignalAggregator) Collect(ctx context.Context) (*AggregatedSignals, err
 		go func(idx int, ad SignalAdapter) {
 			defer wg.Done()
 			batch, err := ad.Collect(ctx)
-			outcomes[idx] = adapterOutcome{adapter: ad, batch: batch, err: err}
+			// Probe availability as soon as this adapter finishes, while ctx
+			// is still live: a slower adapter can run the shared ctx out, and
+			// a source that answered in time must not then read as
+			// unavailable (bd-jv2dq).
+			outcomes[idx] = adapterOutcome{adapter: ad, batch: batch, err: err, available: ad.Available(ctx)}
 		}(i, adapter)
 	}
 
@@ -726,7 +732,7 @@ func (a *SignalAggregator) Collect(ctx context.Context) (*AggregatedSignals, err
 		// Build health result
 		ar := AdapterResult{
 			Name:      outcome.adapter.Name(),
-			Available: outcome.adapter.Available(ctx),
+			Available: outcome.available,
 			Error:     outcome.err,
 			Batch:     outcome.batch,
 		}

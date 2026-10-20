@@ -2566,7 +2566,8 @@ func buildLiveStatus(projectDir string, cfg *config.Config, opts PaginationOptio
 	coordinationConfig := adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir)
 	coordinationConfig.AgentMailClient = newAgentMailClient(resolvedProjectDir)
 	aggregator := adapters.NewSignalAggregator(0)
-	aggregator.RegisterAdapter(adapters.NewWorkCoordinationAdapter(coordinationConfig))
+	aggregator.RegisterAdapter(adapters.NewWorkAdapter(coordinationConfig))
+	aggregator.RegisterAdapter(adapters.NewCoordinationAdapter(coordinationConfig))
 	collectCtx, cancel := context.WithTimeout(context.Background(), statusLiveCollectionLimit)
 	defer cancel()
 
@@ -7745,7 +7746,8 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 	adapterConfig := adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir)
 	adapterConfig.AgentMailClient = mailClient
 	aggregator := adapters.NewSignalAggregator(0)
-	aggregator.RegisterAdapter(adapters.NewWorkCoordinationAdapter(adapterConfig))
+	aggregator.RegisterAdapter(adapters.NewWorkAdapter(adapterConfig))
+	aggregator.RegisterAdapter(adapters.NewCoordinationAdapter(adapterConfig))
 
 	type collectedSignals struct {
 		signals *adapters.AggregatedSignals
