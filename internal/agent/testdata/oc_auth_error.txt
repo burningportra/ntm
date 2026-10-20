@@ -1,0 +1,30 @@
+   Stand-in title            Stand-in title            Stand-in title         +
+                                  ┃                                          ┃
+  ┃                               ┃  Session failed                       x  ┃
+  ┃  Context too long ERR400      ┃                                          ┃
+  ┃                               ┃  Incorrect API key provided: not-a-key.  ┃
+                                  ┃                                          ┃
+  ───────────────────── ✗ Compaction · 2.4K in · 160 out ─────────────────────
+
+     Compaction summary did not match the required template
+
+     Error: This model's maximum context length is 8192 tokens. However, your
+     messages resulted in 9001 tokens.
+
+     Build · Fake Model · 40.5s
+
+  ┃
+  ┃  Bad key ERR401
+  ┃
+
+     Error: Incorrect API key provided: not-a-key.
+
+     Build · Fake Model · 54ms
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Fake Model Standin
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  /…/c63d7fe8-3892-44…/scratchpad/bd-qbs61/ws:main  1.3K (1%)  ctrl+p commands
+

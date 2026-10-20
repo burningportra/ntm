@@ -324,6 +324,10 @@ func (p *parserImpl) detectRateLimit(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, windsurfRateLimitPatterns)
 	case AgentTypeAider:
 		return matchAny(recentOutput, aiderRateLimitPatterns)
+	case AgentTypeOpencode:
+		// Only the notice above the last turn counts: an earlier turn's
+		// quota error stays in the transcript after later turns succeed.
+		return OpencodeRateLimited(output)
 	case AgentTypeOllama:
 		return matchAny(recentOutput, ollamaRateLimitPatterns)
 	default:
@@ -506,6 +510,10 @@ func (p *parserImpl) detectError(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, windsurfErrorPatterns)
 	case AgentTypeAider:
 		return matchAny(recentOutput, aiderErrorPatterns)
+	case AgentTypeOpencode:
+		// The prompt box and its footer fill the last lines, so the error
+		// that ended a turn sits above them, out of recentOutput's reach.
+		return OpencodeErrorShowing(output)
 	case AgentTypeOllama:
 		return matchAny(recentOutput, ollamaErrorPatterns)
 	default:
@@ -547,6 +555,8 @@ func (p *parserImpl) collectLimitIndicators(output string, agentType AgentType) 
 		return collectMatches(recentOutput, windsurfRateLimitPatterns)
 	case AgentTypeAider:
 		return collectMatches(recentOutput, aiderRateLimitPatterns)
+	case AgentTypeOpencode:
+		return []string{"opencode_rate_limit_notice"}
 	case AgentTypeOllama:
 		return collectMatches(recentOutput, ollamaRateLimitPatterns)
 	default:

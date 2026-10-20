@@ -1093,8 +1093,25 @@ var (
 //
 // The hint reads "esc again to interrupt" after one esc and is cut to
 // "esc...upt" in a narrow pane, but the bar is drawn at every width. When
-// the turn ends the footer shows the cwd again. A question the agent asks
-// replaces the box and footer until it is answered.
+// the turn ends the footer shows the cwd again. A question the agent asks,
+// or a request for permission to run a tool, replaces the box and footer
+// until it is answered.
+//
+// The transcript ends each turn with a header naming the agent and model,
+// which gains the turn's duration and output rate when the turn ends. When a
+// request fails opencode draws a notice above that header. It retries rate
+// limits and server errors without end, warning while the turn runs:
+//
+//	⚠ Retrying in 8s · attempt 11 · Rate limit reached for fake-model in
+//	organization org-standin on requests per min (RPM): Limit 3, Used 3,
+//
+//	Build · Fake Model
+//
+// and any other error ends the turn, with no output rate in the header:
+//
+//	Error: Incorrect API key provided: not-a-key.
+//
+//	Build · Fake Model · 54ms
 const (
 	// OpencodeWorkingFooterPattern matches the prompt box's bottom edge with
 	// a live turn's progress bar on the footer line below it.
@@ -1122,6 +1139,19 @@ var (
 	// opencodeProgressBarRe matches the start of the footer line while a
 	// turn runs.
 	opencodeProgressBarRe = regexp.MustCompile(`^[ \t]*[⬝■]{3,}`)
+
+	// opencodeTurnHeaderRe matches a turn's header: the agent, then the
+	// model and, once the turn ends, its duration and output rate.
+	opencodeTurnHeaderRe = regexp.MustCompile(`^[^┃\s·]+ · \S`)
+
+	// opencodeRetryNoticeRe matches the warning shown while opencode waits
+	// to retry a failed request ("Retrying in 8s") or sends the retry
+	// ("Retry due"), and captures the provider's message.
+	opencodeRetryNoticeRe = regexp.MustCompile(`^⚠ Retry.*?\battempt \d+\s*·?\s*(.*)$`)
+
+	// opencodeRateLimitRe matches a provider's message for a rate limit or
+	// an exhausted quota.
+	opencodeRateLimitRe = regexp.MustCompile(`(?i)rate.?limit|too many requests|\b429\b|quota|usage limit|resource.?exhausted`)
 )
 
 // OpencodeActivelyWorking reports whether an opencode pane shows a live
@@ -1197,6 +1227,77 @@ func opencodeTurnShowing(lines []string, bottom int) bool {
 		}
 	}
 	return false
+}
+
+// OpencodeRateLimited reports whether an opencode pane's last turn is held
+// up by a rate limit or an exhausted quota: opencode is retrying a request
+// the provider refused for that, or the refusal ended the turn. The agent
+// parser's detectRateLimit calls it.
+func OpencodeRateLimited(output string) bool {
+	message, ok := opencodeFailureNotice(output)
+	return ok && opencodeRateLimitRe.MatchString(message)
+}
+
+// OpencodeErrorShowing reports whether an opencode pane's last turn failed
+// or is failing: opencode is retrying a failed request, or an error ended
+// the turn. Notices above earlier turns, and a retry warning left above a
+// reply that streamed once the retry went through, do not count. The agent
+// parser's detectError calls it.
+func OpencodeErrorShowing(output string) bool {
+	_, ok := opencodeFailureNotice(output)
+	return ok
+}
+
+// opencodeFailureNotice returns the provider's message from the notice
+// directly above the last turn's header, which sits directly above the
+// prompt box: a retry warning while the turn runs, or the error that ended
+// it. ok is false when the box is not drawn or no such notice shows.
+func opencodeFailureNotice(output string) (message string, ok bool) {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	bottom, found := opencodePromptBox(lines)
+	if !found {
+		return "", false
+	}
+	top := bottom
+	for top > 0 && strings.HasPrefix(strings.TrimSpace(lines[top-1]), "┃") {
+		top--
+	}
+	header, start := opencodeBlockAbove(lines, top)
+	notice, _ := opencodeBlockAbove(lines, start)
+	if !opencodeTurnHeaderRe.MatchString(header) {
+		return "", false
+	}
+	if opencodeTurnShowing(lines, bottom) {
+		if m := opencodeRetryNoticeRe.FindStringSubmatch(notice); m != nil {
+			return m[1], true
+		}
+		return "", false
+	}
+	// A reply's header ends with its output rate; a failed turn's does not,
+	// which keeps a reply whose last paragraph starts with "Error:" from
+	// reading as one.
+	if strings.Contains(header, "tok/s") {
+		return "", false
+	}
+	return strings.CutPrefix(notice, "Error: ")
+}
+
+// opencodeBlockAbove returns the run of non-blank lines nearest above line
+// end, trimmed and joined with spaces to undo the transcript's wrapping, and
+// the index of its first line.
+func opencodeBlockAbove(lines []string, end int) (text string, start int) {
+	for end > 0 && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	start = end
+	for start > 0 && strings.TrimSpace(lines[start-1]) != "" {
+		start--
+	}
+	parts := make([]string, 0, end-start)
+	for _, line := range lines[start:end] {
+		parts = append(parts, strings.TrimSpace(line))
+	}
+	return strings.Join(parts, " "), start
 }
 
 // claudeLiveTailLines bounds the live-tail window scanned for Claude

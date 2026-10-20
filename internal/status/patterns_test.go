@@ -68,6 +68,10 @@ func TestIsPromptLine(t *testing.T) {
 		// Shell prompts should NOT match for known agent types - a shell $ in cod/cc/gmi means agent exited
 		{name: "shell prompt for codex means exited", line: "user@host:~$", agentType: "cod", expected: false},
 		{name: "shell prompt for codex alias means exited", line: "user@host:~$", agentType: "codex", expected: false},
+		// opencode draws no shell-like prompt, so a $ prompt in its pane
+		// means it exited (bd-q9cli).
+		{name: "shell prompt for opencode means exited", line: "user@host:~$", agentType: "oc", expected: false},
+		{name: "shell prompt for opencode alias means exited", line: "$", agentType: "opencode", expected: false},
 
 		// Gemini prompts
 		{name: "gemini prompt", line: "gemini>", agentType: "gmi", expected: true},

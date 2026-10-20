@@ -1,0 +1,24 @@
+‹1    Stand-in  ! Stand-in title      +
+ ┃  TOOLSECS=5
+ ┃
+
+    Running a slow command first.
+
+ ┃
+ ┃  ⠇ sleep 5 && echo slept
+ ┃
+
+    Press ctrl+b to move running work
+    to the background
+
+ ┃
+ ┃  △ Permission required
+ ┃
+ ┃  $ sleep 5 && echo slept
+ ┃
+ ┃
+ ┃   Allow once   Always allow   Reject
+ ┃
+ ┃  ctrl+f fullscreen  ⇆ select  enter c
+ ┃
+

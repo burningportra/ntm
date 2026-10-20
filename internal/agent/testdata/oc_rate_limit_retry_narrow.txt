@@ -1,0 +1,24 @@
+‹1    Stand-in  ⠋ Stand-in title      +
+    Build · Fake Model · 37.8s · 7.5
+    tok/s
+
+ ┃
+ ┃  Hello there RATE429
+ ┃
+
+    ⚠ Retrying in 6s · attempt 11 ·
+    Rate limit reached for fake-model
+    in organization org-standin on
+    requests per min (RPM): Limit 3,
+    Used 3, Requested 1. Please try
+    again in 20s.
+
+    Build · Fake Model
+
+ ┃
+ ┃
+ ┃
+ ┃ Fake Model
+ ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  ⬝■■■■■■⬝ esc interrupt      1.3K (1%)
+

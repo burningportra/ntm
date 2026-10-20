@@ -1042,12 +1042,16 @@ func TestParser_Parse_PiStates(t *testing.T) {
 // opencodeCaptures are opencode 2.0.28 screens captured with tmux
 // capture-pane -p in testdata/oc_*.txt (bd-qbs61). opencode ran with its HOME
 // and XDG directories in a scratch dir, and its only provider was a local
-// stand-in on 127.0.0.1 that streamed slow replies and made the tool calls.
+// stand-in on 127.0.0.1 that streamed slow replies and made the tool calls,
+// and for the failure screens (bd-q9cli) answered with 429s, 5xx and other
+// errors on cue.
 var opencodeCaptures = []struct {
-	file    string
-	desc    string
-	working bool
-	idle    bool
+	file        string
+	desc        string
+	working     bool
+	idle        bool
+	rateLimited bool
+	inError     bool
 }{
 	{file: "oc_idle_fresh.txt", desc: "home screen, 100 columns", idle: true},
 	{file: "oc_idle_fresh_narrow.txt", desc: "home screen with a session tab, 40 columns", idle: true},
@@ -1065,6 +1069,23 @@ var opencodeCaptures = []struct {
 	// Captured with capture-pane -p -e, as tmux.CapturePaneVisible does.
 	{file: "oc_idle_styled.txt", desc: "after a streamed reply, with colors, 40 columns", idle: true},
 	{file: "oc_working_styled.txt", desc: "shell tool running, with colors, 100 columns", working: true},
+	// Failure screens (bd-q9cli). opencode retries 429s and 5xx itself,
+	// showing a warning above the turn's header while the turn runs; other
+	// errors end the turn with an "Error:" line above its footer.
+	{file: "oc_rate_limit_retry.txt", desc: "429 retried at attempt 11, 80 columns", rateLimited: true, inError: true},
+	{file: "oc_rate_limit_retry_narrow.txt", desc: "429 retried at attempt 11, 40 columns", rateLimited: true, inError: true},
+	{file: "oc_rate_limit_retry_styled.txt", desc: "429 retried, with colors, 80 columns", rateLimited: true, inError: true},
+	{file: "oc_quota_error.txt", desc: "insufficient_quota 429 ended the turn, with a toast, 80 columns", rateLimited: true, inError: true},
+	{file: "oc_server_error_retry.txt", desc: "500 retried at attempt 10 below a stale error, 80 columns", working: true, inError: true},
+	{file: "oc_auth_error.txt", desc: "401 ended the turn, with a toast, 80 columns", idle: true, inError: true},
+	{file: "oc_context_error.txt", desc: "context overflow ended the turn after a failed compaction, 80 columns", idle: true, inError: true},
+	{file: "oc_context_error_styled.txt", desc: "context overflow, with colors, 80 columns", idle: true, inError: true},
+	{file: "oc_compacting.txt", desc: "compaction after a context overflow, 80 columns", working: true},
+	{file: "oc_working_after_retry.txt", desc: "reply streaming after a retried stream error, 80 columns", working: true},
+	{file: "oc_idle_after_errors.txt", desc: "after a reply, below a stale quota error and retry warning, 80 columns", idle: true},
+	{file: "oc_idle_retry_interrupted.txt", desc: "429 retry interrupted with esc, 80 columns", idle: true},
+	{file: "oc_permission.txt", desc: "permission request replaces the prompt box, 80 columns"},
+	{file: "oc_permission_narrow.txt", desc: "permission request replaces the prompt box, 40 columns"},
 }
 
 // TestParser_Parse_OpencodeCaptures is the bd-qbs61 regression: the parser
@@ -1090,8 +1111,23 @@ func TestParser_Parse_OpencodeCaptures(t *testing.T) {
 					t.Errorf("hint %q (%s): IsWorking = %v, IsIdle = %v, want %v, %v (indicators %v)",
 						hint, tc.desc, state.IsWorking, state.IsIdle, tc.working, tc.idle, state.WorkIndicators)
 				}
-				if state.IsRateLimited || state.IsInError {
-					t.Errorf("hint %q: IsRateLimited = %v, IsInError = %v, want both false", hint, state.IsRateLimited, state.IsInError)
+				if state.IsRateLimited != tc.rateLimited || state.IsInError != tc.inError {
+					t.Errorf("hint %q (%s): IsRateLimited = %v, IsInError = %v, want %v, %v",
+						hint, tc.desc, state.IsRateLimited, state.IsInError, tc.rateLimited, tc.inError)
+				}
+				if tc.rateLimited && len(state.LimitIndicators) == 0 {
+					t.Errorf("hint %q: rate limited with no LimitIndicators", hint)
+				}
+				if shared := OpencodeRateLimited(output); state.IsRateLimited != shared {
+					t.Errorf("hint %q: IsRateLimited = %v but OpencodeRateLimited = %v", hint, state.IsRateLimited, shared)
+				}
+				if shared := OpencodeErrorShowing(output); state.IsInError != shared {
+					t.Errorf("hint %q: IsInError = %v but OpencodeErrorShowing = %v", hint, state.IsInError, shared)
+				}
+				if tc.rateLimited {
+					// A rate-limited pane is blocked: the parser clears the
+					// idle and working flags the screen would otherwise give.
+					continue
 				}
 				if shared := OpencodeIdlePromptShowing(output); state.IsIdle != shared {
 					t.Errorf("hint %q: IsIdle = %v but OpencodeIdlePromptShowing = %v", hint, state.IsIdle, shared)
@@ -1179,6 +1215,78 @@ func TestOpencodeRecognizers(t *testing.T) {
 			}
 			if got := workingPattern.MatchString(tt.output); got != tt.wantWorking {
 				t.Errorf("OpencodeWorkingFooterPattern match = %v, want %v", got, tt.wantWorking)
+			}
+		})
+	}
+}
+
+func TestOpencodeFailureNotices(t *testing.T) {
+	t.Parallel()
+
+	idle := loadTestData(t, "oc_idle.txt")
+	retry := loadTestData(t, "oc_rate_limit_retry.txt")
+	authError := loadTestData(t, "oc_auth_error.txt")
+	const replyFooter = "     Build · Fake Model · 30.3s · 2.6 tok/s"
+	const rateLimitMessage = "Rate limit reached for fake-model in\n     organization org-standin on requests per min (RPM): Limit 3, Used 3,\n     Requested 1. Please try again in 20s."
+	replace := func(s, old, new string) string {
+		t.Helper()
+		if !strings.Contains(s, old) {
+			t.Fatalf("fixture does not contain %q", old)
+		}
+		return strings.Replace(s, old, new, 1)
+	}
+
+	tests := []struct {
+		name            string
+		output          string
+		wantRateLimited bool
+		wantError       bool
+	}{
+		{name: "idle", output: idle},
+		{
+			// A reply's footer shows its output rate; an errored turn's
+			// shows only how long it ran.
+			name:   "reply whose last paragraph starts with Error:",
+			output: replace(idle, replyFooter, "     Error: the build is broken.\n\n"+replyFooter),
+		},
+		{
+			name:      "error with a draft in the prompt box",
+			output:    replace(authError, "  ┃\n  ┃\n  ┃\n  ┃  Build · Fake Model Standin", "  ┃\n  ┃  try again\n  ┃\n  ┃  Build · Fake Model Standin"),
+			wantError: true,
+		},
+		{
+			name:            "retry for Too Many Requests",
+			output:          replace(retry, rateLimitMessage, "Too Many Requests"),
+			wantRateLimited: true,
+			wantError:       true,
+		},
+		{
+			name:      "retry for an overloaded server",
+			output:    replace(retry, rateLimitMessage, "Overloaded"),
+			wantError: true,
+		},
+		{
+			name:   "rate-limit warning quoted in a reply",
+			output: replace(idle, replyFooter, "     ⚠ Retrying in 8s · attempt 11 · Rate limit reached\n\n"+replyFooter),
+		},
+		{
+			// The retry warning goes once the request is retried, so a
+			// warning left above a finished turn is not a failure.
+			name:   "retry warning above a finished turn",
+			output: replace(retry, "   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt", "  /…/ws:main"),
+		},
+		{name: "permission request", output: loadTestData(t, "oc_permission.txt")},
+		{name: "shell prompt", output: "$ curl api\nError: 429 Too Many Requests\n$ "},
+		{name: "empty output", output: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := OpencodeRateLimited(tt.output); got != tt.wantRateLimited {
+				t.Errorf("OpencodeRateLimited() = %v, want %v", got, tt.wantRateLimited)
+			}
+			if got := OpencodeErrorShowing(tt.output); got != tt.wantError {
+				t.Errorf("OpencodeErrorShowing() = %v, want %v", got, tt.wantError)
 			}
 		})
 	}

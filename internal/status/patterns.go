@@ -140,6 +140,7 @@ var knownAgentTypes = map[string]bool{
 	"cc":       true, // Claude Code uses "claude>" or ">" prompts
 	"cod":      true, // Codex uses "codex>" prompt
 	"gmi":      true, // Gemini uses "gemini>" prompt
+	"oc":       true, // opencode's prompt is a box, matched by agent.OpencodeIdlePromptShowing
 	"cursor":   true,
 	"windsurf": true,
 	"aider":    true,

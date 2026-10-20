@@ -1,0 +1,30 @@
+   Stand-in title            Stand-in title            Stand-in title         +
+                  ┃                                                          ┃
+  ┃               ┃  Session failed                                       x  ┃
+  ┃  Bad key ERR40┃                                                          ┃
+  ┃               ┃  You exceeded your current quota, please check your      ┃
+                  ┃  plan and billing details.                               ┃
+     Error: Incorr┃                                                          ┃
+
+     Build · Fake Model · 54ms
+
+  ┃
+  ┃  Server down ERR500
+  ┃
+
+  ┃
+  ┃  Out of credit QUOTA429
+  ┃
+
+     Error: You exceeded your current quota, please check your plan and
+     billing details.
+
+     Build · Fake Model · 38ms
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Fake Model Standin
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  /…/c63d7fe8-3892-44…/scratchpad/bd-qbs61/ws:main  1.3K (1%)  ctrl+p commands
+
