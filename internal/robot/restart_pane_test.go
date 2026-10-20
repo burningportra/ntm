@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 func TestRestartPaneBeadPromptTemplate(t *testing.T) {
@@ -748,7 +749,7 @@ func TestRespawnRestartPaneTargetsRejectsGrokBatchBeforeMutation(t *testing.T) {
 				tt.targets,
 				false,
 				output,
-				func(context.Context, string, bool) error {
+				func(context.Context, string) error {
 					mutations++
 					return nil
 				},
@@ -784,10 +785,10 @@ func TestRespawnRestartPaneTargetsContextStopsAfterCancellation(t *testing.T) {
 		targets,
 		false,
 		output,
-		func(gotCtx context.Context, target string, kill bool) error {
+		func(gotCtx context.Context, target string) error {
 			calls++
-			if gotCtx != ctx || target != "%1" || !kill {
-				t.Fatalf("first respawn call context=%v target=%q kill=%t", gotCtx, target, kill)
+			if gotCtx != ctx || target != "%1" {
+				t.Fatalf("first respawn call context=%v target=%q", gotCtx, target)
 			}
 			cancel()
 			return nil
@@ -840,9 +841,9 @@ func TestRespawnRestartPaneTargetsContextReportsMutationWhenCommandReturnsCancel
 		targets,
 		false,
 		output,
-		func(gotCtx context.Context, target string, kill bool) error {
-			if gotCtx != ctx || target != "%1" || !kill {
-				t.Fatalf("respawn context=%v target=%q kill=%t", gotCtx, target, kill)
+		func(gotCtx context.Context, target string) error {
+			if gotCtx != ctx || target != "%1" {
+				t.Fatalf("respawn context=%v target=%q", gotCtx, target)
 			}
 			cancel()
 			return context.Canceled
@@ -1885,6 +1886,114 @@ func TestParseRestartLaunchOverride(t *testing.T) {
 	}
 }
 
+// TestValidateRestartOverrideModel covers bd-a9j2o: --restart-model gets the
+// model and effort checks spawn applies (bd-i2pkl), so a typo is rejected
+// before any respawn instead of relaunching an agent that dies at start.
+func TestValidateRestartOverrideModel(t *testing.T) {
+	cfg := config.Default()
+	tests := []struct {
+		name         string
+		cfg          *config.Config
+		resolvedType string
+		model        string
+		wantErr      string
+	}{
+		{name: "unknown claude model", cfg: cfg, resolvedType: "claude", model: "bogusalias", wantErr: "bogusalias"},
+		{name: "misspelled codex effort", cfg: cfg, resolvedType: "codex", model: "gpt-5.5@hgih", wantErr: `did you mean "high"`},
+		{name: "claude effort codex only has", cfg: cfg, resolvedType: "claude", model: "opus@ultra", wantErr: "ultra"},
+		{name: "unknown muse model", cfg: cfg, resolvedType: "muse", model: "wonder-typo@max", wantErr: "wonder-typo"},
+		{name: "codex id and effort", cfg: cfg, resolvedType: "codex", model: "gpt-5.6-terra@high"},
+		{name: "claude alias and effort", cfg: cfg, resolvedType: "claude", model: "opus@max"},
+		{name: "full claude id", cfg: cfg, resolvedType: "claude", model: "claude-opus-4-1"},
+		{name: "muse id and effort", cfg: cfg, resolvedType: "muse", model: "muse-wonder-full-1.0@max"},
+		{name: "gemini id", cfg: cfg, resolvedType: "gemini", model: "gemini-pro"},
+		{name: "pi stays open", cfg: cfg, resolvedType: "pi", model: "anything-goes"},
+		{name: "kimi stays open", cfg: cfg, resolvedType: "kimi", model: "kimi-k2-0905"},
+		{name: "no config still checks the effort", resolvedType: "codex", model: "gpt-5.5@hgih", wantErr: "hgih"},
+		{name: "no config skips the model check", resolvedType: "claude", model: "bogusalias"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			override, err := parseRestartLaunchOverride(tt.model, "")
+			if err != nil {
+				t.Fatalf("parseRestartLaunchOverride(%q) error = %v", tt.model, err)
+			}
+			err = validateRestartOverrideModel(tt.cfg, tt.resolvedType, override)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateRestartOverrideModel(%s, %q) error = %v, want nil", tt.resolvedType, tt.model, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateRestartOverrideModel(%s, %q) error = %v, want one mentioning %q", tt.resolvedType, tt.model, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRestartPaneRejectsUnknownRestartModelBeforeRespawn runs the bd-a9j2o
+// checks through GetRestartPaneContext against a real pane. A dry run returns
+// right before the first respawn, so an INVALID_FLAG here proves the check
+// runs before any pane is touched, and a valid override still reaches it.
+func TestRestartPaneRejectsUnknownRestartModelBeforeRespawn(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	session := fmt.Sprintf("ntm-restart-model-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(session, t.TempDir()); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+	panes, err := tmux.GetPanes(session)
+	if err != nil || len(panes) != 1 {
+		t.Fatalf("GetPanes() = %v, %v; want one pane", panes, err)
+	}
+	if err := tmux.SetPaneTitle(panes[0].ID, tmux.FormatPaneName(session, "cod", 1, "")); err != nil {
+		t.Fatalf("title the pane as codex: %v", err)
+	}
+	pidBefore, err := paneShellPIDContext(t.Context(), panes[0].ID)
+	if err != nil {
+		t.Fatalf("read pane PID: %v", err)
+	}
+
+	for _, tc := range []struct {
+		model   string
+		wantErr string
+	}{
+		{model: "bogusalias", wantErr: "bogusalias"},
+		{model: "gpt-5.5@hgih", wantErr: "hgih"},
+		{model: "gpt-5.6-terra@high"},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			out, err := GetRestartPaneContext(t.Context(), RestartPaneOptions{
+				Session: session,
+				Panes:   []string{panes[0].ID},
+				DryRun:  true,
+				Model:   tc.model,
+				Config:  config.Default(),
+			})
+			if err != nil {
+				t.Fatalf("GetRestartPaneContext() error = %v", err)
+			}
+			if tc.wantErr == "" {
+				if !out.Success || !out.DryRun || len(out.WouldAffect) != 1 {
+					t.Fatalf("valid --restart-model=%s: success=%v dry_run=%v would_affect=%v error=%q, want a dry run of the pane", tc.model, out.Success, out.DryRun, out.WouldAffect, out.Error)
+				}
+				return
+			}
+			if out.Success || out.ErrorCode != ErrCodeInvalidFlag || !strings.Contains(out.Error, tc.wantErr) {
+				t.Fatalf("--restart-model=%s: success=%v code=%q error=%q, want INVALID_FLAG naming %q", tc.model, out.Success, out.ErrorCode, out.Error, tc.wantErr)
+			}
+			if out.DryRun || len(out.WouldAffect) != 0 || len(out.Restarted) != 0 {
+				t.Fatalf("--restart-model=%s got past validation: dry_run=%v would_affect=%v restarted=%v", tc.model, out.DryRun, out.WouldAffect, out.Restarted)
+			}
+		})
+	}
+	if pidAfter, err := paneShellPIDContext(t.Context(), panes[0].ID); err != nil || pidAfter != pidBefore {
+		t.Fatalf("pane PID went from %d to %d (err %v); validation must not touch the pane", pidBefore, pidAfter, err)
+	}
+}
+
 // Respawn PID evidence + soft-restart detection (ntm-tgkb): a "successful"
 // respawn whose shell PID did not change was NOT a restart; it must be
 // reported as a failure with the PID evidence instead of counted restarted.
@@ -1904,10 +2013,7 @@ func TestRespawnRecordsPIDEvidenceAndDetectsSoftRestart(t *testing.T) {
 		targets,
 		false,
 		output,
-		func(_ context.Context, target string, kill bool) error {
-			if !kill {
-				t.Fatalf("respawn without kill for %s", target)
-			}
+		func(context.Context, string) error {
 			return nil
 		},
 		func(_ context.Context, target string) (int, error) {

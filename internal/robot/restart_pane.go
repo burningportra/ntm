@@ -60,10 +60,10 @@ type RestartPaneOutput struct {
 	AssignmentReplayed  bool                                   `json:"assignment_replayed,omitempty"`
 	AssignmentRecovered bool                                   `json:"assignment_recovered,omitempty"`
 	// AgentRelaunched reports, per agent pane, whether the agent CLI was
-	// relaunched after respawn and became ready. respawn-pane -k only restores
-	// the pane's default command (the login shell); in ntm sessions the agent
-	// CLI is started by keystroke after spawn, so it must be relaunched
-	// explicitly (#187). User/unknown panes are not included.
+	// relaunched after respawn and became ready. The respawn restarts the
+	// pane in its shell; in ntm sessions the agent CLI is started by keystroke
+	// after spawn, so it must be relaunched explicitly (#187). User/unknown
+	// panes are not included.
 	AgentRelaunched     map[string]bool                       `json:"agent_relaunched,omitempty"`
 	AgentRelaunchStatus map[string]RestartAgentRelaunchStatus `json:"agent_relaunch_status,omitempty"`
 
@@ -188,6 +188,31 @@ func parseRestartLaunchOverride(model, args string) (restartLaunchOverride, erro
 	}
 	override.Model = value
 	return override, nil
+}
+
+// validateRestartOverrideModel applies spawn's model and effort checks
+// (bd-i2pkl) to a --restart-model override for one target pane's agent type,
+// so --restart-model=bogusalias or gpt-5.5@hgih fails before any pane is
+// respawned instead of relaunching an agent that dies at start (bd-a9j2o).
+// Types those checks leave open (pi, kimi, agy, grok, ...) stay open here.
+func validateRestartOverrideModel(cfg *config.Config, resolvedType string, override restartLaunchOverride) error {
+	if err := config.ValidateReasoningEffort(resolvedType, override.Effort); err != nil {
+		return err
+	}
+	if cfg == nil {
+		return nil
+	}
+	return cfg.Models.ValidateModel(resolvedType, override.Model)
+}
+
+// loadRestartPaneConfig loads the merged config that relaunch commands and
+// model aliases come from when the caller supplied none.
+func loadRestartPaneConfig() *config.Config {
+	cfg, err := config.LoadMerged(mustGetwd(), config.DefaultPath())
+	if err != nil {
+		return config.Default()
+	}
+	return cfg
 }
 
 // restartOverrideAppendFlags composes the per-agent-type flags that carry a
@@ -400,6 +425,10 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 		return output, nil
 	}
 	if !launchOverride.empty() {
+		modelsCfg := opts.Config
+		if modelsCfg == nil && (launchOverride.Model != "" || launchOverride.Effort != "") {
+			modelsCfg = loadRestartPaneConfig()
+		}
 		for _, pane := range targetPanes {
 			resolvedType := restartPaneAgentType(pane)
 			if !restartTargetIsAgent(resolvedType) {
@@ -412,6 +441,14 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 			}
 			if _, err := restartOverrideAppendFlags(resolvedType, launchOverride, true, true); err != nil {
 				output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Use --restart-model only with claude, codex, gemini, muse, pi, or kimi panes")
+				return output, nil
+			}
+			if err := validateRestartOverrideModel(modelsCfg, resolvedType, launchOverride); err != nil {
+				output.RobotResponse = NewErrorResponse(
+					fmt.Errorf("--restart-model=%s for pane %s (%s): %w", strings.TrimSpace(opts.Model), paneTargetKey(pane, multiWindow), resolvedType, err),
+					ErrCodeInvalidFlag,
+					"Use a model alias from [models] or a full model id, and an effort the agent accepts, e.g. --restart-model=gpt-5.6-terra@high",
+				)
 				return output, nil
 			}
 		}
@@ -469,7 +506,7 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 		targetPanes,
 		multiWindow,
 		output,
-		tmux.RespawnPaneContext,
+		tmux.RespawnPaneShellContext,
 		paneShellPIDContext,
 	)
 	if err != nil {
@@ -481,10 +518,11 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 		return output, nil
 	}
 
-	// Relaunch agent CLIs in respawned agent panes (#187). respawn-pane -k
-	// only restores the pane's default command — the login shell. In ntm
-	// sessions the agent CLI is launched by keystroke after spawn, so without
-	// an explicit relaunch the pane is left at a bare shell and any restart
+	// Relaunch agent CLIs in respawned agent panes (#187). The respawn leaves
+	// each pane at the shell a new pane starts with, even when checkpoint
+	// restore started the pane as the agent itself (bd-dehqt). In ntm sessions
+	// the agent CLI is launched by keystroke after spawn, so without an
+	// explicit relaunch the pane is left at a bare shell and any restart
 	// prompt would be typed into zsh instead of an agent.
 	agentPaneReady := make(map[string]bool, len(output.Restarted))
 	if len(output.Restarted) > 0 {
@@ -493,11 +531,7 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 			cfg = beadPreflight.Policy
 		}
 		if cfg == nil {
-			var cfgErr error
-			cfg, cfgErr = config.LoadMerged(mustGetwd(), config.DefaultPath())
-			if cfgErr != nil {
-				cfg = config.Default()
-			}
+			cfg = loadRestartPaneConfig()
 		}
 
 		// Let fresh shells initialize before typing into them.
@@ -1251,7 +1285,7 @@ func respawnRestartPaneTargetsContext(
 	targets []tmux.Pane,
 	multiWindow bool,
 	output *RestartPaneOutput,
-	respawn func(context.Context, string, bool) error,
+	respawn func(context.Context, string) error,
 	panePID func(context.Context, string) (int, error),
 ) (map[string]restartPromptTarget, error) {
 	if ctx == nil {
@@ -1294,7 +1328,7 @@ func respawnRestartPaneTargetsContext(
 			}
 			continue
 		}
-		if err := respawn(ctx, pane.ID, true); err != nil {
+		if err := respawn(ctx, pane.ID); err != nil {
 			if cancelErr := restartPaneCancellationError(ctx, err); cancelErr != nil {
 				afterPID, observationErr := observeRestartPanePIDAfterCancellation(ctx, pane.ID, panePID)
 				if observationErr == nil && afterPID > 0 && afterPID != beforePID {

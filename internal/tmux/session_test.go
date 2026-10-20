@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -3375,6 +3376,82 @@ func TestCircuitBreakerClosesAfterSuccessfulProbe(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		if err := c.cbCheck(); err != nil {
 			t.Fatalf("call %d rejected after a successful probe: %v", i, err)
+		}
+	}
+}
+
+func TestNewPaneShellCommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		defaultShell   string
+		defaultCommand string
+		want           []string
+	}{
+		{name: "login shell", defaultShell: "/bin/zsh", want: []string{"/bin/zsh", "-l"}},
+		{name: "trims the shell", defaultShell: " /usr/local/bin/fish \n", want: []string{"/usr/local/bin/fish", "-l"}},
+		{name: "unreadable shell falls back to sh", want: []string{"/bin/sh", "-l"}},
+		{name: "default-command wins as one argument", defaultShell: "/bin/zsh", defaultCommand: "reattach-to-user-namespace -l zsh", want: []string{"reattach-to-user-namespace -l zsh"}},
+		{name: "blank default-command is unset", defaultShell: "/bin/bash", defaultCommand: "  ", want: []string{"/bin/bash", "-l"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := newPaneShellCommand(tt.defaultShell, tt.defaultCommand); !slices.Equal(got, tt.want) {
+				t.Fatalf("newPaneShellCommand(%q, %q) = %q, want %q", tt.defaultShell, tt.defaultCommand, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRespawnPaneShellContextLeavesRestoredAgentPaneAtShell covers bd-dehqt.
+// Checkpoint restore starts an agent pane with `respawn-pane -k <agent
+// command>`, which makes the agent the pane's start command. A bare
+// respawn-pane -k re-ran that agent, so restart typed the relaunch command
+// into the agent; the pane must come back at its shell instead, every time.
+func TestRespawnPaneShellContextLeavesRestoredAgentPaneAtShell(t *testing.T) {
+	session := createTestSession(t)
+	paneID, err := DefaultClient.Run("display-message", "-p", "-t", session, "#{pane_id}")
+	if err != nil {
+		t.Fatalf("read pane id: %v", err)
+	}
+	defaultShell, err := DefaultClient.Run("display-message", "-p", "-t", paneID, "#{default-shell}")
+	if err != nil || strings.TrimSpace(defaultShell) == "" {
+		t.Fatalf("read default-shell = %q, %v", defaultShell, err)
+	}
+	shellName := filepath.Base(strings.TrimSpace(defaultShell))
+
+	paneState := func() (command, start string) {
+		out, err := DefaultClient.Run("display-message", "-p", "-t", paneID, "#{pane_current_command}\t#{pane_start_command}")
+		if err != nil {
+			t.Fatalf("read pane state: %v", err)
+		}
+		command, start, _ = strings.Cut(out, "\t")
+		return command, start
+	}
+	waitForCommand := func(want string) (string, string) {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			command, start := paneState()
+			if command == want || time.Now().After(deadline) {
+				return command, start
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	if err := DefaultClient.RunSilent("respawn-pane", "-k", "-t", paneID, "sh -c 'exec cat'"); err != nil {
+		t.Fatalf("start the pane as an agent the way checkpoint restore does: %v", err)
+	}
+	if command, _ := waitForCommand("cat"); command != "cat" {
+		t.Fatalf("restored pane runs %q, want the cat stand-in agent", command)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := RespawnPaneShellContext(context.Background(), paneID); err != nil {
+			t.Fatalf("restart %d: RespawnPaneShellContext() error = %v", attempt, err)
+		}
+		command, start := waitForCommand(shellName)
+		if command != shellName || strings.Contains(start, "cat") {
+			t.Fatalf("restart %d left the pane running %q (start command %q), want the %s shell", attempt, command, start, shellName)
 		}
 	}
 }

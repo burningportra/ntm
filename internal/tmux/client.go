@@ -523,28 +523,46 @@ func (c *Client) IsInstalled() bool {
 	return err == nil
 }
 
-// RespawnPane respawns a pane, optionally killing the current process (-k)
-func (c *Client) RespawnPane(target string, kill bool) error {
-	return c.RespawnPaneContext(context.Background(), target, kill)
-}
-
-// RespawnPaneContext respawns a pane with cancellation support
-func (c *Client) RespawnPaneContext(ctx context.Context, target string, kill bool) error {
-	args := []string{"respawn-pane", "-t", target}
-	if kill {
-		args = append(args, "-k")
+// RespawnPaneShellContext kills the pane's process (respawn-pane -k) and
+// restarts the pane in the shell a new pane starts with. A bare respawn-pane
+// re-runs the pane's start command instead, so a pane that checkpoint restore
+// started with `respawn-pane -k <agent command>` came back as the agent, and a
+// caller typing the relaunch command typed it into the agent (bd-dehqt).
+func (c *Client) RespawnPaneShellContext(ctx context.Context, target string) error {
+	defaultShell, err := c.RunContext(ctx, "display-message", "-p", "-t", target, "#{default-shell}")
+	if err != nil {
+		return fmt.Errorf("read default-shell for pane %s: %w", target, err)
 	}
+	defaultCommand, err := c.RunContext(ctx, "display-message", "-p", "-t", target, "#{default-command}")
+	if err != nil {
+		return fmt.Errorf("read default-command for pane %s: %w", target, err)
+	}
+	args := append([]string{"respawn-pane", "-k", "-t", target}, newPaneShellCommand(defaultShell, defaultCommand)...)
 	return c.RunSilentContext(ctx, args...)
 }
 
-// RespawnPane respawns a pane, optionally killing the current process (-k) (default client)
-func RespawnPane(target string, kill bool) error {
-	return DefaultClient.RespawnPane(target, kill)
+// RespawnPaneShellContext restarts a pane in its shell (default client).
+func RespawnPaneShellContext(ctx context.Context, target string) error {
+	return DefaultClient.RespawnPaneShellContext(ctx, target)
 }
 
-// RespawnPaneContext respawns a pane with cancellation support (default client)
-func RespawnPaneContext(ctx context.Context, target string, kill bool) error {
-	return DefaultClient.RespawnPaneContext(ctx, target, kill)
+// newPaneShellCommand returns the respawn-pane command for what tmux runs in
+// a pane created without a command, as ntm's new-session and split-window
+// create them. With default-command set, tmux runs it through the shell's -c,
+// which a single argument also gets. Otherwise tmux starts default-shell as a
+// login shell (argv[0] "-zsh"), and since respawn-pane execs a command given
+// as several arguments directly, "<shell> -l" starts the same login shell.
+// An empty command does not work: tmux hands it to the shell's -c, and the
+// shell exits at once, closing the pane.
+func newPaneShellCommand(defaultShell, defaultCommand string) []string {
+	if command := strings.TrimSpace(defaultCommand); command != "" {
+		return []string{command}
+	}
+	shell := strings.TrimSpace(defaultShell)
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	return []string{shell, "-l"}
 }
 
 // ApplyTiledLayout applies tiled layout to all windows
