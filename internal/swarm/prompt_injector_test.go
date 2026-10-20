@@ -18,12 +18,18 @@ import (
 
 type countingPromptInjectionTmuxClient struct {
 	captureCount  int
+	commandCount  int
 	getPanesCount int
 	submitCount   int
 }
 
 func (c *countingPromptInjectionTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
 	c.captureCount++
+	return "", nil
+}
+
+func (c *countingPromptInjectionTmuxClient) PaneCurrentCommand(context.Context, string) (string, error) {
+	c.commandCount++
 	return "", nil
 }
 
@@ -44,14 +50,27 @@ type submittedPrompt struct {
 }
 
 // submitRecordingTmuxClient shows an idle composer and records each prompt
-// handed to the shared submit.
+// handed to the shared submit. commands are the pane's foreground process on
+// successive polls, the last one repeating; none means the lookup finds
+// nothing.
 type submitRecordingTmuxClient struct {
-	screen    string
-	submitted []submittedPrompt
+	screen       string
+	commands     []string
+	commandCalls int
+	submitted    []submittedPrompt
 }
 
 func (c *submitRecordingTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
 	return c.screen, nil
+}
+
+func (c *submitRecordingTmuxClient) PaneCurrentCommand(context.Context, string) (string, error) {
+	if len(c.commands) == 0 {
+		return "", nil
+	}
+	command := c.commands[min(c.commandCalls, len(c.commands)-1)]
+	c.commandCalls++
+	return command, nil
 }
 
 func (c *submitRecordingTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
@@ -85,6 +104,53 @@ func TestPromptInjector_SubmitsThroughSharedProtocol(t *testing.T) {
 	}
 }
 
+// TestPromptInjector_FailsFastOnShellPane injects into a pane whose foreground
+// process is zsh and whose prompt looks like Claude's idle composer. The
+// injector has to give up after its grace period with ErrPaneNotAgent and send
+// nothing: the old injector read the prompt as an idle agent and typed the
+// marching orders into the shell, and on a plainer prompt it waited out its
+// full 30 s before typing them anyway.
+func TestPromptInjector_FailsFastOnShellPane(t *testing.T) {
+	client := &submitRecordingTmuxClient{screen: "────────\n❯\n────────\n", commands: []string{"zsh"}}
+	injector := NewPromptInjector()
+	injector.tmuxClientOverride = client
+	injector.nonAgentPaneGrace = 300 * time.Millisecond
+
+	start := time.Now()
+	err := injector.InjectPrompt("proj:1.2", "cc", "first read AGENTS.md")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrPaneNotAgent) || !strings.Contains(err.Error(), "proj:1.2 has been running zsh") {
+		t.Fatalf("InjectPrompt() error = %v, want ErrPaneNotAgent naming the pane and its shell", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("InjectPrompt() took %s to refuse a shell pane, want about the 300ms grace", elapsed)
+	}
+	if len(client.submitted) != 0 {
+		t.Fatalf("submitted = %+v to a shell pane, want nothing", client.submitted)
+	}
+}
+
+// TestPromptInjector_WaitsOutLauncherShell injects into a pane whose agent was
+// typed into a shell: the shell is the foreground process for the first polls,
+// then the agent. The shell phase is shorter than the grace period, so the
+// prompt goes to the agent once it shows its idle composer.
+func TestPromptInjector_WaitsOutLauncherShell(t *testing.T) {
+	client := &submitRecordingTmuxClient{screen: "────────\n❯\n────────\n", commands: []string{"zsh", "zsh", "zsh", "claude"}}
+	injector := NewPromptInjector()
+	injector.tmuxClientOverride = client
+	injector.nonAgentPaneGrace = 5 * time.Second
+
+	if err := injector.InjectPrompt("proj:1.2", "cc", "first read AGENTS.md"); err != nil {
+		t.Fatalf("InjectPrompt() error = %v", err)
+	}
+	if client.commandCalls < 4 {
+		t.Fatalf("prompt sent after %d process checks, want it held until the agent replaced the shell", client.commandCalls)
+	}
+	if len(client.submitted) != 1 {
+		t.Fatalf("submitted = %+v, want one prompt", client.submitted)
+	}
+}
+
 func TestPromptInjector_SubmitErrorFailsInjection(t *testing.T) {
 	injector := NewPromptInjector()
 	injector.tmuxClientOverride = failingSubmitTmuxClient{}
@@ -99,6 +165,10 @@ type failingSubmitTmuxClient struct{}
 
 func (failingSubmitTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
 	return "────────\n❯\n────────\n", nil
+}
+
+func (failingSubmitTmuxClient) PaneCurrentCommand(context.Context, string) (string, error) {
+	return "claude", nil
 }
 
 func (failingSubmitTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
@@ -404,7 +474,7 @@ func TestPromptInjector_GrokDirectPathsRejectBeforeTmux(t *testing.T) {
 		})
 	}
 
-	if client.captureCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
+	if client.captureCount != 0 || client.commandCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
 		t.Fatalf("tmux calls occurred before Grok rejection: %+v", client)
 	}
 }
@@ -429,7 +499,7 @@ func TestPromptInjector_MixedBatchPreflightIsAtomic(t *testing.T) {
 	if result.TotalPanes != len(targets) || result.Successful != 0 || result.Failed != 0 || len(result.Results) != 0 {
 		t.Fatalf("batch result mutated before preflight completed: %+v", result)
 	}
-	if client.captureCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
+	if client.captureCount != 0 || client.commandCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
 		t.Fatalf("mixed batch made tmux calls before Grok rejection: %+v", client)
 	}
 }

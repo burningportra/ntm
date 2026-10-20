@@ -2,8 +2,10 @@ package swarm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/dispatch"
@@ -59,8 +61,19 @@ type BatchInjectionResult struct {
 	Duration   time.Duration     `json:"duration"`
 }
 
+// ErrPaneNotAgent reports a target pane whose foreground process stayed a
+// shell, so no agent is running there to take a prompt.
+var ErrPaneNotAgent = errors.New("pane is running a shell, not an agent")
+
+// defaultNonAgentPaneGrace is how long WaitForReady lets a pane's foreground
+// process be a shell before deciding no agent is running there. An agent
+// launched by typing its command into a shell shows the shell only while the
+// shell starts and reads the command.
+const defaultNonAgentPaneGrace = 5 * time.Second
+
 type promptInjectionTmuxClient interface {
 	CaptureForStatusDetectionContext(context.Context, string) (string, error)
+	PaneCurrentCommand(context.Context, string) (string, error)
 	GetPanes(string) ([]tmux.Pane, error)
 	SubmitPrompt(context.Context, string, tmux.AgentType, string) error
 }
@@ -74,6 +87,15 @@ type promptInjectionClient struct {
 
 func (c promptInjectionClient) SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error {
 	return dispatch.TMUXDeliverer{Client: c.Client}.SubmitPrompt(ctx, target, agentType, prompt)
+}
+
+// PaneCurrentCommand returns the name of the pane's foreground process.
+func (c promptInjectionClient) PaneCurrentCommand(ctx context.Context, target string) (string, error) {
+	output, err := c.Client.RunContext(ctx, "display-message", "-p", "-t", target, "#{pane_current_command}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
 }
 
 // PromptInjector sends prompts (marching orders) to agent panes.
@@ -109,6 +131,9 @@ type PromptInjector struct {
 	// When true, StaggerDelay is ignored and GetOptimalDelay() is used instead.
 	// Default: false
 	UseAdaptiveDelay bool
+
+	// nonAgentPaneGrace overrides defaultNonAgentPaneGrace when positive.
+	nonAgentPaneGrace time.Duration
 }
 
 // NewPromptInjector creates a new PromptInjector with default settings.
@@ -275,6 +300,10 @@ func (p *PromptInjector) sendToPane(sessionPane, agentType string, prompt string
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := p.WaitForReady(ctx, sessionPane, agentType); err != nil {
+		// A shell would run the prompt as commands.
+		if errors.Is(err, ErrPaneNotAgent) {
+			return err
+		}
 		p.logger().Warn("[PromptInjector] wait_ready_failed",
 			"target", sessionPane,
 			"error", err,
@@ -288,17 +317,37 @@ func (p *PromptInjector) sendToPane(sessionPane, agentType string, prompt string
 	return nil
 }
 
-// WaitForReady waits for the agent to show an idle prompt.
+// WaitForReady waits for the agent to show an idle prompt. It fails with
+// ErrPaneNotAgent once the pane's foreground process has been a shell for the
+// grace period: no agent is running there, and a shell prompt can look like an
+// agent's idle composer.
 func (p *PromptInjector) WaitForReady(ctx context.Context, target, agentType string) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 
+	grace := defaultNonAgentPaneGrace
+	if p.nonAgentPaneGrace > 0 {
+		grace = p.nonAgentPaneGrace
+	}
+	var shellSince time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			output, err := p.tmuxClient().CaptureForStatusDetectionContext(ctx, target)
+			client := p.tmuxClient()
+			if command, err := client.PaneCurrentCommand(ctx, target); err == nil && tmux.PaneCommandIsShell(command) {
+				if shellSince.IsZero() {
+					shellSince = time.Now()
+				}
+				if time.Since(shellSince) >= grace {
+					return fmt.Errorf("%w: %s has been running %s for %s; prompt not sent", ErrPaneNotAgent, target, command, grace)
+				}
+				continue
+			}
+			shellSince = time.Time{}
+
+			output, err := client.CaptureForStatusDetectionContext(ctx, target)
 			if err != nil {
 				continue
 			}
