@@ -150,7 +150,9 @@ func (t AgentType) ProfileName() string {
 	case AgentTypeOllama:
 		return "Ollama"
 	case AgentTypeCursor:
-		return "Agent"
+		// Cursor's CLI is launched as `agent`, but a label reading "Agent"
+		// in a list of agent types names nothing, so it shows as Cursor.
+		return "Cursor"
 	case AgentTypeWindsurf:
 		return "Windsurf"
 	case AgentTypeAider:

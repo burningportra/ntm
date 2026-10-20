@@ -511,7 +511,9 @@ func TestAgentType_ProfileName(t *testing.T) {
 		{AgentTypeGemini, "Gemini"},
 		{AgentTypeKimi, "Kimi"},
 		{AgentTypeMuse, "Muse"},
-		{AgentTypeCursor, "Agent"},
+		{AgentTypeCursor, "Cursor"},
+		{AgentType("agent"), "Cursor"}, // the launch command names Cursor, not "Agent"
+		{AgentType("cursor-agent"), "Cursor"},
 		{AgentTypeWindsurf, "Windsurf"},
 		{AgentTypeAider, "Aider"},
 		{AgentTypeUser, "User"},
