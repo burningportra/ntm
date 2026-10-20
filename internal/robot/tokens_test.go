@@ -220,11 +220,23 @@ func TestAggregateTokenStats(t *testing.T) {
 				Type:      events.EventSessionCreate,
 				Timestamp: time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC),
 				Data: map[string]interface{}{
-					"claude_count": float64(3),
-					"codex_count":  float64(2),
-					"gemini_count": float64(1),
-					"grok_count":   float64(5),
-					"ollama_count": float64(4),
+					"agent_counts": map[string]interface{}{
+						"cc":     float64(3),
+						"cod":    float64(2),
+						"gmi":    float64(1),
+						"grok":   float64(5),
+						"ollama": float64(4),
+						"pi":     float64(2),
+					},
+				},
+			},
+			{
+				Type:      events.EventPromptSend,
+				Timestamp: time.Date(2026, 1, 15, 10, 2, 0, 0, time.UTC),
+				Data: map[string]interface{}{
+					"estimated_tokens": float64(20),
+					"prompt_length":    float64(70),
+					"target_types":     "pi",
 				},
 			},
 			{
@@ -277,6 +289,9 @@ func TestAggregateTokenStats(t *testing.T) {
 		}
 		if output.AgentStats["ollama"].Spawned != 4 {
 			t.Errorf("expected 4 ollama spawns, got %d", output.AgentStats["ollama"].Spawned)
+		}
+		if output.AgentStats["pi"].Spawned != 2 {
+			t.Errorf("expected 2 pi spawns, got %d", output.AgentStats["pi"].Spawned)
 		}
 	})
 

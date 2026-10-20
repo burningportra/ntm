@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 )
 
@@ -18,9 +19,9 @@ func TestReadEvents(t *testing.T) {
 	// Write test events
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "test1", Data: map[string]interface{}{"claude_count": float64(2), "codex_count": float64(1)}},
+		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "test1", Data: sessionCreateData(map[string]float64{"cc": 2, "cod": 1})},
 		{Timestamp: now.AddDate(0, 0, -3), Type: events.EventPromptSend, Session: "test1", Data: map[string]interface{}{"prompt_length": float64(100), "target_types": "cc"}},
-		{Timestamp: now.AddDate(0, 0, -40), Type: events.EventSessionCreate, Session: "old", Data: map[string]interface{}{"claude_count": float64(1)}},
+		{Timestamp: now.AddDate(0, 0, -40), Type: events.EventSessionCreate, Session: "old", Data: sessionCreateData(map[string]float64{"cc": 1})},
 	}
 
 	var data []byte
@@ -52,7 +53,7 @@ func TestAggregateStats(t *testing.T) {
 	cutoff := now.AddDate(0, 0, -30)
 
 	testEvents := []events.Event{
-		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "test1", Data: map[string]interface{}{"claude_count": float64(2), "codex_count": float64(1)}},
+		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "test1", Data: sessionCreateData(map[string]float64{"cc": 2, "cod": 1})},
 		{Timestamp: now.AddDate(0, 0, -3), Type: events.EventPromptSend, Session: "test1", Data: map[string]interface{}{"prompt_length": float64(100), "target_types": "cc"}},
 		{Timestamp: now.AddDate(0, 0, -2), Type: events.EventPromptSend, Session: "test1", Data: map[string]interface{}{"prompt_length": float64(200), "target_types": "all"}},
 		{Timestamp: now.AddDate(0, 0, -1), Type: events.EventError, Session: "test1", Data: map[string]interface{}{"error_type": "spawn_failed"}},
@@ -130,10 +131,10 @@ func TestParseTargetTypes(t *testing.T) {
 func TestBuildSessionDetails(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "test1", Data: map[string]interface{}{"claude_count": float64(2)}},
+		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "test1", Data: sessionCreateData(map[string]float64{"cc": 2})},
 		{Timestamp: now.AddDate(0, 0, -3), Type: events.EventPromptSend, Session: "test1", Data: map[string]interface{}{}},
 		{Timestamp: now.AddDate(0, 0, -2), Type: events.EventPromptSend, Session: "test1", Data: map[string]interface{}{}},
-		{Timestamp: now.AddDate(0, 0, -1), Type: events.EventSessionCreate, Session: "test2", Data: map[string]interface{}{"codex_count": float64(1)}},
+		{Timestamp: now.AddDate(0, 0, -1), Type: events.EventSessionCreate, Session: "test2", Data: sessionCreateData(map[string]float64{"cod": 1})},
 	}
 
 	details := buildSessionDetails(testEvents)
@@ -171,7 +172,7 @@ func TestAggregateStats_EmptyEvents(t *testing.T) {
 func TestAggregateStats_SincePeriod(t *testing.T) {
 	now := time.Now().UTC()
 	stats := aggregateStats([]events.Event{
-		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: map[string]interface{}{"claude_count": float64(1)}},
+		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: sessionCreateData(map[string]float64{"cc": 1})},
 	}, 0, "2026-01-15", now.AddDate(0, 0, -30))
 
 	if stats.Period != "Since 2026-01-15" {
@@ -266,8 +267,8 @@ func TestAggregateStats_MultipleErrorTypes(t *testing.T) {
 func TestAggregateStats_MultipleSessions(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "sess-a", Data: map[string]interface{}{"claude_count": float64(2)}},
-		{Timestamp: now.AddDate(0, 0, -3), Type: events.EventSessionCreate, Session: "sess-b", Data: map[string]interface{}{"codex_count": float64(1), "gemini_count": float64(1)}},
+		{Timestamp: now.AddDate(0, 0, -5), Type: events.EventSessionCreate, Session: "sess-a", Data: sessionCreateData(map[string]float64{"cc": 2})},
+		{Timestamp: now.AddDate(0, 0, -3), Type: events.EventSessionCreate, Session: "sess-b", Data: sessionCreateData(map[string]float64{"cod": 1, "gmi": 1})},
 	}
 
 	stats := aggregateStats(testEvents, 30, "", now.AddDate(0, 0, -30))
@@ -283,7 +284,7 @@ func TestAggregateStats_MultipleSessions(t *testing.T) {
 func TestAggregateStats_GeminiAgents(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: map[string]interface{}{"gemini_count": float64(3)}},
+		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: sessionCreateData(map[string]float64{"gmi": 3})},
 	}
 
 	stats := aggregateStats(testEvents, 30, "", now.AddDate(0, 0, -30))
@@ -300,7 +301,7 @@ func TestAggregateStats_GeminiAgents(t *testing.T) {
 func TestAggregateStats_GrokAgents(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: map[string]interface{}{"grok_count": float64(3)}},
+		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: sessionCreateData(map[string]float64{"grok": 3})},
 	}
 
 	stats := aggregateStats(testEvents, 30, "", now.AddDate(0, 0, -30))
@@ -371,7 +372,7 @@ func TestParseTargetTypes_ModernAndAliased(t *testing.T) {
 func TestAggregateStats_OllamaAgents(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: map[string]interface{}{"ollama_count": float64(2)}},
+		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: sessionCreateData(map[string]float64{"ollama": 2})},
 	}
 
 	stats := aggregateStats(testEvents, 30, "", now.AddDate(0, 0, -30))
@@ -390,7 +391,7 @@ func TestAggregateStats_OllamaAgents(t *testing.T) {
 func TestBuildSessionDetails_IncludesOllamaAgents(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: map[string]interface{}{"codex_count": float64(1), "ollama_count": float64(2)}},
+		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: sessionCreateData(map[string]float64{"cod": 1, "ollama": 2})},
 	}
 
 	details := buildSessionDetails(testEvents)
@@ -437,7 +438,7 @@ func TestBuildSessionDetails_SkipsEmptySession(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
 		{Timestamp: now, Type: events.EventSessionCreate, Session: "", Data: map[string]interface{}{}},
-		{Timestamp: now, Type: events.EventSessionCreate, Session: "valid", Data: map[string]interface{}{"claude_count": float64(1)}},
+		{Timestamp: now, Type: events.EventSessionCreate, Session: "valid", Data: sessionCreateData(map[string]float64{"cc": 1})},
 	}
 
 	details := buildSessionDetails(testEvents)
@@ -452,21 +453,75 @@ func TestBuildSessionDetails_SkipsEmptySession(t *testing.T) {
 func TestBuildSessionDetails_AgentCounts(t *testing.T) {
 	now := time.Now().UTC()
 	testEvents := []events.Event{
-		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: map[string]interface{}{
-			"claude_count": float64(2),
-			"codex_count":  float64(1),
-			"gemini_count": float64(3),
-			"grok_count":   float64(4),
-		}},
+		{Timestamp: now, Type: events.EventSessionCreate, Session: "s1", Data: sessionCreateData(map[string]float64{
+			"cc":   2,
+			"cod":  1,
+			"gmi":  3,
+			"grok": 4,
+			"pi":   1,
+			"kimi": 1,
+			"muse": 1,
+			"agy":  1,
+			"oc":   1,
+		})},
 	}
 
 	details := buildSessionDetails(testEvents)
 	if len(details) != 1 {
 		t.Fatalf("Got %d sessions, want 1", len(details))
 	}
-	if details[0].AgentCount != 10 {
-		t.Errorf("AgentCount = %d, want 10", details[0].AgentCount)
+	if details[0].AgentCount != 15 {
+		t.Errorf("AgentCount = %d, want 15", details[0].AgentCount)
 	}
+}
+
+// TestAggregateStats_CountsEverySpawnedAgentType covers bd-k01pw: session
+// create events carried no pi, kimi or muse counts, and analytics ignored the
+// antigravity and opencode counts they did carry. The event goes through the
+// spawn builder and a JSON round trip, the way the JSONL log stores it.
+func TestAggregateStats_CountsEverySpawnedAgentType(t *testing.T) {
+	opts := SpawnOptions{Session: "mixed", RecipeName: "r"}
+	for _, agentType := range agentpkg.AgentTypes() {
+		opts.Agents = append(opts.Agents, FlatAgent{Type: AgentType(agentType), Index: 1})
+	}
+	opts.Agents = append(opts.Agents, FlatAgent{Type: AgentTypePi, Index: 2})
+
+	line, err := json.Marshal(events.NewEvent(events.EventSessionCreate, "mixed", events.ToMap(spawnSessionCreateData(opts, "/tmp/mixed"))))
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	var event events.Event
+	if err := json.Unmarshal(line, &event); err != nil {
+		t.Fatalf("unmarshal event: %v", err)
+	}
+
+	stats := aggregateStats([]events.Event{event}, 30, "", event.Timestamp.AddDate(0, 0, -1))
+	if want := len(agentpkg.AgentTypes()) + 1; stats.TotalAgents != want {
+		t.Fatalf("TotalAgents = %d, want %d; breakdown=%+v", stats.TotalAgents, want, stats.AgentBreakdown)
+	}
+	for _, agentType := range agentpkg.AgentTypes() {
+		key := normalizeAgentType(string(agentType))
+		want := 1
+		if agentType == agentpkg.AgentTypePi {
+			want = 2
+		}
+		if got := stats.AgentBreakdown[key].Count; got != want {
+			t.Errorf("AgentBreakdown[%q].Count = %d, want %d", key, got, want)
+		}
+	}
+	if details := buildSessionDetails([]events.Event{event}); len(details) != 1 || details[0].AgentCount != stats.TotalAgents {
+		t.Fatalf("session details = %+v, want one session with %d agents", details, stats.TotalAgents)
+	}
+}
+
+// sessionCreateData is a session_create event payload as the JSONL log
+// decodes it: agent_counts keyed by canonical agent type, float64 counts.
+func sessionCreateData(counts map[string]float64) map[string]interface{} {
+	agentCounts := make(map[string]interface{}, len(counts))
+	for agentType, count := range counts {
+		agentCounts[agentType] = count
+	}
+	return map[string]interface{}{"agent_counts": agentCounts}
 }
 
 func TestBuildSessionDetails_SortOrder(t *testing.T) {

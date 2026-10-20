@@ -60,7 +60,7 @@ func newAnalyticsCmd() *cobra.Command {
 
 Shows summary statistics including:
   - Total sessions created
-  - Agent spawn counts by type (Claude, Codex, Gemini, Grok)
+  - Agent spawn counts for every agent type
   - Prompts sent and character counts
   - Error occurrences
 
@@ -169,38 +169,11 @@ func aggregateStats(eventList []events.Event, days int, since string, cutoff tim
 			stats.TotalSessions++
 			sessions[event.Session] = true
 
-			// Count agents from session create data
-			if cc, ok := event.Data["claude_count"].(float64); ok {
-				stats.TotalAgents += int(cc)
-				updateAgentStats(stats.AgentBreakdown, "claude", int(cc), 0, 0)
-			}
-			if cod, ok := event.Data["codex_count"].(float64); ok {
-				stats.TotalAgents += int(cod)
-				updateAgentStats(stats.AgentBreakdown, "codex", int(cod), 0, 0)
-			}
-			if gmi, ok := event.Data["gemini_count"].(float64); ok {
-				stats.TotalAgents += int(gmi)
-				updateAgentStats(stats.AgentBreakdown, "gemini", int(gmi), 0, 0)
-			}
-			if grok, ok := event.Data["grok_count"].(float64); ok {
-				stats.TotalAgents += int(grok)
-				updateAgentStats(stats.AgentBreakdown, "grok", int(grok), 0, 0)
-			}
-			if cursor, ok := event.Data["cursor_count"].(float64); ok {
-				stats.TotalAgents += int(cursor)
-				updateAgentStats(stats.AgentBreakdown, "cursor", int(cursor), 0, 0)
-			}
-			if windsurf, ok := event.Data["windsurf_count"].(float64); ok {
-				stats.TotalAgents += int(windsurf)
-				updateAgentStats(stats.AgentBreakdown, "windsurf", int(windsurf), 0, 0)
-			}
-			if aider, ok := event.Data["aider_count"].(float64); ok {
-				stats.TotalAgents += int(aider)
-				updateAgentStats(stats.AgentBreakdown, "aider", int(aider), 0, 0)
-			}
-			if ollama, ok := event.Data["ollama_count"].(float64); ok {
-				stats.TotalAgents += int(ollama)
-				updateAgentStats(stats.AgentBreakdown, "ollama", int(ollama), 0, 0)
+			// Count agents from session create data, keyed by the same type
+			// names parseTargetTypes gives prompt targets.
+			for agentType, count := range events.SessionCreateAgentCounts(event.Data) {
+				stats.TotalAgents += count
+				updateAgentStats(stats.AgentBreakdown, normalizeAgentType(agentType), count, 0, 0)
 			}
 
 		case events.EventAgentSpawn:
@@ -249,6 +222,16 @@ func aggregateStats(eventList []events.Event, days int, since string, cutoff tim
 	}
 
 	return stats
+}
+
+// spawnSessionCreateData builds the session_create analytics payload for a
+// spawn: how many agents of each canonical agent type it launched.
+func spawnSessionCreateData(opts SpawnOptions, dir string) events.SessionCreateData {
+	counts := make(map[string]int)
+	for _, agent := range opts.Agents {
+		counts[string(agentpkg.AgentType(agent.Type).Canonical())]++
+	}
+	return events.SessionCreateData{AgentCounts: counts, WorkDir: dir, Recipe: opts.RecipeName}
 }
 
 // updateAgentStats updates or creates agent stats entry.
@@ -322,30 +305,8 @@ func buildSessionDetails(eventList []events.Event) []SessionSummary {
 		switch event.Type {
 		case events.EventSessionCreate:
 			summary.CreatedAt = event.Timestamp
-			// Count agents
-			if cc, ok := event.Data["claude_count"].(float64); ok {
-				summary.AgentCount += int(cc)
-			}
-			if cod, ok := event.Data["codex_count"].(float64); ok {
-				summary.AgentCount += int(cod)
-			}
-			if gmi, ok := event.Data["gemini_count"].(float64); ok {
-				summary.AgentCount += int(gmi)
-			}
-			if grok, ok := event.Data["grok_count"].(float64); ok {
-				summary.AgentCount += int(grok)
-			}
-			if cursor, ok := event.Data["cursor_count"].(float64); ok {
-				summary.AgentCount += int(cursor)
-			}
-			if windsurf, ok := event.Data["windsurf_count"].(float64); ok {
-				summary.AgentCount += int(windsurf)
-			}
-			if aider, ok := event.Data["aider_count"].(float64); ok {
-				summary.AgentCount += int(aider)
-			}
-			if ollama, ok := event.Data["ollama_count"].(float64); ok {
-				summary.AgentCount += int(ollama)
+			for _, count := range events.SessionCreateAgentCounts(event.Data) {
+				summary.AgentCount += count
 			}
 		case events.EventPromptSend:
 			summary.PromptCount++

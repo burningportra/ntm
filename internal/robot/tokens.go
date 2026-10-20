@@ -283,29 +283,8 @@ func aggregateTokenStats(eventList []events.Event, days int, since, groupBy stri
 		switch event.Type {
 		case events.EventSessionCreate:
 			// Count agent spawns
-			if cc, ok := event.Data["claude_count"].(float64); ok && cc > 0 {
-				agentSpawns["claude"] += int(cc)
-			}
-			if cod, ok := event.Data["codex_count"].(float64); ok && cod > 0 {
-				agentSpawns["codex"] += int(cod)
-			}
-			if gmi, ok := event.Data["gemini_count"].(float64); ok && gmi > 0 {
-				agentSpawns["gemini"] += int(gmi)
-			}
-			if grok, ok := event.Data["grok_count"].(float64); ok && grok > 0 {
-				agentSpawns["grok"] += int(grok)
-			}
-			if cursor, ok := event.Data["cursor_count"].(float64); ok && cursor > 0 {
-				agentSpawns["cursor"] += int(cursor)
-			}
-			if windsurf, ok := event.Data["windsurf_count"].(float64); ok && windsurf > 0 {
-				agentSpawns["windsurf"] += int(windsurf)
-			}
-			if aider, ok := event.Data["aider_count"].(float64); ok && aider > 0 {
-				agentSpawns["aider"] += int(aider)
-			}
-			if ollama, ok := event.Data["ollama_count"].(float64); ok && ollama > 0 {
-				agentSpawns["ollama"] += int(ollama)
+			for agentType, count := range events.SessionCreateAgentCounts(event.Data) {
+				agentSpawns[ResolveAgentType(agentType)] += count
 			}
 
 		case events.EventAgentSpawn:

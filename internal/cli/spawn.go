@@ -3471,20 +3471,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 	}
 
 	// Emit analytics events (JSONL) for session creation and agent spawns.
-	events.EmitSessionCreate(opts.Session, events.SessionCreateData{
-		ClaudeCount:      opts.CCCount,
-		CodexCount:       opts.CodCount,
-		GeminiCount:      opts.GmiCount,
-		AntigravityCount: opts.AgyCount,
-		GrokCount:        opts.GrokCount,
-		CursorCount:      opts.CursorCount,
-		WindsurfCount:    opts.WindsurfCount,
-		AiderCount:       opts.AiderCount,
-		OpencodeCount:    opts.OpencodeCount,
-		OllamaCount:      opts.OllamaCount,
-		WorkDir:          dir,
-		Recipe:           opts.RecipeName,
-	})
+	events.EmitSessionCreate(opts.Session, spawnSessionCreateData(opts, dir))
 	for _, agent := range launchedAgents {
 		events.Emit(events.EventAgentSpawn, opts.Session, events.AgentSpawnData{
 			AgentType: agent.agentType,

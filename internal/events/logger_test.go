@@ -380,16 +380,43 @@ func TestExpandPath(t *testing.T) {
 
 func TestToMap(t *testing.T) {
 	data := SessionCreateData{
-		ClaudeCount: 2,
-		CodexCount:  1,
-		CursorCount: 1,
-		OllamaCount: 1,
+		AgentCounts: map[string]int{"cc": 2, "cod": 1, "cursor": 1, "ollama": 1},
 		WorkDir:     "/path",
 	}
 
 	m := ToMap(data)
-	if m["claude_count"] != 2 || m["codex_count"] != 1 || m["cursor_count"] != 1 || m["ollama_count"] != 1 || m["work_dir"] != "/path" {
+	counts := SessionCreateAgentCounts(m)
+	if counts["cc"] != 2 || counts["cod"] != 1 || counts["cursor"] != 1 || counts["ollama"] != 1 || m["work_dir"] != "/path" {
 		t.Errorf("ToMap(SessionCreateData) produced unexpected map: %v", m)
+	}
+}
+
+// TestSessionCreateAgentCountsSurvivesJSONRoundTrip covers bd-k01pw: every
+// agent type's count, pi, kimi and muse included, reads back the same from
+// the JSONL form the log stores, where counts decode as float64.
+func TestSessionCreateAgentCountsSurvivesJSONRoundTrip(t *testing.T) {
+	want := map[string]int{"pi": 2, "kimi": 1, "muse": 3, "agy": 1, "oc": 1}
+	line, err := json.Marshal(NewEvent(EventSessionCreate, "s", ToMap(SessionCreateData{AgentCounts: map[string]int{
+		"pi": 2, "kimi": 1, "muse": 3, "agy": 1, "oc": 1, "cc": 0,
+	}})))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var event Event
+	if err := json.Unmarshal(line, &event); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got := SessionCreateAgentCounts(event.Data)
+	if len(got) != len(want) {
+		t.Fatalf("SessionCreateAgentCounts = %v, want %v (zero counts dropped)", got, want)
+	}
+	for agentType, count := range want {
+		if got[agentType] != count {
+			t.Fatalf("SessionCreateAgentCounts = %v, want %v", got, want)
+		}
+	}
+	if counts := SessionCreateAgentCounts(map[string]interface{}{"claude_count": float64(2)}); len(counts) != 0 {
+		t.Fatalf("SessionCreateAgentCounts(no agent_counts) = %v, want empty", counts)
 	}
 }
 
@@ -399,11 +426,11 @@ func TestToMap_AllTypes(t *testing.T) {
 	t.Run("SessionCreateData", func(t *testing.T) {
 		t.Parallel()
 		m := ToMap(SessionCreateData{
-			ClaudeCount: 3, CodexCount: 2, GeminiCount: 1, GrokCount: 1,
-			CursorCount: 1, WindsurfCount: 1, AiderCount: 1, OllamaCount: 2,
-			WorkDir: "/work", Recipe: "code-review",
+			AgentCounts: map[string]int{"cc": 3, "cod": 2, "gmi": 1, "pi": 1, "kimi": 1, "muse": 1, "grok": 1, "ollama": 2},
+			WorkDir:     "/work", Recipe: "code-review",
 		})
-		if m["claude_count"] != 3 || m["codex_count"] != 2 || m["gemini_count"] != 1 || m["grok_count"] != 1 || m["cursor_count"] != 1 || m["windsurf_count"] != 1 || m["aider_count"] != 1 || m["ollama_count"] != 2 {
+		counts := SessionCreateAgentCounts(m)
+		if counts["cc"] != 3 || counts["cod"] != 2 || counts["gmi"] != 1 || counts["pi"] != 1 || counts["kimi"] != 1 || counts["muse"] != 1 || counts["grok"] != 1 || counts["ollama"] != 2 {
 			t.Errorf("unexpected counts: %v", m)
 		}
 		if m["work_dir"] != "/work" || m["recipe"] != "code-review" {

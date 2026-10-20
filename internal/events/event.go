@@ -84,18 +84,12 @@ func NewEventWithCorrelation(eventType EventType, session, agentName, correlatio
 
 // SessionCreateData contains data for session_create events.
 type SessionCreateData struct {
-	ClaudeCount      int    `json:"claude_count,omitempty"`
-	CodexCount       int    `json:"codex_count,omitempty"`
-	GeminiCount      int    `json:"gemini_count,omitempty"`
-	AntigravityCount int    `json:"antigravity_count,omitempty"`
-	GrokCount        int    `json:"grok_count,omitempty"`
-	CursorCount      int    `json:"cursor_count,omitempty"`
-	WindsurfCount    int    `json:"windsurf_count,omitempty"`
-	AiderCount       int    `json:"aider_count,omitempty"`
-	OpencodeCount    int    `json:"opencode_count,omitempty"`
-	OllamaCount      int    `json:"ollama_count,omitempty"`
-	WorkDir          string `json:"work_dir,omitempty"`
-	Recipe           string `json:"recipe,omitempty"`
+	// AgentCounts maps each launched agent type, in its canonical short form
+	// (cc, cod, gmi, pi, kimi, muse, agy, ...), to the number of panes
+	// launched with it. Read it back with SessionCreateAgentCounts.
+	AgentCounts map[string]int `json:"agent_counts,omitempty"`
+	WorkDir     string         `json:"work_dir,omitempty"`
+	Recipe      string         `json:"recipe,omitempty"`
 }
 
 // AgentSpawnData contains data for agent_spawn events.
@@ -135,18 +129,9 @@ func ToMap(v interface{}) map[string]interface{} {
 	switch d := v.(type) {
 	case SessionCreateData:
 		return map[string]interface{}{
-			"claude_count":      d.ClaudeCount,
-			"codex_count":       d.CodexCount,
-			"gemini_count":      d.GeminiCount,
-			"antigravity_count": d.AntigravityCount,
-			"grok_count":        d.GrokCount,
-			"cursor_count":      d.CursorCount,
-			"windsurf_count":    d.WindsurfCount,
-			"aider_count":       d.AiderCount,
-			"opencode_count":    d.OpencodeCount,
-			"ollama_count":      d.OllamaCount,
-			"work_dir":          d.WorkDir,
-			"recipe":            d.Recipe,
+			"agent_counts": d.AgentCounts,
+			"work_dir":     d.WorkDir,
+			"recipe":       d.Recipe,
 		}
 	case AgentSpawnData:
 		return map[string]interface{}{
@@ -181,4 +166,34 @@ func ToMap(v interface{}) map[string]interface{} {
 	default:
 		return nil
 	}
+}
+
+// SessionCreateAgentCounts returns the positive per-type agent counts of a
+// session_create event's data. It reads both the in-process form ToMap builds
+// (map[string]int) and the form read back from the JSONL log, where the map's
+// values decode as float64.
+func SessionCreateAgentCounts(data map[string]interface{}) map[string]int {
+	counts := map[string]int{}
+	switch raw := data["agent_counts"].(type) {
+	case map[string]int:
+		for agentType, count := range raw {
+			if count > 0 {
+				counts[agentType] = count
+			}
+		}
+	case map[string]interface{}:
+		for agentType, value := range raw {
+			var count int
+			switch n := value.(type) {
+			case float64:
+				count = int(n)
+			case int:
+				count = n
+			}
+			if count > 0 {
+				counts[agentType] = count
+			}
+		}
+	}
+	return counts
 }

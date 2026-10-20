@@ -105,9 +105,7 @@ func TestEmit_DoesNotPanic(t *testing.T) {
 func TestEmitSessionCreate_DoesNotPanic(t *testing.T) {
 	// Not parallel: uses global DefaultLogger.
 	EmitSessionCreate("test-session", SessionCreateData{
-		ClaudeCount: 2,
-		CodexCount:  1,
-		GrokCount:   3,
+		AgentCounts: map[string]int{"cc": 2, "cod": 1, "grok": 3},
 		WorkDir:     "/tmp/test",
 		Recipe:      "default",
 	})
