@@ -2225,7 +2225,8 @@ func ComposerClearKeys(agentType AgentType) []string {
 		return []string{"Escape", "C-u"}
 	case AgentMuse:
 		// Escape and C-c both interrupt a running Muse turn, so only the
-		// line-kill is safe.
+		// line-kill is safe here. ClearComposerContext follows up with C-c
+		// when a multi-line draft outlives it on an idle pane.
 		return []string{"C-u"}
 	default:
 		return []string{"C-u"}
@@ -2320,7 +2321,50 @@ func (c *Client) ClearComposerContext(ctx context.Context, target string, agentT
 	if !found {
 		return true, false, nil
 	}
+	if !empty && agentType.Canonical() == AgentMuse && museCtrlCClearsDraft(capture) {
+		// Muse's C-u kills only the cursor line, so the earlier lines of a
+		// multi-line draft survive it. Ctrl+C clears the whole draft of an
+		// idle Muse pane ("Draft cleared · press ↑ to restore").
+		if err := c.RunSilentContext(ctx, "send-keys", "-t", target, "C-c"); err != nil {
+			return false, true, fmt.Errorf("send Ctrl+C to clear the rest of the Muse draft: %w", err)
+		}
+		if err := waitForSendDelay(ctx, composerClearVerifyWait); err != nil {
+			return false, true, err
+		}
+		capture, err = c.CapturePaneVisibleContext(ctx, target)
+		if err != nil {
+			return false, false, fmt.Errorf("capture pane for composer clear verification: %w", err)
+		}
+		found, empty = composerLineEmpty(capture, marker, composerPlaceholder(agentType))
+		if !found {
+			return true, false, nil
+		}
+	}
 	return empty, true, nil
+}
+
+// museCtrlCClearsDraft reports whether Ctrl+C would only clear the draft
+// left in a Muse pane's composer. Ctrl+C means something else whenever the
+// composer is not Muse's idle input chrome: during a turn it submits queued
+// input as a steer, on an empty composer it arms quit, and under a dialog it
+// acts on the dialog. So it is sent only to an idle pane whose bottom-most
+// "❯" line has the composer rule below it.
+func museCtrlCClearsDraft(capture string) bool {
+	if agent.MuseActivelyWorking(capture) {
+		return false
+	}
+	lines := strings.Split(capture, "\n")
+	ruleBelow := false
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "❯") {
+			return ruleBelow
+		}
+		if line != "" && strings.Trim(line, "─") == "" {
+			ruleBelow = true
+		}
+	}
+	return false
 }
 
 // ClearComposerContext clears the composer using the default client.

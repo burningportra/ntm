@@ -2584,6 +2584,105 @@ esac
 	}
 }
 
+// TestClearComposerContextMuseDraftHelper runs inside the subprocess started
+// by TestClearComposerContextMuseDraft, where NTM_TMUX_BINARY points at a fake
+// tmux that serves canned captures.
+func TestClearComposerContextMuseDraftHelper(t *testing.T) {
+	root := os.Getenv("NTM_TEST_MUSE_CLEAR_ROOT")
+	if os.Getenv("NTM_TEST_MUSE_CLEAR_HELPER") != "1" || root == "" {
+		return
+	}
+	cleared, verified, err := NewClient("").ClearComposerContext(context.Background(), "%1", AgentMuse)
+	if err != nil {
+		t.Fatalf("ClearComposerContext() error = %v", err)
+	}
+	result := fmt.Sprintf("cleared=%v verified=%v", cleared, verified)
+	if err := os.WriteFile(filepath.Join(root, "result"), []byte(result), 0o600); err != nil {
+		t.Fatalf("write result: %v", err)
+	}
+}
+
+// TestClearComposerContextMuseDraft: Muse's C-u kills only the cursor line,
+// so the first line of a multi-line draft survived the clear and every
+// --clear-input send to that pane failed with COMPOSER_NOT_CLEARED. Ctrl+C
+// clears the whole draft of an idle pane, but during a turn it submits queued
+// input as a steer and under a dialog it acts on the dialog, so it must only
+// follow C-u on an idle composer.
+func TestClearComposerContextMuseDraft(t *testing.T) {
+	screen := func(aboveComposer, composer string) string {
+		return "❯ hi\n\n◆ echo: hi\n\n" + aboveComposer +
+			"── Voice input (alt(option)+v to start) ──────────\n" +
+			composer + "\n" +
+			"──────────────────────────────────────────────────\n" +
+			"  echo · /private/tmp/claude-501/musews · YOLO"
+	}
+	emptyComposer := screen("", "❯")
+	script := `#!/bin/sh
+set -eu
+root="$NTM_TEST_MUSE_CLEAR_ROOT"
+printf '%s\n' "$*" >> "$root/tmux.log"
+case "$1" in
+  send-keys)
+    for last; do :; done
+    if [ "$last" = "C-c" ]; then cp "$root/after-ctrl-c" "$root/screen"; fi
+    ;;
+  capture-pane)
+    cat "$root/screen"
+    ;;
+esac
+`
+	for _, tc := range []struct {
+		name          string
+		afterLineKill string
+		wantCleared   bool
+		wantCtrlC     bool
+	}{
+		{name: "multi-line draft on an idle pane", afterLineKill: screen("", "❯ draft line one"), wantCleared: true, wantCtrlC: true},
+		{name: "one-line draft", afterLineKill: emptyComposer, wantCleared: true},
+		{name: "draft during a turn", afterLineKill: screen("◇ Thinking (2s · esc to interrupt)\n\n", "❯ queued line one"), wantCleared: false},
+		{name: "dialog over the composer", afterLineKill: "❯ hi\n\n◆ echo: hi\n\n  Resume which session?\n  ⟩ 1  Today\n    2  Yesterday", wantCleared: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			for name, content := range map[string]string{
+				"tmux":         script,
+				"screen":       tc.afterLineKill,
+				"after-ctrl-c": emptyComposer,
+			} {
+				if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o700); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestClearComposerContextMuseDraftHelper$")
+			cmd.Env = append(os.Environ(),
+				"NTM_TEST_MUSE_CLEAR_HELPER=1",
+				"NTM_TEST_MUSE_CLEAR_ROOT="+root,
+				"NTM_TEST_TMUX_ENV_OWNED=1",
+				"NTM_TMUX_BINARY="+filepath.Join(root, "tmux"),
+			)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("Muse clear helper failed: %v output=%s", err, output)
+			}
+			result, err := os.ReadFile(filepath.Join(root, "result"))
+			if err != nil {
+				t.Fatalf("read helper result: %v", err)
+			}
+			if want := fmt.Sprintf("cleared=%v verified=true", tc.wantCleared); string(result) != want {
+				t.Errorf("ClearComposerContext() = %s, want %s", result, want)
+			}
+			logData, err := os.ReadFile(filepath.Join(root, "tmux.log"))
+			if err != nil {
+				t.Fatalf("read fake tmux log: %v", err)
+			}
+			if gotCtrlC := strings.Contains(string(logData), "send-keys -t %1 C-c"); gotCtrlC != tc.wantCtrlC {
+				t.Errorf("Ctrl+C sent = %v, want %v; tmux calls:\n%s", gotCtrlC, tc.wantCtrlC, logData)
+			}
+		})
+	}
+}
+
 // truncateForLog truncates long strings for readable test output
 func truncateForLog(s string) string {
 	if len(s) > 50 {
