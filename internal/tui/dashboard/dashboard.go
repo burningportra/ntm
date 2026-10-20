@@ -3705,45 +3705,18 @@ func (m *Model) cycleFocus(dir int) {
 	}
 }
 
+// updateStats counts the panes by canonical agent type. Panes of no known
+// agent type count as user panes.
 func (m *Model) updateStats() {
-	m.claudeCount = 0
-	m.codexCount = 0
-	m.geminiCount = 0
-	m.grokCount = 0
-	m.antigravityCount = 0
-	m.museCount = 0
-	m.cursorCount = 0
-	m.windsurfCount = 0
-	m.aiderCount = 0
-	m.ollamaCount = 0
-	m.userCount = 0
-
+	counts := make(map[tmux.AgentType]int)
 	for _, p := range m.panes {
-		switch p.Type.Canonical() {
-		case tmux.AgentClaude:
-			m.claudeCount++
-		case tmux.AgentCodex:
-			m.codexCount++
-		case tmux.AgentGemini:
-			m.geminiCount++
-		case tmux.AgentGrok:
-			m.grokCount++
-		case tmux.AgentAntigravity:
-			m.antigravityCount++
-		case tmux.AgentMuse:
-			m.museCount++
-		case tmux.AgentCursor:
-			m.cursorCount++
-		case tmux.AgentWindsurf:
-			m.windsurfCount++
-		case tmux.AgentAider:
-			m.aiderCount++
-		case tmux.AgentOllama:
-			m.ollamaCount++
-		default:
-			m.userCount++
+		agentType := p.Type.Canonical()
+		if !agentType.IsValid() {
+			agentType = tmux.AgentUser
 		}
+		counts[agentType]++
 	}
+	m.agentCounts = counts
 }
 
 func (m *Model) seedInitialPanes(panesWithActivity []tmux.PaneActivity) {
@@ -3785,7 +3758,7 @@ func (m *Model) updateTickerData() {
 	if activeAgents == 0 && len(m.panes) > 0 {
 		// Status detection hasn't populated yet; show total agents as placeholder
 		// This prevents showing "0/17" when we simply haven't fetched status yet
-		activeAgents = m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.antigravityCount + m.museCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount
+		activeAgents = len(m.panes) - m.agentCounts[tmux.AgentUser]
 	}
 
 	// Count alerts by severity
@@ -3805,17 +3778,7 @@ func (m *Model) updateTickerData() {
 	data := panels.TickerData{
 		TotalAgents:      len(m.panes),
 		ActiveAgents:     activeAgents,
-		ClaudeCount:      m.claudeCount,
-		CodexCount:       m.codexCount,
-		GeminiCount:      m.geminiCount,
-		GrokCount:        m.grokCount,
-		AntigravityCount: m.antigravityCount,
-		MuseCount:        m.museCount,
-		CursorCount:      m.cursorCount,
-		WindsurfCount:    m.windsurfCount,
-		AiderCount:       m.aiderCount,
-		OllamaCount:      m.ollamaCount,
-		UserCount:        m.userCount,
+		AgentCounts:      m.agentCounts,
 		CriticalAlerts:   critAlerts,
 		WarningAlerts:    warnAlerts,
 		InfoAlerts:       infoAlerts,

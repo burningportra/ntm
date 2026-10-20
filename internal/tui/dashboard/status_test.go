@@ -739,8 +739,8 @@ func TestSeedInitialPanes_SortsAndMarksSnapshotComplete(t *testing.T) {
 	if m.panes[0].ID != "%0" || m.panes[1].ID != "%1" || m.panes[2].ID != "%2" {
 		t.Fatalf("expected seeded panes sorted by index, got %s %s %s", m.panes[0].ID, m.panes[1].ID, m.panes[2].ID)
 	}
-	if m.claudeCount != 1 || m.codexCount != 1 || m.userCount != 1 {
-		t.Fatalf("expected seeded counts Claude=1 Codex=1 User=1, got C=%d O=%d U=%d", m.claudeCount, m.codexCount, m.userCount)
+	if m.agentCounts[tmux.AgentClaude] != 1 || m.agentCounts[tmux.AgentCodex] != 1 || m.agentCounts[tmux.AgentUser] != 1 {
+		t.Fatalf("expected seeded counts Claude=1 Codex=1 User=1, got %v", m.agentCounts)
 	}
 }
 

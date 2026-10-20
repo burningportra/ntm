@@ -3493,12 +3493,12 @@ func TestUpdateStatsCountsMusePanes(t *testing.T) {
 	}
 
 	m.updateStats()
-	if m.museCount != 2 || m.claudeCount != 1 || m.userCount != 1 {
-		t.Fatalf("counts = muse:%d claude:%d user:%d, want muse:2 claude:1 user:1", m.museCount, m.claudeCount, m.userCount)
+	if want := map[tmux.AgentType]int{tmux.AgentMuse: 2, tmux.AgentClaude: 1, tmux.AgentUser: 1}; !reflect.DeepEqual(m.agentCounts, want) {
+		t.Fatalf("agentCounts = %v, want %v", m.agentCounts, want)
 	}
 
 	statsBar := status.StripANSI(m.renderStatsBar())
-	if want := fmt.Sprintf("%s 2", m.icons.AgentIcon(string(tmux.AgentMuse))); !strings.Contains(statsBar, want) {
+	if want := "MUSE 2"; !strings.Contains(statsBar, want) {
 		t.Errorf("stats bar = %q, want Muse badge %q", statsBar, want)
 	}
 	if want := fmt.Sprintf("%s 1", m.icons.User); !strings.Contains(statsBar, want) {
@@ -3510,8 +3510,70 @@ func TestUpdateStatsCountsMusePanes(t *testing.T) {
 	m.updateTickerData()
 	m.tickerPanel.SetSize(400, 1)
 	ticker := status.StripANSI(m.tickerPanel.View())
-	if !strings.Contains(ticker, "Fleet: 3 active / 4 total") || !strings.Contains(ticker, "Muse:2") || !strings.Contains(ticker, "U:1") {
-		t.Errorf("ticker = %q, want 3 active of 4 with Muse:2 and U:1", ticker)
+	if !strings.Contains(ticker, "Fleet: 3 active / 4 total (CC:1 MUSE:2 USR:1)") {
+		t.Errorf("ticker = %q, want 3 active of 4 with CC:1 MUSE:2 USR:1", ticker)
+	}
+}
+
+// Pi, Kimi and Opencode panes used to count as user panes, so the ticker
+// showed "0 active / 4 total (U:4)" for three agents and a shell, and the
+// status bar had no badge for them. Each type with panes gets its own count in
+// the ticker, the status bar and the header, and types without panes add none.
+func TestUpdateStatsCountsEveryAgentType(t *testing.T) {
+	m := New("test", "")
+	m.width = 160
+	m.height = 40
+	m.tier = layout.TierForWidth(m.width)
+	m.panes = []tmux.Pane{
+		{ID: "%1", Index: 1, Title: "test__pi_1", Type: tmux.AgentPi},
+		{ID: "%2", Index: 2, Title: "test__kimi_1", Type: tmux.AgentKimi},
+		{ID: "%3", Index: 3, Title: "test__kimi_2", Type: tmux.AgentType("moonshot")},
+		{ID: "%4", Index: 4, Title: "test__oc_1", Type: tmux.AgentType("opencode")},
+		{ID: "%5", Index: 5, Title: "test__muse_1", Type: tmux.AgentMuse},
+		{ID: "%6", Index: 6, Title: "test__user_1", Type: tmux.AgentUser},
+		{ID: "%7", Index: 7, Title: "mystery", Type: tmux.AgentType("mystery")},
+	}
+
+	m.updateStats()
+	want := map[tmux.AgentType]int{
+		tmux.AgentPi:       1,
+		tmux.AgentKimi:     2,
+		tmux.AgentOpencode: 1,
+		tmux.AgentMuse:     1,
+		tmux.AgentUser:     2,
+	}
+	if !reflect.DeepEqual(m.agentCounts, want) {
+		t.Fatalf("agentCounts = %v, want %v", m.agentCounts, want)
+	}
+
+	// No pane status yet, so the ticker's active count falls back to the five
+	// agent panes.
+	m.updateTickerData()
+	m.tickerPanel.SetSize(400, 1)
+	ticker := status.StripANSI(m.tickerPanel.View())
+	if !strings.Contains(ticker, "Fleet: 5 active / 7 total (PI:1 KIMI:2 MUSE:1 OC:1 USR:2)") {
+		t.Errorf("ticker = %q, want 5 active of 7 with PI:1 KIMI:2 MUSE:1 OC:1 USR:2", ticker)
+	}
+
+	footer := status.StripANSI(m.renderFooterSection())
+	for _, badge := range []string{"PI:1", "KIMI:2", "MUSE:1", "OC:1", "USR:2"} {
+		if !strings.Contains(footer, badge) {
+			t.Errorf("status bar lacks %q:\n%s", badge, footer)
+		}
+	}
+	for _, absent := range []string{"CC:", "COD:", "GMI:", "AGY:", "GRK:"} {
+		if strings.Contains(footer, absent) {
+			t.Errorf("status bar shows %q for a type without panes:\n%s", absent, footer)
+		}
+	}
+
+	// The header shows the label for types whose only icon is the generic
+	// robot glyph, so these badges stay distinguishable.
+	statsBar := status.StripANSI(m.renderStatsBar())
+	for _, badge := range []string{"PI 1", "KIMI 2", "MUSE 1", "OC 1", fmt.Sprintf("%s 2", m.icons.User)} {
+		if !strings.Contains(statsBar, badge) {
+			t.Errorf("stats bar = %q, want badge %q", statsBar, badge)
+		}
 	}
 }
 
@@ -3869,7 +3931,10 @@ func TestFleetCount_Consistent(t *testing.T) {
 	}
 
 	// Verify agent type counts sum correctly
-	sumAgentTypes := m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount + m.userCount
+	sumAgentTypes := 0
+	for _, n := range m.agentCounts {
+		sumAgentTypes += n
+	}
 	if sumAgentTypes != totalPanes {
 		t.Errorf("agent type counts (%d) should equal total panes (%d)", sumAgentTypes, totalPanes)
 	}
@@ -3944,14 +4009,14 @@ func TestFleetCount_FallbackWhenNoStatus(t *testing.T) {
 	// Don't set any paneStatus (simulates startup before status detection runs)
 	// paneStatus map is empty
 
-	m.updateStats() // This sets claudeCount = 5
+	m.updateStats() // This counts 5 Claude panes
 	m.updateTickerData()
 
 	// With the fallback, when paneStatus is empty, activeAgents should use agent counts
-	// The fallback sets activeAgents = claudeCount + codexCount + geminiCount
+	// The fallback sets activeAgents to the non-user panes
 	// This prevents showing "0/5" when we just haven't fetched status yet
-	if m.claudeCount != 5 {
-		t.Errorf("expected claudeCount = 5, got %d", m.claudeCount)
+	if got := m.agentCounts[tmux.AgentClaude]; got != 5 {
+		t.Errorf("expected 5 Claude panes, got %d", got)
 	}
 }
 
@@ -4053,20 +4118,28 @@ func TestFleetCount_AgentTypesSumCorrectly(t *testing.T) {
 			m.updateStats()
 
 			expectedTotal := tc.claudeCount + tc.codexCount + tc.geminiCount + tc.grokCount + tc.cursorCount + tc.windsurfCount + tc.aiderCount + tc.ollamaCount + tc.userCount
-			actualSum := m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount + m.userCount
+			actualSum := 0
+			for _, n := range m.agentCounts {
+				actualSum += n
+			}
 
 			if actualSum != expectedTotal {
-				t.Errorf("expected sum %d, got %d (claude=%d codex=%d gemini=%d grok=%d cursor=%d windsurf=%d aider=%d ollama=%d user=%d)",
-					expectedTotal, actualSum, m.claudeCount, m.codexCount, m.geminiCount, m.grokCount, m.cursorCount, m.windsurfCount, m.aiderCount, m.ollamaCount, m.userCount)
+				t.Errorf("expected sum %d, got %d (counts %v)", expectedTotal, actualSum, m.agentCounts)
 			}
-			if m.grokCount != tc.grokCount {
-				t.Errorf("grokCount = %d, want %d", m.grokCount, tc.grokCount)
-			}
-			if m.ollamaCount != tc.ollamaCount {
-				t.Errorf("ollamaCount = %d, want %d", m.ollamaCount, tc.ollamaCount)
-			}
-			if m.userCount != tc.userCount {
-				t.Errorf("userCount = %d, want %d", m.userCount, tc.userCount)
+			for agentType, want := range map[tmux.AgentType]int{
+				tmux.AgentClaude:   tc.claudeCount,
+				tmux.AgentCodex:    tc.codexCount,
+				tmux.AgentGemini:   tc.geminiCount,
+				tmux.AgentGrok:     tc.grokCount,
+				tmux.AgentCursor:   tc.cursorCount,
+				tmux.AgentWindsurf: tc.windsurfCount,
+				tmux.AgentAider:    tc.aiderCount,
+				tmux.AgentOllama:   tc.ollamaCount,
+				tmux.AgentUser:     tc.userCount,
+			} {
+				if got := m.agentCounts[agentType]; got != want {
+					t.Errorf("agentCounts[%s] = %d, want %d", agentType, got, want)
+				}
 			}
 
 			if len(m.panes) != expectedTotal {

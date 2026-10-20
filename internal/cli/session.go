@@ -94,7 +94,7 @@ func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (
 		return string(th.Gemini), ic.AgentIcon(string(agentpkg.AgentTypeGemini))
 	case agentpkg.AgentTypePi:
 		// Pi and Kimi use the accents output.AgentBadge gives them.
-		return string(th.Mauve), ic.AgentIcon(string(agentpkg.AgentTypePi))
+		return string(th.Rosewater), ic.AgentIcon(string(agentpkg.AgentTypePi))
 	case agentpkg.AgentTypeKimi:
 		return string(th.Sapphire), ic.AgentIcon(string(agentpkg.AgentTypeKimi))
 	case agentpkg.AgentTypeAntigravity:

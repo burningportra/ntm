@@ -208,7 +208,7 @@ func TestSessionPanePresentationCanonicalizesAliases(t *testing.T) {
 		{name: "ollama", agentType: tmux.AgentOllama, wantColor: string(th.Ollama), wantIcon: ic.Ollama},
 		{name: "user", agentType: tmux.AgentUser, wantColor: string(th.User), wantIcon: ic.Terminal},
 		{name: "unknown", agentType: tmux.AgentType("mystery"), wantColor: string(th.Overlay), wantIcon: ic.Robot},
-		{name: "pi", agentType: tmux.AgentPi, wantColor: string(th.Mauve), wantIcon: ic.Robot},
+		{name: "pi", agentType: tmux.AgentPi, wantColor: string(th.Rosewater), wantIcon: ic.Robot},
 		{name: "kimi alias", agentType: tmux.AgentType("moonshot"), wantColor: string(th.Sapphire), wantIcon: ic.Robot},
 		{name: "opencode alias", agentType: tmux.AgentType("opencode"), wantColor: string(th.Opencode), wantIcon: ic.Robot},
 	}

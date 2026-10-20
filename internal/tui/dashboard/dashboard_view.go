@@ -13,6 +13,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard/panels"
+	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/layout"
 	"github.com/Dicklesworthstone/ntm/internal/tui/styles"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -398,20 +399,14 @@ func (m Model) renderFooterSection() string {
 	// STATUS BAR (session info, focused panel, layout tier)
 	// ═══════════════════════════════════════════════════════════════
 	b.WriteString(components.RenderStatusBar(components.StatusBarOptions{
-		Width:            m.width,
-		Session:          m.session,
-		ClaudeCount:      m.claudeCount,
-		CodexCount:       m.codexCount,
-		GeminiCount:      m.geminiCount,
-		GrokCount:        m.grokCount,
-		AntigravityCount: m.antigravityCount,
-		MuseCount:        m.museCount,
-		UserCount:        m.userCount,
-		FocusedPanel:     panelIDString(m.focusedPanel),
-		LayoutTier:       tierLabel(m.tier),
-		Paused:           m.refreshPaused,
-		CurrentVelocity:  m.currentAggregateVelocity(),
-		VelocityHistory:  m.aggregateVelocityHistory,
+		Width:           m.width,
+		Session:         m.session,
+		AgentCounts:     m.agentCounts,
+		FocusedPanel:    panelIDString(m.focusedPanel),
+		LayoutTier:      tierLabel(m.tier),
+		Paused:          m.refreshPaused,
+		CurrentVelocity: m.currentAggregateVelocity(),
+		VelocityHistory: m.aggregateVelocityHistory,
 	}) + "\n")
 
 	// ═══════════════════════════════════════════════════════════════
@@ -422,6 +417,20 @@ func (m Model) renderFooterSection() string {
 	b.WriteString("  " + m.renderHelpBar() + "\n")
 
 	return b.String()
+}
+
+// statsBarAgentGlyph returns what the header stats bar shows before an agent
+// type's pane count: the type's icon, or its short label when the icon set has
+// only the generic robot glyph for it, so Pi, Kimi, Muse, Grok and Opencode
+// badges stay distinguishable without color.
+func statsBarAgentGlyph(c components.AgentCount, ic icons.IconSet) string {
+	if c.Type == tmux.AgentUser {
+		return ic.User
+	}
+	if icon := ic.AgentIcon(string(c.Type)); icon != ic.Robot {
+		return icon
+	}
+	return c.Label
 }
 
 func (m Model) renderStatsBar() string {
@@ -477,93 +486,14 @@ func (m Model) renderStatsBar() string {
 		Render(fmt.Sprintf("%s %d panes", ic.Pane, len(m.panes)))
 	parts = append(parts, totalBadge)
 
-	if m.claudeCount > 0 {
+	palette := t.Semantic()
+	for _, c := range components.AgentCountsInOrder(m.agentCounts) {
 		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Claude).
+			Background(palette.AgentColor(string(c.Type))).
 			Foreground(t.Base).
 			Bold(true).
 			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Claude, m.claudeCount)))
-	}
-	if m.codexCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Codex).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Codex, m.codexCount)))
-	}
-	if m.geminiCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Gemini).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Gemini, m.geminiCount)))
-	}
-	if m.grokCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Pink).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("GRK %d", m.grokCount)))
-	}
-	if m.antigravityCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Lavender).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Gemini, m.antigravityCount)))
-	}
-	if m.museCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Sky).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.AgentIcon(string(tmux.AgentMuse)), m.museCount)))
-	}
-	if m.cursorCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Success).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Robot, m.cursorCount)))
-	}
-	if m.windsurfCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Success).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Robot, m.windsurfCount)))
-	}
-	if m.aiderCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Success).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Robot, m.aiderCount)))
-	}
-	if m.ollamaCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Success).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.Robot, m.ollamaCount)))
-	}
-	if m.userCount > 0 {
-		parts = append(parts, lipgloss.NewStyle().
-			Background(t.Green).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("%s %d", ic.User, m.userCount)))
+			Render(fmt.Sprintf("%s %d", statsBarAgentGlyph(c, ic), c.Count)))
 	}
 	if scanBadge := m.renderScanBadge(); scanBadge != "" {
 		parts = append(parts, scanBadge)

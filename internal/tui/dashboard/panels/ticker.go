@@ -7,25 +7,19 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
 
 // TickerData holds the data displayed in the ticker
 type TickerData struct {
 	// Fleet status
-	TotalAgents      int
-	ActiveAgents     int
-	ClaudeCount      int
-	CodexCount       int
-	GeminiCount      int
-	GrokCount        int
-	AntigravityCount int
-	MuseCount        int
-	CursorCount      int
-	WindsurfCount    int
-	AiderCount       int
-	OllamaCount      int
-	UserCount        int
+	TotalAgents  int
+	ActiveAgents int
+	// AgentCounts holds pane counts by canonical agent type, with user shell
+	// panes under agent.AgentTypeUser.
+	AgentCounts map[agent.AgentType]int
 
 	// Alerts
 	CriticalAlerts int
@@ -229,38 +223,8 @@ func (m *TickerPanel) buildPlainFleetSegment() string {
 
 	if m.data.TotalAgents > 0 {
 		var agentParts []string
-		if m.data.ClaudeCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("C:%d", m.data.ClaudeCount))
-		}
-		if m.data.CodexCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("X:%d", m.data.CodexCount))
-		}
-		if m.data.GeminiCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("G:%d", m.data.GeminiCount))
-		}
-		if m.data.GrokCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("Grk:%d", m.data.GrokCount))
-		}
-		if m.data.AntigravityCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("A:%d", m.data.AntigravityCount))
-		}
-		if m.data.MuseCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("Muse:%d", m.data.MuseCount))
-		}
-		if m.data.CursorCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("Cur:%d", m.data.CursorCount))
-		}
-		if m.data.WindsurfCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("W:%d", m.data.WindsurfCount))
-		}
-		if m.data.AiderCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("A:%d", m.data.AiderCount))
-		}
-		if m.data.OllamaCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("Oll:%d", m.data.OllamaCount))
-		}
-		if m.data.UserCount > 0 {
-			agentParts = append(agentParts, fmt.Sprintf("U:%d", m.data.UserCount))
+		for _, c := range components.AgentCountsInOrder(m.data.AgentCounts) {
+			agentParts = append(agentParts, fmt.Sprintf("%s:%d", c.Label, c.Count))
 		}
 		if len(agentParts) > 0 {
 			parts = append(parts, "("+strings.Join(agentParts, " ")+")")

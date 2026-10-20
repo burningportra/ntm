@@ -831,7 +831,7 @@ func TestRenderStatsBar(t *testing.T) {
 	})
 
 	t.Run("with claude agents", func(t *testing.T) {
-		m := Model{theme: th, icons: ic, claudeCount: 3}
+		m := Model{theme: th, icons: ic, agentCounts: map[tmux.AgentType]int{tmux.AgentClaude: 3}}
 		got := m.renderStatsBar()
 		if !strings.Contains(got, "3") {
 			t.Error("expected claude count '3' in stats bar")
@@ -839,7 +839,7 @@ func TestRenderStatsBar(t *testing.T) {
 	})
 
 	t.Run("with codex agents", func(t *testing.T) {
-		m := Model{theme: th, icons: ic, codexCount: 2}
+		m := Model{theme: th, icons: ic, agentCounts: map[tmux.AgentType]int{tmux.AgentCodex: 2}}
 		got := m.renderStatsBar()
 		if !strings.Contains(got, "2") {
 			t.Error("expected codex count '2' in stats bar")
@@ -847,7 +847,7 @@ func TestRenderStatsBar(t *testing.T) {
 	})
 
 	t.Run("with gemini agents", func(t *testing.T) {
-		m := Model{theme: th, icons: ic, geminiCount: 1}
+		m := Model{theme: th, icons: ic, agentCounts: map[tmux.AgentType]int{tmux.AgentGemini: 1}}
 		got := m.renderStatsBar()
 		if !strings.Contains(got, "1") {
 			t.Error("expected gemini count '1' in stats bar")
@@ -855,7 +855,7 @@ func TestRenderStatsBar(t *testing.T) {
 	})
 
 	t.Run("with grok agents", func(t *testing.T) {
-		m := Model{theme: th, icons: ic, grokCount: 4}
+		m := Model{theme: th, icons: ic, agentCounts: map[tmux.AgentType]int{tmux.AgentGrok: 4}}
 		got := m.renderStatsBar()
 		if !strings.Contains(got, "GRK 4") {
 			t.Errorf("expected explicit Grok count in stats bar, got %q", got)
@@ -863,7 +863,7 @@ func TestRenderStatsBar(t *testing.T) {
 	})
 
 	t.Run("with user panes", func(t *testing.T) {
-		m := Model{theme: th, icons: ic, userCount: 1}
+		m := Model{theme: th, icons: ic, agentCounts: map[tmux.AgentType]int{tmux.AgentUser: 1}}
 		got := m.renderStatsBar()
 		if !strings.Contains(got, "1") {
 			t.Error("expected user count '1' in stats bar")
@@ -872,13 +872,15 @@ func TestRenderStatsBar(t *testing.T) {
 
 	t.Run("with all badges", func(t *testing.T) {
 		m := Model{
-			theme:              th,
-			icons:              ic,
-			claudeCount:        2,
-			codexCount:         1,
-			geminiCount:        1,
-			grokCount:          1,
-			userCount:          1,
+			theme: th,
+			icons: ic,
+			agentCounts: map[tmux.AgentType]int{
+				tmux.AgentClaude: 2,
+				tmux.AgentCodex:  1,
+				tmux.AgentGemini: 1,
+				tmux.AgentGrok:   1,
+				tmux.AgentUser:   1,
+			},
 			healthStatus:       "ok",
 			scanStatus:         "clean",
 			agentMailAvailable: true,

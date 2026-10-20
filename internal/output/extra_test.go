@@ -900,6 +900,9 @@ func TestOutputAgentBadgeColor(t *testing.T) {
 		{"claude", "claude", string(current.Claude)},
 		{"codex alias", "openai-codex", string(current.Codex)},
 		{"gemini alias", "google-gemini", string(current.Gemini)},
+		// Pi used to share Claude's mauve.
+		{"pi", "pi", string(current.Rosewater)},
+		{"kimi alias", "moonshot", string(current.Sapphire)},
 		{"muse", "muse", string(current.Sky)},
 		{"muse alias", "muse-code", string(current.Sky)},
 		{"cursor", "cursor", string(current.Cursor)},

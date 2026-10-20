@@ -3,6 +3,8 @@ package panels
 import (
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 func TestNewTickerPanel(t *testing.T) {
@@ -42,13 +44,15 @@ func TestTickerPanelSetData(t *testing.T) {
 	panel := NewTickerPanel()
 
 	data := TickerData{
-		TotalAgents:     5,
-		ActiveAgents:    3,
-		ClaudeCount:     2,
-		CodexCount:      2,
-		GeminiCount:     1,
-		GrokCount:       1,
-		OllamaCount:     1,
+		TotalAgents:  5,
+		ActiveAgents: 3,
+		AgentCounts: map[agent.AgentType]int{
+			agent.AgentTypeClaudeCode: 2,
+			agent.AgentTypeCodex:      2,
+			agent.AgentTypeGemini:     1,
+			agent.AgentTypeGrok:       1,
+			agent.AgentTypeOllama:     1,
+		},
 		CriticalAlerts:  1,
 		WarningAlerts:   2,
 		InfoAlerts:      0,
@@ -65,14 +69,14 @@ func TestTickerPanelSetData(t *testing.T) {
 	if panel.data.TotalAgents != 5 {
 		t.Errorf("expected TotalAgents 5, got %d", panel.data.TotalAgents)
 	}
-	if panel.data.ClaudeCount != 2 {
-		t.Errorf("expected ClaudeCount 2, got %d", panel.data.ClaudeCount)
+	if got := panel.data.AgentCounts[agent.AgentTypeClaudeCode]; got != 2 {
+		t.Errorf("expected 2 Claude panes, got %d", got)
 	}
-	if panel.data.GrokCount != 1 {
-		t.Errorf("expected GrokCount 1, got %d", panel.data.GrokCount)
+	if got := panel.data.AgentCounts[agent.AgentTypeGrok]; got != 1 {
+		t.Errorf("expected 1 Grok pane, got %d", got)
 	}
-	if panel.data.OllamaCount != 1 {
-		t.Errorf("expected OllamaCount 1, got %d", panel.data.OllamaCount)
+	if got := panel.data.AgentCounts[agent.AgentTypeOllama]; got != 1 {
+		t.Errorf("expected 1 Ollama pane, got %d", got)
 	}
 	if !panel.data.MailConnected {
 		t.Error("expected MailConnected to be true")
@@ -108,11 +112,13 @@ func TestTickerPanelViewContainsSegments(t *testing.T) {
 	panel.SetSize(200, 1) // Wide enough to see all content
 
 	data := TickerData{
-		TotalAgents:     3,
-		ActiveAgents:    2,
-		ClaudeCount:     1,
-		CodexCount:      1,
-		GeminiCount:     1,
+		TotalAgents:  3,
+		ActiveAgents: 2,
+		AgentCounts: map[agent.AgentType]int{
+			agent.AgentTypeClaudeCode: 1,
+			agent.AgentTypeCodex:      1,
+			agent.AgentTypeGemini:     1,
+		},
 		CriticalAlerts:  0,
 		WarningAlerts:   0,
 		InfoAlerts:      0,
@@ -158,54 +164,63 @@ func TestTickerPanelBuildFleetSegment(t *testing.T) {
 			data: TickerData{
 				TotalAgents:  3,
 				ActiveAgents: 1,
-				ClaudeCount:  2,
-				UserCount:    1,
+				AgentCounts:  map[agent.AgentType]int{agent.AgentTypeClaudeCode: 2, agent.AgentTypeUser: 1},
 			},
-			contains: []string{"Fleet", "1 active / 3 total", "C:2", "U:1"},
+			contains: []string{"Fleet", "1 active / 3 total", "(CC:2 USR:1)"},
 		},
 		{
 			name: "with all agent types",
 			data: TickerData{
-				TotalAgents:   11,
-				ActiveAgents:  9,
-				ClaudeCount:   2,
-				CodexCount:    2,
-				GeminiCount:   2,
-				GrokCount:     1,
-				CursorCount:   1,
-				WindsurfCount: 1,
-				AiderCount:    1,
-				OllamaCount:   1,
+				TotalAgents:  12,
+				ActiveAgents: 10,
+				AgentCounts: map[agent.AgentType]int{
+					agent.AgentTypeClaudeCode:  2,
+					agent.AgentTypeCodex:       2,
+					agent.AgentTypeGemini:      2,
+					agent.AgentTypeAntigravity: 1,
+					agent.AgentTypeGrok:        1,
+					agent.AgentTypeCursor:      1,
+					agent.AgentTypeWindsurf:    1,
+					agent.AgentTypeAider:       1,
+					agent.AgentTypeOllama:      1,
+				},
 			},
-			contains: []string{"Fleet", "9 active / 11 total", "C:2", "X:2", "G:2", "Grk:1", "Cur:1", "W:1", "A:1", "Oll:1"},
+			contains: []string{"Fleet", "10 active / 12 total", "(CC:2 COD:2 GMI:2 AGY:1 GRK:1 CUR:1 WND:1 AID:1 OLL:1)"},
 		},
 		{
 			name: "with only Claude",
 			data: TickerData{
 				TotalAgents:  2,
 				ActiveAgents: 1,
-				ClaudeCount:  2,
+				AgentCounts:  map[agent.AgentType]int{agent.AgentTypeClaudeCode: 2},
 			},
-			contains: []string{"Fleet", "1 active / 2 total", "C:2"},
+			contains: []string{"Fleet", "1 active / 2 total", "(CC:2)"},
 		},
 		{
 			name: "with only Grok",
 			data: TickerData{
 				TotalAgents:  2,
 				ActiveAgents: 2,
-				GrokCount:    2,
+				AgentCounts:  map[agent.AgentType]int{agent.AgentTypeGrok: 2},
 			},
-			contains: []string{"Fleet", "2 active / 2 total", "Grk:2"},
+			contains: []string{"Fleet", "2 active / 2 total", "(GRK:2)"},
 		},
 		{
-			name: "with Muse and a user pane",
+			// Pi, Kimi and Opencode panes used to fall into the user count.
+			name: "with Pi, Kimi, Opencode, Muse and a user pane",
 			data: TickerData{
-				TotalAgents:  3,
-				ActiveAgents: 2,
-				MuseCount:    2,
-				UserCount:    1,
+				TotalAgents:  8,
+				ActiveAgents: 7,
+				AgentCounts: map[agent.AgentType]int{
+					agent.AgentTypePi:       1,
+					agent.AgentTypeKimi:     2,
+					agent.AgentTypeMuse:     3,
+					agent.AgentTypeOpencode: 1,
+					agent.AgentTypeUser:     1,
+					agent.AgentTypeCodex:    0,
+				},
 			},
-			contains: []string{"Fleet", "2 active / 3 total", "Muse:2", "U:1"},
+			contains: []string{"Fleet", "7 active / 8 total", "(PI:1 KIMI:2 MUSE:3 OC:1 USR:1)"},
 		},
 		{
 			name: "empty fleet",
@@ -478,11 +493,13 @@ func TestTickerPanelViewShowsOverflowBadge(t *testing.T) {
 	panel.SetSize(32, 1)
 	panel.SetAnimTick(14)
 	panel.SetData(TickerData{
-		TotalAgents:      9,
-		ActiveAgents:     7,
-		ClaudeCount:      3,
-		CodexCount:       3,
-		GeminiCount:      3,
+		TotalAgents:  9,
+		ActiveAgents: 7,
+		AgentCounts: map[agent.AgentType]int{
+			agent.AgentTypeClaudeCode: 3,
+			agent.AgentTypeCodex:      3,
+			agent.AgentTypeGemini:     3,
+		},
 		CriticalAlerts:   2,
 		WarningAlerts:    4,
 		ReadyBeads:       11,

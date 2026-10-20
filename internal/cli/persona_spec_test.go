@@ -243,7 +243,7 @@ func TestPersonaAgentPresentationCoversEveryAgentType(t *testing.T) {
 		wantLabel string
 		wantColor string
 	}{
-		{"pi", "pi", string(th.Mauve)},
+		{"pi", "pi", string(th.Rosewater)},
 		{"kimi", "kimi", string(th.Sapphire)},
 		{"moonshot", "kimi", string(th.Sapphire)},
 		{"muse-code", "muse", string(th.Sky)},

@@ -86,6 +86,9 @@ func TestAgentColor(t *testing.T) {
 		{"gemini", string(p.AgentGemini)},
 		{"gmi", string(p.AgentGemini)},
 		{"google-gemini", string(p.AgentGemini)},
+		{"pi", string(p.AgentPi)},
+		{"kimi", string(p.AgentKimi)},
+		{"moonshot", string(p.AgentKimi)},
 		{"grok", string(p.AgentGrok)},
 		{"grok-build", string(p.AgentGrok)},
 		{"muse", string(p.AgentMuse)},
@@ -105,6 +108,22 @@ func TestAgentColor(t *testing.T) {
 				t.Errorf("AgentColor(%q) = %q, want %q", tt.agentType, got, tt.expected)
 			}
 		})
+	}
+}
+
+// Pi used to borrow Claude's mauve, so a Pi badge read as Claude. It gets
+// rosewater, which no other agent type or status uses.
+func TestAgentColorPiDiffersFromClaude(t *testing.T) {
+	for name, th := range map[string]Theme{
+		"mocha":     CatppuccinMocha,
+		"macchiato": CatppuccinMacchiato,
+		"latte":     CatppuccinLatte,
+		"nord":      Nord,
+	} {
+		p := th.Semantic()
+		if got := p.AgentColor("pi"); got != th.Rosewater || got == p.AgentColor("cc") {
+			t.Errorf("%s: AgentColor(pi) = %q, want rosewater %q, distinct from Claude's %q", name, got, th.Rosewater, p.AgentColor("cc"))
+		}
 	}
 }
 

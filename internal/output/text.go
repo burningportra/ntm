@@ -360,7 +360,8 @@ func outputAgentBadgeColor(agentType string, th theme.Theme) lipgloss.Color {
 	case agent.AgentTypeGemini:
 		return th.Gemini
 	case agent.AgentTypePi:
-		return th.Mauve
+		// Rosewater, not Claude's mauve; it matches the semantic palette.
+		return th.Rosewater
 	case agent.AgentTypeKimi:
 		return th.Sapphire
 	case agent.AgentTypeMuse:

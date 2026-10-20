@@ -132,18 +132,9 @@ type Model struct {
 	statusFetchLatency  time.Duration
 	statusFetchErr      error
 
-	// Stats
-	claudeCount      int
-	codexCount       int
-	geminiCount      int
-	grokCount        int
-	antigravityCount int
-	museCount        int
-	cursorCount      int
-	windsurfCount    int
-	aiderCount       int
-	ollamaCount      int
-	userCount        int
+	// Stats: pane counts by canonical agent type, with user shell panes and
+	// panes of no known agent type under tmux.AgentUser
+	agentCounts map[tmux.AgentType]int
 
 	// Theme
 	theme theme.Theme

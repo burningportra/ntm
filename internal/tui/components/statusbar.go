@@ -7,26 +7,66 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tui/styles"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
 
 // StatusBarOptions configures status bar rendering.
 type StatusBarOptions struct {
-	Width            int
-	Session          string
-	ClaudeCount      int
-	CodexCount       int
-	GeminiCount      int
-	GrokCount        int
-	AntigravityCount int
-	MuseCount        int
-	UserCount        int
-	FocusedPanel     string
-	LayoutTier       string // "Narrow", "Split", "Wide", "Ultra", "Mega"
-	Paused           bool
-	CurrentVelocity  float64
-	VelocityHistory  []float64
+	Width   int
+	Session string
+	// AgentCounts holds pane counts by canonical agent type, with user shell
+	// panes under agent.AgentTypeUser.
+	AgentCounts     map[agent.AgentType]int
+	FocusedPanel    string
+	LayoutTier      string // "Narrow", "Split", "Wide", "Ultra", "Mega"
+	Paused          bool
+	CurrentVelocity float64
+	VelocityHistory []float64
+}
+
+// AgentCount is one agent type's pane count and the short label the
+// dashboard's count badges show for it.
+type AgentCount struct {
+	Type  agent.AgentType
+	Label string
+	Count int
+}
+
+// AgentCountsInOrder returns the non-zero counts in counts, agent types in
+// agent.AgentTypes() order and then user panes, so every type ntm can launch
+// gets its own badge and types without panes add nothing.
+func AgentCountsInOrder(counts map[agent.AgentType]int) []AgentCount {
+	var out []AgentCount
+	for _, agentType := range append(agent.AgentTypes(), agent.AgentTypeUser) {
+		if n := counts[agentType]; n > 0 {
+			out = append(out, AgentCount{Type: agentType, Label: AgentCountLabel(agentType), Count: n})
+		}
+	}
+	return out
+}
+
+// AgentCountLabel returns the short badge label for a canonical agent type:
+// its short form in upper case (CC, COD, PI, KIMI, OC), or the three-letter
+// code `ntm list` uses when the short form is a whole word.
+func AgentCountLabel(agentType agent.AgentType) string {
+	switch agentType {
+	case agent.AgentTypeGrok:
+		return "GRK"
+	case agent.AgentTypeCursor:
+		return "CUR"
+	case agent.AgentTypeWindsurf:
+		return "WND"
+	case agent.AgentTypeAider:
+		return "AID"
+	case agent.AgentTypeOllama:
+		return "OLL"
+	case agent.AgentTypeUser:
+		return "USR"
+	default:
+		return strings.ToUpper(string(agentType))
+	}
 }
 
 // RenderStatusBar renders a three-section status bar: left | center | right.
@@ -93,43 +133,16 @@ func renderStatusLeft(t theme.Theme, base lipgloss.Style, opts StatusBarOptions)
 		Padding(0, 1)
 	parts = append(parts, sessionStyle.Render(session))
 
-	// Agent count badges — only show when count > 0
-	type agentBadge struct {
-		label string
-		color lipgloss.Color
-		count int
-	}
-	badges := []agentBadge{
-		{"CC", t.Claude, opts.ClaudeCount},
-		{"COD", t.Codex, opts.CodexCount},
-		{"GMI", t.Gemini, opts.GeminiCount},
-		{"GRK", t.Pink, opts.GrokCount},
-		{"AGY", t.Lavender, opts.AntigravityCount},
-		{"MUSE", t.Sky, opts.MuseCount},
-	}
-
-	for _, ab := range badges {
-		if ab.count <= 0 {
-			continue
-		}
+	// Agent count badges, only for types with panes
+	palette := t.Semantic()
+	for _, c := range AgentCountsInOrder(opts.AgentCounts) {
 		badge := lipgloss.NewStyle().
-			Background(ab.color).
+			Background(palette.AgentColor(string(c.Type))).
 			Foreground(t.Base).
 			Bold(true).
 			Padding(0, 1).
-			Render(fmt.Sprintf("%s:%d", ab.label, ab.count))
+			Render(fmt.Sprintf("%s:%d", c.Label, c.Count))
 		parts = append(parts, badge)
-	}
-
-	// User count badge (distinct color)
-	if opts.UserCount > 0 {
-		userBadge := lipgloss.NewStyle().
-			Background(t.User).
-			Foreground(t.Base).
-			Bold(true).
-			Padding(0, 1).
-			Render(fmt.Sprintf("USR:%d", opts.UserCount))
-		parts = append(parts, userBadge)
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
