@@ -724,6 +724,70 @@ func TestFetchAgentMailStatusDoesNotRegisterProject(t *testing.T) {
 	}
 }
 
+// TestNewAgentMailClientFollowsAgentMailConfig locks bd-46tqx: the dashboard
+// builds its Agent Mail client through config.AgentMailConfig.NewClient, so
+// AGENT_MAIL_URL wins over [agent_mail] url as it does for the robot and cli,
+// and enabled = false leaves the dashboard without a client.
+func TestNewAgentMailClientFollowsAgentMailConfig(t *testing.T) {
+	const envURL = "http://127.0.0.1:1/env/"
+	t.Setenv("AGENT_MAIL_URL", envURL)
+	projectDir := t.TempDir()
+
+	m := newTestModel(120)
+	m.cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: true, URL: "http://127.0.0.1:1/config/"}}
+	client := m.newAgentMailClient(projectDir)
+	if client == nil {
+		t.Fatal("newAgentMailClient returned nil with Agent Mail enabled")
+	}
+	if got := client.BaseURL(); got != envURL {
+		t.Fatalf("BaseURL = %q, want AGENT_MAIL_URL %q to override the config", got, envURL)
+	}
+
+	m.cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: false}}
+	if client := m.newAgentMailClient(projectDir); client != nil {
+		t.Fatalf("newAgentMailClient = %v, want nil when [agent_mail] enabled = false", client.BaseURL())
+	}
+}
+
+// TestHandleConflictActionSilentWhenAgentMailDisabled locks bd-46tqx: the
+// conflict actions use the dashboard's configured client, so with
+// [agent_mail] enabled = false a force-release is refused without contacting
+// any Agent Mail server.
+func TestHandleConflictActionSilentWhenAgentMailDisabled(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	m := &Model{
+		session:    "sess",
+		projectDir: t.TempDir(),
+		cfg:        &config.Config{AgentMail: config.AgentMailConfig{Enabled: false}},
+	}
+	err := m.handleConflictAction(watcher.FileConflict{
+		Path:                 "internal/robot/attention_feed.go",
+		RequestorAgent:       "worker-a",
+		HolderReservationIDs: []int{42},
+	}, watcher.ConflictActionForce)
+	if err == nil {
+		t.Fatal("handleConflictAction(force) succeeded with Agent Mail disabled, want an error")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Fatalf("Agent Mail requests = %d, want none when [agent_mail] enabled = false", requests)
+	}
+}
+
 // The dashboard shows the session agents' inboxes to the operator; polling
 // them must not mark the agents' mail read.
 func TestFetchAgentMailInboxesPeek(t *testing.T) {

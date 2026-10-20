@@ -691,24 +691,22 @@ func (m *Model) fetchPendingRotations() tea.Cmd {
 	}
 }
 
+// newAgentMailClient builds the dashboard's Agent Mail client from the
+// [agent_mail] config, or returns nil when there is no project or the
+// integration is disabled: the dashboard's Agent Mail panels and conflict
+// actions are automatic integration.
 func (m *Model) newAgentMailClient(projectKey string) *agentmail.Client {
 	if projectKey == "" {
 		return nil
 	}
-	var opts []agentmail.Option
-	opts = append(opts, agentmail.WithProjectKey(projectKey))
+	settings := config.Default().AgentMail
 	if m.cfg != nil {
-		if !m.cfg.AgentMail.Enabled {
-			return nil
-		}
-		if m.cfg.AgentMail.URL != "" {
-			opts = append(opts, agentmail.WithBaseURL(m.cfg.AgentMail.URL))
-		}
-		if m.cfg.AgentMail.Token != "" {
-			opts = append(opts, agentmail.WithToken(m.cfg.AgentMail.Token))
-		}
+		settings = m.cfg.AgentMail
 	}
-	return agentmail.NewClient(opts...)
+	if !settings.Enabled {
+		return nil
+	}
+	return settings.NewClient(projectKey)
 }
 
 func resolveAgentMailProjectKey(sessionName, projectDir string) string {
@@ -6033,7 +6031,10 @@ func (m *Model) handleConflictAction(conflict watcher.FileConflict, action watch
 		}
 	}
 
-	client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+	client := m.newAgentMailClient(projectKey)
+	if client == nil && (action == watcher.ConflictActionRequest || action == watcher.ConflictActionForce) {
+		return fmt.Errorf("agent mail is disabled ([agent_mail] enabled = false)")
+	}
 
 	switch action {
 	case watcher.ConflictActionWait:
