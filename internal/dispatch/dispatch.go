@@ -321,7 +321,19 @@ func (f DelivererFunc) Deliver(ctx context.Context, delivery Delivery) error {
 }
 
 // TMUXDeliverer maps the neutral delivery protocol to NTM's tmux primitives.
-type TMUXDeliverer struct{}
+// Every tmux call goes through Client, or through tmux.DefaultClient when
+// Client is nil, so a caller that owns a client (a remote swarm) delivers
+// through the same protocol as one that uses the default.
+type TMUXDeliverer struct {
+	Client *tmux.Client
+}
+
+func (d TMUXDeliverer) client() *tmux.Client {
+	if d.Client != nil {
+		return d.Client
+	}
+	return tmux.DefaultClient
+}
 
 // RefuseDeadAgentPane rejects delivery to an agent-typed pane whose CLI has
 // exited back to a bare shell (ntm-0g0b): the keystrokes would land in zsh —
@@ -338,7 +350,7 @@ func RefuseDeadAgentPane(pane tmux.Pane) error {
 		pane.Ref().Physical(), pane.Title, pane.Command)
 }
 
-func (TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
+func (d TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
@@ -349,42 +361,44 @@ func (TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 	if target == "" {
 		target = fmt.Sprintf("%s:%s", delivery.Session, delivery.Target.Ref.Physical())
 	}
-	if err := ClearComposerForDelivery(ctx, target, delivery); err != nil {
+	if err := d.ClearComposerForDelivery(ctx, target, delivery); err != nil {
 		return err
 	}
+	client := d.client()
 	switch delivery.Protocol {
 	case ProtocolStageOnly:
-		return tmux.SendKeysForAgentWithDelayContext(ctx, target, delivery.Message, false, 0, delivery.Target.AgentType)
+		return client.SendKeysForAgentWithDelayContext(ctx, target, delivery.Message, false, 0, delivery.Target.AgentType)
 	case ProtocolSingleEnter:
-		return tmux.SendKeysForAgentWithDelayContext(ctx, target, delivery.Message, true, delivery.EnterDelay, delivery.Target.AgentType)
+		return client.SendKeysForAgentWithDelayContext(ctx, target, delivery.Message, true, delivery.EnterDelay, delivery.Target.AgentType)
 	case ProtocolDoubleEnter:
 		if delivery.EnterDelay != tmux.DoubleEnterFirstDelay || delivery.SecondEnterDelay != tmux.DoubleEnterSecondDelay {
 			return fmt.Errorf("tmux double-enter protocol requires delays %s and %s", tmux.DoubleEnterFirstDelay, tmux.DoubleEnterSecondDelay)
 		}
-		if err := tmux.SendKeysForAgentDoubleEnterContext(ctx, target, delivery.Message, delivery.Target.AgentType); err != nil {
+		if err := client.SendKeysForAgentDoubleEnterContext(ctx, target, delivery.Message, delivery.Target.AgentType); err != nil {
 			return err
 		}
-		return VerifyAgentSubmission(ctx, target, delivery.Message, delivery.Target.AgentType)
+		return d.VerifyAgentSubmission(ctx, target, delivery.Message, delivery.Target.AgentType)
 	default:
 		return fmt.Errorf("unsupported delivery protocol %q", delivery.Protocol)
 	}
 }
 
 // SubmitPrompt types prompt into the pane target and submits it with the
-// protocol DefaultProtocolPlanner picks for agentType, delivered by
-// TMUXDeliverer: an agent pane gets the agent-aware text send (a paste for a
-// multi-line prompt), the double Enter and, for Claude and Codex, the
-// submission check that ntm send and --robot-send use, while a user or
-// unknown pane gets one Enter after the shell delay. Callers that address one
-// pane outside a dispatch plan, such as ntm controller and pipeline steps, use
-// it so every prompt goes through the same submit path.
-func SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error {
+// protocol DefaultProtocolPlanner picks for agentType: an agent pane gets the
+// agent-aware text send (a paste for a multi-line prompt), the double Enter
+// and, for Claude and Codex, the submission check that ntm send and
+// --robot-send use, while a user or unknown pane gets one Enter after the
+// shell delay. Callers that address one pane outside a dispatch plan, such as
+// ntm controller, pipeline steps, the swarm prompt injector, checkpoint
+// context injection and context rotation, use it so every prompt goes through
+// the same submit path.
+func (d TMUXDeliverer) SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error {
 	dest := Target{Ref: tmux.PaneRef{ID: target}, AgentType: agentType}
 	plan, err := DefaultProtocolPlanner{}.PlanDelivery(ctx, dest, true)
 	if err != nil {
 		return err
 	}
-	return TMUXDeliverer{}.Deliver(ctx, Delivery{
+	return d.Deliver(ctx, Delivery{
 		Target:           dest,
 		Message:          prompt,
 		Protocol:         plan.Protocol,
@@ -399,7 +413,7 @@ func SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, 
 // concatenate and corrupt both payloads — while an unverifiable clear
 // (no marker visible) proceeds best-effort. User/unknown panes are skipped:
 // C-u in an operator shell would kill whatever the human was typing.
-func ClearComposerForDelivery(ctx context.Context, target string, delivery Delivery) error {
+func (d TMUXDeliverer) ClearComposerForDelivery(ctx context.Context, target string, delivery Delivery) error {
 	if !delivery.ClearInput {
 		return nil
 	}
@@ -407,7 +421,7 @@ func ClearComposerForDelivery(ctx context.Context, target string, delivery Deliv
 	if canonical == tmux.AgentUser || canonical == tmux.AgentUnknown || !canonical.IsValid() {
 		return nil
 	}
-	cleared, verified, err := tmux.ClearComposerContext(ctx, target, delivery.Target.AgentType)
+	cleared, verified, err := d.client().ClearComposerContext(ctx, target, delivery.Target.AgentType)
 	if err != nil {
 		return fmt.Errorf("COMPOSER_CLEAR_FAILED: pane %s: %w", delivery.Target.Ref.Physical(), err)
 	}
@@ -428,7 +442,7 @@ func ClearComposerForDelivery(ctx context.Context, target string, delivery Deliv
 // "delivered" keeps meaning "submitted". Verification infrastructure errors
 // (a capture hiccup) are logged but do not fail an already-delivered send.
 // Agent types without a verifier return nil immediately.
-func VerifyAgentSubmission(ctx context.Context, target, message string, agentType tmux.AgentType) error {
+func (d TMUXDeliverer) VerifyAgentSubmission(ctx context.Context, target, message string, agentType tmux.AgentType) error {
 	var (
 		confirmed, rescued bool
 		err                error
@@ -437,10 +451,10 @@ func VerifyAgentSubmission(ctx context.Context, target, message string, agentTyp
 	switch agentType.Canonical() {
 	case tmux.AgentCodex:
 		kind = "codex"
-		confirmed, rescued, err = tmux.VerifyCodexSubmissionContext(ctx, target, message)
+		confirmed, rescued, err = d.client().VerifyCodexSubmissionContext(ctx, target, message)
 	case tmux.AgentClaude:
 		kind = "claude"
-		confirmed, rescued, err = tmux.VerifyClaudeSubmissionContext(ctx, target, message)
+		confirmed, rescued, err = d.client().VerifyClaudeSubmissionContext(ctx, target, message)
 	default:
 		return nil
 	}

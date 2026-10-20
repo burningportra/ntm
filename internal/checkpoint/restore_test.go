@@ -538,6 +538,111 @@ func TestRestorer_RestoreFromCheckpoint_SkipsLegacyLayoutForMultiWindowSession(t
 	}
 }
 
+// TestRestorer_InjectContextSubmitsToAgentPanesOnly restores a checkpoint with
+// context injection into panes whose "agent" draws an idle composer, turns on
+// bracketed paste and records its raw input, plus a user pane. Each agent's
+// context message has to arrive as one paste followed by the shared
+// protocol's two Enters; the old path pasted it and pressed Enter once, 100 ms
+// later, whatever the agent. The user pane is a shell, so it must get nothing:
+// its scrollback is a command that creates a file if the shell runs it.
+func TestRestorer_InjectContextSubmitsToAgentPanesOnly(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	workDir := t.TempDir()
+	storage := NewStorageWithDir(t.TempDir())
+	r := NewRestorerWithStorage(storage)
+	sessionName := "cpinject-" + time.Now().Format("150405000000")
+	const checkpointID = "inject-context-checkpoint"
+	marker := filepath.Join(workDir, "user-pane-ran-its-scrollback")
+
+	cp := &Checkpoint{
+		ID:          checkpointID,
+		SessionName: sessionName,
+		WorkingDir:  workDir,
+		CreatedAt:   time.Now(),
+	}
+	addPane := func(window int, agentType, command, scrollback string) {
+		paneID := fmt.Sprintf("%%%d", window)
+		rel, err := storage.SaveScrollback(sessionName, checkpointID, paneID, scrollback)
+		if err != nil {
+			t.Fatalf("SaveScrollback(%s): %v", agentType, err)
+		}
+		cp.Session.Panes = append(cp.Session.Panes, PaneState{
+			WindowIndex:    window,
+			ID:             paneID,
+			Title:          fmt.Sprintf("%s__%s_1", sessionName, agentType),
+			AgentType:      agentType,
+			Command:        command,
+			ScrollbackFile: rel,
+		})
+		cp.Session.WindowLayouts = append(cp.Session.WindowLayouts, WindowLayoutState{WindowIndex: window, Layout: "tiled"})
+	}
+
+	agentTypes := []string{"cc", "cod", "muse"}
+	received := make(map[string]string, len(agentTypes))
+	for window, agentType := range agentTypes {
+		dir := filepath.Join(workDir, agentType)
+		if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		received[agentType] = filepath.Join(dir, "received.txt")
+		idleScreen := `────────\n❯\n────────\n`
+		if agentType == "cod" {
+			idleScreen = `›\n`
+		}
+		// The recorder is named cat so the restore's wait for the relaunched
+		// command sees it once the script execs cat. stty -echo keeps the
+		// input off the screen, where the Claude and Codex submission checks
+		// would read it as a stranded composer.
+		recorder := filepath.Join(dir, "bin", "cat")
+		script := fmt.Sprintf("#!/bin/sh\nstty -echo\nprintf '\\033[?2004h%s'\nexec /bin/cat -uv > %q\n", idleScreen, received[agentType])
+		if err := os.WriteFile(recorder, []byte(script), 0o755); err != nil {
+			t.Fatalf("write recorder: %v", err)
+		}
+		addPane(window, agentType, recorder, agentType+" line one\n"+agentType+" line two")
+	}
+	addPane(len(agentTypes), "user", "", "touch "+marker)
+
+	t.Cleanup(func() {
+		if tmux.SessionExists(sessionName) {
+			_ = tmux.KillSession(sessionName)
+		}
+	})
+
+	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{InjectContext: true})
+	if err != nil {
+		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+	}
+	if !result.ContextInjected {
+		t.Fatalf("context was not injected; warnings: %v", result.Warnings)
+	}
+
+	for _, agentType := range agentTypes {
+		// The tty turns the paste's CRs and each Enter into newlines.
+		want := "^[[200~# Context from checkpoint (just now ago)\n\n" +
+			agentType + " line one\n" + agentType + " line two^[[201~\n\n"
+		var got string
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			data, _ := os.ReadFile(received[agentType])
+			if got = string(data); got == want {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got != want {
+			t.Errorf("%s pane input = %q, want %q", agentType, got, want)
+		}
+	}
+
+	// Give a shell that got the paste time to start and run it.
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("user pane ran its pasted scrollback as a shell command (stat err = %v)", err)
+		}
+	}
+}
+
 func TestRestorer_loadPaneScrollback_Compressed(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "ntm-restore-test")
 	if err != nil {

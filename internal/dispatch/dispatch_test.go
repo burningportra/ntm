@@ -1180,6 +1180,43 @@ func TestTMUXDelivererRejectsInvalidOrUnrepresentableDoubleEnterPlans(t *testing
 	}
 }
 
+// TestTMUXDelivererUsesItsClient points tmux.DefaultClient and the
+// deliverer's Client at two unreachable hosts, so every tmux call fails with
+// the name of the host it went to and none reaches a real pane. A deliverer
+// with a Client (the swarm injector's, which may be remote) has to send and
+// clear through it; one without falls back to the default client.
+func TestTMUXDelivererUsesItsClient(t *testing.T) {
+	defaultClient := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("ntm-test-default.invalid")
+	t.Cleanup(func() { tmux.DefaultClient = defaultClient })
+
+	for _, tt := range []struct {
+		name   string
+		client *tmux.Client
+		host   string
+	}{
+		{name: "own client", client: tmux.NewClient("ntm-test-own.invalid"), host: "ntm-test-own.invalid"},
+		{name: "default client", host: "ntm-test-default.invalid"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			deliverer := TMUXDeliverer{Client: tt.client}
+			for _, agentType := range []tmux.AgentType{tmux.AgentClaude, tmux.AgentUser} {
+				err := deliverer.SubmitPrompt(context.Background(), "%1", agentType, "first\nsecond")
+				if err == nil || !strings.Contains(err.Error(), tt.host) {
+					t.Fatalf("SubmitPrompt(%s) error = %v, want a failure on %s", agentType, err, tt.host)
+				}
+			}
+			err := deliverer.ClearComposerForDelivery(context.Background(), "%1", Delivery{
+				Target:     Target{AgentType: tmux.AgentCodex},
+				ClearInput: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.host) {
+				t.Fatalf("ClearComposerForDelivery() error = %v, want a failure on %s", err, tt.host)
+			}
+		})
+	}
+}
+
 // Delivery to a dead agent pane must refuse loudly (ntm-0g0b): keystrokes
 // into a bare shell can EXECUTE message text.
 func TestRefuseDeadAgentPane(t *testing.T) {

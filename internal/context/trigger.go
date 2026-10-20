@@ -3,12 +3,14 @@
 package context
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -55,9 +57,8 @@ type CompactionTrigger struct {
 	predictor *ContextPredictor
 
 	// Input hooks keep automated delivery testable without a live tmux server.
-	inputSender      paneInputSender
-	sendKeysForAgent func(string, string, bool, tmux.AgentType) error
-	sleep            func(time.Duration)
+	submitter promptSubmitter
+	sleep     func(time.Duration)
 
 	// Tracking state
 	mu                sync.RWMutex
@@ -87,8 +88,7 @@ func NewCompactionTrigger(
 		monitor:           monitor,
 		compactor:         compactor,
 		predictor:         predictor,
-		inputSender:       tmuxPaneInputSender{},
-		sendKeysForAgent:  tmux.SendKeysForAgent,
+		submitter:         dispatch.TMUXDeliverer{},
 		sleep:             time.Sleep,
 		lastCompaction:    make(map[string]time.Time),
 		activeCompactions: make(map[string]bool),
@@ -383,7 +383,7 @@ func (t *CompactionTrigger) executeCompaction(agentID, paneID string, agentType 
 		)
 
 		// Send the command.
-		err := t.sendCompactionCommand(paneID, cmd)
+		err := sendCompactionCommandToPane(t.promptSubmitter(), paneID, agentType, cmd)
 		if err != nil {
 			slog.Error("Failed to send compaction command",
 				"pane_id", paneID,
@@ -427,13 +427,13 @@ func (t *CompactionTrigger) executeCompaction(agentID, paneID string, agentType 
 	}
 }
 
-// sendCompactionCommand sends a compaction command to a pane.
-func (t *CompactionTrigger) sendCompactionCommand(paneID string, cmd CompactionCommand) error {
-	sender := t.inputSender
-	if sender == nil {
-		sender = tmuxPaneInputSender{}
+// promptSubmitter returns the configured submitter, or dispatch's agent-aware
+// submit for a trigger built without NewCompactionTrigger.
+func (t *CompactionTrigger) promptSubmitter() promptSubmitter {
+	if t.submitter != nil {
+		return t.submitter
 	}
-	return sendCompactionCommandToPane(sender, paneID, cmd)
+	return dispatch.TMUXDeliverer{}
 }
 
 // injectRecoveryContext injects recovery context after successful compaction.
@@ -456,17 +456,13 @@ func (t *CompactionTrigger) injectRecoveryContext(paneID string, agentType tmux.
 	// Wait a moment for compaction to settle
 	t.sleepFor(2 * time.Second)
 
-	// Send recovery context via the agent-aware path so Claude (and other
+	// Submit through dispatch's agent-aware submit so Claude (and other
 	// agents) get the atomic buffer (bracketed-paste) treatment. The recovery
 	// prompt routinely contains file paths / @-tokens, which jam Claude Code's
 	// TUI autocomplete picker when delivered char-by-char via send-keys — the
 	// trailing Enter selects a menu entry and the prompt silently never submits
 	// (operators worked around this with --no-recovery). (#198)
-	sendKeysForAgent := t.sendKeysForAgent
-	if sendKeysForAgent == nil {
-		sendKeysForAgent = tmux.SendKeysForAgent
-	}
-	err := sendKeysForAgent(paneID, recoveryPrompt, true, agentType)
+	err := t.promptSubmitter().SubmitPrompt(context.Background(), paneID, agentType, recoveryPrompt)
 	if err != nil {
 		slog.Error("Failed to inject recovery context",
 			"pane_id", paneID,

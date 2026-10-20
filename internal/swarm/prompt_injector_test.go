@@ -3,19 +3,23 @@ package swarm
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 type countingPromptInjectionTmuxClient struct {
-	captureCount      int
-	getPanesCount     int
-	sendKeysCount     int
-	sendForAgentCount int
+	captureCount  int
+	getPanesCount int
+	submitCount   int
 }
 
 func (c *countingPromptInjectionTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
@@ -28,56 +32,144 @@ func (c *countingPromptInjectionTmuxClient) GetPanes(string) ([]tmux.Pane, error
 	return nil, nil
 }
 
-func (c *countingPromptInjectionTmuxClient) SendKeys(string, string, bool) error {
-	c.sendKeysCount++
+func (c *countingPromptInjectionTmuxClient) SubmitPrompt(context.Context, string, tmux.AgentType, string) error {
+	c.submitCount++
 	return nil
 }
 
-func (c *countingPromptInjectionTmuxClient) SendKeysForAgent(string, string, bool, tmux.AgentType) error {
-	c.sendForAgentCount++
-	return nil
+type submittedPrompt struct {
+	target    string
+	agentType tmux.AgentType
+	prompt    string
 }
 
-// timedPromptInjectionTmuxClient shows an idle Muse composer and records when
-// the prompt text and each Enter were sent.
-type timedPromptInjectionTmuxClient struct {
-	textSentAt  time.Time
-	enterSentAt []time.Time
+// submitRecordingTmuxClient shows an idle composer and records each prompt
+// handed to the shared submit.
+type submitRecordingTmuxClient struct {
+	screen    string
+	submitted []submittedPrompt
 }
 
-func (c *timedPromptInjectionTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
-	return "────────\n❯\n────────\n", nil
+func (c *submitRecordingTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
+	return c.screen, nil
 }
 
-func (c *timedPromptInjectionTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
+func (c *submitRecordingTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
 	return nil, nil
 }
 
-func (c *timedPromptInjectionTmuxClient) SendKeys(_ string, keys string, enter bool) error {
-	if keys == "" && enter {
-		c.enterSentAt = append(c.enterSentAt, time.Now())
+func (c *submitRecordingTmuxClient) SubmitPrompt(_ context.Context, target string, agentType tmux.AgentType, prompt string) error {
+	c.submitted = append(c.submitted, submittedPrompt{target: target, agentType: agentType, prompt: prompt})
+	return nil
+}
+
+// TestPromptInjector_SubmitsThroughSharedProtocol checks that the injector
+// hands each prompt, whole and with its pane's agent type, to the shared
+// submit and sends no keys of its own.
+func TestPromptInjector_SubmitsThroughSharedProtocol(t *testing.T) {
+	for _, agentType := range []string{"cc", "cod", "muse-code"} {
+		t.Run(agentType, func(t *testing.T) {
+			client := &submitRecordingTmuxClient{screen: "────────\n❯\n────────\n›\n"}
+			injector := NewPromptInjector()
+			injector.tmuxClientOverride = client
+
+			prompt := "first read AGENTS.md\nthen run bv --robot-triage\nthen claim a bead"
+			if err := injector.InjectPrompt("proj:1.2", agentType, prompt); err != nil {
+				t.Fatalf("InjectPrompt() error = %v", err)
+			}
+			want := []submittedPrompt{{target: "proj:1.2", agentType: tmux.AgentType(agentType), prompt: prompt}}
+			if len(client.submitted) != 1 || client.submitted[0] != want[0] {
+				t.Fatalf("submitted = %+v, want %+v", client.submitted, want)
+			}
+		})
 	}
-	return nil
 }
 
-func (c *timedPromptInjectionTmuxClient) SendKeysForAgent(string, string, bool, tmux.AgentType) error {
-	c.textSentAt = time.Now()
-	return nil
-}
-
-func TestPromptInjector_MuseEnterWaitsForEnterFloor(t *testing.T) {
-	client := &timedPromptInjectionTmuxClient{}
+func TestPromptInjector_SubmitErrorFailsInjection(t *testing.T) {
 	injector := NewPromptInjector()
-	injector.tmuxClientOverride = client
+	injector.tmuxClientOverride = failingSubmitTmuxClient{}
 
-	if err := injector.sendToPane("proj:1.2", "muse-code", "start\nwith the triage"); err != nil {
-		t.Fatalf("sendToPane() error = %v", err)
+	err := injector.InjectPrompt("proj:1.2", "cc", "continue")
+	if err == nil || !strings.Contains(err.Error(), "claude submission unconfirmed") {
+		t.Fatalf("InjectPrompt() error = %v, want the submit error", err)
 	}
-	if client.textSentAt.IsZero() || len(client.enterSentAt) != 1 {
-		t.Fatalf("text sent at %v, Enters %v; want the text then one Enter", client.textSentAt, client.enterSentAt)
-	}
-	if gap := client.enterSentAt[0].Sub(client.textSentAt); gap < tmux.MuseEnterDelay {
-		t.Fatalf("Enter followed the prompt by %v, want at least tmux.MuseEnterDelay (%v)", gap, tmux.MuseEnterDelay)
+}
+
+type failingSubmitTmuxClient struct{}
+
+func (failingSubmitTmuxClient) CaptureForStatusDetectionContext(context.Context, string) (string, error) {
+	return "────────\n❯\n────────\n", nil
+}
+
+func (failingSubmitTmuxClient) GetPanes(string) ([]tmux.Pane, error) {
+	return nil, nil
+}
+
+func (failingSubmitTmuxClient) SubmitPrompt(context.Context, string, tmux.AgentType, string) error {
+	return errors.New("claude submission unconfirmed: prompt still in composer after rescue")
+}
+
+// TestPromptInjector_SubmitsMultiLinePromptOnItsClient injects a 3-line
+// prompt into a pane whose "agent" draws an idle composer, turns on bracketed
+// paste and records its raw input, once per agent type. tmux.DefaultClient
+// points at an unreachable host meanwhile, so only the injector's own client
+// (cli/swarm.go passes a remote one) can reach the pane. The prompt has to
+// arrive as one paste followed by the shared protocol's two Enters; the old
+// injector gave Claude and Muse one Enter 100 or 300 ms after the paste.
+func TestPromptInjector_SubmitsMultiLinePromptOnItsClient(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	for _, agentType := range []string{"cc", "cod", "muse"} {
+		t.Run(agentType, func(t *testing.T) {
+			dir := t.TempDir()
+			received := filepath.Join(dir, "received.txt")
+			idleScreen := `────────\n❯\n────────\n`
+			if agentType == "cod" {
+				idleScreen = `›\n`
+			}
+			// stty -echo keeps the input off the screen, where the Claude and
+			// Codex submission checks would read it as a stranded composer;
+			// cat -u writes each line to the file as it arrives.
+			script := filepath.Join(dir, "agent.sh")
+			body := fmt.Sprintf("#!/bin/sh\nstty -echo\nprintf '\\033[?2004h%s'\nexec cat -uv > %q\n", idleScreen, received)
+			if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+				t.Fatalf("write agent script: %v", err)
+			}
+
+			local := tmux.NewClient("")
+			session := fmt.Sprintf("ntm-test-injector-%s-%d", agentType, time.Now().UnixNano())
+			if err := local.RunSilent("new-session", "-d", "-s", session, "-x", "120", "-y", "30", script); err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			t.Cleanup(func() { _ = local.RunSilent("kill-session", "-t", session) })
+			paneID, err := local.Run("display-message", "-p", "-t", session, "#{pane_id}")
+			if err != nil {
+				t.Fatalf("pane id: %v", err)
+			}
+
+			defaultClient := tmux.DefaultClient
+			tmux.DefaultClient = tmux.NewClient("ntm-test-unreachable.invalid")
+			t.Cleanup(func() { tmux.DefaultClient = defaultClient })
+
+			prompt := "first read AGENTS.md\nthen run bv --robot-triage\nthen claim a bead"
+			if err := NewPromptInjectorWithClient(local).InjectPrompt(strings.TrimSpace(paneID), agentType, prompt); err != nil {
+				t.Fatalf("InjectPrompt() error = %v", err)
+			}
+
+			// The tty turns the paste's CRs and each Enter into newlines.
+			const want = "^[[200~first read AGENTS.md\nthen run bv --robot-triage\nthen claim a bead^[[201~\n\n"
+			var got string
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				data, _ := os.ReadFile(received)
+				got = string(data)
+				if got == want {
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			t.Fatalf("%s pane input = %q, want %q", agentType, got, want)
+		})
 	}
 }
 
@@ -94,14 +186,6 @@ func TestNewPromptInjector(t *testing.T) {
 
 	if injector.StaggerDelay != 300*time.Millisecond {
 		t.Errorf("expected StaggerDelay of 300ms, got %v", injector.StaggerDelay)
-	}
-
-	if injector.EnterDelay != 100*time.Millisecond {
-		t.Errorf("expected EnterDelay of 100ms, got %v", injector.EnterDelay)
-	}
-
-	if injector.DoubleEnterDelay != 500*time.Millisecond {
-		t.Errorf("expected DoubleEnterDelay of 500ms, got %v", injector.DoubleEnterDelay)
 	}
 
 	if injector.Logger == nil {
@@ -320,7 +404,7 @@ func TestPromptInjector_GrokDirectPathsRejectBeforeTmux(t *testing.T) {
 		})
 	}
 
-	if client.captureCount != 0 || client.getPanesCount != 0 || client.sendKeysCount != 0 || client.sendForAgentCount != 0 {
+	if client.captureCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
 		t.Fatalf("tmux calls occurred before Grok rejection: %+v", client)
 	}
 }
@@ -345,7 +429,7 @@ func TestPromptInjector_MixedBatchPreflightIsAtomic(t *testing.T) {
 	if result.TotalPanes != len(targets) || result.Successful != 0 || result.Failed != 0 || len(result.Results) != 0 {
 		t.Fatalf("batch result mutated before preflight completed: %+v", result)
 	}
-	if client.captureCount != 0 || client.getPanesCount != 0 || client.sendKeysCount != 0 || client.sendForAgentCount != 0 {
+	if client.captureCount != 0 || client.getPanesCount != 0 || client.submitCount != 0 {
 		t.Fatalf("mixed batch made tmux calls before Grok rejection: %+v", client)
 	}
 }
@@ -781,36 +865,6 @@ func TestPromptInjector_AdaptiveDelayWithDifferentProviders(t *testing.T) {
 				t.Errorf("[TEST] Expected delay %v for %s, got %v", expected, tc.agentType, delay)
 			}
 		})
-	}
-}
-
-// TestPromptInjector_EnterDelayConfiguration tests enter delay configuration.
-func TestPromptInjector_EnterDelayConfiguration(t *testing.T) {
-	t.Log("[TEST] Testing enter delay configuration")
-
-	injector := NewPromptInjector()
-
-	t.Logf("[TEST] Default EnterDelay: %v", injector.EnterDelay)
-	t.Logf("[TEST] Default DoubleEnterDelay: %v", injector.DoubleEnterDelay)
-
-	// Verify defaults
-	if injector.EnterDelay != 100*time.Millisecond {
-		t.Errorf("[TEST] Expected default EnterDelay of 100ms, got %v", injector.EnterDelay)
-	}
-
-	if injector.DoubleEnterDelay != 500*time.Millisecond {
-		t.Errorf("[TEST] Expected default DoubleEnterDelay of 500ms, got %v", injector.DoubleEnterDelay)
-	}
-
-	// Test that they can be modified
-	injector.EnterDelay = 200 * time.Millisecond
-	injector.DoubleEnterDelay = 750 * time.Millisecond
-
-	t.Logf("[TEST] Modified EnterDelay: %v", injector.EnterDelay)
-	t.Logf("[TEST] Modified DoubleEnterDelay: %v", injector.DoubleEnterDelay)
-
-	if injector.EnterDelay != 200*time.Millisecond {
-		t.Errorf("[TEST] Expected EnterDelay of 200ms after modification, got %v", injector.EnterDelay)
 	}
 }
 

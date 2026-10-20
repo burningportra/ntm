@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -669,7 +671,8 @@ func (r *Restorer) applyWindowLayouts(sessionName string, windowLayouts []Window
 	return nil
 }
 
-// injectContext sends scrollback content to restored agents.
+// injectContext sends scrollback content to restored agents, submitting each
+// message through dispatch's agent-aware submit, the protocol ntm send uses.
 func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
 	panes, err := tmux.GetPanes(cp.SessionName)
 	if err != nil {
@@ -679,6 +682,12 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
 	var lastErr error
 	for i, paneState := range cp.Session.Panes {
 		if paneState.ScrollbackFile == "" {
+			continue
+		}
+		// restoreAgents relaunched an agent only where this returns a
+		// command. Any other pane (a user pane) is a shell, which would run
+		// the pasted scrollback as commands.
+		if restorableAgentCommand(paneState) == "" {
 			continue
 		}
 
@@ -699,9 +708,8 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
 			content = truncateToLines(content, maxLines)
 		}
 
-		// Send as context message
 		contextMsg := formatContextInjection(content, cp.CreatedAt)
-		if err := tmux.SendBuffer(targetPane.ID, contextMsg, true); err != nil {
+		if err := (dispatch.TMUXDeliverer{}).SubmitPrompt(context.Background(), targetPane.ID, tmux.AgentType(paneState.AgentType), contextMsg); err != nil {
 			lastErr = err
 		}
 	}

@@ -64,7 +64,7 @@ func Execute(ctx context.Context, p Pipeline) error {
 		}
 
 		// 3. Send prompt
-		if err := dispatch.SubmitPrompt(ctx, paneID, tmux.AgentType(stage.AgentType), prompt); err != nil {
+		if err := (dispatch.TMUXDeliverer{}).SubmitPrompt(ctx, paneID, tmux.AgentType(stage.AgentType), prompt); err != nil {
 			return fmt.Errorf("stage %d sending prompt: %w", i+1, err)
 		}
 

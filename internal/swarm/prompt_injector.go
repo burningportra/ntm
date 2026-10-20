@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -61,8 +62,18 @@ type BatchInjectionResult struct {
 type promptInjectionTmuxClient interface {
 	CaptureForStatusDetectionContext(context.Context, string) (string, error)
 	GetPanes(string) ([]tmux.Pane, error)
-	SendKeys(string, string, bool) error
-	SendKeysForAgent(string, string, bool, tmux.AgentType) error
+	SubmitPrompt(context.Context, string, tmux.AgentType, string) error
+}
+
+// promptInjectionClient submits prompts on its tmux client through dispatch's
+// agent-aware submit, the protocol ntm send uses, so a remote swarm's panes
+// get the same text send, Enters and submission check as local ones.
+type promptInjectionClient struct {
+	*tmux.Client
+}
+
+func (c promptInjectionClient) SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error {
+	return dispatch.TMUXDeliverer{Client: c.Client}.SubmitPrompt(ctx, target, agentType, prompt)
 }
 
 // PromptInjector sends prompts (marching orders) to agent panes.
@@ -83,15 +94,6 @@ type PromptInjector struct {
 	// Default: 300ms
 	// Only used when UseAdaptiveDelay is false.
 	StaggerDelay time.Duration
-
-	// EnterDelay is the delay before sending Enter after the prompt.
-	// Default: 100ms
-	EnterDelay time.Duration
-
-	// DoubleEnterDelay is the delay between first and second Enter for agents
-	// that need double-Enter (like Codex).
-	// Default: 500ms
-	DoubleEnterDelay time.Duration
 
 	// Logger for structured logging.
 	Logger *slog.Logger
@@ -115,8 +117,6 @@ func NewPromptInjector() *PromptInjector {
 		TmuxClient:          nil,
 		SessionOrchestrator: NewSessionOrchestrator(),
 		StaggerDelay:        300 * time.Millisecond,
-		EnterDelay:          100 * time.Millisecond,
-		DoubleEnterDelay:    500 * time.Millisecond,
 		Logger:              slog.Default(),
 		Templates: map[string]string{
 			"default": DefaultMarchingOrders,
@@ -164,9 +164,9 @@ func (p *PromptInjector) tmuxClient() promptInjectionTmuxClient {
 		return p.tmuxClientOverride
 	}
 	if p.TmuxClient != nil {
-		return p.TmuxClient
+		return promptInjectionClient{Client: p.TmuxClient}
 	}
-	return tmux.DefaultClient
+	return promptInjectionClient{Client: tmux.DefaultClient}
 }
 
 // logger returns the configured logger or the default logger.
@@ -263,13 +263,12 @@ func (p *PromptInjector) InjectPromptWithResult(sessionPane, agentType, prompt s
 	return result, nil
 }
 
-// sendToPane sends a prompt to a specific pane, handling agent-specific quirks.
+// sendToPane waits for the pane's agent to look idle, then submits the prompt
+// through dispatch's agent-aware submit, the protocol ntm send uses.
 func (p *PromptInjector) sendToPane(sessionPane, agentType string, prompt string) error {
 	if err := validatePromptInjectionTarget(InjectionTarget{SessionPane: sessionPane, AgentType: agentType}); err != nil {
 		return err
 	}
-
-	client := p.tmuxClient()
 
 	// Wait for agent to be ready (at idle prompt)
 	// This prevents race conditions where we send input before the agent process is fully started
@@ -282,37 +281,10 @@ func (p *PromptInjector) sendToPane(sessionPane, agentType string, prompt string
 			"proceeding", true)
 	}
 
-	// Use agent-aware send method for reliable multi-line prompt delivery
-	// For Gemini, this uses buffer-based paste to avoid newline interpretation issues
-	// Send without Enter first
-	aType := tmux.AgentType(agentType)
-	if err := client.SendKeysForAgent(sessionPane, prompt, false, aType); err != nil {
-		return fmt.Errorf("send prompt text: %w", err)
+	// The readiness wait may have used up ctx, so the submit gets its own.
+	if err := p.tmuxClient().SubmitPrompt(context.Background(), sessionPane, tmux.AgentType(agentType), prompt); err != nil {
+		return fmt.Errorf("submit prompt: %w", err)
 	}
-
-	// Wait before sending Enter. Muse Code takes an Enter that arrives
-	// within MuseEnterDelay of the text as a newline in the draft, so a Muse
-	// pane gets the same floor the agent-aware send applies.
-	enterDelay := p.EnterDelay
-	if aType.Canonical() == tmux.AgentMuse {
-		enterDelay = max(enterDelay, tmux.MuseEnterDelay)
-	}
-	time.Sleep(enterDelay)
-
-	// Send first Enter
-	if err := client.SendKeys(sessionPane, "", true); err != nil {
-		return fmt.Errorf("send first enter: %w", err)
-	}
-
-	// AGENT QUIRK: Codex and some other agents need double-Enter
-	// The first Enter may not be recognized immediately
-	if aType.NeedsDoubleEnter() {
-		time.Sleep(p.DoubleEnterDelay)
-		if err := client.SendKeys(sessionPane, "", true); err != nil {
-			return fmt.Errorf("send second enter: %w", err)
-		}
-	}
-
 	return nil
 }
 
@@ -337,8 +309,6 @@ func (p *PromptInjector) WaitForReady(ctx context.Context, target, agentType str
 		}
 	}
 }
-
-// needsDoubleEnter is removed, now uses tmux.AgentType.NeedsDoubleEnter()
 
 // InjectBatch sends prompts to multiple panes with staggering.
 // All targets receive the same prompt.

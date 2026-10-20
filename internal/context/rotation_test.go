@@ -1,6 +1,7 @@
 package context
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -18,8 +19,7 @@ import (
 type MockPaneSpawner struct {
 	spawnedPanes []string
 	killedPanes  []string
-	sentKeys     map[string][]string
-	sentBuffers  map[string][]string
+	submitted    map[string][]submittedPrompt
 	getPanesFor  []string
 	panes        []tmux.Pane
 	spawnError   error
@@ -29,11 +29,17 @@ type MockPaneSpawner struct {
 	getPanesFunc func(string) ([]tmux.Pane, error)
 }
 
+// submittedPrompt is one prompt handed to the shared submit, with the agent
+// type that picks its protocol.
+type submittedPrompt struct {
+	agentType tmux.AgentType
+	prompt    string
+}
+
 func NewMockPaneSpawner() *MockPaneSpawner {
 	return &MockPaneSpawner{
-		sentKeys:    make(map[string][]string),
-		sentBuffers: make(map[string][]string),
-		panes:       []tmux.Pane{},
+		submitted: make(map[string][]submittedPrompt),
+		panes:     []tmux.Pane{},
 	}
 }
 
@@ -54,19 +60,11 @@ func (m *MockPaneSpawner) KillPane(paneID string) error {
 	return nil
 }
 
-func (m *MockPaneSpawner) SendKeys(paneID, text string, enter bool) error {
+func (m *MockPaneSpawner) SubmitPrompt(_ context.Context, paneID string, agentType tmux.AgentType, prompt string) error {
 	if m.sendError != nil {
 		return m.sendError
 	}
-	m.sentKeys[paneID] = append(m.sentKeys[paneID], text)
-	return nil
-}
-
-func (m *MockPaneSpawner) SendBuffer(paneID, text string, enter bool) error {
-	if m.sendError != nil {
-		return m.sendError
-	}
-	m.sentBuffers[paneID] = append(m.sentBuffers[paneID], text)
+	m.submitted[paneID] = append(m.submitted[paneID], submittedPrompt{agentType: agentType, prompt: prompt})
 	return nil
 }
 
@@ -318,7 +316,11 @@ func TestRotateAgentFailureEmitsRotationAlert(t *testing.T) {
 	}
 }
 
-func TestRotateAgentSuccessEmitsCompletionAlert(t *testing.T) {
+// TestRotateAgentSuccessSubmitsPromptsAndEmitsCompletionAlert also checks
+// that the summary request and the handoff context go to the shared submit
+// with each pane's agent type, so Claude gets the paste, the double Enter and
+// the submission check; the old path pasted both and pressed Enter once.
+func TestRotateAgentSuccessSubmitsPromptsAndEmitsCompletionAlert(t *testing.T) {
 	tracker := alerts.GetGlobalTracker()
 	tracker.Clear()
 	t.Cleanup(tracker.Clear)
@@ -339,6 +341,15 @@ func TestRotateAgentSuccessEmitsCompletionAlert(t *testing.T) {
 	result := r.rotateAgent("test-session", "test__cc_1", "/tmp")
 	if !result.Success || result.State != RotationStateCompleted {
 		t.Fatalf("rotation result = %+v, want completed success", result)
+	}
+
+	oldPane := spawner.submitted["%0"]
+	if len(oldPane) != 1 || oldPane[0].prompt != SummaryPromptTemplate || oldPane[0].agentType != tmux.AgentClaude {
+		t.Fatalf("old pane submits = %+v, want the summary request as claude", oldPane)
+	}
+	newPane := spawner.submitted["%new-pane"]
+	if len(newPane) != 1 || !strings.Contains(newPane[0].prompt, "HANDOFF CONTEXT") || newPane[0].agentType.Canonical() != tmux.AgentClaude {
+		t.Fatalf("replacement pane submits = %+v, want the handoff context as claude", newPane)
 	}
 
 	active := tracker.GetActive()
@@ -432,8 +443,8 @@ func TestCheckAndRotate_MixedGrokBatchIsAtomic(t *testing.T) {
 	if results != nil {
 		t.Fatalf("CheckAndRotate() results = %+v, want nil rejected batch", results)
 	}
-	if len(spawner.sentKeys) != 0 || len(spawner.sentBuffers) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
-		t.Fatalf("mixed Grok batch mutated panes: keys=%v buffers=%v spawned=%v killed=%v", spawner.sentKeys, spawner.sentBuffers, spawner.spawnedPanes, spawner.killedPanes)
+	if len(spawner.submitted) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
+		t.Fatalf("mixed Grok batch mutated panes: submitted=%v spawned=%v killed=%v", spawner.submitted, spawner.spawnedPanes, spawner.killedPanes)
 	}
 }
 
@@ -794,8 +805,8 @@ func TestManualRotate_GrokFailsBeforeAnyLifecycleMutation(t *testing.T) {
 	if !strings.Contains(result.Error, agent.GrokPhaseOneCapabilityHint) {
 		t.Fatalf("ManualRotate() error = %q, want Grok capability hint", result.Error)
 	}
-	if len(spawner.sentKeys) != 0 || len(spawner.sentBuffers) != 0 {
-		t.Fatalf("Grok rotation sent input: keys=%v buffers=%v", spawner.sentKeys, spawner.sentBuffers)
+	if len(spawner.submitted) != 0 {
+		t.Fatalf("Grok rotation sent input: %v", spawner.submitted)
 	}
 	if len(spawner.spawnedPanes) != 0 {
 		t.Fatalf("Grok rotation spawned panes: %v", spawner.spawnedPanes)
@@ -891,71 +902,33 @@ func TestDefaultPaneSpawnerGetAgentCommand(t *testing.T) {
 	}
 }
 
-func TestSendCompactionCommandToPane_UsesBufferForPrompts(t *testing.T) {
+// TestSendCompactionCommandToPane_SubmitsWithPaneAgentType checks that slash
+// commands and the summarize prompt both go to the shared submit unchanged
+// and with the pane's agent type, which picks the paste-or-type send and the
+// Enters; the old path typed slash commands and pasted prompts, each with one
+// Enter, whatever the agent.
+func TestSendCompactionCommandToPane_SubmitsWithPaneAgentType(t *testing.T) {
 	t.Parallel()
 
-	spawner := NewMockPaneSpawner()
-	cmd := CompactionCommand{
-		Command:  CompactionPromptTemplate,
-		IsPrompt: true,
-	}
-
-	if err := sendCompactionCommandToPane(spawner, "%1", cmd); err != nil {
-		t.Fatalf("sendCompactionCommandToPane() error = %v", err)
-	}
-
-	if got := len(spawner.sentBuffers["%1"]); got != 1 {
-		t.Fatalf("buffer sends = %d, want 1", got)
-	}
-	if got := len(spawner.sentKeys["%1"]); got != 0 {
-		t.Fatalf("key sends = %d, want 0", got)
-	}
-	if got := spawner.sentBuffers["%1"][0]; got != CompactionPromptTemplate {
-		t.Fatalf("buffer payload mismatch: got %q", got)
-	}
-}
-
-func TestSendCompactionCommandToPane_UsesKeysForCommands(t *testing.T) {
-	t.Parallel()
-
-	spawner := NewMockPaneSpawner()
-	cmd := CompactionCommand{
-		Command: "/compact",
-	}
-
-	if err := sendCompactionCommandToPane(spawner, "%2", cmd); err != nil {
-		t.Fatalf("sendCompactionCommandToPane() error = %v", err)
-	}
-
-	if got := len(spawner.sentKeys["%2"]); got != 1 {
-		t.Fatalf("key sends = %d, want 1", got)
-	}
-	if got := len(spawner.sentBuffers["%2"]); got != 0 {
-		t.Fatalf("buffer sends = %d, want 0", got)
-	}
-	if got := spawner.sentKeys["%2"][0]; got != "/compact" {
-		t.Fatalf("key payload mismatch: got %q", got)
-	}
-}
-
-func TestSendRotationPrompt_UsesBuffer(t *testing.T) {
-	t.Parallel()
-
-	spawner := NewMockPaneSpawner()
-	prompt := SummaryPromptTemplate
-
-	if err := sendRotationPrompt(spawner, "%3", prompt); err != nil {
-		t.Fatalf("sendRotationPrompt() error = %v", err)
-	}
-
-	if got := len(spawner.sentBuffers["%3"]); got != 1 {
-		t.Fatalf("buffer sends = %d, want 1", got)
-	}
-	if got := len(spawner.sentKeys["%3"]); got != 0 {
-		t.Fatalf("key sends = %d, want 0", got)
-	}
-	if got := spawner.sentBuffers["%3"][0]; got != prompt {
-		t.Fatalf("buffer payload mismatch: got %q", got)
+	for _, tt := range []struct {
+		name      string
+		agentType tmux.AgentType
+		cmd       CompactionCommand
+	}{
+		{name: "claude compact", agentType: tmux.AgentClaude, cmd: CompactionCommand{Command: "/compact"}},
+		{name: "gemini clear", agentType: tmux.AgentGemini, cmd: CompactionCommand{Command: "/clear"}},
+		{name: "codex summarize", agentType: tmux.AgentCodex, cmd: CompactionCommand{Command: CompactionPromptTemplate, IsPrompt: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			spawner := NewMockPaneSpawner()
+			if err := sendCompactionCommandToPane(spawner, "%1", tt.agentType, tt.cmd); err != nil {
+				t.Fatalf("sendCompactionCommandToPane() error = %v", err)
+			}
+			want := []submittedPrompt{{agentType: tt.agentType, prompt: tt.cmd.Command}}
+			if got := spawner.submitted["%1"]; len(got) != 1 || got[0] != want[0] {
+				t.Fatalf("submitted = %+v, want %+v", got, want)
+			}
+		})
 	}
 }
 
@@ -992,14 +965,19 @@ func TestTryCompaction_ExhaustsFallbackCommandsViaSpawner(t *testing.T) {
 		t.Fatalf("Error = %q, want exhausted message", result.Error)
 	}
 
-	if got := spawner.sentKeys["%0"]; len(got) != 2 || got[0] != "/compact" || got[1] != "/clear" {
-		t.Fatalf("sentKeys = %#v, want [/compact /clear]", got)
+	want := []submittedPrompt{
+		{agentType: tmux.AgentClaude, prompt: "/compact"},
+		{agentType: tmux.AgentClaude, prompt: "/clear"},
+		{agentType: tmux.AgentClaude, prompt: CompactionPromptTemplate},
 	}
-	if got := len(spawner.sentBuffers["%0"]); got != 1 {
-		t.Fatalf("buffer sends = %d, want 1", got)
+	got := spawner.submitted["%0"]
+	if len(got) != len(want) {
+		t.Fatalf("submitted = %+v, want %+v", got, want)
 	}
-	if got := spawner.sentBuffers["%0"][0]; got != CompactionPromptTemplate {
-		t.Fatalf("buffer payload mismatch: got %q", got)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("submitted = %+v, want %+v", got, want)
+		}
 	}
 }
 
@@ -1243,8 +1221,8 @@ func TestProcessExpiredPending_MixedGrokBatchIsAtomic(t *testing.T) {
 			t.Fatalf("persisted pending rotation %s was deleted", item.AgentID)
 		}
 	}
-	if len(spawner.sentKeys) != 0 || len(spawner.sentBuffers) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
-		t.Fatalf("expired mixed batch mutated panes: keys=%v buffers=%v spawned=%v killed=%v", spawner.sentKeys, spawner.sentBuffers, spawner.spawnedPanes, spawner.killedPanes)
+	if len(spawner.submitted) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
+		t.Fatalf("expired mixed batch mutated panes: submitted=%v spawned=%v killed=%v", spawner.submitted, spawner.spawnedPanes, spawner.killedPanes)
 	}
 }
 
@@ -1321,9 +1299,9 @@ func TestProcessExpiredPendingDoesNotActAfterConcurrentPostpone(t *testing.T) {
 	if got := getPanesCalls.Load(); got != 1 {
 		t.Fatalf("GetPanes calls = %d, want only the blocked preflight", got)
 	}
-	if len(spawner.sentKeys) != 0 || len(spawner.sentBuffers) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
-		t.Fatalf("stale expired action mutated panes: keys=%v buffers=%v spawned=%v killed=%v",
-			spawner.sentKeys, spawner.sentBuffers, spawner.spawnedPanes, spawner.killedPanes)
+	if len(spawner.submitted) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
+		t.Fatalf("stale expired action mutated panes: submitted=%v spawned=%v killed=%v",
+			spawner.submitted, spawner.spawnedPanes, spawner.killedPanes)
 	}
 	inMemory := r.GetPendingRotation(agentID)
 	if inMemory == nil || !inMemory.TimeoutAt.After(time.Now().Add(9*time.Minute)) {
@@ -1373,8 +1351,8 @@ func TestProcessExpiredPending_AllowsIgnoreAndPostpone(t *testing.T) {
 	if !postponed.TimeoutAt.After(now.Add(29 * time.Minute)) {
 		t.Fatalf("postponed timeout = %s, want about 30 minutes in the future", postponed.TimeoutAt)
 	}
-	if len(spawner.sentKeys) != 0 || len(spawner.sentBuffers) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
-		t.Fatalf("ignore/postpone mutated panes: keys=%v buffers=%v spawned=%v killed=%v", spawner.sentKeys, spawner.sentBuffers, spawner.spawnedPanes, spawner.killedPanes)
+	if len(spawner.submitted) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
+		t.Fatalf("ignore/postpone mutated panes: submitted=%v spawned=%v killed=%v", spawner.submitted, spawner.spawnedPanes, spawner.killedPanes)
 	}
 }
 
@@ -1457,7 +1435,7 @@ func TestConfirmRotation_CustomTitleGrokKeepsPending(t *testing.T) {
 			if !r.HasPendingRotation("operator-selected-title") {
 				t.Fatalf("ConfirmRotation(%s) removed pending state before capability admission", tt.action)
 			}
-			if len(spawner.sentKeys) != 0 || len(spawner.sentBuffers) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
+			if len(spawner.submitted) != 0 || len(spawner.spawnedPanes) != 0 || len(spawner.killedPanes) != 0 {
 				t.Fatalf("ConfirmRotation(%s) mutated panes: %+v", tt.action, spawner)
 			}
 		})

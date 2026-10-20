@@ -259,7 +259,7 @@ func TestCompactionTrigger_GrokPreflightRejectsBeforeMutation(t *testing.T) {
 	predictor := NewContextPredictor(DefaultPredictorConfig())
 	trigger := NewCompactionTrigger(config, monitor, compactor, predictor)
 	sender := NewMockPaneSpawner()
-	trigger.inputSender = sender
+	trigger.submitter = sender
 
 	monitor.RegisterAgent("grok-agent", "%9", "grok-3")
 	monitor.SetAgentType("grok-agent", string(tmux.AgentGrok))
@@ -277,8 +277,8 @@ func TestCompactionTrigger_GrokPreflightRejectsBeforeMutation(t *testing.T) {
 	if triggered != 0 || completed != 0 {
 		t.Fatalf("handler calls = triggered:%d completed:%d, want zero", triggered, completed)
 	}
-	if len(sender.sentKeys["%9"]) != 0 || len(sender.sentBuffers["%9"]) != 0 {
-		t.Fatalf("pane input was sent before Grok capability rejection: keys=%v buffers=%v", sender.sentKeys["%9"], sender.sentBuffers["%9"])
+	if len(sender.submitted["%9"]) != 0 {
+		t.Fatalf("pane input was sent before Grok capability rejection: %v", sender.submitted["%9"])
 	}
 	if _, ok := trigger.lastCompaction["grok-agent"]; ok {
 		t.Fatal("unsupported Grok compaction changed cooldown state")
@@ -295,12 +295,7 @@ func TestCompactionTrigger_GrokDirectPathsSendNothing(t *testing.T) {
 	predictor := NewContextPredictor(DefaultPredictorConfig())
 	trigger := NewCompactionTrigger(config, monitor, compactor, predictor)
 	sender := NewMockPaneSpawner()
-	trigger.inputSender = sender
-	recoverySends := 0
-	trigger.sendKeysForAgent = func(string, string, bool, tmux.AgentType) error {
-		recoverySends++
-		return nil
-	}
+	trigger.submitter = sender
 	trigger.sleep = func(time.Duration) {
 		t.Fatal("unsupported Grok path waited before rejecting capability")
 	}
@@ -314,14 +309,52 @@ func TestCompactionTrigger_GrokDirectPathsSendNothing(t *testing.T) {
 	}
 	trigger.injectRecoveryContext("%9", tmux.AgentGrok)
 
-	if recoverySends != 0 {
-		t.Fatalf("recovery sends = %d, want zero", recoverySends)
-	}
-	if len(sender.sentKeys["%9"]) != 0 || len(sender.sentBuffers["%9"]) != 0 {
-		t.Fatalf("compaction input was sent: keys=%v buffers=%v", sender.sentKeys["%9"], sender.sentBuffers["%9"])
+	if len(sender.submitted["%9"]) != 0 {
+		t.Fatalf("compaction or recovery input was sent: %v", sender.submitted["%9"])
 	}
 	if result := trigger.executeCompaction("grok-agent", "%9", tmux.AgentGrok); result == nil || result.Success || !strings.Contains(result.Error, agent.GrokPromptDeliveryCapabilityHint) {
 		t.Fatalf("executeCompaction() result = %+v, want unsupported Grok failure", result)
+	}
+}
+
+// TestCompactionTrigger_SubmitsCommandsAndRecoveryWithAgentType checks that
+// the trigger's compaction commands and its post-compaction recovery prompt
+// go to the shared submit with the pane's agent type, so a Claude pane gets
+// the paste, the double Enter and the submission check. The recovery prompt
+// used to be typed with one Enter 100 ms after the text.
+func TestCompactionTrigger_SubmitsCommandsAndRecoveryWithAgentType(t *testing.T) {
+	monitor := NewContextMonitor(DefaultMonitorConfig())
+	monitor.RegisterAgent("test__cc_1", "%4", "claude-opus-4")
+	monitor.RecordMessage("test__cc_1", 500, 500)
+	compactor := NewCompactor(monitor, CompactorConfig{
+		MinReduction:     0.10,
+		BuiltinTimeout:   time.Millisecond,
+		SummarizeTimeout: time.Millisecond,
+	})
+	trigger := NewCompactionTrigger(DefaultCompactionTriggerConfig(), monitor, compactor, NewContextPredictor(DefaultPredictorConfig()))
+	sender := NewMockPaneSpawner()
+	trigger.submitter = sender
+	trigger.sleep = func(time.Duration) {}
+
+	if result := trigger.executeCompaction("test__cc_1", "%4", tmux.AgentClaude); result == nil || result.Success {
+		t.Fatalf("executeCompaction() result = %+v, want exhausted failure without a context reduction", result)
+	}
+	trigger.injectRecoveryContext("%4", tmux.AgentClaude)
+
+	want := []submittedPrompt{
+		{agentType: tmux.AgentClaude, prompt: "/compact"},
+		{agentType: tmux.AgentClaude, prompt: "/clear"},
+		{agentType: tmux.AgentClaude, prompt: CompactionPromptTemplate},
+		{agentType: tmux.AgentClaude, prompt: trigger.generateRecoveryPrompt(tmux.AgentClaude)},
+	}
+	got := sender.submitted["%4"]
+	if len(got) != len(want) {
+		t.Fatalf("submitted = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("submitted = %+v, want %+v", got, want)
+		}
 	}
 }
 

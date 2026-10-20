@@ -3,6 +3,7 @@
 package context
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -155,20 +157,18 @@ type PaneSpawner interface {
 	SpawnAgent(session, agentType string, index int, variant string, workDir string) (paneID string, err error)
 	// KillPane terminates a pane.
 	KillPane(paneID string) error
-	// SendKeys sends text to a pane.
-	SendKeys(paneID, text string, enter bool) error
-	// SendBuffer pastes text into a pane using tmux's buffer mechanism.
-	SendBuffer(paneID, text string, enter bool) error
+	// SubmitPrompt types prompt into a pane and submits it with the protocol
+	// ntm send uses for the pane's agent type.
+	SubmitPrompt(ctx context.Context, paneID string, agentType tmux.AgentType, prompt string) error
 	// GetPanes returns all panes in a session.
 	GetPanes(session string) ([]tmux.Pane, error)
 }
 
-type paneInputSender interface {
-	SendKeys(paneID, text string, enter bool) error
-	SendBuffer(paneID, text string, enter bool) error
+// promptSubmitter submits prompts to panes. dispatch.TMUXDeliverer is the
+// production implementation.
+type promptSubmitter interface {
+	SubmitPrompt(ctx context.Context, paneID string, agentType tmux.AgentType, prompt string) error
 }
-
-type tmuxPaneInputSender struct{}
 
 // DefaultPaneSpawner implements PaneSpawner using the tmux package.
 type DefaultPaneSpawner struct {
@@ -228,14 +228,11 @@ func (s *DefaultPaneSpawner) KillPane(paneID string) error {
 	return tmux.KillPane(paneID)
 }
 
-// SendKeys sends text to a pane.
-func (s *DefaultPaneSpawner) SendKeys(paneID, text string, enter bool) error {
-	return tmux.SendKeys(paneID, text, enter)
-}
-
-// SendBuffer pastes text into a pane using tmux's buffer mechanism.
-func (s *DefaultPaneSpawner) SendBuffer(paneID, text string, enter bool) error {
-	return tmux.SendBuffer(paneID, text, enter)
+// SubmitPrompt submits prompt through dispatch's agent-aware submit: the
+// agent's text send (a paste for a multi-line prompt), Enter after 1 s, a
+// second Enter 0.5 s later and, for Claude and Codex, the submission check.
+func (s *DefaultPaneSpawner) SubmitPrompt(ctx context.Context, paneID string, agentType tmux.AgentType, prompt string) error {
+	return dispatch.TMUXDeliverer{}.SubmitPrompt(ctx, paneID, agentType, prompt)
 }
 
 // GetPanes returns all panes in a session.
@@ -317,23 +314,15 @@ func (s *DefaultPaneSpawner) getAgentCommand(agentType string) string {
 	return strings.TrimSpace(agentType)
 }
 
-func (tmuxPaneInputSender) SendKeys(paneID, text string, enter bool) error {
-	return tmux.SendKeys(paneID, text, enter)
-}
-
-func (tmuxPaneInputSender) SendBuffer(paneID, text string, enter bool) error {
-	return tmux.SendBuffer(paneID, text, enter)
-}
-
-func sendCompactionCommandToPane(sender paneInputSender, paneID string, cmd CompactionCommand) error {
-	if cmd.IsPrompt {
-		return sender.SendBuffer(paneID, cmd.Command, true)
-	}
-	return sender.SendKeys(paneID, cmd.Command, true)
-}
-
-func sendRotationPrompt(spawner PaneSpawner, paneID, prompt string) error {
-	return spawner.SendBuffer(paneID, prompt, true)
+// sendCompactionCommandToPane submits a compaction slash command or prompt
+// exactly as `ntm send <session> /compact` would, the path operators already
+// use by hand. Claude's /compact and /clear contain "/", so the agent-aware
+// send pastes them rather than typing them under the autocomplete picker
+// (#198), and the Claude submission check rescues a command still sitting in
+// the composer with Escape then Enter. Gemini's and Antigravity's /clear is
+// typed. The protocol's second Enter lands on the emptied composer.
+func sendCompactionCommandToPane(submitter promptSubmitter, paneID string, agentType tmux.AgentType, cmd CompactionCommand) error {
+	return submitter.SubmitPrompt(context.Background(), paneID, agentType, cmd.Command)
 }
 
 func validateAutomatedRotation(agentType agent.AgentType) error {
@@ -873,7 +862,7 @@ func (r *Rotator) rotateAgent(session, agentID, workDir string, method ...Rotati
 
 	// Request handoff summary from the old agent
 	summaryPrompt := r.summary.GeneratePrompt()
-	if err := sendRotationPrompt(r.spawner, oldPane.ID, summaryPrompt); err != nil {
+	if err := r.spawner.SubmitPrompt(context.Background(), oldPane.ID, oldPane.Type, summaryPrompt); err != nil {
 		result.Success = false
 		result.State = RotationStateFailed
 		result.Error = fmt.Sprintf("failed to request summary: %v", err)
@@ -950,7 +939,7 @@ func (r *Rotator) rotateAgent(session, agentID, workDir string, method ...Rotati
 	// Send handoff context to new agent
 	if handoffSummary != nil {
 		handoffContext := handoffSummary.FormatForNewAgent()
-		if err := sendRotationPrompt(r.spawner, newPaneID, handoffContext); err != nil {
+		if err := r.spawner.SubmitPrompt(context.Background(), newPaneID, tmux.AgentType(agentType), handoffContext); err != nil {
 			// Non-fatal: agent is spawned but may not have context
 			result.Error = fmt.Sprintf("warning: failed to send handoff context: %v", err)
 		}
@@ -1043,8 +1032,7 @@ func (r *Rotator) tryCompaction(agentID, paneID string, agentType agent.AgentTyp
 	}
 
 	for _, cmd := range cmds {
-		// Both slash commands and prompts need enter=true to be submitted.
-		if err := sendCompactionCommandToPane(r.spawner, paneID, cmd); err != nil {
+		if err := sendCompactionCommandToPane(r.spawner, paneID, agentType, cmd); err != nil {
 			slog.Error("failed to send compaction command", "pane_id", paneID, "error", err)
 			continue
 		}

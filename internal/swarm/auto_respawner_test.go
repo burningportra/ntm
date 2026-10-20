@@ -17,14 +17,12 @@ import (
 
 // mockPaneSpawner implements context.PaneSpawner for testing.
 type mockPaneSpawner struct {
-	mu            sync.Mutex
-	spawnCalls    []spawnCall
-	killCalls     []string
-	sendKeysCalls []sendKeysCall
-	spawnErr      error
-	killErr       error
-	sendKeysErr   error
-	panes         []tmux.Pane
+	mu         sync.Mutex
+	spawnCalls []spawnCall
+	killCalls  []string
+	spawnErr   error
+	killErr    error
+	panes      []tmux.Pane
 }
 
 type spawnCall struct {
@@ -96,19 +94,8 @@ func (m *mockPaneSpawner) KillPane(paneID string) error {
 	return m.killErr
 }
 
-func (m *mockPaneSpawner) SendKeys(paneID, text string, enter bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sendKeysCalls = append(m.sendKeysCalls, sendKeysCall{
-		paneID: paneID,
-		text:   text,
-		enter:  enter,
-	})
-	return m.sendKeysErr
-}
-
-func (m *mockPaneSpawner) SendBuffer(paneID, text string, enter bool) error {
-	return m.SendKeys(paneID, text, enter)
+func (m *mockPaneSpawner) SubmitPrompt(context.Context, string, tmux.AgentType, string) error {
+	return nil
 }
 
 func (m *mockPaneSpawner) GetPanes(session string) ([]tmux.Pane, error) {

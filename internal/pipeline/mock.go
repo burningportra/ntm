@@ -31,11 +31,12 @@ func (realTmuxClient) GetPanes(session string) ([]tmux.Pane, error) {
 	return tmux.GetPanes(session)
 }
 
-// SubmitPrompt goes through dispatch.SubmitPrompt, the submit path ntm send
-// uses: typed with send-keys and a 100 ms Enter, a multi-line prompt reached
-// Claude and Codex as keystrokes and stayed an unsent draft in Muse.
+// SubmitPrompt goes through dispatch.TMUXDeliverer.SubmitPrompt, the submit
+// path ntm send uses: typed with send-keys and a 100 ms Enter, a multi-line
+// prompt reached Claude and Codex as keystrokes and stayed an unsent draft in
+// Muse.
 func (realTmuxClient) SubmitPrompt(ctx context.Context, target string, agentType tmux.AgentType, prompt string) error {
-	return dispatch.SubmitPrompt(ctx, target, agentType, prompt)
+	return dispatch.TMUXDeliverer{}.SubmitPrompt(ctx, target, agentType, prompt)
 }
 
 func (realTmuxClient) CapturePaneOutput(target string, lines int) (string, error) {

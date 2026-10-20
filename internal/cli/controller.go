@@ -382,7 +382,7 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		}
 		promptUsed = source
 
-		if err := dispatchsvc.SubmitPrompt(ctx, targetPaneID, tmux.AgentType(agentTypeFull), promptContent); err != nil {
+		if err := (dispatchsvc.TMUXDeliverer{}).SubmitPrompt(ctx, targetPaneID, tmux.AgentType(agentTypeFull), promptContent); err != nil {
 			return nil, fmt.Errorf("sending prompt: %w", err)
 		}
 	}

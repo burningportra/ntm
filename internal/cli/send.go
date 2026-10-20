@@ -3758,7 +3758,7 @@ func newShellDispatchServiceWithGate(
 			if target.ID == "" {
 				target.ID = fmt.Sprintf("%s:%s", session, target.Ref().Physical())
 			}
-			if err := dispatchsvc.ClearComposerForDelivery(ctx, target.ID, delivery); err != nil {
+			if err := (dispatchsvc.TMUXDeliverer{}).ClearComposerForDelivery(ctx, target.ID, delivery); err != nil {
 				return err
 			}
 			switch delivery.Protocol {
@@ -3768,7 +3768,7 @@ func newShellDispatchServiceWithGate(
 				if err := tmux.SendKeysForAgentDoubleEnterContext(ctx, target.ID, delivery.Message, target.Type); err != nil {
 					return err
 				}
-				return dispatchsvc.VerifyAgentSubmission(ctx, target.ID, delivery.Message, target.Type)
+				return dispatchsvc.TMUXDeliverer{}.VerifyAgentSubmission(ctx, target.ID, delivery.Message, target.Type)
 			default:
 				return fmt.Errorf("unsupported shell send protocol %q", delivery.Protocol)
 			}
