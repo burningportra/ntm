@@ -220,7 +220,7 @@ func TestFetchAgentMailStatusSkipsEmptyProjectKey(t *testing.T) {
 	t.Setenv("AGENT_MAIL_URL", stub.server.URL)
 
 	oldCfg := cfg
-	cfg = &config.Config{}
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: true}}
 	t.Cleanup(func() { cfg = oldCfg })
 
 	status := fetchAgentMailStatus("")
@@ -283,7 +283,7 @@ func TestFetchAgentMailStatusDoesNotRegisterProject(t *testing.T) {
 	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
 
 	oldCfg := cfg
-	cfg = &config.Config{}
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: true}}
 	t.Cleanup(func() { cfg = oldCfg })
 
 	if status := fetchAgentMailStatus(unregistered); !status.Available || status.Connected {
@@ -296,5 +296,37 @@ func TestFetchAgentMailStatusDoesNotRegisterProject(t *testing.T) {
 	defer mu.Unlock()
 	if len(tools) != 0 {
 		t.Fatalf("tool calls = %v, want none (status must not call ensure_project)", tools)
+	}
+}
+
+// TestFetchAgentMailStatusSilentWhenDisabled locks bd-46tqx: the Agent Mail
+// section of ntm status is automatic integration, so with [agent_mail]
+// enabled = false it is left out and the server is never contacted.
+func TestFetchAgentMailStatusSilentWhenDisabled(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+	oldCfg := cfg
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: false}}
+	t.Cleanup(func() { cfg = oldCfg })
+
+	if status := fetchAgentMailStatus(t.TempDir()); status != nil {
+		t.Fatalf("status = %+v, want nil when [agent_mail] enabled = false", status)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 0 {
+		t.Fatalf("Agent Mail requests = %v, want none when [agent_mail] enabled = false", requests)
 	}
 }

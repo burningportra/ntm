@@ -1645,8 +1645,12 @@ func updateSessionActivity(parent context.Context, sessionName string) {
 }
 
 // fetchAgentMailStatus retrieves Agent Mail status for display in ntm status.
-// Returns nil if Agent Mail is unavailable (graceful degradation).
+// It returns nil when [agent_mail] enabled is false: the status section is
+// automatic integration, so it stays silent rather than probing the server.
 func fetchAgentMailStatus(projectKey string) *output.AgentMailStatus {
+	if cfg != nil && !cfg.AgentMail.Enabled {
+		return nil
+	}
 	client := newAgentMailClient(projectKey)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
