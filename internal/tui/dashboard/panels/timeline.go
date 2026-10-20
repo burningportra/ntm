@@ -747,21 +747,6 @@ func (m *TimelinePanel) formatAgentLabel(agentID string, width int) string {
 	return fmt.Sprintf("%-*s", width, agentID)
 }
 
-func (m *TimelinePanel) agentColor(agentID string) lipgloss.Color {
-	t := m.theme
-	// Color based on agent type prefix
-	if strings.HasPrefix(agentID, "cc") {
-		return t.Claude
-	}
-	if strings.HasPrefix(agentID, "cod") {
-		return t.Codex
-	}
-	if strings.HasPrefix(agentID, "gmi") {
-		return t.Gemini
-	}
-	return t.Text
-}
-
 func (m *TimelinePanel) stateColor(s state.TimelineState) lipgloss.Color {
 	t := m.theme
 	switch s {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -117,7 +118,7 @@ func toPaneItems(panes []tmux.Pane, statuses map[string]PaneStatus, beads []bv.B
 		row.WindowIndex = pane.WindowIndex
 		row.PaneID = pane.ID
 		row.Address = pane.Ref().Canonical(multiWindow)
-		row.BorderColor = agentTypeColor(pane.Type, t)
+		row.BorderColor = components.AgentTypeColor(pane.Type, t)
 		items[i] = paneItem{pane: pane, row: row}
 	}
 	return items

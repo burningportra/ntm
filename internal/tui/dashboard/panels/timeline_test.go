@@ -424,36 +424,6 @@ func TestTimelinePanel_Keybindings(t *testing.T) {
 	}
 }
 
-func TestTimelinePanel_AgentColors(t *testing.T) {
-	t.Log("TIMELINE_TEST: TestTimelinePanel_AgentColors | Testing agent type colors")
-	t.Setenv("NTM_NO_COLOR", "0")
-	t.Setenv("NTM_THEME", "mocha")
-
-	panel := NewTimelinePanel()
-
-	tests := []struct {
-		agentID      string
-		expectedType string
-	}{
-		{"cc_1", "Claude"},
-		{"cc_worker", "Claude"},
-		{"cod_1", "Codex"},
-		{"cod_main", "Codex"},
-		{"gmi_1", "Gemini"},
-		{"gmi_helper", "Gemini"},
-		{"other", "default"},
-	}
-
-	for _, tt := range tests {
-		color := panel.agentColor(tt.agentID)
-		// Just verify we get a non-empty color
-		if color == "" {
-			t.Errorf("agentColor(%q): returned empty", tt.agentID)
-		}
-		t.Logf("TIMELINE_TEST: Agent=%q Type=%s Color=%v", tt.agentID, tt.expectedType, color)
-	}
-}
-
 func TestTimelinePanel_FormatAgentLabel(t *testing.T) {
 	t.Log("TIMELINE_TEST: TestTimelinePanel_FormatAgentLabel | Testing label formatting")
 

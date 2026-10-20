@@ -9,6 +9,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
+	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/styles"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -497,7 +498,7 @@ func TestRenderPaneDetail(t *testing.T) {
 		if strings.Contains(got, "grok-build") {
 			t.Fatalf("expected Grok alias to be canonicalized in detail output, got %q", got)
 		}
-		if color := agentTypeColor(pane.Type, th); color != th.Pink {
+		if color := components.AgentTypeColor(pane.Type, th); color != th.Pink {
 			t.Fatalf("Grok pane detail color = %q, want pink %q", color, th.Pink)
 		}
 	})

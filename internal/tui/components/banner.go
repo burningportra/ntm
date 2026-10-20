@@ -171,44 +171,26 @@ func RenderAgentBadge(agentType string) string {
 	ic := icons.Current()
 
 	bgColor, icon := renderAgentBadgeStyle(agentType, t, ic)
-	fgColor := string(t.Crust)
 	label := strings.ToUpper(renderAgentBadgeLabel(agentType))
 
 	return lipgloss.NewStyle().
-		Background(lipgloss.Color(bgColor)).
-		Foreground(lipgloss.Color(fgColor)).
+		Background(bgColor).
+		Foreground(t.Crust).
 		Bold(true).
 		Padding(0, 1).
 		Render(strings.TrimSpace(icon + " " + label))
 }
 
-func renderAgentBadgeStyle(agentType string, t theme.Theme, ic icons.IconSet) (string, string) {
-	switch agent.AgentType(agentType).Canonical() {
-	case agent.AgentTypeClaudeCode:
-		return string(t.Claude), ic.Claude
-	case agent.AgentTypeCodex:
-		return string(t.Codex), ic.Codex
-	case agent.AgentTypeGemini:
-		return string(t.Gemini), ic.Gemini
-	case agent.AgentTypeGrok:
-		return string(t.Pink), ic.Robot
-	case agent.AgentTypeAntigravity:
-		return string(t.Lavender), ic.Gemini
-	case agent.AgentTypeMuse:
-		return string(t.Sky), ic.AgentIcon(string(agent.AgentTypeMuse))
-	case agent.AgentTypeCursor:
-		return string(t.Cursor), ic.Cursor
-	case agent.AgentTypeWindsurf:
-		return string(t.Windsurf), ic.Windsurf
-	case agent.AgentTypeAider:
-		return string(t.Aider), ic.Aider
-	case agent.AgentTypeOllama:
-		return string(t.Ollama), ic.Ollama
-	case agent.AgentTypeUser:
-		return string(t.User), ic.User
-	default:
-		return string(t.Green), ""
+// renderAgentBadgeStyle returns the agent badge's background, the type's
+// AgentTypeColor, and its icon: the generic robot glyph for types the icon
+// set has none for, which the badge's label then names. Types ntm doesn't
+// know take the user pane's color and icon, as on the dashboard.
+func renderAgentBadgeStyle(agentType string, t theme.Theme, ic icons.IconSet) (lipgloss.Color, string) {
+	paneType := PaneAgentType(agent.AgentType(agentType))
+	if paneType == agent.AgentTypeUser {
+		return AgentTypeColor(paneType, t), ic.User
 	}
+	return AgentTypeColor(paneType, t), ic.AgentIcon(string(paneType))
 }
 
 func renderAgentBadgeLabel(agentType string) string {

@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/history"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 )
 
 // stripANSI removes ANSI escape sequences from text for test comparison.
@@ -201,6 +202,38 @@ func TestRenderPreviewUsesAgentBadgeForNewerAgentCategories(t *testing.T) {
 	}
 	if strings.Contains(preview, "Quick Actions") {
 		t.Fatalf("preview should be showing the selected cursor command, got:\n%s", preview)
+	}
+}
+
+// A command whose category names any agent type ntm can launch, or the user
+// pane, shows that type's agent badge in the preview. Pi, Kimi, Muse,
+// Antigravity, Grok and Opencode categories used to get the generic category
+// badge instead.
+func TestRenderPreviewUsesAgentBadgeForEveryAgentCategory(t *testing.T) {
+	categories := map[string]agent.AgentType{
+		"kimi-cli":    agent.AgentTypeKimi,
+		"grok-build":  agent.AgentTypeGrok,
+		"opencode":    agent.AgentTypeOpencode,
+		"antigravity": agent.AgentTypeAntigravity,
+		"muse-code":   agent.AgentTypeMuse,
+	}
+	for _, agentType := range append(agent.AgentTypes(), agent.AgentTypeUser) {
+		categories[string(agentType)] = agentType
+	}
+
+	for category, agentType := range categories {
+		m := New("test-session", []config.PaletteCmd{
+			{Key: "task", Label: "Agent Task", Category: category, Prompt: "Do the thing"},
+		})
+		m.width = 80
+		m.filtered = append([]config.PaletteCmd(nil), m.commands...)
+		m.cursor = 0
+
+		preview := stripANSI(m.renderPreview(80))
+		badge := stripANSI(components.RenderAgentBadge(string(agentType)))
+		if !strings.Contains(preview, badge) {
+			t.Errorf("category %q: preview lacks the %q agent badge %q:\n%s", category, agentType, badge, preview)
+		}
 	}
 }
 

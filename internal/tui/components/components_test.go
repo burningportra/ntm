@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -106,37 +107,97 @@ func TestRenderAgentBadge(t *testing.T) {
 	}
 }
 
-func TestRenderAgentBadgeStyle(t *testing.T) {
-	currentTheme := theme.Current()
-	currentIcons := icons.Current()
-
-	tests := []struct {
-		name      string
-		agentType string
-		wantColor string
-		wantIcon  string
-	}{
-		{"claude", "claude", string(currentTheme.Claude), currentIcons.Claude},
-		{"codex alias", "openai-codex", string(currentTheme.Codex), currentIcons.Codex},
-		{"gemini alias", "google-gemini", string(currentTheme.Gemini), currentIcons.Gemini},
-		{"grok alias", "grok-build", string(currentTheme.Pink), currentIcons.Robot},
-		{"muse", "muse", string(currentTheme.Sky), currentIcons.AgentIcon("muse")},
-		{"muse alias", "muse-code", string(currentTheme.Sky), currentIcons.AgentIcon("muse")},
-		{"cursor", "cursor", string(currentTheme.Cursor), currentIcons.Cursor},
-		{"windsurf alias", "ws", string(currentTheme.Windsurf), currentIcons.Windsurf},
-		{"aider", "aider", string(currentTheme.Aider), currentIcons.Aider},
-		{"ollama", "ollama", string(currentTheme.Ollama), currentIcons.Ollama},
-		{"user", "user", string(currentTheme.User), currentIcons.User},
-		{"unknown", "mystery", string(currentTheme.Green), ""},
+// Every agent type ntm can launch gets its semantic palette color and its
+// icon on the command palette's agent badge. Pi, Kimi and Opencode used to
+// get green with no icon, the fallback for types the badge didn't know.
+func TestRenderAgentBadgeStyleCoversEveryAgentType(t *testing.T) {
+	iconSets := map[string]icons.IconSet{
+		"nerd":    icons.NerdFonts.WithFallback(icons.Unicode).WithFallback(icons.ASCII),
+		"unicode": icons.Unicode.WithFallback(icons.ASCII),
+		"ascii":   icons.ASCII,
+	}
+	for _, th := range []theme.Theme{theme.CatppuccinMocha, theme.CatppuccinLatte} {
+		palette := th.Semantic()
+		for name, ic := range iconSets {
+			for _, agentType := range agent.AgentTypes() {
+				gotColor, gotIcon := renderAgentBadgeStyle(string(agentType), th, ic)
+				if want := palette.AgentColor(string(agentType)); gotColor != want {
+					t.Errorf("%s: renderAgentBadgeStyle(%q) color = %q, want palette color %q", name, agentType, gotColor, want)
+				}
+				if want := ic.AgentIcon(string(agentType)); gotIcon != want || gotIcon == "" {
+					t.Errorf("%s: renderAgentBadgeStyle(%q) icon = %q, want its icon %q", name, agentType, gotIcon, want)
+				}
+			}
+			// User panes, and types ntm doesn't know, which the dashboard
+			// draws as user panes.
+			for _, agentType := range []string{"user", "unknown", "mystery"} {
+				gotColor, gotIcon := renderAgentBadgeStyle(agentType, th, ic)
+				if gotColor != palette.AgentUser || gotIcon != ic.User {
+					t.Errorf("%s: renderAgentBadgeStyle(%q) = (%q, %q), want user (%q, %q)", name, agentType, gotColor, gotIcon, palette.AgentUser, ic.User)
+				}
+			}
+		}
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			gotColor, gotIcon := renderAgentBadgeStyle(tc.agentType, currentTheme, currentIcons)
-			if gotColor != tc.wantColor || gotIcon != tc.wantIcon {
-				t.Fatalf("renderAgentBadgeStyle(%q) = (%q, %q), want (%q, %q)", tc.agentType, gotColor, gotIcon, tc.wantColor, tc.wantIcon)
-			}
-		})
+	ic := iconSets["nerd"]
+	for _, pair := range [][2]string{
+		{"claude", "cc"},
+		{"openai-codex", "cod"},
+		{"google-gemini", "gmi"},
+		{"grok-build", "grok"},
+		{"muse-code", "muse"},
+		{"moonshot", "kimi"},
+		{"pi-coding-agent", "pi"},
+		{"opencode", "oc"},
+		{"ws", "windsurf"},
+	} {
+		gotColor, gotIcon := renderAgentBadgeStyle(pair[0], theme.CatppuccinMocha, ic)
+		wantColor, wantIcon := renderAgentBadgeStyle(pair[1], theme.CatppuccinMocha, ic)
+		if gotColor != wantColor || gotIcon != wantIcon {
+			t.Errorf("renderAgentBadgeStyle(%q) = (%q, %q), want %q's (%q, %q)", pair[0], gotColor, gotIcon, pair[1], wantColor, wantIcon)
+		}
+	}
+}
+
+// The dashboard's pane cards, the context panel and the palette badge all
+// take a type's color from AgentTypeColor: the semantic palette color for
+// every agent type, and user green for panes of no known type.
+func TestAgentTypeColorCoversEveryAgentType(t *testing.T) {
+	th := theme.CatppuccinMocha
+	palette := th.Semantic()
+	for _, agentType := range agent.AgentTypes() {
+		if got, want := AgentTypeColor(agentType, th), palette.AgentColor(string(agentType)); got != want {
+			t.Errorf("AgentTypeColor(%q) = %q, want palette color %q", agentType, got, want)
+		}
+		if got := PaneAgentType(agentType); got != agentType {
+			t.Errorf("PaneAgentType(%q) = %q, want it unchanged", agentType, got)
+		}
+	}
+	for _, agentType := range []agent.AgentType{agent.AgentTypeUser, agent.AgentTypeUnknown, "", "bash"} {
+		if got := AgentTypeColor(agentType, th); got != palette.AgentUser {
+			t.Errorf("AgentTypeColor(%q) = %q, want user color %q", agentType, got, palette.AgentUser)
+		}
+		if got := PaneAgentType(agentType); got != agent.AgentTypeUser {
+			t.Errorf("PaneAgentType(%q) = %q, want user", agentType, got)
+		}
+	}
+	for alias, canonical := range map[agent.AgentType]agent.AgentType{
+		"claude-code":   agent.AgentTypeClaudeCode,
+		"claude_code":   agent.AgentTypeClaudeCode,
+		"openai-codex":  agent.AgentTypeCodex,
+		"google-gemini": agent.AgentTypeGemini,
+		"grok-build":    agent.AgentTypeGrok,
+		"muse-code":     agent.AgentTypeMuse,
+		"Moonshot":      agent.AgentTypeKimi,
+		"opencode":      agent.AgentTypeOpencode,
+		"ws":            agent.AgentTypeWindsurf,
+	} {
+		if got := PaneAgentType(alias); got != canonical {
+			t.Errorf("PaneAgentType(%q) = %q, want %q", alias, got, canonical)
+		}
+		if got, want := AgentTypeColor(alias, th), AgentTypeColor(canonical, th); got != want {
+			t.Errorf("AgentTypeColor(%q) = %q, want %q's %q", alias, got, canonical, want)
+		}
 	}
 }
 

@@ -3710,7 +3710,7 @@ func (m *Model) cycleFocus(dir int) {
 func (m *Model) updateStats() {
 	counts := make(map[tmux.AgentType]int)
 	for _, p := range m.panes {
-		counts[dashboardAgentType(p.Type)]++
+		counts[components.PaneAgentType(p.Type)]++
 	}
 	m.agentCounts = counts
 }
@@ -3970,7 +3970,7 @@ func (m Model) renderPaneGrid() string {
 		ps, hasPaneStatus := m.paneStatus[paneStatusKey(p)]
 
 		// Determine card colors based on agent type
-		iconColor := agentTypeColor(p.Type, t)
+		iconColor := components.AgentTypeColor(p.Type, t)
 		agentIcon := agentTypeGlyph(p.Type, ic)
 		borderColor := iconColor
 
@@ -5732,7 +5732,7 @@ func (m Model) renderPaneDetail(width int) string {
 
 	// Type badge
 	typeBadge := lipgloss.NewStyle().
-		Background(agentTypeColor(p.Type, t)).
+		Background(components.AgentTypeColor(p.Type, t)).
 		Foreground(t.Base).
 		Bold(true).
 		Padding(0, 1).

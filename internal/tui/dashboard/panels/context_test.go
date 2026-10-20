@@ -1,10 +1,16 @@
 package panels
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/context"
+	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
 
 func TestNewContextPanel(t *testing.T) {
@@ -192,42 +198,47 @@ func TestContextPanel_Keybindings(t *testing.T) {
 	}
 }
 
-func TestContextAgentTypeColor_CanonicalizesAliases(t *testing.T) {
-	t.Parallel()
+// Each agent's name in the context panel takes its type's semantic palette
+// color, the one the dashboard's pane cards use. Grok, Pi, Kimi and Opencode
+// used to fall to plain text, and panes of no known type draw as user panes.
+func TestContextPanelColorsEveryAgentTypeFromPalette(t *testing.T) {
+	prevProfile := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(prevProfile) })
+	lipgloss.SetColorProfile(termenv.TrueColor)
 
-	panel := NewContextPanel()
-	aliasPairs := [][2]string{
-		{"claude_code", "cc"},
-		{"openai-codex", "cod"},
-		{"google-gemini", "gmi"},
-		{"ws", "windsurf"},
+	th := theme.CatppuccinMocha
+	palette := th.Semantic()
+	cases := map[string]lipgloss.Color{"user": palette.AgentUser, "": palette.AgentUser, "bash": palette.AgentUser}
+	for _, agentType := range agent.AgentTypes() {
+		cases[string(agentType)] = palette.AgentColor(string(agentType))
+	}
+	for alias, canonical := range map[string]agent.AgentType{
+		"claude_code":   agent.AgentTypeClaudeCode,
+		"openai-codex":  agent.AgentTypeCodex,
+		"grok-build":    agent.AgentTypeGrok,
+		"muse-code":     agent.AgentTypeMuse,
+		"moonshot":      agent.AgentTypeKimi,
+		"opencode":      agent.AgentTypeOpencode,
+		"google-gemini": agent.AgentTypeGemini,
+	} {
+		cases[alias] = palette.AgentColor(string(canonical))
 	}
 
-	for _, pair := range aliasPairs {
-		got := contextAgentTypeColor(pair[0], panel.theme)
-		want := contextAgentTypeColor(pair[1], panel.theme)
-		if got != want {
-			t.Errorf("contextAgentTypeColor(%q) = %q, want same color as %q (%q)", pair[0], got, pair[1], want)
-		}
-	}
-}
+	for agentType, wantColor := range cases {
+		panel := NewContextPanel()
+		panel.theme = th
+		panel.SetSize(60, 20)
+		name := "agent-" + agentType
+		panel.SetData(ContextPanelData{Agents: []AgentContextStatus{{
+			PaneID:       "proj__x_1",
+			AgentType:    agentType,
+			AgentName:    name,
+			CurrentUsage: 0.3,
+		}}}, nil)
 
-func TestContextAgentTypeColor_User(t *testing.T) {
-	t.Parallel()
-
-	panel := NewContextPanel()
-	if got := contextAgentTypeColor("user", panel.theme); got != panel.theme.User {
-		t.Fatalf("contextAgentTypeColor(user) = %q, want %q", got, panel.theme.User)
-	}
-}
-
-func TestContextAgentTypeColor_Muse(t *testing.T) {
-	t.Parallel()
-
-	panel := NewContextPanel()
-	for _, agentType := range []string{"muse", "muse-code"} {
-		if got := contextAgentTypeColor(agentType, panel.theme); got != panel.theme.Sky {
-			t.Errorf("contextAgentTypeColor(%q) = %q, want sky %q", agentType, got, panel.theme.Sky)
+		want := lipgloss.NewStyle().Foreground(wantColor).Bold(true).Render(name)
+		if view := panel.View(); !strings.Contains(view, want) {
+			t.Errorf("context panel draws a %q agent's name without its color %q; want %q in %q", agentType, wantColor, want, view)
 		}
 	}
 }

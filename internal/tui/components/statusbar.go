@@ -69,6 +69,24 @@ func AgentCountLabel(agentType agent.AgentType) string {
 	}
 }
 
+// PaneAgentType returns agentType's canonical form, with types ntm doesn't
+// know as user panes, which is how the dashboard counts and draws them.
+func PaneAgentType(agentType agent.AgentType) agent.AgentType {
+	canonical := agentType.Canonical()
+	if !canonical.IsValid() {
+		return agent.AgentTypeUser
+	}
+	return canonical
+}
+
+// AgentTypeColor returns the color that marks an agent type wherever the TUI
+// draws one: the semantic palette's agent color, which the dashboard's count
+// badges, pane cards, rows and borders, the context panel and the command
+// palette's agent badge all share.
+func AgentTypeColor(agentType agent.AgentType, t theme.Theme) lipgloss.Color {
+	return t.Semantic().AgentColor(string(PaneAgentType(agentType)))
+}
+
 // RenderStatusBar renders a three-section status bar: left | center | right.
 // Uses the full terminal width with a Surface0 background and Surface1 top border.
 func RenderStatusBar(opts StatusBarOptions) string {

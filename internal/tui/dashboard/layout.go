@@ -361,7 +361,7 @@ func BuildPaneTableRows(
 			ContextHistory: append([]float64(nil), ps.ContextHistory...), // [tui-upgrade: bd-3btd6]
 			Model:          ps.ContextModel,
 			IsCompacted:    ps.LastCompaction != nil,
-			BorderColor:    agentTypeColor(pane.Type, t),
+			BorderColor:    components.AgentTypeColor(pane.Type, t),
 		}
 
 		// Populate health classification from process_triage
@@ -617,7 +617,7 @@ func RenderPaneRow(row PaneTableRow, dims LayoutDimensions, t theme.Theme, ic ic
 	// Per-agent colored border indicator (pulses when working)
 	borderColor := row.BorderColor
 	if borderColor == "" {
-		borderColor = agentTypeColor(agentType, t)
+		borderColor = components.AgentTypeColor(agentType, t)
 	}
 	if row.Status == "working" && row.Tick > 0 {
 		borderColor = styles.Pulse(string(borderColor), row.Tick)
@@ -641,7 +641,7 @@ func RenderPaneRow(row PaneTableRow, dims LayoutDimensions, t theme.Theme, ic ic
 	}
 	parts = append(parts, idxStyle.Render(fmt.Sprintf("%2s", address)))
 
-	typeColor := agentTypeColor(agentType, t)
+	typeColor := components.AgentTypeColor(agentType, t)
 
 	// Apply pulse animation when agent is actively working
 	if row.Status == "working" && row.Tick > 0 {
@@ -861,7 +861,7 @@ func RenderPaneDetail(pane tmux.Pane, ps PaneStatus, dims LayoutDimensions, t th
 	// Type
 	canonicalType := pane.Type.Canonical()
 	typeBadge := lipgloss.NewStyle().
-		Background(agentTypeColor(canonicalType, t)).
+		Background(components.AgentTypeColor(canonicalType, t)).
 		Foreground(t.Base).
 		Bold(true).
 		Padding(0, 1).
@@ -1213,30 +1213,12 @@ func WorkingSpinnerFrame(tick int) string {
 	return workingSpinnerFrames[tick%len(workingSpinnerFrames)]
 }
 
-// dashboardAgentType returns agentType's canonical form, with types ntm
-// doesn't know as user panes, which is how the dashboard counts and draws them.
-func dashboardAgentType(agentType tmux.AgentType) tmux.AgentType {
-	canonical := agentType.Canonical()
-	if !canonical.IsValid() {
-		return tmux.AgentUser
-	}
-	return canonical
-}
-
-// agentTypeColor returns the color that marks a pane's agent type on the
-// dashboard's pane cards, rows, borders and type badges: the semantic
-// palette's agent color, the one the header, ticker and status bar count
-// badges use.
-func agentTypeColor(agentType tmux.AgentType, t theme.Theme) lipgloss.Color {
-	return t.Semantic().AgentColor(string(dashboardAgentType(agentType)))
-}
-
 // agentTypeGlyph returns what the dashboard shows to mark a pane's agent
 // type: the type's icon, or its count badge label when the icon set has only
 // the generic robot glyph for it, so Pi, Kimi, Muse, Grok and Opencode panes
 // stay distinguishable without color.
 func agentTypeGlyph(agentType tmux.AgentType, ic icons.IconSet) string {
-	agentType = dashboardAgentType(agentType)
+	agentType = components.PaneAgentType(agentType)
 	if agentType == tmux.AgentUser {
 		return ic.User
 	}
@@ -1249,7 +1231,7 @@ func agentTypeGlyph(agentType tmux.AgentType, ic icons.IconSet) string {
 // AgentBorderStyle returns a lipgloss border style for an agent.
 // When isActive is true and tick > 0, the border pulses to indicate active processing.
 func AgentBorderStyle(agentType string, isActive bool, tick int, t theme.Theme) lipgloss.Style {
-	baseColor := agentTypeColor(tmux.AgentType(agentType), t)
+	baseColor := components.AgentTypeColor(tmux.AgentType(agentType), t)
 
 	var borderColor lipgloss.Color
 	if isActive && tick > 0 {
@@ -1268,7 +1250,7 @@ func AgentBorderStyle(agentType string, isActive bool, tick int, t theme.Theme) 
 // AgentPanelStyles returns list and detail panel styles with agent-specific border colors.
 // The selected/focused panel uses the agent's color; unfocused uses a neutral color.
 func AgentPanelStyles(agentType string, focused FocusedPanel, isActive bool, tick int, t theme.Theme) (listStyle, detailStyle lipgloss.Style) {
-	agentColor := agentTypeColor(tmux.AgentType(agentType), t)
+	agentColor := components.AgentTypeColor(tmux.AgentType(agentType), t)
 	unfocusedBorder := t.Surface1
 
 	// Apply pulse effect if agent is active

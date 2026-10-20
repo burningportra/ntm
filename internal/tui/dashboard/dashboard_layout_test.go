@@ -3392,10 +3392,11 @@ var detectedIconSets = map[string]icons.IconSet{
 	"ascii":   icons.ASCII,
 }
 
-// Every agent type ntm can launch takes its semantic palette color, and its
-// icon or, where the icon set has only the generic robot glyph for it, its
-// count badge label. None falls back to the user pane's glyph, and panes of
-// no known type look like user panes, the way they count.
+// Every agent type ntm can launch takes its icon or, where the icon set has
+// only the generic robot glyph for it, its count badge label. None falls back
+// to the user pane's glyph, and panes of no known type look like user panes,
+// the way they count. Colors come from components.AgentTypeColor, tested
+// with it.
 func TestAgentTypePresentationCoversEveryAgentType(t *testing.T) {
 	nerd := detectedIconSets["nerd"]
 	wantNerdGlyphs := map[tmux.AgentType]string{
@@ -3425,13 +3426,8 @@ func TestAgentTypePresentationCoversEveryAgentType(t *testing.T) {
 		}
 	}
 
-	th := theme.CatppuccinMocha
-	palette := th.Semantic()
 	for name, ic := range detectedIconSets {
 		for _, agentType := range agent.AgentTypes() {
-			if got, want := agentTypeColor(agentType, th), palette.AgentColor(string(agentType)); got != want {
-				t.Errorf("agentTypeColor(%q) = %q, want palette color %q", agentType, got, want)
-			}
 			glyph := agentTypeGlyph(agentType, ic)
 			if glyph != ic.AgentIcon(string(agentType)) && glyph != components.AgentCountLabel(agentType) {
 				t.Errorf("%s: agentTypeGlyph(%q) = %q, want its icon or its label %q", name, agentType, glyph, components.AgentCountLabel(agentType))
@@ -3441,9 +3437,6 @@ func TestAgentTypePresentationCoversEveryAgentType(t *testing.T) {
 			}
 		}
 		for _, agentType := range []tmux.AgentType{tmux.AgentUser, tmux.AgentUnknown, "", "bash"} {
-			if got := agentTypeColor(agentType, th); got != palette.AgentUser {
-				t.Errorf("agentTypeColor(%q) = %q, want user color %q", agentType, got, palette.AgentUser)
-			}
 			if got := agentTypeGlyph(agentType, ic); got != ic.User {
 				t.Errorf("%s: agentTypeGlyph(%q) = %q, want user glyph %q", name, agentType, got, ic.User)
 			}
@@ -3452,7 +3445,6 @@ func TestAgentTypePresentationCoversEveryAgentType(t *testing.T) {
 }
 
 func TestAgentTypePresentationCanonicalizesAliases(t *testing.T) {
-	th := theme.CatppuccinMocha
 	ic := detectedIconSets["nerd"]
 	aliasPairs := [][2]tmux.AgentType{
 		{"claude-code", tmux.AgentClaude},
@@ -3466,9 +3458,6 @@ func TestAgentTypePresentationCanonicalizesAliases(t *testing.T) {
 		{"ws", tmux.AgentWindsurf},
 	}
 	for _, pair := range aliasPairs {
-		if got, want := agentTypeColor(pair[0], th), agentTypeColor(pair[1], th); got != want {
-			t.Errorf("agentTypeColor(%q) = %q, want %q's %q", pair[0], got, pair[1], want)
-		}
 		if got, want := agentTypeGlyph(pair[0], ic), agentTypeGlyph(pair[1], ic); got != want {
 			t.Errorf("agentTypeGlyph(%q) = %q, want %q's %q", pair[0], got, pair[1], want)
 		}

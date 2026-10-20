@@ -473,7 +473,7 @@ func (m Model) renderStatsBar() string {
 
 	for _, c := range components.AgentCountsInOrder(m.agentCounts) {
 		parts = append(parts, lipgloss.NewStyle().
-			Background(agentTypeColor(c.Type, t)).
+			Background(components.AgentTypeColor(c.Type, t)).
 			Foreground(t.Base).
 			Bold(true).
 			Padding(0, 1).

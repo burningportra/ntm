@@ -2018,11 +2018,11 @@ func (m Model) renderPreview(width int) string {
 		badges = append(badges, styles.TextBadge("key: "+cmd.Key, t.Surface0, t.Text))
 	}
 	if cmd.Category != "" {
-		// Use the shared agent canonicalizer so newer agent categories keep their
-		// dedicated badge styling instead of falling back to the generic category badge.
+		// A category naming any agent type ntm can launch, or the user pane,
+		// gets that type's agent badge; anything else gets the generic badge.
 		canonicalCategory := agent.AgentType(cmd.Category).Canonical()
 		var badge string
-		if isKnownPaletteAgentCategory(canonicalCategory) {
+		if canonicalCategory.IsValid() {
 			badge = components.RenderAgentBadge(string(canonicalCategory))
 		} else {
 			badge = lipgloss.NewStyle().
@@ -2074,22 +2074,6 @@ func (m Model) renderPreview(width int) string {
 	}
 
 	return b.String()
-}
-
-func isKnownPaletteAgentCategory(category agent.AgentType) bool {
-	switch category {
-	case agent.AgentTypeClaudeCode,
-		agent.AgentTypeCodex,
-		agent.AgentTypeGemini,
-		agent.AgentTypeCursor,
-		agent.AgentTypeWindsurf,
-		agent.AgentTypeAider,
-		agent.AgentTypeOllama,
-		agent.AgentTypeUser:
-		return true
-	default:
-		return false
-	}
 }
 
 func (m Model) renderTargetSummaryBadges() string {

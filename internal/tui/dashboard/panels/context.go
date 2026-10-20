@@ -277,7 +277,7 @@ func (c *ContextPanel) View() string {
 		availHeight = 0
 	}
 
-	for i, agent := range c.data.Agents {
+	for i, status := range c.data.Agents {
 		if i >= availHeight/3 { // 3 lines per agent
 			remaining := len(c.data.Agents) - i
 			content.WriteString(lipgloss.NewStyle().
@@ -290,13 +290,13 @@ func (c *ContextPanel) View() string {
 		var statusColor lipgloss.Color
 		var statusIcon string
 		switch {
-		case agent.ShouldCompact:
+		case status.ShouldCompact:
 			statusColor = t.Red
 			statusIcon = "⚠️"
-		case agent.ShouldWarn:
+		case status.ShouldWarn:
 			statusColor = t.Yellow
 			statusIcon = "⚡"
-		case agent.CurrentUsage > 0.60:
+		case status.CurrentUsage > 0.60:
 			statusColor = t.Peach
 			statusIcon = "●"
 		default:
@@ -304,17 +304,17 @@ func (c *ContextPanel) View() string {
 			statusIcon = "●"
 		}
 
-		typeColor := contextAgentTypeColor(agent.AgentType, t)
+		typeColor := components.AgentTypeColor(agent.AgentType(status.AgentType), t)
 
 		// Name (use pane ID if no agent name)
-		displayName := agent.AgentName
+		displayName := status.AgentName
 		if displayName == "" {
-			displayName = agent.PaneID
+			displayName = status.PaneID
 		}
 
 		// First line: status icon + name + usage percentage
 		nameStyle := lipgloss.NewStyle().Foreground(typeColor).Bold(true)
-		usagePct := fmt.Sprintf("%.0f%%", agent.CurrentUsage*100)
+		usagePct := fmt.Sprintf("%.0f%%", status.CurrentUsage*100)
 		usageStyle := lipgloss.NewStyle().Foreground(statusColor).Bold(true)
 
 		line1 := fmt.Sprintf("%s %s  %s",
@@ -325,19 +325,19 @@ func (c *ContextPanel) View() string {
 
 		// Second line: time remaining or velocity info
 		var line2 string
-		if agent.MinutesToExhaustion > 0 {
-			minutesStr := formatMinutes(agent.MinutesToExhaustion)
+		if status.MinutesToExhaustion > 0 {
+			minutesStr := formatMinutes(status.MinutesToExhaustion)
 			line2 = fmt.Sprintf("   Est. exhaustion in %s", minutesStr)
-			if agent.ShouldCompact {
+			if status.ShouldCompact {
 				line2 = lipgloss.NewStyle().Foreground(t.Red).Render(line2)
-			} else if agent.ShouldWarn {
+			} else if status.ShouldWarn {
 				line2 = lipgloss.NewStyle().Foreground(t.Yellow).Render(line2)
 			} else {
 				line2 = lipgloss.NewStyle().Foreground(t.Subtext).Render(line2)
 			}
-		} else if agent.TokenVelocity > 0 {
+		} else if status.TokenVelocity > 0 {
 			line2 = lipgloss.NewStyle().Foreground(t.Subtext).
-				Render(fmt.Sprintf("   %.0f tok/min", agent.TokenVelocity))
+				Render(fmt.Sprintf("   %.0f tok/min", status.TokenVelocity))
 		} else {
 			line2 = lipgloss.NewStyle().Foreground(t.Overlay).
 				Render("   Stable")
@@ -348,7 +348,7 @@ func (c *ContextPanel) View() string {
 
 		// Third line: mini progress bar
 		barColor := string(statusColor)
-		miniBar := styles.ProgressBar(agent.CurrentUsage, w-6, "━", "┄", barColor)
+		miniBar := styles.ProgressBar(status.CurrentUsage, w-6, "━", "┄", barColor)
 		content.WriteString(miniBar + "\n")
 	}
 
@@ -362,33 +362,6 @@ func (c *ContextPanel) View() string {
 	}
 
 	return boxStyle.Render(FitToHeight(content.String(), h-4))
-}
-
-func contextAgentTypeColor(agentType string, t theme.Theme) lipgloss.Color {
-	switch agent.AgentType(agentType).Canonical() {
-	case agent.AgentTypeClaudeCode:
-		return t.Claude
-	case agent.AgentTypeCodex:
-		return t.Codex
-	case agent.AgentTypeGemini:
-		return t.Gemini
-	case agent.AgentTypeAntigravity:
-		return t.Lavender
-	case agent.AgentTypeMuse:
-		return t.Sky
-	case agent.AgentTypeCursor:
-		return t.Cursor
-	case agent.AgentTypeWindsurf:
-		return t.Windsurf
-	case agent.AgentTypeAider:
-		return t.Aider
-	case agent.AgentTypeOllama:
-		return t.Ollama
-	case agent.AgentTypeUser:
-		return t.User
-	default:
-		return t.Text
-	}
 }
 
 // formatMinutes formats a duration in minutes to a human-readable string.
