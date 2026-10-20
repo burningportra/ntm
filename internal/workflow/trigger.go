@@ -115,9 +115,12 @@ type fileTrigger struct {
 	pattern string
 	op      fsnotify.Op
 
-	mu      sync.Mutex
-	root    string
-	fired   bool
+	mu    sync.Mutex
+	root  string
+	fired bool
+	// err holds watch failures that Check has not returned yet. Check
+	// returns each one once, because the watch keeps covering everything
+	// else and a single failure must not disable the trigger for good.
 	err     error
 	watcher *fsnotify.Watcher
 	done    chan struct{}
@@ -189,11 +192,16 @@ func (t *fileTrigger) run(watcher *fsnotify.Watcher, done <-chan struct{}) {
 			if !ok {
 				return
 			}
-			t.mu.Lock()
-			t.err = err
-			t.mu.Unlock()
+			t.report(err)
 		}
 	}
+}
+
+// report keeps err for the next Check to return.
+func (t *fileTrigger) report(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.err = errors.Join(t.err, err)
 }
 
 // observe records what one filesystem event means for the trigger.
@@ -203,11 +211,11 @@ func (t *fileTrigger) observe(watcher *fsnotify.Watcher, event fsnotify.Event) {
 			switch {
 			case info.IsDir():
 				// Files created in a new directory before its watch exists
-				// produce no events, so the walk reports the ones already there.
-				if err := addDirectoryTree(watcher, event.Name, t.fileAppeared); err != nil {
-					t.mu.Lock()
-					t.err = fmt.Errorf("watch created directory %q: %w", event.Name, err)
-					t.mu.Unlock()
+				// produce no events, so the walk reports the ones already
+				// there. A directory that is already gone has nothing to watch.
+				err := addDirectoryTree(watcher, event.Name, t.fileAppeared)
+				if err != nil && !removed(event.Name) {
+					t.report(fmt.Errorf("watch created directory %q: %w", event.Name, err))
 				}
 			case info.Mode().IsRegular():
 				t.fileAppeared(event.Name, info)
@@ -265,30 +273,48 @@ func (t *fileTrigger) matches(name string) bool {
 // individually, so watching only the project root misses events produced in
 // nested source trees. Each directory is watched before it is listed, so a
 // file created during the walk is either listed or reported by the watch.
+//
+// A failure on root ends the walk. Below root, an entry removed while the
+// walk runs is skipped, since there is nothing left to watch, and any other
+// failure skips that entry and everything beneath it; the walk carries on
+// and returns those failures together, each naming its path.
 func addDirectoryTree(watcher *fsnotify.Watcher, root string, found func(string, os.FileInfo)) error {
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	var failures []error
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err == nil && entry.IsDir() {
+			err = watcher.Add(path)
+		} else if err == nil && found != nil && entry.Type().IsRegular() {
+			var info os.FileInfo
+			if info, err = entry.Info(); err == nil {
+				found(path, info)
+			}
+		}
+		switch {
+		case err == nil:
+			return nil
+		case path == root:
+			return fmt.Errorf("watch %q: %w", path, err)
+		case !removed(path):
+			failures = append(failures, fmt.Errorf("watch %q: %w", path, err))
 		}
 		if entry.IsDir() {
-			if err := watcher.Add(path); err != nil {
-				return fmt.Errorf("watch %q: %w", path, err)
-			}
-			return nil
+			return filepath.SkipDir
 		}
-		if found == nil || !entry.Type().IsRegular() {
-			return nil
-		}
-		info, err := entry.Info()
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		found(path, info)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return errors.Join(failures...)
+}
+
+// removed reports whether path no longer exists, in which case failing to
+// watch it is no failure. The error alone cannot tell: when a watched
+// directory is deleted, kqueue can fail a new watch of it with EBADF because
+// fsnotify closes its old descriptor at the same time.
+func removed(path string) bool {
+	_, err := os.Lstat(path)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // matchPathPattern matches slash-separated relative paths and gives ** its
@@ -319,8 +345,9 @@ func matchPathPattern(pattern, rel string) bool {
 func (t *fileTrigger) Check(_ *TriggerContext) (bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.err != nil {
-		return false, fmt.Errorf("watch filesystem: %w", t.err)
+	if err := t.err; err != nil {
+		t.err = nil
+		return false, fmt.Errorf("watch filesystem: %w", err)
 	}
 	for path := range t.pending {
 		if t.fired {

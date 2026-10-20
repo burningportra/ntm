@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -181,6 +183,117 @@ func TestFileTriggersReportFilesInMovedInDirectories(t *testing.T) {
 	}
 }
 
+// Build tools create and delete scratch directories all the time. One that is
+// removed while the walk runs has nothing left to watch, so the walk skips it
+// and carries on.
+func TestAddDirectoryTreeSkipsDirectoryRemovedDuringWalk(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a"), 0o755); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a", "x.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatalf("write a/x.go: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "b", "c"), 0o755); err != nil {
+		t.Fatalf("create b/c: %v", err)
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatalf("NewWatcher(): %v", err)
+	}
+	// fsnotify needs its channels read, as fileTrigger.run does. Closing an
+	// unread kqueue watcher under load made TempDir cleanup fail with EBADF.
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range watcher.Events {
+		}
+	}()
+	go func() {
+		for range watcher.Errors {
+		}
+	}()
+	t.Cleanup(func() {
+		_ = watcher.Close()
+		<-drained
+	})
+	var found []string
+	// The walk lists root before visiting a/, so b/ is still on its list
+	// when the callback for a/x.go removes it.
+	err = addDirectoryTree(watcher, root, func(path string, _ os.FileInfo) {
+		found = append(found, path)
+		if err := os.RemoveAll(filepath.Join(root, "b")); err != nil {
+			t.Errorf("remove b: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("addDirectoryTree() = %v, want nil", err)
+	}
+	if want := []string{filepath.Join(root, "a", "x.go")}; !slices.Equal(found, want) {
+		t.Fatalf("found = %v, want %v", found, want)
+	}
+	watched := watcher.WatchList()
+	for _, dir := range []string{root, filepath.Join(root, "a")} {
+		if !slices.Contains(watched, dir) {
+			t.Errorf("WatchList() = %v, missing %q", watched, dir)
+		}
+	}
+}
+
+// A directory the watcher cannot open must not disable the trigger: Check
+// reports the failure once, naming the directory, and the trigger keeps
+// watching everything else.
+func TestFileTriggerReportsWalkFailureOnceAndKeepsWatching(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can open a directory that has no permissions")
+	}
+	staging := t.TempDir()
+	locked := filepath.Join(staging, "vendor", "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatalf("create locked directory: %v", err)
+	}
+	dir := t.TempDir()
+	movedLocked := filepath.Join(dir, "vendor", "locked")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatalf("lock directory: %v", err)
+	}
+	t.Cleanup(func() {
+		// TempDir cleanup cannot remove a directory it cannot read.
+		_ = os.Chmod(movedLocked, 0o755)
+		_ = os.Chmod(locked, 0o755)
+	})
+	trigger, err := NewTriggerRegistry().Create(Trigger{Type: TriggerFileCreated, Pattern: "*.go"})
+	if err != nil {
+		t.Fatalf("Create(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := trigger.Stop(); err != nil {
+			t.Errorf("Stop(): %v", err)
+		}
+	})
+	ctx := &TriggerContext{ProjectRoot: dir}
+	if err := trigger.Start(ctx); err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	if err := os.Rename(filepath.Join(staging, "vendor"), filepath.Join(dir, "vendor")); err != nil {
+		t.Fatalf("move vendor into project: %v", err)
+	}
+	err = waitForCheckError(t, trigger, ctx)
+	if !strings.Contains(err.Error(), movedLocked) {
+		t.Fatalf("Check() error = %v, want it to name %q", err, movedLocked)
+	}
+	if fired, err := trigger.Check(ctx); err != nil || fired {
+		t.Fatalf("Check after the failure was reported = (%v, %v), want (false, nil)", fired, err)
+	}
+	// Not in vendor/: fsnotify's kqueue backend stops listing a changed
+	// directory at its first unreadable entry, so on macOS a new file that
+	// sorts after locked/ is never reported.
+	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package example\n"), 0o644); err != nil {
+		t.Fatalf("write new.go: %v", err)
+	}
+	waitForTrigger(t, trigger, ctx)
+}
+
 // kqueue reports a new file's Create but starts watching the file only after
 // that, so content written straight after the create can arrive with no Write
 // event at all. Delivering only the Create reproduces that deterministically.
@@ -339,4 +452,21 @@ func waitForTrigger(t *testing.T, trigger RuntimeTrigger, ctx *TriggerContext) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("trigger did not fire before deadline")
+}
+
+func waitForCheckError(t *testing.T, trigger RuntimeTrigger, ctx *TriggerContext) error {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		fired, err := trigger.Check(ctx)
+		if err != nil {
+			return err
+		}
+		if fired {
+			t.Fatal("trigger fired while waiting for a Check error")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("Check did not report an error before deadline")
+	return nil
 }
