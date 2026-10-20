@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-01-07T22:39:29.586Z",
+  "generated_at": "2026-10-20T04:40:28.107Z",
   "count": 223,
   "endpoints": [
     {
@@ -1490,15 +1490,15 @@
     {
       "id": "message.read",
       "method": "get",
-      "path": "/message/{id}",
+      "path": "/api/v1/mail/messages/{id}",
       "tags": [
         "agentmail"
       ],
-      "summary": "Message read",
-      "description": "Read message.",
+      "summary": "Read one message",
+      "description": "Reads one Agent Mail message, body included, through Agent Mail's resource://message/{id}. Subject and body are redacted like inbox bodies, and reading does not mark the message read.",
       "source": null,
       "requestSchema": null,
-      "responseSchema": "GenericResponse"
+      "responseSchema": "MailMessageGetResponse"
     },
     {
       "id": "message.ack",
@@ -1555,15 +1555,15 @@
     {
       "id": "locks.forceRelease",
       "method": "post",
-      "path": "/locks/{id}/force-release",
+      "path": "/api/v1/reservations/{id}/force-release",
       "tags": [
         "agentmail"
       ],
-      "summary": "Force release",
-      "description": "Force release reservation (may require SLB).",
+      "summary": "Force-release a reservation",
+      "description": "Releases another agent's file reservation through Agent Mail's force_release_file_reservation, acting as agent_name. A reservation released before the call answers 200 with force_released false and already_released true; nothing changes and no reservation event is published. A release publishes a reservation.released event.",
       "source": null,
-      "requestSchema": null,
-      "responseSchema": "GenericResponse"
+      "requestSchema": "ForceReleaseRequest",
+      "responseSchema": "ForceReleaseResponse"
     },
     {
       "id": "locks.renew",

@@ -462,6 +462,77 @@ const exampleOverrides = {
       ],
     }),
   },
+  "message.read": {
+    response: exampleMap({
+      success: true,
+      timestamp: "2026-01-07T00:00:00Z",
+      request_id: "req_01HZZV8R4WJY9W9Y2M6J1T8M0N",
+      message: {
+        id: 4021,
+        project_id: 7,
+        sender_id: 12,
+        thread_id: "FEAT-OPENAPI",
+        subject: "OpenAPI generator updates",
+        subject_disclosure: {
+          disclosure_state: "visible",
+          preview: "OpenAPI generator updates",
+          redaction_mode: "redact",
+        },
+        preview: "Generated docs/openapi.json from parity matrix.",
+        preview_disclosure: {
+          disclosure_state: "visible",
+          preview: "Generated docs/openapi.json from parity matrix.",
+          redaction_mode: "redact",
+        },
+        body_md: "Generated docs/openapi.json from parity matrix.",
+        body_disclosure: {
+          disclosure_state: "visible",
+          preview: "Generated docs/openapi.json from parity matrix.",
+          redaction_mode: "redact",
+        },
+        from: "BlueLake",
+        to: ["GreenCastle"],
+        importance: "normal",
+        ack_required: true,
+        created_ts: "2026-01-07T00:00:00Z",
+      },
+    }),
+  },
+  "locks.forceRelease": {
+    request: exampleMap({
+      agent_name: "GreenCastle",
+      note: "Holder went idle mid-edit",
+      notify_previous: true,
+    }),
+    response: multiExamples([
+      [
+        "released",
+        {
+          success: true,
+          timestamp: "2026-01-07T00:00:00Z",
+          request_id: "req_01HZZV8R4WJY9W9Y2M6J1T8M0N",
+          reservation_id: 42,
+          force_released: true,
+          released_at: "2026-01-07T00:00:00Z",
+          previous_holder: "BlueLake",
+          path_pattern: "internal/serve/*.go",
+          notified: true,
+        },
+      ],
+      [
+        "already_released",
+        {
+          success: true,
+          timestamp: "2026-01-07T00:00:00Z",
+          request_id: "req_01HZZV8R4WJY9W9Y2M6J1T8M0N",
+          reservation_id: 42,
+          force_released: false,
+          already_released: true,
+          released_at: "2026-01-06T23:58:00Z",
+        },
+      ],
+    ]),
+  },
   "robot.mail": {
     response: exampleMap({
       success: true,
@@ -665,6 +736,77 @@ const exampleOverrides = {
           priority: 1,
         },
       ],
+    }),
+  },
+};
+
+const errorResponses = (descriptions) => {
+  const out = {};
+  for (const [status, description] of Object.entries(descriptions)) {
+    out[status] = {
+      description,
+      content: {
+        "application/json": {
+          schema: { $ref: "#/components/schemas/ErrorResponse" },
+        },
+      },
+    };
+  }
+  return out;
+};
+
+// operationOverrides carries what a parity entry cannot say, keyed by
+// endpoint id: typed path parameters, query parameters and error responses.
+const operationOverrides = {
+  "message.read": {
+    parameters: [
+      {
+        name: "id",
+        in: "path",
+        required: true,
+        description: "Agent Mail message id.",
+        schema: { type: "integer" },
+      },
+      {
+        name: "agent_name",
+        in: "query",
+        required: false,
+        description:
+          "The reading agent. The Python Agent Mail server returns a message only to its sender or a recipient and authenticates that agent with its registration token, which serve sends only when its mail client has one cached; the Rust server ignores both.",
+        schema: { type: "string" },
+      },
+    ],
+    responses: errorResponses({
+      "400": "BAD_REQUEST: the id is not an integer, or Agent Mail rejected the request.",
+      "401": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail rejected serve's.",
+      "403": "FORBIDDEN: the caller's role lacks the mail:read permission.",
+      "404": "MESSAGE_NOT_FOUND: Agent Mail has no such message in this project.",
+      "500": "INTERNAL_ERROR: serve could not build its mail client, or any other Agent Mail failure, including the Python server refusing a reader it cannot authenticate.",
+      "501": "NOT_IMPLEMENTED: the configured Agent Mail server cannot read one message; hint names the inbox and thread summary alternatives.",
+      "503": "MAIL_UNAVAILABLE when Agent Mail is unreachable or disabled, SERVICE_UNAVAILABLE when it reports itself busy.",
+      "504": "TIMEOUT: Agent Mail did not answer within 10 seconds.",
+    }),
+  },
+  "locks.forceRelease": {
+    parameters: [
+      {
+        name: "id",
+        in: "path",
+        required: true,
+        description: "Agent Mail file reservation id.",
+        schema: { type: "integer" },
+      },
+    ],
+    responses: errorResponses({
+      "400": "BAD_REQUEST: the id is not an integer, the body is not JSON, agent_name is missing, or Agent Mail rejected the request.",
+      "401": "UNAUTHORIZED: missing or invalid credentials, or Agent Mail rejected serve's.",
+      "403": "FORBIDDEN: the caller's role lacks the dangerous:force_release permission.",
+      "404": "AGENT_NOT_FOUND when agent_name is not registered, NOT_FOUND when Agent Mail has no such reservation.",
+      "409": "CONFLICT: Agent Mail reported a reservation conflict, or released nothing without saying the reservation was already released (details carries notified, previous_holder and path_pattern).",
+      "500": "INTERNAL_ERROR: serve could not build its mail client or got no result, or any other Agent Mail failure, including the tool error both servers return when the reservation still looks active and the Python server refusing an agent_name it cannot authenticate.",
+      "501": "NOT_IMPLEMENTED: the configured Agent Mail server cannot force-release reservations.",
+      "503": "MAIL_UNAVAILABLE when Agent Mail is unreachable or disabled, SERVICE_UNAVAILABLE when it reports itself busy.",
+      "504": "TIMEOUT: Agent Mail did not answer within 10 seconds.",
     }),
   },
 };
@@ -1068,6 +1210,102 @@ const schemaOverrides = {
       messages: { type: "array", items: { type: "object" } },
     },
   },
+  ErrorResponse: {
+    type: "object",
+    properties: {
+      success: { type: "boolean" },
+      timestamp: { type: "string", format: "date-time" },
+      request_id: { type: "string" },
+      error: { type: "string" },
+      error_code: { type: "string" },
+      details: { type: "object", additionalProperties: true },
+      hint: { type: "string" },
+    },
+    required: ["success", "timestamp", "error", "error_code"],
+  },
+  DisclosureMetadata: {
+    type: "object",
+    description:
+      "How a free-text field was disclosed: visible, redacted (secrets replaced; findings counts them) or preview_only (long text cut to its preview).",
+    properties: {
+      disclosure_state: { type: "string", enum: ["visible", "redacted", "preview_only"] },
+      preview: { type: "string" },
+      redaction_mode: { type: "string" },
+      findings: { type: "integer" },
+    },
+  },
+  MailMessage: {
+    type: "object",
+    description:
+      "One Agent Mail message. subject, preview and body_md pass through the same redaction as inbox bodies; preview is the body, or the subject when the body is empty.",
+    properties: {
+      id: { type: "integer" },
+      project_id: { type: "integer" },
+      sender_id: { type: "integer" },
+      thread_id: { type: "string" },
+      subject: { type: "string" },
+      subject_disclosure: { $ref: "#/components/schemas/DisclosureMetadata" },
+      preview: { type: "string" },
+      preview_disclosure: { $ref: "#/components/schemas/DisclosureMetadata" },
+      body_md: { type: "string" },
+      body_disclosure: { $ref: "#/components/schemas/DisclosureMetadata" },
+      from: { type: "string" },
+      to: { type: "array", items: { type: "string" } },
+      cc: { type: "array", items: { type: "string" } },
+      bcc: { type: "array", items: { type: "string" } },
+      importance: { type: "string" },
+      ack_required: { type: "boolean" },
+      created_ts: { type: "string", format: "date-time" },
+      kind: { type: "string" },
+    },
+    required: ["id", "project_id", "sender_id", "subject", "from", "to", "importance", "ack_required", "created_ts"],
+  },
+  MailMessageGetResponse: {
+    type: "object",
+    properties: {
+      success: { type: "boolean" },
+      timestamp: { type: "string", format: "date-time" },
+      request_id: { type: "string" },
+      message: { $ref: "#/components/schemas/MailMessage" },
+    },
+    required: ["success", "timestamp", "message"],
+  },
+  ForceReleaseRequest: {
+    type: "object",
+    properties: {
+      agent_name: {
+        type: "string",
+        description: "The registered agent doing the release.",
+      },
+      note: {
+        type: "string",
+        description: "Reason passed to Agent Mail and, when notify_previous is set, to the previous holder.",
+      },
+      notify_previous: {
+        type: "boolean",
+        description: "Send the previous holder a notice. Defaults to false.",
+      },
+    },
+    required: ["agent_name"],
+  },
+  ForceReleaseResponse: {
+    type: "object",
+    description:
+      "force_released is true when this call released the reservation. A reservation that was released before the call answers force_released false and already_released true, with released_at holding when it was released; previous_holder, path_pattern and notified are then absent.",
+    properties: {
+      success: { type: "boolean" },
+      timestamp: { type: "string", format: "date-time" },
+      request_id: { type: "string" },
+      reservation_id: { type: "integer" },
+      force_released: { type: "boolean" },
+      already_released: { type: "boolean" },
+      released_at: { type: "string", format: "date-time" },
+      previous_holder: { type: "string" },
+      path_pattern: { type: "string" },
+      notified: { type: "boolean" },
+    },
+    required: ["success", "timestamp", "reservation_id", "force_released"],
+  },
   AuthLoginRequest: {
     type: "object",
     properties: {
@@ -1167,7 +1405,8 @@ const buildOpenAPI = (endpoints, schemas) => {
     }
     const method = ep.method.toLowerCase();
     const examples = exampleOverrides[ep.id] || {};
-    const parameters = addPathParams(ep.path);
+    const overrides = operationOverrides[ep.id] || {};
+    const parameters = overrides.parameters || addPathParams(ep.path);
     const op = {
       tags: ep.tags || ["general"],
       summary: ep.summary,
@@ -1187,6 +1426,7 @@ const buildOpenAPI = (endpoints, schemas) => {
             },
           },
         },
+        ...overrides.responses,
       },
     };
     if (ep.requestSchema) {
