@@ -8,7 +8,6 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 	"github.com/Dicklesworthstone/ntm/internal/util"
@@ -92,74 +91,6 @@ func DefaultBadgeOptions() BadgeOptions {
 		Style:    BadgeStyleDefault,
 		Bold:     true,
 		ShowIcon: true,
-	}
-}
-
-// AgentBadge renders a badge for an agent type using theme colors.
-// agentType can be: "claude", "cc", "codex", "cod", "gemini", "gmi", "user"
-func AgentBadge(agentType string, opts ...BadgeOptions) string {
-	t := theme.Current()
-	ic := icons.Current()
-	opt := DefaultBadgeOptions()
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	label, bgColor, icon := agentBadgeMeta(agentType, t, ic)
-
-	text := label
-	if opt.ShowIcon {
-		text = icon + " " + label
-	}
-
-	return renderBadge(text, bgColor, t.Base, opt)
-}
-
-// AgentBadgeWithCount renders an agent badge with a count (e.g., "󰗣 3")
-func AgentBadgeWithCount(agentType string, count int, opts ...BadgeOptions) string {
-	t := theme.Current()
-	ic := icons.Current()
-	opt := DefaultBadgeOptions()
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	_, bgColor, icon := agentBadgeMeta(agentType, t, ic)
-
-	text := fmt.Sprintf("%s %d", icon, count)
-	return renderBadge(text, bgColor, t.Base, opt)
-}
-
-func agentBadgeMeta(agentType string, t theme.Theme, ic icons.IconSet) (label string, bgColor lipgloss.Color, icon string) {
-	switch agent.AgentType(agentType).Canonical() {
-	case agent.AgentTypeClaudeCode:
-		return "claude", t.Claude, ic.Claude
-	case agent.AgentTypeCodex:
-		return "codex", t.Codex, ic.Codex
-	case agent.AgentTypeGemini:
-		return "gemini", t.Gemini, ic.Gemini
-	case agent.AgentTypeGrok:
-		return "grok", t.Pink, ic.Robot
-	case agent.AgentTypeMuse:
-		return "muse", t.Sky, ic.AgentIcon(string(agent.AgentTypeMuse))
-	case agent.AgentTypeAntigravity:
-		return "antigravity", t.Lavender, ic.Gemini
-	case agent.AgentTypeCursor:
-		return "cursor", t.Cursor, ic.Cursor
-	case agent.AgentTypeWindsurf:
-		return "windsurf", t.Windsurf, ic.Windsurf
-	case agent.AgentTypeAider:
-		return "aider", t.Aider, ic.Aider
-	case agent.AgentTypeOllama:
-		return "ollama", t.Ollama, ic.Ollama
-	case agent.AgentTypeUser:
-		return "user", t.User, ic.User
-	default:
-		label = strings.TrimSpace(strings.ToLower(agentType))
-		if label == "" {
-			label = "unknown"
-		}
-		return label, t.Overlay, "?"
 	}
 }
 

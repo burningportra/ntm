@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
 
 // Helper to capture stdout/stderr
@@ -827,106 +825,6 @@ func TestStatusBadge_CaseInsensitive(t *testing.T) {
 	result = StatusBadge("Error")
 	if !strings.Contains(result, "Error") {
 		t.Errorf("StatusBadge(\"Error\") should contain 'Error', got %q", result)
-	}
-}
-
-func TestAgentBadge(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		agentType string
-		wantLabel string
-	}{
-		// Claude variants
-		{"claude", "claude", "Claude"},
-		{"cc", "cc", "Claude"},
-		// Codex variants
-		{"codex", "codex", "Codex"},
-		{"codex alias", "openai-codex", "Codex"},
-		{"cod", "cod", "Codex"},
-		// Gemini variants
-		{"gemini", "gemini", "Gemini"},
-		{"gmi", "gmi", "Gemini"},
-		{"gemini alias", "google-gemini", "Gemini"},
-		{"muse", "muse", "Muse"},
-		{"muse alias", "muse-code", "Muse"},
-		{"cursor", "cursor", "Cursor"},
-		{"windsurf", "windsurf", "Windsurf"},
-		{"aider", "aider", "Aider"},
-		{"opencode short", "oc", "Opencode"},
-		{"opencode long", "opencode", "Opencode"},
-		{"ollama", "ollama", "Ollama"},
-		{"user", "user", "User"},
-		// Default/unknown
-		{"unknown agent", "other", "other"},
-		{"empty string", "", "unknown"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			result := AgentBadge(tc.agentType)
-			if !strings.Contains(result, tc.wantLabel) {
-				t.Errorf("AgentBadge(%q) = %q, does not contain label %q", tc.agentType, result, tc.wantLabel)
-			}
-		})
-	}
-}
-
-func TestAgentBadge_CaseInsensitive(t *testing.T) {
-	t.Parallel()
-
-	result := AgentBadge("Claude")
-	if !strings.Contains(result, "Claude") {
-		t.Errorf("AgentBadge(\"Claude\") should contain 'Claude', got %q", result)
-	}
-
-	result = AgentBadge("CODEX")
-	if !strings.Contains(result, "Codex") {
-		t.Errorf("AgentBadge(\"CODEX\") should contain canonical 'Codex', got %q", result)
-	}
-}
-
-func TestOutputAgentBadgeColor(t *testing.T) {
-	t.Parallel()
-
-	current := theme.Current()
-	tests := []struct {
-		name      string
-		agentType string
-		want      string
-	}{
-		{"claude", "claude", string(current.Claude)},
-		{"codex alias", "openai-codex", string(current.Codex)},
-		{"gemini alias", "google-gemini", string(current.Gemini)},
-		// Pi used to share Claude's mauve.
-		{"pi", "pi", string(current.Rosewater)},
-		{"kimi alias", "moonshot", string(current.Sapphire)},
-		{"muse", "muse", string(current.Sky)},
-		{"muse alias", "muse-code", string(current.Sky)},
-		{"cursor", "cursor", string(current.Cursor)},
-		{"windsurf alias", "ws", string(current.Windsurf)},
-		{"aider", "aider", string(current.Aider)},
-		{"ollama", "ollama", string(current.Ollama)},
-		{"user", "user", string(current.User)},
-		// Opencode currently has no dedicated theme color, so it falls
-		// through to current.Overlay (same as the unknown bucket). This
-		// test pins that behavior — if a future change adds a theme.Opencode
-		// color and an explicit case, this test will fail and should be
-		// updated to expect the new color.
-		{"opencode short", "oc", string(current.Overlay)},
-		{"opencode long", "opencode", string(current.Overlay)},
-		{"unknown", "other", string(current.Overlay)},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := string(outputAgentBadgeColor(tc.agentType, current)); got != tc.want {
-				t.Fatalf("outputAgentBadgeColor(%q) = %q, want %q", tc.agentType, got, tc.want)
-			}
-		})
 	}
 }
 

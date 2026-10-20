@@ -93,7 +93,7 @@ func sessionPanePresentation(pane tmux.Pane, th theme.Theme, ic icons.IconSet) (
 	case agentpkg.AgentTypeGemini:
 		return string(th.Gemini), ic.AgentIcon(string(agentpkg.AgentTypeGemini))
 	case agentpkg.AgentTypePi:
-		// Pi and Kimi use the accents output.AgentBadge gives them.
+		// Pi and Kimi use their semantic palette accents.
 		return string(th.Rosewater), ic.AgentIcon(string(agentpkg.AgentTypePi))
 	case agentpkg.AgentTypeKimi:
 		return string(th.Sapphire), ic.AgentIcon(string(agentpkg.AgentTypeKimi))

@@ -6,100 +6,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
-
-	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
-	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
-
-func TestAgentBadge(t *testing.T) {
-	tests := []struct {
-		agentType string
-		wantLabel string
-	}{
-		{"claude", "claude"},
-		{"cc", "claude"},
-		{"claude_code", "claude"},
-		{"codex", "codex"},
-		{"cod", "codex"},
-		{"openai-codex", "codex"},
-		{"gemini", "gemini"},
-		{"gmi", "gemini"},
-		{"google-gemini", "gemini"},
-		{"grok", "grok"},
-		{"grok-build", "grok"},
-		{"muse", "muse"},
-		{"muse-code", "muse"},
-		{"ws", "windsurf"},
-		{"user", "user"},
-		{"unknown", "unknown"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.agentType, func(t *testing.T) {
-			result := AgentBadge(tt.agentType)
-			if result == "" {
-				t.Error("AgentBadge returned empty string")
-			}
-			// Badge should contain the label
-			if !strings.Contains(result, tt.wantLabel) {
-				t.Errorf("AgentBadge(%q) should contain %q", tt.agentType, tt.wantLabel)
-			}
-		})
-	}
-}
-
-func TestAgentBadgeMeta_Grok(t *testing.T) {
-	currentTheme := theme.Current()
-	currentIcons := icons.Current()
-
-	label, color, icon := agentBadgeMeta("grok-build", currentTheme, currentIcons)
-	if label != "grok" || color != currentTheme.Pink || icon != currentIcons.Robot {
-		t.Fatalf("agentBadgeMeta(grok-build) = (%q, %q, %q), want (%q, %q, %q)", label, color, icon, "grok", currentTheme.Pink, currentIcons.Robot)
-	}
-}
-
-func TestAgentBadgeMeta_Muse(t *testing.T) {
-	th := theme.CatppuccinMocha
-	ic := icons.ASCII
-
-	label, color, icon := agentBadgeMeta("muse-code", th, ic)
-	if label != "muse" || color != th.Sky || icon != ic.AgentIcon("muse") {
-		t.Fatalf("agentBadgeMeta(muse-code) = (%q, %q, %q), want (%q, %q, %q)", label, color, icon, "muse", th.Sky, ic.AgentIcon("muse"))
-	}
-
-	// Muse's badge color must not collide with any other agent type's.
-	others := []string{"claude", "codex", "gemini", "grok", "antigravity", "cursor", "windsurf", "aider", "ollama", "user"}
-	for _, other := range others {
-		if _, otherColor, _ := agentBadgeMeta(other, th, ic); otherColor == color {
-			t.Errorf("agentBadgeMeta(%q) color %q collides with muse", other, otherColor)
-		}
-	}
-}
-
-func TestAgentBadgeWithCount(t *testing.T) {
-	tests := []struct {
-		agentType string
-		count     int
-	}{
-		{"claude", 3},
-		{"claude_code", 2},
-		{"codex", 1},
-		{"openai-codex", 4},
-		{"gemini", 5},
-		{"google-gemini", 6},
-		{"grok-build", 2},
-		{"user", 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.agentType, func(t *testing.T) {
-			result := AgentBadgeWithCount(tt.agentType, tt.count)
-			if result == "" {
-				t.Error("AgentBadgeWithCount returned empty string")
-			}
-		})
-	}
-}
 
 func TestStatusBadge(t *testing.T) {
 	statuses := []string{
@@ -311,15 +218,15 @@ func TestBadgeOptions(t *testing.T) {
 	}
 
 	for i, opt := range opts {
-		result := AgentBadge("claude", opt)
+		result := StatusBadge("running", opt)
 		if result == "" {
-			t.Errorf("AgentBadge with opts[%d] returned empty string", i)
+			t.Errorf("StatusBadge with opts[%d] returned empty string", i)
 		}
 	}
 }
 
 func TestBadgeGroup(t *testing.T) {
-	b1 := AgentBadge("claude")
+	b1 := RankBadge(1)
 	b2 := StatusBadge("running")
 	b3 := PriorityBadge(1)
 
@@ -334,7 +241,7 @@ func TestBadgeGroup(t *testing.T) {
 }
 
 func TestBadgeBar(t *testing.T) {
-	b1 := AgentBadge("claude")
+	b1 := RankBadge(1)
 	b2 := StatusBadge("running")
 
 	result := BadgeBar(b1, b2)

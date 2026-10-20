@@ -9,7 +9,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/term"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
 
@@ -340,62 +339,4 @@ func StatusBadge(status string) string {
 
 	style := lipgloss.NewStyle().Foreground(color)
 	return style.Render(status)
-}
-
-// AgentBadge returns a styled agent type badge with consistent colors.
-func AgentBadge(agentType string) string {
-	th := theme.Current()
-
-	color := outputAgentBadgeColor(agentType, th)
-	style := lipgloss.NewStyle().Foreground(color).Bold(true)
-	return style.Render(outputAgentBadgeLabel(agentType))
-}
-
-func outputAgentBadgeColor(agentType string, th theme.Theme) lipgloss.Color {
-	switch agent.AgentType(agentType).Canonical() {
-	case agent.AgentTypeClaudeCode:
-		return th.Claude
-	case agent.AgentTypeCodex:
-		return th.Codex
-	case agent.AgentTypeGemini:
-		return th.Gemini
-	case agent.AgentTypePi:
-		// Rosewater, not Claude's mauve; it matches the semantic palette.
-		return th.Rosewater
-	case agent.AgentTypeKimi:
-		return th.Sapphire
-	case agent.AgentTypeMuse:
-		return th.Sky
-	case agent.AgentTypeAntigravity:
-		// Antigravity (agy) gets its own lavender accent, matching the semantic
-		// theme palette, to distinguish it from the legacy Gemini CLI.
-		return th.Lavender
-	case agent.AgentTypeCursor:
-		return th.Cursor
-	case agent.AgentTypeWindsurf:
-		return th.Windsurf
-	case agent.AgentTypeAider:
-		return th.Aider
-	case agent.AgentTypeOllama:
-		return th.Ollama
-	case agent.AgentTypeUser:
-		return th.User
-	default:
-		return th.Overlay
-	}
-}
-
-func outputAgentBadgeLabel(agentType string) string {
-	canonical := agent.AgentType(agentType).Canonical()
-	if canonical.IsValid() || canonical == agent.AgentTypeUnknown {
-		if label := strings.TrimSpace(canonical.ProfileName()); label != "" {
-			return label
-		}
-	}
-
-	label := strings.TrimSpace(agentType)
-	if label == "" {
-		return "unknown"
-	}
-	return label
 }
