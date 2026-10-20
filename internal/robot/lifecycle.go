@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -62,11 +61,9 @@ type KillAgentOutput struct {
 	Results []LifecyclePaneResult `json:"results"`
 }
 
-// Graceful-exit choreography constants. Claude Code needs the second Ctrl+C
-// within roughly 0.1-0.3s of the first to treat the pair as "exit" instead
-// of "clear input"; other CLIs tolerate the same cadence.
+// Lifecycle timing constants. The exit keys and their timing live with each
+// agent's exit sequence in exit_sequences.go.
 const (
-	lifecycleDoubleTapGap  = 200 * time.Millisecond
 	lifecycleExitTimeout   = 6 * time.Second
 	lifecyclePollInterval  = 250 * time.Millisecond
 	lifecycleTermGrace     = 2 * time.Second
@@ -242,24 +239,14 @@ func waitForBareShell(ctx context.Context, session, paneID string, timeout time.
 	}
 }
 
-// sendExitChoreography sends the graceful double Ctrl+C with the per-CLI
-// timing window encapsulated. Muse panes get exitMuse's sequence instead: on
-// a working Muse the first Ctrl+C interrupts the turn and puts the prompt back
-// as a draft, and the second only clears that draft, so a double Ctrl+C left
-// Muse running until the second attempt.
+// sendExitChoreography sends the pane agent's exit keys, the same ones smart
+// restart sends (exit_sequences.go). It used to send every agent but Muse a
+// plain double Ctrl+C, which left a working Kimi running until the second
+// attempt: its first Ctrl+C puts the interrupted prompt back as a draft and
+// its second only clears it (bd-3sbjp).
 func sendExitChoreography(ctx context.Context, pane tmux.Pane) error {
-	if restartCanonicalAgentType(restartPaneAgentType(pane)) == agent.AgentTypeMuse {
-		return sendMuseExitKeys(ctx, pane.ID)
-	}
-	if err := tmux.DefaultClient.SendInterrupt(pane.ID); err != nil {
-		return err
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(lifecycleDoubleTapGap):
-	}
-	return tmux.DefaultClient.SendInterrupt(pane.ID)
+	_, err := sendAgentExitKeys(ctx, pane.ID, restartPaneAgentType(pane))
+	return err
 }
 
 // relaunchAgentCLI sends the configured launch command into the pane's shell

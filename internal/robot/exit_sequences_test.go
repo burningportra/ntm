@@ -151,6 +151,16 @@ func TestExitAgentPiAndKimiSendTheirExitSequences(t *testing.T) {
 			wantMethod: "escape_then_triple_ctrl_c",
 			minGaps:    []time.Duration{100 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond},
 		},
+		{
+			// bd-3sbjp: agents without a sequence of their own get the
+			// double Ctrl+C --robot-exit-cli always sent them; the single
+			// Ctrl+C smart restart sent only cleared or armed most of them.
+			agentType:  "agy",
+			wantKeys:   []string{"C-c", "C-c"},
+			wantMethod: "double_ctrl_c_fallback",
+			minGaps:    []time.Duration{100 * time.Millisecond},
+			maxGap:     450 * time.Millisecond,
+		},
 	} {
 		t.Run(tc.agentType, func(t *testing.T) {
 			calls := useTimedTmuxBinary(t)
@@ -190,12 +200,19 @@ func TestExitAgentPiAndKimiSendTheirExitSequences(t *testing.T) {
 	}
 }
 
-// TestSendExitChoreographyUsesMuseExitSequence covers --robot-exit-cli. A
-// plain double Ctrl+C on a working Muse pane interrupts the turn and then
+// TestSendExitChoreographyUsesEachAgentsExitSequence covers --robot-exit-cli.
+// It sends the same per-agent keys smart restart does, addressed by pane ID.
+// A plain double Ctrl+C on a working Muse pane interrupts the turn and then
 // clears the restored draft, so Muse only quit on the second attempt, about
-// 15 s later. Muse panes get the exitMuse keys, addressed by pane ID; other
-// agents keep the double Ctrl+C.
-func TestSendExitChoreographyUsesMuseExitSequence(t *testing.T) {
+// 15 s later (bd-fkuad); Kimi has the same key model and still got the plain
+// double Ctrl+C until bd-3sbjp gave exit-cli the exit_sequences.go keys.
+func TestSendExitChoreographyUsesEachAgentsExitSequence(t *testing.T) {
+	museKeys := func(id string) []string {
+		return []string{"send-keys -t " + id + " Escape", "send-keys -t " + id + " C-c", "send-keys -t " + id + " C-c", "send-keys -t " + id + " C-c"}
+	}
+	doubleCtrlC := func(id string) []string {
+		return []string{"send-keys -t " + id + " C-c", "send-keys -t " + id + " C-c"}
+	}
 	for _, tc := range []struct {
 		name string
 		pane tmux.Pane
@@ -204,17 +221,44 @@ func TestSendExitChoreographyUsesMuseExitSequence(t *testing.T) {
 		{
 			name: "muse pane type",
 			pane: tmux.Pane{ID: "%7", Type: tmux.AgentMuse, Title: "proj__muse_1"},
-			want: []string{"send-keys -t %7 Escape", "send-keys -t %7 C-c", "send-keys -t %7 C-c", "send-keys -t %7 C-c"},
+			want: museKeys("%7"),
 		},
 		{
 			name: "muse title with model variant",
 			pane: tmux.Pane{ID: "%8", Title: "proj__muse_2_wonder-full@xhigh"},
-			want: []string{"send-keys -t %8 Escape", "send-keys -t %8 C-c", "send-keys -t %8 C-c", "send-keys -t %8 C-c"},
+			want: museKeys("%8"),
+		},
+		{
+			name: "kimi gets the muse keys",
+			pane: tmux.Pane{ID: "%10", Type: tmux.AgentKimi, Title: "proj__kimi_1"},
+			want: museKeys("%10"),
 		},
 		{
 			name: "claude keeps the double ctrl-c",
 			pane: tmux.Pane{ID: "%9", Type: tmux.AgentClaude, Title: "proj__cc_1"},
-			want: []string{"send-keys -t %9 C-c", "send-keys -t %9 C-c"},
+			want: doubleCtrlC("%9"),
+		},
+		{
+			name: "pi gets the double ctrl-c",
+			pane: tmux.Pane{ID: "%11", Type: tmux.AgentPi, Title: "proj__pi_1"},
+			want: doubleCtrlC("%11"),
+		},
+		{
+			// The typed "/exit\n" ends the fake tmux's log line early,
+			// which leaves an empty line after it.
+			name: "codex gets the exit command",
+			pane: tmux.Pane{ID: "%12", Type: tmux.AgentCodex, Title: "proj__cod_1"},
+			want: []string{"send-keys -t %12 -l /exit", ""},
+		},
+		{
+			name: "gemini gets escape then the exit command",
+			pane: tmux.Pane{ID: "%13", Type: tmux.AgentGemini, Title: "proj__gmi_1"},
+			want: []string{"send-keys -t %13 Escape", "send-keys -t %13 -l /exit", ""},
+		},
+		{
+			name: "other agents get the double ctrl-c fallback",
+			pane: tmux.Pane{ID: "%14", Type: tmux.AgentAntigravity, Title: "proj__agy_1"},
+			want: doubleCtrlC("%14"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

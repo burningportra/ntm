@@ -1,5 +1,6 @@
 // Package robot provides machine-readable output for AI agents.
-// exit_sequences.go implements agent-specific exit methods for smart restart.
+// exit_sequences.go implements agent-specific exit methods for smart restart
+// and --robot-exit-cli.
 package robot
 
 import (
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -16,107 +18,98 @@ import (
 // Agent Exit Sequences (bd-2c7f4)
 // =============================================================================
 //
-// Each AI coding agent has different exit methods:
-// - Claude Code (cc): Double Ctrl+C with CRITICAL 0.1s timing
-// - Pi: the same double Ctrl+C (Pi quits on a second Ctrl+C within 500ms)
+// Each AI coding agent has different exit methods. sendAgentExitKeys is the
+// one place that knows them; smart restart and --robot-exit-cli both send
+// them through it (bd-3sbjp):
+// - Claude Code (cc) and Pi: double Ctrl+C, 100ms apart
 // - Codex (cod): /exit command
 // - Gemini (gmi): Escape (exit shell mode if active) then /exit
 // - Muse and Kimi: Escape, then three Ctrl+Cs (the last one 500ms after the
 //   second)
-// - Unknown: Try Ctrl+C as fallback
+// - Any other agent: the double Ctrl+C that most agent CLIs quit on
+
+// exitDoubleCtrlCGap is the pause between the two presses of a double Ctrl+C.
+// Claude Code treats the pair as "exit" only when the second press lands
+// roughly 0.1-0.3s after the first; slower reads as two separate interrupts
+// (ntm-3lbb). Pi quits only when it lands within 500ms (bd-7po31).
+const exitDoubleCtrlCGap = 100 * time.Millisecond
 
 // exitAgent exits the current agent using the appropriate method. win is the
 // pane's tmux window index (#172) so the exit keys target the correct window on
 // multi-window / window-per-agent layouts rather than always window 1.
 func exitAgent(ctx context.Context, session string, win, pane int, agentType string, seq *RestartSequence) error {
+	method, err := sendAgentExitKeys(ctx, formatTargetWin(session, win, pane), agentType)
+	seq.ExitMethod = method
+	return err
+}
+
+// sendAgentExitKeys sends agentType's exit keys to a tmux target and returns
+// the name of the method it used, even when a key fails. Smart restart
+// addresses the pane as session:window.pane; --robot-exit-cli addresses it by
+// pane ID.
+//
+// Pi uses Claude's double Ctrl+C. Pi's Ctrl+C handler clears the editor and
+// quits on a second Ctrl+C within 500ms of the first, and its source binds it
+// whether or not a turn is running; a single Ctrl+C only clears. Verified
+// against pi 1.3.0 in tmux (bd-7po31): the 100ms double Ctrl+C quit an empty
+// editor and one holding a draft, both with exit status 0. A running turn was
+// not tried, since that needs a model call.
+func sendAgentExitKeys(ctx context.Context, target, agentType string) (string, error) {
 	switch restartCanonicalAgentType(agentType) {
-	case "cc":
-		return exitClaudeCode(ctx, session, win, pane, seq)
-	case "pi":
-		return exitPi(ctx, session, win, pane, seq)
-	case "cod":
-		return exitCodex(ctx, session, win, pane, seq)
-	case "gmi":
-		return exitGemini(ctx, session, win, pane, seq)
-	case "muse":
-		return exitMuse(ctx, session, win, pane, seq)
-	case "kimi":
-		return exitKimi(ctx, session, win, pane, seq)
+	case agent.AgentTypeClaudeCode, agent.AgentTypePi:
+		return "double_ctrl_c", sendDoubleCtrlC(ctx, target)
+	case agent.AgentTypeCodex:
+		return "exit_command", sendExitCommand(ctx, target)
+	case agent.AgentTypeGemini:
+		return "escape_then_exit", sendEscapeThenExitCommand(ctx, target)
+	case agent.AgentTypeMuse, agent.AgentTypeKimi:
+		return "escape_then_triple_ctrl_c", sendMuseExitKeys(ctx, target)
 	default:
-		return exitUnknown(ctx, session, win, pane, seq)
+		return "double_ctrl_c_fallback", sendDoubleCtrlC(ctx, target)
 	}
 }
 
-// exitClaudeCode exits Claude Code with double Ctrl+C.
-// CRITICAL: The 0.1s timing between Ctrl+Cs is essential!
-func exitClaudeCode(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
-	seq.ExitMethod = "double_ctrl_c"
-
-	// First Ctrl+C
-	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+// sendDoubleCtrlC presses Ctrl+C twice, exitDoubleCtrlCGap apart.
+func sendDoubleCtrlC(ctx context.Context, target string) error {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "C-c"); err != nil {
 		return wrapError("first ctrl-c failed", err)
 	}
-
-	// CRITICAL: 100ms pause between Ctrl+Cs
-	if err := waitForExitSequenceDelay(ctx, 100*time.Millisecond); err != nil {
+	if err := waitForExitSequenceDelay(ctx, exitDoubleCtrlCGap); err != nil {
 		return err
 	}
-
-	// Second Ctrl+C
-	if err := sendCtrlC(ctx, session, win, pane); err != nil {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "C-c"); err != nil {
 		return wrapError("second ctrl-c failed", err)
 	}
-
 	return nil
 }
 
-// exitPi exits Pi with Claude's double Ctrl+C. Pi's Ctrl+C handler clears the
-// editor and quits on a second Ctrl+C within 500ms of the first, and its
-// source binds it whether or not a turn is running; a single Ctrl+C only
-// clears. Verified against pi 1.3.0 in tmux (bd-7po31): the 100ms double
-// Ctrl+C quit an empty editor and one holding a draft, both with exit status
-// 0. A running turn was not tried, since that needs a model call.
-func exitPi(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
-	return exitClaudeCode(ctx, session, win, pane, seq)
-}
-
-// exitCodex exits Codex CLI with /exit command.
-func exitCodex(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
-	seq.ExitMethod = "exit_command"
-
-	if err := sendKeys(ctx, session, win, pane, "/exit\n"); err != nil {
+// sendExitCommand exits Codex CLI with its /exit command.
+func sendExitCommand(ctx context.Context, target string) error {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "-l", "/exit\n"); err != nil {
 		return wrapError("exit command failed", err)
 	}
-
 	return nil
 }
 
-// exitGemini exits Gemini CLI with Escape (to exit shell mode) then /exit.
-func exitGemini(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
-	seq.ExitMethod = "escape_then_exit"
-
-	// Send Escape to exit shell mode if active
-	if err := sendEscape(ctx, session, win, pane); err != nil {
+// sendEscapeThenExitCommand exits Gemini CLI: Escape leaves shell mode if it
+// is active, then /exit quits.
+func sendEscapeThenExitCommand(ctx context.Context, target string) error {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "Escape"); err != nil {
 		return wrapError("escape failed", err)
 	}
-
-	// Brief pause
 	if err := waitForExitSequenceDelay(ctx, 100*time.Millisecond); err != nil {
 		return err
 	}
-
-	// Send /exit command
-	if err := sendKeys(ctx, session, win, pane, "/exit\n"); err != nil {
+	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "-l", "/exit\n"); err != nil {
 		return wrapError("exit failed", err)
 	}
-
 	return nil
 }
 
-// exitMuse exits Muse Code. A single Ctrl+C only clears the draft, and when a
-// draft is present the double Ctrl+C that quits an empty composer is spent
-// clearing it and arming "Press Ctrl-C again to quit". Verified against muse
-// 1.4.11 (bd-3l5df):
+// sendMuseExitKeys exits Muse Code. A single Ctrl+C only clears the draft,
+// and when a draft is present the double Ctrl+C that quits an empty composer
+// is spent clearing it and arming "Press Ctrl-C again to quit". Verified
+// against muse 1.4.11 (bd-3l5df):
 //   - Escape interrupts a running turn, whose prompt comes back as a draft,
 //     and does nothing at an idle composer.
 //   - The first Ctrl+C clears any draft; on an empty composer it arms quit.
@@ -127,25 +120,13 @@ func exitGemini(ctx context.Context, session string, win, pane int, seq *Restart
 //
 // /exit and /quit also quit an idle Muse, but typed after a draft they are
 // submitted as part of a prompt; Ctrl+D does nothing.
-func exitMuse(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
-	seq.ExitMethod = "escape_then_triple_ctrl_c"
-	return sendMuseExitKeys(ctx, formatTargetWin(session, win, pane))
-}
-
-// exitKimi exits Kimi Code with exitMuse's keys. Kimi Code documents the same
-// key model (moonshotai.github.io/kimi-code, keyboard reference): Escape
-// interrupts a running turn, Ctrl+C clears a draft, and on an empty input box
-// the first Ctrl+C only arms quit and the second quits. So a draft takes three
+//
+// Kimi Code gets the same keys. It documents the same key model
+// (moonshotai.github.io/kimi-code, keyboard reference): Escape interrupts a
+// running turn, Ctrl+C clears a draft, and on an empty input box the first
+// Ctrl+C only arms quit and the second quits. So a draft takes three
 // Ctrl+Cs, and when two were enough the third lands on the shell prompt. Not
 // run against a real kimi binary (bd-7po31).
-func exitKimi(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
-	seq.ExitMethod = "escape_then_triple_ctrl_c"
-	return sendMuseExitKeys(ctx, formatTargetWin(session, win, pane))
-}
-
-// sendMuseExitKeys sends the exitMuse key sequence to a tmux target. Smart
-// restart addresses the pane by session, window and index; --robot-exit-cli
-// addresses it by pane ID.
 func sendMuseExitKeys(ctx context.Context, target string) error {
 	if err := runTmuxCommand(ctx, "send-keys", "-t", target, "Escape"); err != nil {
 		return wrapError("escape failed", err)
@@ -173,27 +154,6 @@ func sendMuseExitKeys(ctx context.Context, target string) error {
 	}
 
 	return nil
-}
-
-// exitUnknown tries Ctrl+C as a fallback for unknown agent types.
-func exitUnknown(ctx context.Context, session string, win, pane int, seq *RestartSequence) error {
-	seq.ExitMethod = "ctrl_c_fallback"
-
-	if err := sendCtrlC(ctx, session, win, pane); err != nil {
-		return wrapError("ctrl-c failed", err)
-	}
-
-	return nil
-}
-
-// sendCtrlC sends Ctrl+C to a tmux pane.
-func sendCtrlC(ctx context.Context, session string, win, pane int) error {
-	return runTmuxCommand(ctx, "send-keys", "-t", formatTargetWin(session, win, pane), "C-c")
-}
-
-// sendEscape sends Escape key to a tmux pane.
-func sendEscape(ctx context.Context, session string, win, pane int) error {
-	return runTmuxCommand(ctx, "send-keys", "-t", formatTargetWin(session, win, pane), "Escape")
 }
 
 // sendKeys sends literal keys to a tmux pane.

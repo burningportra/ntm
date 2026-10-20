@@ -83,8 +83,9 @@ type SmartRestartOptions struct {
 	promptDispatch smartRestartPromptDispatcher
 	executor       smartRestartExecutor
 
-	// Config supplies the relaunch command for Muse, Pi and Kimi panes; nil
-	// loads the merged config the way --robot-restart-pane does.
+	// Config supplies the relaunch command for every agent type except cc,
+	// cod and gmi (see smartRestartLaunchCommand); nil loads the merged
+	// config the way --robot-restart-pane does.
 	Config *config.Config
 }
 
@@ -903,9 +904,9 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 		}
 	}
 
-	// Step 4: Launch new agent using the canonical agent alias/command name
-	// (for Muse, Pi and Kimi, the configured command; see
-	// smartRestartLaunchCommand).
+	// Step 4: Launch new agent using its flag-carrying shell alias (cc, cod,
+	// gmi) or, for every other type, its configured command; see
+	// smartRestartLaunchCommand.
 	alias := restartLaunchAlias(agentType)
 	launchCmd := smartRestartLaunchCommand(opts, agentType)
 	if err := ctx.Err(); err != nil {
@@ -1388,26 +1389,23 @@ func restartLaunchAlias(agentType string) string {
 }
 
 // smartRestartLaunchCommand returns the command smart restart types to
-// relaunch an agent. Most agents relaunch through their launch alias (cc, cod
-// and gmi are shell aliases that carry the configured flags). Muse, Pi and
-// Kimi have no such alias, so their panes relaunch with the configured
-// command, the same one --robot-restart-pane uses: a bare `muse` stops at "Do
-// you trust this workspace?" in an untrusted directory (bd-3l5df), and a bare
-// `pi` or `kimi` drops the [agents] flags and model the pane was spawned with
-// (bd-7po31).
+// relaunch an agent. cc, cod and gmi relaunch through their launch alias,
+// since `ntm init` makes them shell aliases that carry the configured flags.
+// Every other agent type has no such alias, so it relaunches with the
+// configured command, the same one --robot-restart-pane uses: a bare `muse`
+// stops at "Do you trust this workspace?" in an untrusted directory
+// (bd-3l5df), a bare `pi` or `kimi` drops the [agents] flags and model the
+// pane was spawned with (bd-7po31), and a bare agy, oc, cursor, windsurf,
+// aider or ollama drops theirs too (bd-3sbjp). Types without a configured
+// command still fall back to the alias.
 func smartRestartLaunchCommand(opts SmartRestartOptions, agentType string) string {
 	switch restartCanonicalAgentType(agentType) {
-	case agent.AgentTypeMuse, agent.AgentTypePi, agent.AgentTypeKimi:
-	default:
+	case agent.AgentTypeClaudeCode, agent.AgentTypeCodex, agent.AgentTypeGemini:
 		return restartLaunchAlias(agentType)
 	}
 	cfg := opts.Config
 	if cfg == nil {
-		loaded, err := config.LoadMerged(mustGetwd(), config.DefaultPath())
-		if err != nil {
-			loaded = config.Default()
-		}
-		cfg = loaded
+		cfg = loadRestartPaneConfig()
 	}
 	return restartAgentLaunchCommand(cfg, agentType, "")
 }

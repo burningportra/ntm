@@ -1234,15 +1234,27 @@ func TestExecuteRestartLaunchesAliaslessAgentsWithConfiguredCommand(t *testing.T
 	// types the configured Muse command; a bare `muse` would stop at the
 	// workspace trust prompt. bd-7po31: Pi and Kimi have no shell alias
 	// either, and before they were restart types at all they relaunched as
-	// `cc`. Agents with a flag-carrying alias (cc, cod, gmi) keep it.
+	// `cc`. bd-3sbjp: agy, oc, cursor, windsurf, aider and ollama have no
+	// flag-carrying alias, so a bare alias dropped their [agents] flags. Only
+	// cc, cod and gmi, whose `ntm init` aliases carry the flags, keep the
+	// alias.
 	overrideCfg := config.Default()
 	overrideCfg.Agents.Muse = "muse --provider echo --yolo"
 	overrideCfg.Agents.Pi = "sh -c 'echo PI-LAUNCH; exec cat'"
 	overrideCfg.Agents.Kimi = "sh -c 'echo KIMI-LAUNCH; exec cat'"
+	overrideCfg.Agents.Antigravity = "agy --dangerously-skip-permissions --from-config"
+	overrideCfg.Agents.Opencode = "opencode --from-config"
+	overrideCfg.Agents.Cursor = "cursor-agent --yolo --from-config"
+	overrideCfg.Agents.Windsurf = "windsurf --from-config"
+	overrideCfg.Agents.Aider = "aider --yes-always"
+	overrideCfg.Agents.Ollama = "ollama run qwen3-coder"
+	overrideCfg.Agents.Codex = "codex --not-typed"
+	overrideCfg.Agents.Gemini = "gemini --not-typed"
 	unsetCfg := config.Default()
 	unsetCfg.Agents.Muse = ""
 	unsetCfg.Agents.Pi = ""
 	unsetCfg.Agents.Kimi = ""
+	unsetCfg.Agents.Opencode = ""
 
 	tests := []struct {
 		name      string
@@ -1256,7 +1268,16 @@ func TestExecuteRestartLaunchesAliaslessAgentsWithConfiguredCommand(t *testing.T
 		{"pi default template", "pi", unsetCfg, "0.2:pi\n"},
 		{"kimi override", "kimi", overrideCfg, "0.2:sh -c 'echo KIMI-LAUNCH; exec cat'\n"},
 		{"kimi default template", "kimi-code", unsetCfg, "0.2:kimi --model 'kimi-k2'\n"},
+		{"agy override", "agy", overrideCfg, "0.2:agy --dangerously-skip-permissions --from-config\n"},
+		{"oc override", "oc", overrideCfg, "0.2:opencode --from-config\n"},
+		{"oc default template", "opencode", unsetCfg, "0.2:opencode --model " + tmux.ShellQuote(unsetCfg.Models.GetModelName("oc", "")) + "\n"},
+		{"cursor override", "cursor", overrideCfg, "0.2:cursor-agent --yolo --from-config\n"},
+		{"windsurf override", "ws", overrideCfg, "0.2:windsurf --from-config\n"},
+		{"aider override", "aider", overrideCfg, "0.2:aider --yes-always\n"},
+		{"ollama override", "ollama", overrideCfg, "0.2:ollama run qwen3-coder\n"},
 		{"claude keeps alias", "cc", overrideCfg, "0.2:cc\n"},
+		{"codex keeps alias", "codex", overrideCfg, "0.2:cod\n"},
+		{"gemini keeps alias", "gmi", overrideCfg, "0.2:gmi\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
