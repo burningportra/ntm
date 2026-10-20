@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -331,13 +332,13 @@ func TestReserveForBeadNoClient(t *testing.T) {
 
 func TestCollectGrantedReservationsValidatesDispatchAuthority(t *testing.T) {
 	valid := agentmail.FileReservation{
-		ID: 71, ProjectID: 9, AgentName: "TestAgent", PathPattern: "src/api/handler.go", Exclusive: true,
+		ID: 71, AgentName: "TestAgent", PathPattern: "src/api/handler.go", Exclusive: true,
 		ExpiresTS: agentmail.FlexTime{Time: time.Now().UTC().Add(time.Hour)},
 		Reason:    "bead assignment: bd-test",
 	}
 	result := &FileReservationResult{}
 	now := time.Now().UTC()
-	if err := collectGrantedReservations(result, []agentmail.FileReservation{valid}, []string{"src/api/handler.go"}, "TestAgent", "bead assignment: bd-test", 9, now, false); err != nil {
+	if err := collectGrantedReservations(result, []agentmail.FileReservation{valid}, []string{"src/api/handler.go"}, "TestAgent", "bead assignment: bd-test", now, false); err != nil {
 		t.Fatalf("valid grant: %v", err)
 	}
 	if !reflect.DeepEqual(result.ReservationIDs, []int{71}) || !reflect.DeepEqual(result.GrantedPaths, []string{"src/api/handler.go"}) {
@@ -350,8 +351,6 @@ func TestCollectGrantedReservationsValidatesDispatchAuthority(t *testing.T) {
 		requested []string
 	}{
 		{name: "missing id", grants: []agentmail.FileReservation{func() agentmail.FileReservation { grant := valid; grant.ID = 0; return grant }()}, requested: []string{"src/api/handler.go"}},
-		{name: "missing project", grants: []agentmail.FileReservation{func() agentmail.FileReservation { grant := valid; grant.ProjectID = 0; return grant }()}, requested: []string{"src/api/handler.go"}},
-		{name: "wrong project", grants: []agentmail.FileReservation{func() agentmail.FileReservation { grant := valid; grant.ProjectID = 10; return grant }()}, requested: []string{"src/api/handler.go"}},
 		{name: "missing expiry", grants: []agentmail.FileReservation{func() agentmail.FileReservation { grant := valid; grant.ExpiresTS = agentmail.FlexTime{}; return grant }()}, requested: []string{"src/api/handler.go"}},
 		{name: "expired", grants: []agentmail.FileReservation{func() agentmail.FileReservation {
 			grant := valid
@@ -379,7 +378,7 @@ func TestCollectGrantedReservationsValidatesDispatchAuthority(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := &FileReservationResult{}
-			if err := collectGrantedReservations(got, test.grants, test.requested, "TestAgent", "bead assignment: bd-test", 9, now, false); err == nil {
+			if err := collectGrantedReservations(got, test.grants, test.requested, "TestAgent", "bead assignment: bd-test", now, false); err == nil {
 				t.Fatalf("collectGrantedReservations() result=%+v, want validation error", got)
 			}
 		})
@@ -476,7 +475,6 @@ func TestReservationManagerRequiresExactProjectHumanKey(t *testing.T) {
 func reconcileReservation(id int, agentName, path, reason string) agentmail.FileReservation {
 	return agentmail.FileReservation{
 		ID:          id,
-		ProjectID:   1,
 		AgentName:   agentName,
 		PathPattern: path,
 		Exclusive:   true,
@@ -739,8 +737,6 @@ func TestReconcileForBeadReturnsMalformedHandlesForFailClosedCleanup(t *testing.
 		name   string
 		mutate func(*agentmail.FileReservation)
 	}{
-		{name: "missing project", mutate: func(reservation *agentmail.FileReservation) { reservation.ProjectID = 0 }},
-		{name: "wrong project", mutate: func(reservation *agentmail.FileReservation) { reservation.ProjectID = 2 }},
 		{name: "nonexclusive", mutate: func(reservation *agentmail.FileReservation) { reservation.Exclusive = false }},
 		{name: "missing expiry", mutate: func(reservation *agentmail.FileReservation) { reservation.ExpiresTS = agentmail.FlexTime{} }},
 		{name: "expired", mutate: func(reservation *agentmail.FileReservation) {
@@ -764,6 +760,175 @@ func TestReconcileForBeadRequiresOriginalRequestedPaths(t *testing.T) {
 	result, err := manager.ReconcileForBead(t.Context(), "bd-1", "AgentOne", []string{"", "  "})
 	if err == nil || result == nil || result.Error == "" {
 		t.Fatalf("ReconcileForBead() empty paths result=%+v error=%v", result, err)
+	}
+}
+
+// Replies the Agent Mail servers sent live to the calls an assignment's
+// reservation makes, with the project path shortened to /p. The grants are
+// the capturedRustReservationGrantText (am 0.3.36) and
+// capturedPythonReservationReply (mcp_agent_mail 0.3.4) replays in
+// internal/agentmail/tools_httptest_test.go, and the Python release reply
+// came from the same capture. The ensure_project reply, the Rust listing and
+// the Rust release reply were read from am 0.3.36; the Python listing row is
+// the one mcp_agent_mail 0.3.4's file_reservations_resource builds. No grant
+// and no listing row names a project.
+const (
+	capturedRustEnsureProjectText      = `{"id":79,"created_at":"2026-10-20T12:15:35.816042Z","slug":"p","identity_mode_used":"dir","canonical_path":"/p","human_key":"/p","repo_root":null,"git_common_dir":null,"branch":null,"worktree_name":null,"core_ignorecase":null,"normalized_remote":null,"project_uid":"a39a2518130842bb247a","discovery":null}`
+	capturedRustReservationGrantText   = `{"granted":[{"id":14598,"path_pattern":"scratch-bd-m0gm2-probe/does-not-exist.txt","exclusive":true,"reason":"bd-m0gm2 live probe (nonexistent path)","expires_ts":"2026-10-20T04:48:02.649015Z"}],"conflicts":[]}`
+	capturedPythonReservationReply     = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"granted\":[{\"id\":4,\"path_pattern\":\"probe/c.txt\",\"exclusive\":true,\"reason\":\"bd-q7kzm capture\",\"expires_ts\":\"2026-10-20T05:26:42.061712+00:00\",\"reused\":false}],\"conflicts\":[],\"warnings\":[\"enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate.\"]}"}],"structuredContent":{"granted":[{"id":4,"path_pattern":"probe/c.txt","exclusive":true,"reason":"bd-q7kzm capture","expires_ts":"2026-10-20T05:26:42.061712+00:00","reused":false}],"conflicts":[],"warnings":["enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate."]},"isError":false}}`
+	capturedRustReservationListingText = `[{"id":14709,"agent":"NobleStork","path_pattern":"scratch-bd-00tl4/does-not-exist.txt","exclusive":true,"reason":"bd-00tl4 listing probe","created_ts":"2026-10-20T12:15:51.128223Z","expires_ts":"2026-10-20T12:16:51.128223Z","released_ts":null,"stale":false,"stale_reasons":["agent_recently_active","no_recent_mail_activity>900s","path_pattern_unmatched"],"last_agent_activity_ts":"2026-10-20T12:15:43.447686Z","last_mail_activity_ts":null,"last_git_activity_ts":null,"last_filesystem_activity_ts":null}]`
+	pythonReservationListingText       = `[{"id":4,"agent":"RedStone","agent_id":3,"path_pattern":"probe/c.txt","exclusive":true,"reason":"bd-q7kzm capture","created_ts":"2026-10-20T05:24:42.061712+00:00","expires_ts":"2026-10-20T05:26:42.061712+00:00","released_ts":null,"stale":false,"stale_reasons":[],"last_agent_activity_ts":"2026-10-20T05:24:42.232976+00:00","last_mail_activity_ts":null,"last_filesystem_activity_ts":null,"last_git_activity_ts":null}]`
+	capturedRustReleaseText            = `{"released":1,"released_at":"2026-10-20T12:16:14.000164Z"}`
+	capturedPythonReleaseReply         = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"released\":1,\"released_at\":\"2026-10-20T05:24:42.149119+00:00\"}"}],"structuredContent":{"released":1,"released_at":"2026-10-20T05:24:42.149119+00:00"},"isError":false}}`
+)
+
+// liveReply rewrites the captured reasons and expiries in reply so its
+// reservations are for beadID and still live, since the captures are hours
+// old. Every other byte stays as the server sent it.
+func liveReply(reply, beadID string) string {
+	reason := "bead assignment: " + beadID
+	later := time.Now().UTC().Add(time.Hour)
+	rust := later.Format("2006-01-02T15:04:05.000000Z07:00")
+	python := later.Format("2006-01-02T15:04:05.000000-07:00")
+	return strings.NewReplacer(
+		"bd-m0gm2 live probe (nonexistent path)", reason, "2026-10-20T04:48:02.649015Z", rust,
+		"bd-00tl4 listing probe", reason, "2026-10-20T12:16:51.128223Z", rust,
+		"bd-q7kzm capture", reason, "2026-10-20T05:26:42.061712+00:00", python,
+	).Replace(reply)
+}
+
+func agentMailToolReply(text string) string {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 1,
+		"result": map[string]interface{}{"content": []map[string]string{{"type": "text", "text": text}}},
+	})
+	return string(body)
+}
+
+func agentMailResourceReply(text string) string {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 1,
+		"result": map[string]interface{}{"contents": []map[string]string{{"uri": "resource://file_reservations/%2Fp", "text": text}}},
+	})
+	return string(body)
+}
+
+// replayAgentMail returns a real client whose server answers each call with
+// the next reply recorded for its tool name, or for "resources/read"; the
+// last reply for a call repeats.
+func replayAgentMail(t *testing.T, replies map[string][]string) *agentmail.Client {
+	t.Helper()
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode Agent Mail request: %v", err)
+			return
+		}
+		call := req.Method
+		if call == "tools/call" {
+			call = req.Params.Name
+		}
+		mu.Lock()
+		queue := replies[call]
+		if len(queue) > 1 {
+			replies[call] = queue[1:]
+		}
+		mu.Unlock()
+		if len(queue) == 0 {
+			t.Errorf("unexpected Agent Mail call %q", call)
+			http.Error(w, "unexpected call", http.StatusNotImplemented)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(queue[0]))
+	}))
+	t.Cleanup(server.Close)
+	return agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
+}
+
+// TestReservePathsForBeadChecksLiveGrants replays both servers' grants through
+// the real client. Neither names a project, and the call that got them named
+// the bound project, so they are valid receipts; a grant for another holder or
+// for a path nobody asked for still is not.
+func TestReservePathsForBeadChecksLiveGrants(t *testing.T) {
+	rustGrant := agentMailToolReply(liveReply(capturedRustReservationGrantText, "bd-live"))
+	otherHolder := agentMailToolReply(liveReply(strings.Replace(capturedRustReservationGrantText,
+		`"id":14598,`, `"id":14598,"agent_name":"OtherAgent",`, 1), "bd-live"))
+	for _, test := range []struct {
+		name    string
+		reply   string
+		path    string
+		wantID  int
+		wantErr string
+	}{
+		{name: "rust", reply: rustGrant, path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598},
+		{name: "python", reply: liveReply(capturedPythonReservationReply, "bd-live"), path: "probe/c.txt", wantID: 4},
+		{name: "path not requested", reply: rustGrant, path: "internal/other.go", wantID: 14598, wantErr: "unexpected path"},
+		{name: "another holder", reply: otherHolder, path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598, wantErr: "agent mismatch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := replayAgentMail(t, map[string][]string{
+				"ensure_project":         {agentMailToolReply(capturedRustEnsureProjectText)},
+				"file_reservation_paths": {test.reply},
+			})
+			result, err := NewFileReservationManager(client, "/p").ReservePathsForBead(t.Context(), "bd-live", "NobleStork", []string{test.path})
+			if result == nil || !reflect.DeepEqual(result.ReservationIDs, []int{test.wantID}) {
+				t.Fatalf("result = %+v, want reservation %d kept for release", result, test.wantID)
+			}
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) || result.Success {
+					t.Fatalf("ReservePathsForBead() result=%+v error=%v, want %q", result, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil || !result.Success || !reflect.DeepEqual(result.GrantedPaths, []string{test.path}) ||
+				result.ExpiresAt == nil || !result.ExpiresAt.After(time.Now()) {
+				t.Fatalf("ReservePathsForBead() result=%+v error=%v, want %s held until a future expiry", result, err, test.path)
+			}
+		})
+	}
+}
+
+// TestReconcileAndReleaseExactForBeadUseLiveListing replays both servers'
+// reservation listings, whose rows name no project, through reconciliation and
+// through the exact release a cleared assignment runs.
+func TestReconcileAndReleaseExactForBeadUseLiveListing(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		listing string
+		release string
+		agent   string
+		path    string
+		wantID  int
+	}{
+		{name: "rust", listing: capturedRustReservationListingText, release: agentMailToolReply(capturedRustReleaseText), agent: "NobleStork", path: "scratch-bd-00tl4/does-not-exist.txt", wantID: 14709},
+		{name: "python", listing: pythonReservationListingText, release: capturedPythonReleaseReply, agent: "RedStone", path: "probe/c.txt", wantID: 4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listing := agentMailResourceReply(liveReply(test.listing, "bd-live"))
+			client := replayAgentMail(t, map[string][]string{
+				"ensure_project":            {agentMailToolReply(capturedRustEnsureProjectText)},
+				"resources/read":            {listing, listing, agentMailResourceReply("[]")},
+				"release_file_reservations": {test.release},
+			})
+			manager := NewFileReservationManager(client, "/p")
+
+			reconciled, err := manager.ReconcileForBead(t.Context(), "bd-live", test.agent, []string{test.path})
+			if err != nil || !reconciled.Success || !reflect.DeepEqual(reconciled.ReservationIDs, []int{test.wantID}) {
+				t.Fatalf("ReconcileForBead() result=%+v error=%v, want reservation %d", reconciled, err, test.wantID)
+			}
+
+			released, err := manager.ReleaseExactForBead(t.Context(), exactReleaseBarrier("bd-live", test.agent), []int{test.wantID}, []string{test.path})
+			if err != nil || !reflect.DeepEqual(released, []string{test.path}) {
+				t.Fatalf("ReleaseExactForBead() released=%v error=%v, want %s released", released, err, test.path)
+			}
+		})
 	}
 }
 

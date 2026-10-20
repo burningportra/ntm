@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2767,6 +2769,185 @@ func TestRobotReservationReconciliationDistinguishesAbsentPartialAndReserved(t *
 			}
 			if test.want == assignment.ReservationReconciliationReserved && len(got.Lease.ReservationIDs) != 2 {
 				t.Fatalf("reserved lease = %+v", got.Lease)
+			}
+		})
+	}
+}
+
+// Replies the Agent Mail servers sent live to the calls a bulk assignment's
+// reservation makes, with the project path shortened to /p. The grants are the
+// capturedRustReservationGrantText (am 0.3.36) and
+// capturedPythonReservationReply (mcp_agent_mail 0.3.4) replays in
+// internal/agentmail/tools_httptest_test.go. The ensure_project reply, the
+// agent listing and the Rust reservation listing were read from am 0.3.36;
+// the Python listing row is the one mcp_agent_mail 0.3.4's
+// file_reservations_resource builds. No grant and no reservation listing row
+// names a project.
+const (
+	capturedRustEnsureProjectText      = `{"id":79,"created_at":"2026-10-20T12:15:35.816042Z","slug":"p","identity_mode_used":"dir","canonical_path":"/p","human_key":"/p","repo_root":null,"git_common_dir":null,"branch":null,"worktree_name":null,"core_ignorecase":null,"normalized_remote":null,"project_uid":"a39a2518130842bb247a","discovery":null}`
+	capturedRustAgentsText             = `{"project":{"slug":"p","human_key":"/p"},"agents":[{"id":2153,"name":"NobleStork","program":"claude-code","model":"claude-opus-5-5","task_description":"bd-00tl4 live check (scratch project)","inception_ts":"2026-10-20T12:15:43.447686Z","last_active_ts":"2026-10-20T12:15:43.447686Z","project_id":79,"attachments_policy":"auto","unread_count":0}],"retired_agents":[]}`
+	capturedRustReservationGrantText   = `{"granted":[{"id":14598,"path_pattern":"scratch-bd-m0gm2-probe/does-not-exist.txt","exclusive":true,"reason":"bd-m0gm2 live probe (nonexistent path)","expires_ts":"2026-10-20T04:48:02.649015Z"}],"conflicts":[]}`
+	capturedPythonReservationReply     = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"granted\":[{\"id\":4,\"path_pattern\":\"probe/c.txt\",\"exclusive\":true,\"reason\":\"bd-q7kzm capture\",\"expires_ts\":\"2026-10-20T05:26:42.061712+00:00\",\"reused\":false}],\"conflicts\":[],\"warnings\":[\"enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate.\"]}"}],"structuredContent":{"granted":[{"id":4,"path_pattern":"probe/c.txt","exclusive":true,"reason":"bd-q7kzm capture","expires_ts":"2026-10-20T05:26:42.061712+00:00","reused":false}],"conflicts":[],"warnings":["enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via ` + "`install_precommit_guard`" + ` for the authoritative reservation gate."]},"isError":false}}`
+	capturedRustReservationListingText = `[{"id":14709,"agent":"NobleStork","path_pattern":"scratch-bd-00tl4/does-not-exist.txt","exclusive":true,"reason":"bd-00tl4 listing probe","created_ts":"2026-10-20T12:15:51.128223Z","expires_ts":"2026-10-20T12:16:51.128223Z","released_ts":null,"stale":false,"stale_reasons":["agent_recently_active","no_recent_mail_activity>900s","path_pattern_unmatched"],"last_agent_activity_ts":"2026-10-20T12:15:43.447686Z","last_mail_activity_ts":null,"last_git_activity_ts":null,"last_filesystem_activity_ts":null}]`
+	pythonReservationListingText       = `[{"id":4,"agent":"RedStone","agent_id":3,"path_pattern":"probe/c.txt","exclusive":true,"reason":"bd-q7kzm capture","created_ts":"2026-10-20T05:24:42.061712+00:00","expires_ts":"2026-10-20T05:26:42.061712+00:00","released_ts":null,"stale":false,"stale_reasons":[],"last_agent_activity_ts":"2026-10-20T05:24:42.232976+00:00","last_mail_activity_ts":null,"last_filesystem_activity_ts":null,"last_git_activity_ts":null}]`
+)
+
+// liveReply rewrites the captured reasons and expiries in reply so its
+// reservations are for beadID and still live, since the captures are hours
+// old. Every other byte stays as the server sent it.
+func liveReply(reply, beadID string) string {
+	reason := "bead assignment: " + beadID
+	later := time.Now().UTC().Add(time.Hour)
+	rust := later.Format("2006-01-02T15:04:05.000000Z07:00")
+	python := later.Format("2006-01-02T15:04:05.000000-07:00")
+	return strings.NewReplacer(
+		"bd-m0gm2 live probe (nonexistent path)", reason, "2026-10-20T04:48:02.649015Z", rust,
+		"bd-00tl4 listing probe", reason, "2026-10-20T12:16:51.128223Z", rust,
+		"bd-q7kzm capture", reason, "2026-10-20T05:26:42.061712+00:00", python,
+	).Replace(reply)
+}
+
+func agentMailToolReply(text string) string {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 1,
+		"result": map[string]interface{}{"content": []map[string]string{{"type": "text", "text": text}}},
+	})
+	return string(body)
+}
+
+func agentMailResourceReply(text string) string {
+	body, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 1,
+		"result": map[string]interface{}{"contents": []map[string]string{{"uri": "resource://p", "text": text}}},
+	})
+	return string(body)
+}
+
+// replayAgentMail returns a real client whose server answers each call with
+// the reply recorded for its tool name, or for the resource kind it reads
+// ("resource://agents", "resource://file_reservations").
+func replayAgentMail(t *testing.T, replies map[string]string) *agentmail.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			Params struct {
+				Name string `json:"name"`
+				URI  string `json:"uri"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode Agent Mail request: %v", err)
+			return
+		}
+		call := req.Params.Name
+		if req.Method == "resources/read" {
+			kind, _, _ := strings.Cut(strings.TrimPrefix(req.Params.URI, "resource://"), "/")
+			call = "resource://" + kind
+		}
+		reply, ok := replies[call]
+		if !ok {
+			t.Errorf("unexpected Agent Mail call %s %q", req.Method, call)
+			http.Error(w, "unexpected call", http.StatusNotImplemented)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(reply))
+	}))
+	t.Cleanup(server.Close)
+	return agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
+}
+
+// TestRobotReservationChecksLiveGrants replays both servers' grants through the
+// real client. Neither names a project, and the call that got them named the
+// bound project, so they are valid receipts; a grant for another holder or for
+// a path nobody asked for still is not.
+func TestRobotReservationChecksLiveGrants(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	rustGrant := agentMailToolReply(liveReply(capturedRustReservationGrantText, "bd-live"))
+	otherHolder := agentMailToolReply(liveReply(strings.Replace(capturedRustReservationGrantText,
+		`"id":14598,`, `"id":14598,"agent_name":"OtherAgent",`, 1), "bd-live"))
+	for _, test := range []struct {
+		name    string
+		reply   string
+		path    string
+		wantID  int
+		wantErr string
+	}{
+		{name: "rust", reply: rustGrant, path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598},
+		{name: "python", reply: liveReply(capturedPythonReservationReply, "bd-live"), path: "probe/c.txt", wantID: 4},
+		{name: "path not requested", reply: rustGrant, path: "internal/other.go", wantID: 14598, wantErr: "unexpected path"},
+		{name: "another holder", reply: otherHolder, path: "scratch-bd-m0gm2-probe/does-not-exist.txt", wantID: 14598, wantErr: "recipient mismatch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := replayAgentMail(t, map[string]string{
+				"ensure_project":         agentMailToolReply(capturedRustEnsureProjectText),
+				"resource://agents":      agentMailResourceReply(capturedRustAgentsText),
+				"file_reservation_paths": test.reply,
+			})
+			runtime, err := newRobotAgentMailReservationRuntime(t.Context(), "/p", "bd-00tl4-replay", client)
+			if err != nil {
+				t.Fatalf("newRobotAgentMailReservationRuntime: %v", err)
+			}
+			lease, err := runtime.Reserve(t.Context(), assignment.ReservationRequest{
+				BeadID: "bd-live", AgentName: "NobleStork", Target: "%1", RequestedPaths: []string{test.path},
+			})
+			if !reflect.DeepEqual(lease.ReservationIDs, []int{test.wantID}) {
+				t.Fatalf("lease = %+v, want reservation %d kept for release", lease, test.wantID)
+			}
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) || assignment.IsGuaranteedNoReservation(err) {
+					t.Fatalf("Reserve() error = %v, want %q with the lease kept", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Reserve() error = %v, want the live grant accepted", err)
+			}
+			if !reflect.DeepEqual(lease.Granted, []string{test.path}) || lease.ExpiresAt == nil || !lease.ExpiresAt.After(time.Now()) {
+				t.Fatalf("lease = %+v, want %s held until a future expiry", lease, test.path)
+			}
+		})
+	}
+}
+
+// TestRobotReservationReconcilesLiveListing replays both servers' reservation
+// listings, whose rows name no project, through the real client.
+func TestRobotReservationReconcilesLiveListing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, test := range []struct {
+		name    string
+		listing string
+		agent   string
+		path    string
+		wantID  int
+		want    assignment.ReservationReconciliationState
+	}{
+		{name: "rust", listing: capturedRustReservationListingText, agent: "NobleStork", path: "scratch-bd-00tl4/does-not-exist.txt", wantID: 14709, want: assignment.ReservationReconciliationReserved},
+		{name: "python", listing: pythonReservationListingText, agent: "RedStone", path: "probe/c.txt", wantID: 4, want: assignment.ReservationReconciliationReserved},
+		{name: "another holder", listing: capturedRustReservationListingText, agent: "OtherAgent", path: "scratch-bd-00tl4/does-not-exist.txt", want: assignment.ReservationReconciliationAbsent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := replayAgentMail(t, map[string]string{
+				"ensure_project":               agentMailToolReply(capturedRustEnsureProjectText),
+				"resource://agents":            agentMailResourceReply(capturedRustAgentsText),
+				"resource://file_reservations": agentMailResourceReply(liveReply(test.listing, "bd-live")),
+			})
+			runtime, err := newRobotAgentMailReservationRuntime(t.Context(), "/p", "bd-00tl4-replay", client)
+			if err != nil {
+				t.Fatalf("newRobotAgentMailReservationRuntime: %v", err)
+			}
+			got, err := runtime.ReconcileReservation(t.Context(), assignment.ReservationRequest{
+				BeadID: "bd-live", AgentName: test.agent, Target: "%1", RequestedPaths: []string{test.path},
+			}, assignment.LeaseReceipt{})
+			if err != nil {
+				t.Fatalf("ReconcileReservation: %v", err)
+			}
+			if got.State != test.want {
+				t.Fatalf("reconciliation = %+v, want %s", got, test.want)
+			}
+			if test.want == assignment.ReservationReconciliationReserved && !reflect.DeepEqual(got.Lease.ReservationIDs, []int{test.wantID}) {
+				t.Fatalf("reconciled lease = %+v, want reservation %d", got.Lease, test.wantID)
 			}
 		})
 	}

@@ -1885,8 +1885,10 @@ func (r *robotAgentMailReservationRuntime) Reserve(ctx context.Context, req assi
 		} else {
 			seenIDs[granted.ID] = struct{}{}
 		}
-		if granted.ProjectID != r.projectID || granted.AgentName != req.AgentName {
-			validationErrors = append(validationErrors, fmt.Errorf("Agent Mail reservation %d receipt project or recipient mismatch", granted.ID))
+		// A grant carries no project: the call named r.projectKey, so every
+		// grant it returns is in that project.
+		if granted.AgentName != req.AgentName {
+			validationErrors = append(validationErrors, fmt.Errorf("Agent Mail reservation %d receipt recipient mismatch: got %q, want %q", granted.ID, granted.AgentName, req.AgentName))
 		}
 		if granted.Reason != expectedReason {
 			validationErrors = append(validationErrors, fmt.Errorf("Agent Mail reservation %d receipt reason mismatch", granted.ID))
@@ -1988,8 +1990,8 @@ func (r *robotAgentMailReservationRuntime) ReconcileReservation(ctx context.Cont
 		lease.Granted = append(lease.Granted, reservation.PathPattern)
 		lease.ReservationIDs = append(lease.ReservationIDs, reservation.ID)
 		expiresAt := reservation.ExpiresTS.Time
-		if reservation.ProjectID != r.projectID || !reservation.Exclusive ||
-			expiresAt.IsZero() || !expiresAt.After(now) {
+		// The listing is the project's own, so its rows carry no project.
+		if !reservation.Exclusive || expiresAt.IsZero() || !expiresAt.After(now) {
 			return assignment.ReservationReconciliation{State: assignment.ReservationReconciliationUnknown, Lease: lease}, nil
 		}
 		if lease.ExpiresAt == nil || expiresAt.Before(*lease.ExpiresAt) {

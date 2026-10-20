@@ -73,12 +73,8 @@ func TestEnsureProjectAcceptsSymlinkEquivalentHumanKey(t *testing.T) {
 	// keys by the symlinked alias. This must bind, not mismatch (GH#239).
 	client := &fakeReservationClient{project: &agentmail.Project{ID: 7, HumanKey: realDir}}
 	m := NewFileReservationManager(client, linkDir)
-	id, err := m.ensureProject(context.Background())
-	if err != nil {
+	if err := m.ensureProject(context.Background()); err != nil {
 		t.Fatalf("ensureProject with symlinked key: %v", err)
-	}
-	if id != 7 {
-		t.Errorf("project ID = %d, want 7", id)
 	}
 }
 
@@ -89,7 +85,7 @@ func TestEnsureProjectStillFailsClosedOnRealMismatch(t *testing.T) {
 
 	client := &fakeReservationClient{project: &agentmail.Project{ID: 9, HumanKey: otherDir}}
 	m := NewFileReservationManager(client, realDir)
-	if _, err := m.ensureProject(context.Background()); err == nil || !strings.Contains(err.Error(), "binding mismatch") {
+	if err := m.ensureProject(context.Background()); err == nil || !strings.Contains(err.Error(), "binding mismatch") {
 		t.Fatalf("genuinely different HumanKey must fail closed, got err=%v", err)
 	}
 }

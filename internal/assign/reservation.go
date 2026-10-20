@@ -234,8 +234,7 @@ func (m *FileReservationManager) reservePathsForBead(ctx context.Context, beadID
 		result.Error = "agent mail client not configured"
 		return result, nil
 	}
-	expectedProjectID, err := m.ensureProject(ctx)
-	if err != nil {
+	if err := m.ensureProject(ctx); err != nil {
 		result.Error = err.Error()
 		return result, err
 	}
@@ -254,7 +253,7 @@ func (m *FileReservationManager) reservePathsForBead(ctx context.Context, beadID
 		// Check if it's a conflict error with partial results
 		if reservationResult != nil {
 			result.Conflicts = reservationResult.Conflicts
-			if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), expectedProjectID, time.Now().UTC(), false); validationErr != nil {
+			if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), time.Now().UTC(), false); validationErr != nil {
 				result.Error = validationErr.Error()
 				return result, validationErr
 			}
@@ -270,7 +269,7 @@ func (m *FileReservationManager) reservePathsForBead(ctx context.Context, beadID
 		return result, errors.New(result.Error)
 	}
 	// Process successful reservations
-	if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), expectedProjectID, time.Now().UTC(), false); validationErr != nil {
+	if validationErr := collectGrantedReservations(result, reservationResult.Granted, paths, agentName, fmt.Sprintf("bead assignment: %s", beadID), time.Now().UTC(), false); validationErr != nil {
 		result.Error = validationErr.Error()
 		return result, validationErr
 	}
@@ -292,8 +291,7 @@ func (m *FileReservationManager) ReconcileForBead(ctx context.Context, beadID, a
 		result.Error = "agent mail client not configured"
 		return result, errors.New(result.Error)
 	}
-	expectedProjectID, err := m.ensureProject(ctx)
-	if err != nil {
+	if err := m.ensureProject(ctx); err != nil {
 		result.Error = err.Error()
 		return result, err
 	}
@@ -340,9 +338,6 @@ func (m *FileReservationManager) ReconcileForBead(ctx context.Context, beadID, a
 			result.GrantedPaths = append(result.GrantedPaths, path)
 		}
 		result.ReservationIDs = append(result.ReservationIDs, reservation.ID)
-		if reservation.ProjectID != expectedProjectID {
-			validationErrors = append(validationErrors, fmt.Errorf("active reservation %d for %s belongs to project %d, want %d", reservation.ID, path, reservation.ProjectID, expectedProjectID))
-		}
 		if !reservation.Exclusive {
 			validationErrors = append(validationErrors, fmt.Errorf("active reservation %d for %s is not exclusive", reservation.ID, path))
 		}
@@ -366,35 +361,38 @@ func (m *FileReservationManager) ReconcileForBead(ctx context.Context, beadID, a
 	return result, nil
 }
 
-func (m *FileReservationManager) ensureProject(ctx context.Context) (int, error) {
+// ensureProject binds m.projectKey to an Agent Mail project before any
+// reservation call. Reservation grants and listing rows carry no project, so
+// this binding is what places them: every call names m.projectKey.
+func (m *FileReservationManager) ensureProject(ctx context.Context) error {
 	if m == nil || m.client == nil {
-		return 0, errors.New("agent mail client not configured")
+		return errors.New("agent mail client not configured")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	project, err := m.client.EnsureProject(ctx, m.projectKey)
 	if err != nil {
-		return 0, fmt.Errorf("ensure Agent Mail project %q: %w", m.projectKey, err)
+		return fmt.Errorf("ensure Agent Mail project %q: %w", m.projectKey, err)
 	}
 	if project == nil || project.ID <= 0 {
-		return 0, fmt.Errorf("ensure Agent Mail project %q returned no durable project ID", m.projectKey)
+		return fmt.Errorf("ensure Agent Mail project %q returned no durable project ID", m.projectKey)
 	}
 	expectedKey := strings.TrimSpace(m.projectKey)
 	if expectedKey == "" {
-		return 0, errors.New("agent-mail project binding requires a non-empty project key")
+		return errors.New("agent-mail project binding requires a non-empty project key")
 	}
 	// Symlink-equivalent compare: Agent Mail canonicalizes project paths, so
 	// the returned human key may be the resolved form of a symlinked key
 	// (GH#239). Fail-closed semantics are preserved for genuinely different
 	// directories.
 	if humanKey := strings.TrimSpace(project.HumanKey); !agentmail.ProjectKeysEquivalent(humanKey, expectedKey) {
-		return 0, fmt.Errorf("agent-mail project binding mismatch: got %q, want %q", humanKey, m.projectKey)
+		return fmt.Errorf("agent-mail project binding mismatch: got %q, want %q", humanKey, m.projectKey)
 	}
-	return project.ID, nil
+	return nil
 }
 
-func collectGrantedReservations(result *FileReservationResult, granted []agentmail.FileReservation, requested []string, agentName, expectedReason string, expectedProjectID int, now time.Time, allowDuplicatePaths bool) error {
+func collectGrantedReservations(result *FileReservationResult, granted []agentmail.FileReservation, requested []string, agentName, expectedReason string, now time.Time, allowDuplicatePaths bool) error {
 	wanted := make(map[string]struct{}, len(requested))
 	for _, raw := range requested {
 		if path := strings.TrimSpace(raw); path != "" {
@@ -415,9 +413,6 @@ func collectGrantedReservations(result *FileReservationResult, granted []agentma
 			validHandle = false
 		} else {
 			seenIDs[reservation.ID] = struct{}{}
-		}
-		if reservation.ProjectID != expectedProjectID {
-			validationErrors = append(validationErrors, fmt.Errorf("reservation %d for %q belongs to project %d, want %d", reservation.ID, path, reservation.ProjectID, expectedProjectID))
 		}
 		if reservation.ReleasedTS != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("reservation %d for %q is already released", reservation.ID, path))
@@ -518,8 +513,7 @@ func (m *FileReservationManager) ReleaseExactForBead(ctx context.Context, barrie
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	expectedProjectID, err := m.ensureProject(ctx)
-	if err != nil {
+	if err := m.ensureProject(ctx); err != nil {
 		return nil, err
 	}
 	reason := fmt.Sprintf("bead assignment: %s", strings.TrimSpace(beadID))
@@ -540,7 +534,7 @@ func (m *FileReservationManager) ReleaseExactForBead(ctx context.Context, barrie
 			return nil, fmt.Errorf("list active reservations for exact release: %w", listErr)
 		}
 		selectedIDs, selectedPaths, selectErr := selectExactReleaseReservations(
-			active, expectedProjectID, beadID, agentName, reason, wantedIDs, wantedPaths,
+			active, beadID, agentName, reason, wantedIDs, wantedPaths,
 		)
 		if selectErr != nil {
 			return nil, selectErr
@@ -561,7 +555,7 @@ func (m *FileReservationManager) ReleaseExactForBead(ctx context.Context, barrie
 		return nil, fmt.Errorf("verify exact reservation release: %w", err)
 	}
 	selectedIDs, _, err := selectExactReleaseReservations(
-		remaining, expectedProjectID, beadID, agentName, reason, wantedIDs, wantedPaths,
+		remaining, beadID, agentName, reason, wantedIDs, wantedPaths,
 	)
 	if err != nil {
 		return nil, err
@@ -592,7 +586,6 @@ func exactReleaseBarrierBinding(barrier *assignmentstore.Assignment) (string, st
 
 func selectExactReleaseReservations(
 	active []agentmail.FileReservation,
-	expectedProjectID int,
 	beadID, agentName, reason string,
 	wantedIDs map[int]struct{},
 	wantedPaths map[string]struct{},
@@ -607,7 +600,7 @@ func selectExactReleaseReservations(
 		path := strings.TrimSpace(reservation.PathPattern)
 		_, requestedByID := wantedIDs[reservation.ID]
 		_, requestedByPath := wantedPaths[path]
-		exactBinding := reservation.ID > 0 && reservation.ProjectID == expectedProjectID &&
+		exactBinding := reservation.ID > 0 &&
 			strings.TrimSpace(reservation.AgentName) == agentName && strings.TrimSpace(reservation.Reason) == reason
 		if requestedByID && !exactBinding {
 			return nil, nil, fmt.Errorf("reservation %d is not authoritatively bound to bead %s", reservation.ID, beadID)
@@ -615,7 +608,7 @@ func selectExactReleaseReservations(
 		if requestedByID && len(wantedPaths) > 0 && !requestedByPath {
 			return nil, nil, fmt.Errorf("reservation %d path %q is not authoritatively bound to bead %s durable paths", reservation.ID, path, beadID)
 		}
-		if requestedByPath && reservation.ProjectID == expectedProjectID &&
+		if requestedByPath &&
 			strings.TrimSpace(reservation.AgentName) == agentName && strings.TrimSpace(reservation.Reason) == reason && reservation.ID <= 0 {
 			return nil, nil, fmt.Errorf("active reservation for path %q has no durable ID", path)
 		}

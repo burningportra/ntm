@@ -852,8 +852,7 @@ func (p *coordinatorAgentMailReservationPort) Reserve(ctx context.Context, req a
 		return lease, assignmentstore.GuaranteeNoReservation(err)
 	}
 	lease.Requested = append([]string(nil), requested...)
-	projectID, err := p.ensureProject(ctx)
-	if err != nil {
+	if err := p.ensureProject(ctx); err != nil {
 		return lease, assignmentstore.GuaranteeNoReservation(err)
 	}
 
@@ -884,6 +883,8 @@ func (p *coordinatorAgentMailReservationPort) Reserve(ctx context.Context, req a
 	seenIDs := make(map[int]struct{}, len(reserved.Granted))
 	expectedReason := fmt.Sprintf("bead assignment: %s", req.BeadID)
 	now := time.Now().UTC()
+	// A grant carries no project: the call named p.projectKey, which
+	// ensureProject just bound, so every grant it returns is in that project.
 	for _, granted := range reserved.Granted {
 		if granted.ID > 0 {
 			if _, duplicate := seenIDs[granted.ID]; duplicate {
@@ -894,7 +895,7 @@ func (p *coordinatorAgentMailReservationPort) Reserve(ctx context.Context, req a
 			lease.ReservationIDs = append(lease.ReservationIDs, granted.ID)
 		}
 		expiresAt := granted.ExpiresTS.Time
-		if granted.ID <= 0 || granted.ProjectID != projectID || granted.AgentName != req.AgentName || granted.Reason != expectedReason || !granted.Exclusive ||
+		if granted.ID <= 0 || granted.AgentName != req.AgentName || granted.Reason != expectedReason || !granted.Exclusive ||
 			granted.ReleasedTS != nil || expiresAt.IsZero() || !expiresAt.After(now) {
 			sort.Ints(lease.ReservationIDs)
 			return lease, fmt.Errorf("agent mail returned invalid reservation receipt for %q", granted.PathPattern)
@@ -943,10 +944,10 @@ func (p *coordinatorAgentMailReservationPort) ReconcileReservation(ctx context.C
 	if err != nil {
 		return assignmentstore.ReservationReconciliation{State: assignmentstore.ReservationReconciliationUnknown}, err
 	}
-	projectID, err := p.ensureProject(ctx)
-	if err != nil {
+	if err := p.ensureProject(ctx); err != nil {
 		return assignmentstore.ReservationReconciliation{State: assignmentstore.ReservationReconciliationUnknown}, err
 	}
+	// The listing is the project's own, so its rows carry no project either.
 	reservations, err := p.client.ListReservations(ctx, p.projectKey, req.AgentName, false)
 	if err != nil {
 		return assignmentstore.ReservationReconciliation{State: assignmentstore.ReservationReconciliationUnknown}, err
@@ -981,7 +982,7 @@ func (p *coordinatorAgentMailReservationPort) ReconcileReservation(ctx context.C
 			lease.ReservationIDs = append(lease.ReservationIDs, reservation.ID)
 		}
 		expiresAt := reservation.ExpiresTS.Time
-		if reservation.ID <= 0 || reservation.ProjectID != projectID || !reservation.Exclusive ||
+		if reservation.ID <= 0 || !reservation.Exclusive ||
 			expiresAt.IsZero() || !expiresAt.After(now) {
 			sort.Ints(lease.ReservationIDs)
 			return assignmentstore.ReservationReconciliation{State: assignmentstore.ReservationReconciliationUnknown, Lease: lease}, nil
@@ -1004,15 +1005,16 @@ func (p *coordinatorAgentMailReservationPort) ReconcileReservation(ctx context.C
 	return assignmentstore.ReservationReconciliation{State: assignmentstore.ReservationReconciliationReserved, Lease: lease}, nil
 }
 
-func (p *coordinatorAgentMailReservationPort) ensureProject(ctx context.Context) (int, error) {
+func (p *coordinatorAgentMailReservationPort) ensureProject(ctx context.Context) error {
 	if p == nil || p.client == nil {
-		return 0, errors.New("agent mail reservation client is not configured")
+		return errors.New("agent mail reservation client is not configured")
 	}
 	project, err := p.client.EnsureProject(ctx, p.projectKey)
 	if err != nil {
-		return 0, fmt.Errorf("ensure Agent Mail project %q: %w", p.projectKey, err)
+		return fmt.Errorf("ensure Agent Mail project %q: %w", p.projectKey, err)
 	}
-	return validatedCoordinatorAgentMailProjectID(project, p.projectKey)
+	_, err = validatedCoordinatorAgentMailProjectID(project, p.projectKey)
+	return err
 }
 
 func validatedCoordinatorAgentMailProjectID(project *agentmail.Project, projectKey string) (int, error) {
