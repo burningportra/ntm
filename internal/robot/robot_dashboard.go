@@ -14,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
 )
@@ -65,10 +66,7 @@ func GetDashboard() (*DashboardOutput, error) {
 			BuildDate: Date,
 			TmuxOK:    tmux.IsInstalled(),
 		},
-		Summary: StatusSummary{
-			AgentsByState: map[string]int{},
-			AgentsByType:  map[string]int{},
-		},
+		Summary: newStatusSummary(),
 	}
 
 	// Sessions and agents (best-effort). One capture per pane feeds the
@@ -80,67 +78,11 @@ func GetDashboard() (*DashboardOutput, error) {
 			observer := newRobotSessionObserver(tmux.LinesHealthCheck)
 			parser := agent.NewParser()
 			for _, sess := range sessions {
-				snapSession := SnapshotSession{
-					Name:     sess.Name,
-					Attached: sess.Attached,
-					Agents:   []SnapshotAgent{},
+				var panes []statuspkg.PaneObservation
+				if observation, err := observer.Observe(context.Background(), sess.Name); err == nil {
+					panes = observation.Panes
 				}
-				observation, err := observer.Observe(context.Background(), sess.Name)
-				if err == nil {
-					for _, paneObservation := range observation.Panes {
-						pane := paneObservation.Metadata
-						agentType, ok := dashboardAgentType(pane)
-						if !ok {
-							continue
-						}
-						agentState := string(runtimeAgentState(agentType, observedPaneWork(parser, paneObservation)))
-						snapSession.Agents = append(snapSession.Agents, SnapshotAgent{
-							Pane:           fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
-							Type:           agentType,
-							Variant:        pane.Variant,
-							TypeConfidence: 0.5,
-							TypeMethod:     "tmux-pane",
-							State:          agentState,
-						})
-
-						switch agentType {
-						case "claude":
-							output.Summary.ClaudeCount++
-						case "codex":
-							output.Summary.CodexCount++
-						case "gemini":
-							output.Summary.GeminiCount++
-						case "pi":
-							// Pi is represented in AgentsByType; StatusSummary has no per-provider field.
-						case "kimi":
-							// Kimi is represented in AgentsByType; StatusSummary has no per-provider field.
-						case "muse":
-							// Muse is represented in AgentsByType; StatusSummary has no per-provider field.
-						case "antigravity":
-							output.Summary.AntigravityCount++
-						case "grok":
-							output.Summary.GrokCount++
-						case "cursor":
-							output.Summary.CursorCount++
-						case "windsurf":
-							output.Summary.WindsurfCount++
-						case "aider":
-							output.Summary.AiderCount++
-						case "oc":
-							output.Summary.OpencodeCount++
-						case "ollama":
-							output.Summary.OllamaCount++
-						}
-						output.Summary.TotalAgents++
-						output.Summary.AgentsByType[agentType]++
-						output.Summary.AgentsByState[agentState]++
-					}
-				}
-				output.Agents = append(output.Agents, snapSession)
-				output.Summary.TotalSessions++
-				if sess.Attached {
-					output.Summary.AttachedCount++
-				}
+				addDashboardSession(output, sess, panes, parser)
 			}
 		}
 	}
@@ -197,15 +139,35 @@ func GetDashboard() (*DashboardOutput, error) {
 	return output, nil
 }
 
-func dashboardAgentType(pane tmux.Pane) (string, bool) {
-	agentType := agentTypeString(pane.Type)
-	if agentType == "user" {
-		return "", false
+// addDashboardSession lists every observed pane of one session and adds them
+// to the summary. User shells are listed too, with type and state "user", the
+// way --robot-snapshot lists them, so the User Panes and User counts see them.
+func addDashboardSession(output *DashboardOutput, sess tmux.Session, panes []statuspkg.PaneObservation, parser agent.Parser) {
+	snapSession := SnapshotSession{
+		Name:     sess.Name,
+		Attached: sess.Attached,
+		Agents:   []SnapshotAgent{},
 	}
-	if agentType == "" {
-		agentType = "unknown"
+	for _, paneObservation := range panes {
+		pane := paneObservation.Metadata
+		agentType := agentTypeString(pane.Type)
+		agentState := string(runtimeAgentState(agentType, observedPaneWork(parser, paneObservation)))
+		snapSession.Agents = append(snapSession.Agents, SnapshotAgent{
+			Pane:           fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
+			Type:           agentType,
+			Variant:        pane.Variant,
+			TypeConfidence: 0.5,
+			TypeMethod:     "tmux-pane",
+			State:          agentState,
+		})
+		output.Summary.TotalAgents++
+		statusAccumulateAgentSummary(&output.Summary, agentType, agentState)
 	}
-	return agentType, true
+	output.Agents = append(output.Agents, snapSession)
+	output.Summary.TotalSessions++
+	if sess.Attached {
+		output.Summary.AttachedCount++
+	}
 }
 
 // PrintDashboard outputs a dashboard-oriented view for AI orchestrators.
@@ -265,19 +227,9 @@ func printDashboardMarkdown(output DashboardOutput) error {
 	fmt.Fprintf(&sb, "| Panes (total) | %d |\n", totalPanes)
 	fmt.Fprintf(&sb, "| Agent Panes | %d |\n", agentPanes)
 	fmt.Fprintf(&sb, "| User Panes | %d |\n", userPanes)
-	fmt.Fprintf(&sb, "| Claude | %d |\n", typeCounts["claude"])
-	fmt.Fprintf(&sb, "| Codex | %d |\n", typeCounts["codex"])
-	fmt.Fprintf(&sb, "| Gemini | %d |\n", typeCounts["gemini"])
-	fmt.Fprintf(&sb, "| Pi | %d |\n", typeCounts["pi"])
-	fmt.Fprintf(&sb, "| Kimi | %d |\n", typeCounts["kimi"])
-	fmt.Fprintf(&sb, "| Muse | %d |\n", typeCounts["muse"])
-	fmt.Fprintf(&sb, "| Antigravity | %d |\n", typeCounts["antigravity"])
-	fmt.Fprintf(&sb, "| Grok Build | %d |\n", typeCounts["grok"])
-	fmt.Fprintf(&sb, "| Cursor | %d |\n", typeCounts["cursor"])
-	fmt.Fprintf(&sb, "| Windsurf | %d |\n", typeCounts["windsurf"])
-	fmt.Fprintf(&sb, "| Aider | %d |\n", typeCounts["aider"])
-	fmt.Fprintf(&sb, "| Opencode | %d |\n", typeCounts["oc"])
-	fmt.Fprintf(&sb, "| Ollama | %d |\n", typeCounts["ollama"])
+	for _, agentType := range agent.AgentTypes() {
+		fmt.Fprintf(&sb, "| %s | %d |\n", dashboardAgentTypeLabel(agentType), typeCounts[ResolveAgentType(string(agentType))])
+	}
 	if otherPanes > 0 {
 		fmt.Fprintf(&sb, "| Other Agents | %d |\n", otherPanes)
 	}
@@ -307,30 +259,21 @@ func printDashboardMarkdown(output DashboardOutput) error {
 	if len(output.Agents) == 0 {
 		sb.WriteString("_No tmux sessions detected._\n\n")
 	} else {
-		sb.WriteString("| Session | Attached | Panes | User | Claude | Codex | Gemini | Pi | Kimi | Muse | Antigravity | Grok | Cursor | Windsurf | Aider | Ollama | Other |\n")
-		sb.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+		agentTypes := agent.AgentTypes()
+		sb.WriteString("| Session | Attached | Panes | User |")
+		for _, agentType := range agentTypes {
+			fmt.Fprintf(&sb, " %s |", dashboardAgentTypeLabel(agentType))
+		}
+		sb.WriteString(" Other |\n|---|---|---:|---:|")
+		sb.WriteString(strings.Repeat("---:|", len(agentTypes)+1))
+		sb.WriteString("\n")
 		for _, sess := range output.Agents {
 			sessTotal, sessUsers, sessCounts := dashboardCounts([]SnapshotSession{sess})
-			sessOther := dashboardOtherAgentCount(sessTotal, sessUsers, sessCounts)
-			fmt.Fprintf(&sb, "| %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |\n",
-				escapeMarkdownCell(sess.Name, 80),
-				yesNo(sess.Attached),
-				sessTotal,
-				sessUsers,
-				sessCounts["claude"],
-				sessCounts["codex"],
-				sessCounts["gemini"],
-				sessCounts["pi"],
-				sessCounts["kimi"],
-				sessCounts["muse"],
-				sessCounts["antigravity"],
-				sessCounts["grok"],
-				sessCounts["cursor"],
-				sessCounts["windsurf"],
-				sessCounts["aider"],
-				sessCounts["ollama"],
-				sessOther,
-			)
+			fmt.Fprintf(&sb, "| %s | %s | %d | %d |", escapeMarkdownCell(sess.Name, 80), yesNo(sess.Attached), sessTotal, sessUsers)
+			for _, agentType := range agentTypes {
+				fmt.Fprintf(&sb, " %d |", sessCounts[ResolveAgentType(string(agentType))])
+			}
+			fmt.Fprintf(&sb, " %d |\n", dashboardOtherAgentCount(sessTotal, sessUsers, sessCounts))
 		}
 		sb.WriteString("\n")
 	}
@@ -451,53 +394,46 @@ func writeAttentionSection(sb *strings.Builder, attention *SnapshotAttentionSumm
 	}
 }
 
+// dashboardCounts returns the pane total, the user pane count, and a count
+// for every launchable agent type keyed by its robot name.
 func dashboardCounts(sessions []SnapshotSession) (int, int, map[string]int) {
 	totalPanes := 0
 	userPanes := 0
-	typeCounts := map[string]int{
-		"claude":      0,
-		"codex":       0,
-		"gemini":      0,
-		"pi":          0,
-		"kimi":        0,
-		"muse":        0,
-		"antigravity": 0,
-		"grok":        0,
-		"cursor":      0,
-		"windsurf":    0,
-		"aider":       0,
-		"oc":          0,
-		"ollama":      0,
-		"user":        0,
-	}
+	typeCounts := newAgentTypeCounts()
 
 	for _, sess := range sessions {
 		for _, agent := range sess.Agents {
 			totalPanes++
 			typ := normalizeAgentType(agent.Type)
-			if typ == "" {
-				typ = "unknown"
+			if typ == "user" {
+				userPanes++
+				continue
 			}
 			if _, ok := typeCounts[typ]; ok {
 				typeCounts[typ]++
-			}
-			if typ == "user" {
-				userPanes++
 			}
 		}
 	}
 	return totalPanes, userPanes, typeCounts
 }
 
+// dashboardOtherAgentCount is the number of panes that are neither user
+// shells nor a launchable agent type.
 func dashboardOtherAgentCount(totalPanes, userPanes int, typeCounts map[string]int) int {
 	otherPanes := totalPanes - userPanes
-	for _, agentType := range []string{"claude", "codex", "gemini", "pi", "kimi", "muse", "antigravity", "grok", "cursor", "windsurf", "aider", "oc", "ollama"} {
-		otherPanes -= typeCounts[agentType]
+	for _, agentType := range agent.AgentTypes() {
+		otherPanes -= typeCounts[ResolveAgentType(string(agentType))]
 	}
 	if otherPanes < 0 {
 		return 0
 	}
 	return otherPanes
+}
+
+// dashboardAgentTypeLabel is an agent type's name without its product suffix
+// ("Claude" for Claude Code, "Cursor" for Cursor Agent).
+func dashboardAgentTypeLabel(agentType agent.AgentType) string {
+	return strings.Fields(agentType.DisplayName())[0]
 }
 
 func writeAgentsTable(sb *strings.Builder, sessions []SnapshotSession, maxRows int) {

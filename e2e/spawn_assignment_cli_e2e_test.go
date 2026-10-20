@@ -477,7 +477,6 @@ func TestE2ESpawnGrokPhaseOneBuiltBinary(t *testing.T) {
 				Agents     json.RawMessage `json:"agents"`
 			} `json:"sessions"`
 			Summary struct {
-				GrokCount    int            `json:"grok_count"`
 				AgentsByType map[string]int `json:"agents_by_type"`
 			} `json:"summary"`
 		}
@@ -503,10 +502,9 @@ func TestE2ESpawnGrokPhaseOneBuiltBinary(t *testing.T) {
 		if !foundSession {
 			t.Fatalf("configured-default compact robot status omits session %q: %s", session, statusResult.stdout)
 		}
-		if statusOutput.Summary.GrokCount < 1 ||
-			statusOutput.Summary.AgentsByType["grok"] != statusOutput.Summary.GrokCount {
-			t.Fatalf("configured-default compact robot Grok summary = count %d/by-type %d, want matching positive counts; status=%s",
-				statusOutput.Summary.GrokCount, statusOutput.Summary.AgentsByType["grok"], statusResult.stdout)
+		if statusOutput.Summary.AgentsByType["grok"] < 1 {
+			t.Fatalf("configured-default compact robot Grok summary = by-type %d, want a positive count; status=%s",
+				statusOutput.Summary.AgentsByType["grok"], statusResult.stdout)
 		}
 		fixture.assertNoAgentInput(t)
 	})
@@ -1363,8 +1361,8 @@ reasoning_effort = "medium"
 		statusSchema := fixture.runNTM(t, cliDir, "--robot-format=json", "--robot-schema=status")
 		fixture.requireSuccess(t, statusSchema)
 		schemaText := strings.ToLower(string(statusSchema.stdout))
-		if !strings.Contains(schemaText, `"summary"`) || !strings.Contains(schemaText, `"grok_count"`) {
-			t.Fatalf("status schema omits Grok agent count: %s", statusSchema.stdout)
+		if !strings.Contains(schemaText, `"summary"`) || !strings.Contains(schemaText, `"agents_by_type"`) {
+			t.Fatalf("status schema omits per-type agent counts: %s", statusSchema.stdout)
 		}
 
 		for _, command := range []string{"spawn", "add", "adopt"} {

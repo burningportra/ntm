@@ -185,7 +185,7 @@ test_summary_fields() {
     fi
 
     # Check summary subfields
-    local summary_fields=("total_sessions" "total_agents" "attached_count" "claude_count" "codex_count" "gemini_count")
+    local summary_fields=("total_sessions" "total_agents" "attached_count")
     for field in "${summary_fields[@]}"; do
         local has_field
         has_field=$(echo "$output" | jq --arg f "$field" '.summary | has($f)')
@@ -200,6 +200,18 @@ test_summary_fields() {
             log_assert_eq "1" "1" "summary.$field is a valid integer ($value)"
         else
             log_assert_eq "$value" "integer" "summary.$field should be integer"
+        fi
+    done
+
+    # agents_by_type lists every launchable agent type, at 0 when none run
+    local agent_types=("claude" "codex" "gemini" "pi" "kimi" "muse" "antigravity" "grok" "cursor" "windsurf" "aider" "oc" "ollama")
+    for agent_type in "${agent_types[@]}"; do
+        local value
+        value=$(echo "$output" | jq -r --arg t "$agent_type" '.summary.agents_by_type[$t]')
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+            log_assert_eq "1" "1" "summary.agents_by_type.$agent_type is a valid integer ($value)"
+        else
+            log_assert_eq "$value" "integer" "summary.agents_by_type.$agent_type should be integer"
         fi
     done
 }
@@ -707,7 +719,7 @@ test_summary_counts() {
     local summary_total_sessions summary_total_agents summary_claude_count
     summary_total_sessions=$(echo "$output" | jq -r '.summary.total_sessions')
     summary_total_agents=$(echo "$output" | jq -r '.summary.total_agents')
-    summary_claude_count=$(echo "$output" | jq -r '.summary.claude_count')
+    summary_claude_count=$(echo "$output" | jq -r '.summary.agents_by_type.claude')
 
     # Calculate actual values from sessions
     local actual_sessions actual_agents actual_claude
@@ -718,7 +730,7 @@ test_summary_counts() {
     # Verify counts match
     log_assert_eq "$summary_total_sessions" "$actual_sessions" "summary.total_sessions matches actual session count"
     log_assert_eq "$summary_total_agents" "$actual_agents" "summary.total_agents matches actual agent count"
-    log_assert_eq "$summary_claude_count" "$actual_claude" "summary.claude_count matches actual claude count"
+    log_assert_eq "$summary_claude_count" "$actual_claude" "summary.agents_by_type.claude matches actual claude count"
 
     # Verify total_sessions >= 1 (we just created one)
     if [[ "$summary_total_sessions" -ge 1 ]]; then

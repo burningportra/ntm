@@ -62,14 +62,9 @@ func TestRobotStatusEmptySessions(t *testing.T) {
 		GeneratedAt string                   `json:"generated_at"`
 		Sessions    []map[string]interface{} `json:"sessions"`
 		Summary     struct {
-			TotalSessions int `json:"total_sessions"`
-			TotalAgents   int `json:"total_agents"`
-			ClaudeCount   int `json:"claude_count"`
-			CodexCount    int `json:"codex_count"`
-			GeminiCount   int `json:"gemini_count"`
-			CursorCount   int `json:"cursor_count"`
-			WindsurfCount int `json:"windsurf_count"`
-			AiderCount    int `json:"aider_count"`
+			TotalSessions int            `json:"total_sessions"`
+			TotalAgents   int            `json:"total_agents"`
+			AgentsByType  map[string]int `json:"agents_by_type"`
 		} `json:"summary"`
 	}
 
@@ -243,13 +238,8 @@ func TestRobotStatusWithSyntheticAgents(t *testing.T) {
 			} `json:"agents"`
 		} `json:"sessions"`
 		Summary struct {
-			TotalAgents   int `json:"total_agents"`
-			ClaudeCount   int `json:"claude_count"`
-			CodexCount    int `json:"codex_count"`
-			GeminiCount   int `json:"gemini_count"`
-			CursorCount   int `json:"cursor_count"`
-			WindsurfCount int `json:"windsurf_count"`
-			AiderCount    int `json:"aider_count"`
+			TotalAgents  int            `json:"total_agents"`
+			AgentsByType map[string]int `json:"agents_by_type"`
 		} `json:"summary"`
 	}
 
@@ -299,8 +289,8 @@ func TestRobotStatusWithSyntheticAgents(t *testing.T) {
 	if payload.Summary.TotalAgents < 3 {
 		t.Fatalf("summary.total_agents should reflect at least synthetic agents, got %d", payload.Summary.TotalAgents)
 	}
-	if payload.Summary.ClaudeCount < 1 || payload.Summary.CodexCount < 1 || payload.Summary.GeminiCount < 1 {
-		t.Fatalf("summary counts missing agent types: %+v", payload.Summary)
+	if payload.Summary.AgentsByType["claude"] < 1 || payload.Summary.AgentsByType["codex"] < 1 || payload.Summary.AgentsByType["gemini"] < 1 {
+		t.Fatalf("summary agents_by_type missing agent types: %+v", payload.Summary)
 	}
 }
 
@@ -361,14 +351,9 @@ func TestRobotStatusHandlesLongSessionNames(t *testing.T) {
 			Name string `json:"name"`
 		} `json:"sessions"`
 		Summary struct {
-			TotalSessions int `json:"total_sessions"`
-			TotalAgents   int `json:"total_agents"`
-			ClaudeCount   int `json:"claude_count"`
-			CodexCount    int `json:"codex_count"`
-			GeminiCount   int `json:"gemini_count"`
-			CursorCount   int `json:"cursor_count"`
-			WindsurfCount int `json:"windsurf_count"`
-			AiderCount    int `json:"aider_count"`
+			TotalSessions int            `json:"total_sessions"`
+			TotalAgents   int            `json:"total_agents"`
+			AgentsByType  map[string]int `json:"agents_by_type"`
 		} `json:"summary"`
 	}
 
@@ -747,14 +732,9 @@ gemini = "bash"
 			} `json:"summary"`
 		} `json:"sessions"`
 		Summary struct {
-			TotalSessions int `json:"total_sessions"`
-			TotalAgents   int `json:"total_agents"`
-			ClaudeCount   int `json:"claude_count"`
-			CodexCount    int `json:"codex_count"`
-			GeminiCount   int `json:"gemini_count"`
-			CursorCount   int `json:"cursor_count"`
-			WindsurfCount int `json:"windsurf_count"`
-			AiderCount    int `json:"aider_count"`
+			TotalSessions int            `json:"total_sessions"`
+			TotalAgents   int            `json:"total_agents"`
+			AgentsByType  map[string]int `json:"agents_by_type"`
 		} `json:"summary"`
 	}
 

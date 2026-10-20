@@ -645,9 +645,6 @@ func buildTestProjection(sessionCount, agentCount, eventCount int) *SectionProje
 		TotalSessions: sessionCount,
 		TotalAgents:   agentCount,
 		AttachedCount: sessionCount / 2,
-		ClaudeCount:   agentCount / 3,
-		CodexCount:    agentCount / 3,
-		CursorCount:   agentCount / 3,
 		AgentsByState: map[string]int{
 			"active": agentCount / 2,
 			"idle":   agentCount / 4,

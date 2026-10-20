@@ -249,7 +249,21 @@ per pane, and report its verdict as one of these values:
 | `unknown` | `--robot-is-working` recommends `UNKNOWN`, or the pane's output could not be captured. |
 | `user` | A user shell pane. It holds no agent, so it is not classified and is never a dispatch target. |
 
-The dashboard lists agent panes only, so it never reports `user`.
+The snapshot and the dashboard both list user shell panes next to the agent
+panes, with type and state `user`, so the dashboard's User Panes counts see
+them.
+
+### 3.3.2 Agent Type Counts
+
+`--robot-status`, `--robot-snapshot` and `--robot-dashboard` report per-type
+pane counts in one map, `summary.agents_by_type`, keyed by the names their
+`type` fields use: `claude`, `codex`, `gemini`, `pi`, `kimi`, `muse`,
+`antigravity`, `grok`, `cursor`, `windsurf`, `aider`, `oc` and `ollama`. Every
+one of those keys is present, at 0 when no pane runs that type, because the
+list comes from the launchable agent types, so a newly added agent type shows
+up without a schema change. User shells count under `user` and panes whose
+type can't be detected under `unknown`, and those two keys appear only when
+such panes exist. There are no per-type `*_count` fields.
 
 ### 3.4 Post-Action Verification Evidence
 

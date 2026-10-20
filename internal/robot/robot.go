@@ -1835,28 +1835,39 @@ const (
 
 // StatusSummary provides aggregate stats
 type StatusSummary struct {
-	TotalSessions    int            `json:"total_sessions"`
-	TotalAgents      int            `json:"total_agents"`
-	AttachedCount    int            `json:"attached_count"`
-	ClaudeCount      int            `json:"claude_count"`
-	CodexCount       int            `json:"codex_count"`
-	GeminiCount      int            `json:"gemini_count"`
-	AntigravityCount int            `json:"antigravity_count"`
-	GrokCount        int            `json:"grok_count"`
-	CursorCount      int            `json:"cursor_count"`
-	WindsurfCount    int            `json:"windsurf_count"`
-	AiderCount       int            `json:"aider_count"`
-	OpencodeCount    int            `json:"opencode_count"`
-	OllamaCount      int            `json:"ollama_count"`
-	AgentsByState    map[string]int `json:"agents_by_state"`
-	AgentsByType     map[string]int `json:"agents_by_type"`
-	ReadyWork        int            `json:"ready_work"`
-	InProgress       int            `json:"in_progress"`
-	HealthScore      float64        `json:"health_score"`
-	HealthStatus     string         `json:"health_status,omitempty"`
-	AlertsActive     int            `json:"alerts_active"`
-	MailUnread       int            `json:"mail_unread"`
-	MailUrgent       int            `json:"mail_urgent"`
+	TotalSessions int            `json:"total_sessions"`
+	TotalAgents   int            `json:"total_agents"`
+	AttachedCount int            `json:"attached_count"`
+	AgentsByState map[string]int `json:"agents_by_state"`
+	// AgentsByType is the per-type pane count: every launchable agent type
+	// (see newAgentTypeCounts) appears, at 0 when none run, plus "user" and
+	// "unknown" when such panes exist.
+	AgentsByType map[string]int `json:"agents_by_type"`
+	ReadyWork    int            `json:"ready_work"`
+	InProgress   int            `json:"in_progress"`
+	HealthScore  float64        `json:"health_score"`
+	HealthStatus string         `json:"health_status,omitempty"`
+	AlertsActive int            `json:"alerts_active"`
+	MailUnread   int            `json:"mail_unread"`
+	MailUrgent   int            `json:"mail_urgent"`
+}
+
+// newStatusSummary returns an empty summary whose count maps are ready to
+// accumulate into.
+func newStatusSummary() StatusSummary {
+	return StatusSummary{AgentsByState: map[string]int{}, AgentsByType: newAgentTypeCounts()}
+}
+
+// newAgentTypeCounts returns a zero count for every agent type ntm can
+// launch, keyed by its robot name (claude, codex, ..., oc, ollama), so a
+// per-type count lists every type whether or not any pane runs it.
+func newAgentTypeCounts() map[string]int {
+	types := agent.AgentTypes()
+	counts := make(map[string]int, len(types)+1)
+	for _, agentType := range types {
+		counts[ResolveAgentType(string(agentType))] = 0
+	}
+	return counts
 }
 
 // ProgressSummary provides bead completion metrics for status and dashboard (bd-1qct).
@@ -2282,7 +2293,7 @@ func newStatusOutput(cfg *config.Config) *StatusOutput {
 			TmuxOK:    tmux.IsInstalled(),
 		},
 		Sessions:        []StatusSessionHeader{},
-		Summary:         StatusSummary{AgentsByState: map[string]int{}, AgentsByType: map[string]int{}},
+		Summary:         newStatusSummary(),
 		AlertCounts:     map[string]int{},
 		Sources:         &adapters.SourceHealthSection{Sources: map[string]adapters.SourceInfo{}, Degraded: []string{}, AllFresh: true},
 		DegradedSources: []string{},
@@ -2302,7 +2313,7 @@ func newSnapshotOutput(cfg *config.Config) *SnapshotOutput {
 		AttentionContractVersion: AttentionContractVersion,
 		Sessions:                 []SnapshotSession{},
 		ActiveIncidents:          []SnapshotIncident{},
-		Summary:                  StatusSummary{AgentsByState: map[string]int{}, AgentsByType: map[string]int{}},
+		Summary:                  newStatusSummary(),
 		Alerts:                   []string{},
 	}
 }
@@ -2344,28 +2355,18 @@ func cloneSnapshotOutput(base *SnapshotOutput) *SnapshotOutput {
 	cloned.Tools = append([]ToolInfoOutput(nil), base.Tools...)
 	cloned.AlertsDetailed = append([]AlertInfo(nil), base.AlertsDetailed...)
 	cloned.Summary = StatusSummary{
-		TotalSessions:    base.Summary.TotalSessions,
-		TotalAgents:      base.Summary.TotalAgents,
-		AttachedCount:    base.Summary.AttachedCount,
-		ClaudeCount:      base.Summary.ClaudeCount,
-		CodexCount:       base.Summary.CodexCount,
-		GeminiCount:      base.Summary.GeminiCount,
-		AntigravityCount: base.Summary.AntigravityCount,
-		GrokCount:        base.Summary.GrokCount,
-		CursorCount:      base.Summary.CursorCount,
-		WindsurfCount:    base.Summary.WindsurfCount,
-		AiderCount:       base.Summary.AiderCount,
-		OpencodeCount:    base.Summary.OpencodeCount,
-		OllamaCount:      base.Summary.OllamaCount,
-		AgentsByState:    make(map[string]int, len(base.Summary.AgentsByState)),
-		AgentsByType:     make(map[string]int, len(base.Summary.AgentsByType)),
-		ReadyWork:        base.Summary.ReadyWork,
-		InProgress:       base.Summary.InProgress,
-		HealthScore:      base.Summary.HealthScore,
-		HealthStatus:     base.Summary.HealthStatus,
-		AlertsActive:     base.Summary.AlertsActive,
-		MailUnread:       base.Summary.MailUnread,
-		MailUrgent:       base.Summary.MailUrgent,
+		TotalSessions: base.Summary.TotalSessions,
+		TotalAgents:   base.Summary.TotalAgents,
+		AttachedCount: base.Summary.AttachedCount,
+		AgentsByState: make(map[string]int, len(base.Summary.AgentsByState)),
+		AgentsByType:  make(map[string]int, len(base.Summary.AgentsByType)),
+		ReadyWork:     base.Summary.ReadyWork,
+		InProgress:    base.Summary.InProgress,
+		HealthScore:   base.Summary.HealthScore,
+		HealthStatus:  base.Summary.HealthStatus,
+		AlertsActive:  base.Summary.AlertsActive,
+		MailUnread:    base.Summary.MailUnread,
+		MailUrgent:    base.Summary.MailUrgent,
 	}
 	for key, value := range base.Summary.AgentsByState {
 		cloned.Summary.AgentsByState[key] = value
@@ -2702,7 +2703,7 @@ func statusAccumulateAgentSummary(summary *StatusSummary, agentType, agentState 
 	if summary == nil {
 		return
 	}
-	typeKey := strings.TrimSpace(agentType)
+	typeKey := normalizeAgentType(agentType)
 	if typeKey == "" {
 		typeKey = "unknown"
 	}
@@ -2712,29 +2713,6 @@ func statusAccumulateAgentSummary(summary *StatusSummary, agentType, agentState 
 	}
 	summary.AgentsByType[typeKey]++
 	summary.AgentsByState[stateKey]++
-
-	switch typeKey {
-	case "claude":
-		summary.ClaudeCount++
-	case "codex":
-		summary.CodexCount++
-	case "gemini":
-		summary.GeminiCount++
-	case "antigravity":
-		summary.AntigravityCount++
-	case "grok":
-		summary.GrokCount++
-	case "cursor":
-		summary.CursorCount++
-	case "windsurf":
-		summary.WindsurfCount++
-	case "aider":
-		summary.AiderCount++
-	case "oc":
-		summary.OpencodeCount++
-	case "ollama":
-		summary.OllamaCount++
-	}
 }
 
 func statusApplyAlertCounts(output *StatusOutput, active []alerts.Alert) {
@@ -2786,7 +2764,7 @@ func statusFinalize(output *StatusOutput, opts PaginationOptions) {
 		output.Summary.AgentsByState = map[string]int{}
 	}
 	if output.Summary.AgentsByType == nil {
-		output.Summary.AgentsByType = map[string]int{}
+		output.Summary.AgentsByType = newAgentTypeCounts()
 	}
 	output.DegradedSources = uniqueSortedStrings(output.DegradedSources)
 	output.Summary.AlertsActive = statusAlertTotal(output.AlertCounts)
@@ -5300,10 +5278,7 @@ func snapshotFinalize(output *SnapshotOutput, opts PaginationOptions) {
 }
 
 func buildSnapshotSummary(output *SnapshotOutput) StatusSummary {
-	summary := StatusSummary{
-		AgentsByState: map[string]int{},
-		AgentsByType:  map[string]int{},
-	}
+	summary := newStatusSummary()
 	if output == nil {
 		return summary
 	}

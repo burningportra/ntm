@@ -73,7 +73,7 @@ type SummarySection struct {
 
     // Agent state breakdown
     AgentsByState map[string]int `json:"agents_by_state"` // idle, busy, error, unknown, user
-    AgentsByType  map[string]int `json:"agents_by_type"`  // claude, codex, antigravity, gemini (legacy)
+    AgentsByType  map[string]int `json:"agents_by_type"`  // every launchable type (claude ... ollama) at 0+, plus user/unknown when present
 
     // Work state
     ReadyWork     int    `json:"ready_work"`      // Beads ready to claim

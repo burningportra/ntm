@@ -28,6 +28,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/privacy"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
@@ -2616,13 +2617,7 @@ func TestStatusSummaryMarshal(t *testing.T) {
 		TotalSessions: 5,
 		TotalAgents:   10,
 		AttachedCount: 2,
-		ClaudeCount:   4,
-		CodexCount:    3,
-		GeminiCount:   2,
-		CursorCount:   1,
-		WindsurfCount: 0,
-		AiderCount:    0,
-		OllamaCount:   1,
+		AgentsByType:  map[string]int{"claude": 4, "pi": 3, "kimi": 2, "ollama": 1},
 	}
 
 	data, err := json.Marshal(summary)
@@ -2638,11 +2633,8 @@ func TestStatusSummaryMarshal(t *testing.T) {
 	if result.TotalAgents != 10 {
 		t.Errorf("TotalAgents = %d, want 10", result.TotalAgents)
 	}
-	if result.ClaudeCount != 4 {
-		t.Errorf("ClaudeCount = %d, want 4", result.ClaudeCount)
-	}
-	if result.OllamaCount != 1 {
-		t.Errorf("OllamaCount = %d, want 1", result.OllamaCount)
+	if result.AgentsByType["claude"] != 4 || result.AgentsByType["pi"] != 3 || result.AgentsByType["kimi"] != 2 || result.AgentsByType["ollama"] != 1 {
+		t.Errorf("AgentsByType = %+v, want claude=4 pi=3 kimi=2 ollama=1", result.AgentsByType)
 	}
 }
 
@@ -3273,48 +3265,59 @@ func TestGetDashboardRespectsDisabledAlertsConfig(t *testing.T) {
 	}
 }
 
-func TestDashboardAgentTypeSkipsUserPane(t *testing.T) {
-	tests := []struct {
-		name   string
-		pane   tmux.Pane
-		want   string
-		wantOK bool
-	}{
-		{
-			name:   "user pane skipped",
-			pane:   tmux.Pane{Type: tmux.AgentUser},
-			wantOK: false,
-		},
-		{
-			name:   "claude pane kept",
-			pane:   tmux.Pane{Type: tmux.AgentClaude},
-			want:   "claude",
-			wantOK: true,
-		},
-		{
-			name:   "ollama pane kept",
-			pane:   tmux.Pane{Type: tmux.AgentOllama},
-			want:   "ollama",
-			wantOK: true,
-		},
-		{
-			name:   "unknown pane kept",
-			pane:   tmux.Pane{Type: tmux.AgentType("mystery")},
-			want:   "unknown",
-			wantOK: true,
-		},
+// TestDashboardCountsUserPanesAndEveryAgentType covers bd-k01pw: the dashboard
+// dropped user shells, so its User Panes summary and Sessions User column were
+// always 0, and its Sessions table had no Opencode column.
+func TestDashboardCountsUserPanesAndEveryAgentType(t *testing.T) {
+	paneTypes := []tmux.AgentType{
+		tmux.AgentUser, tmux.AgentClaude, tmux.AgentCodex, tmux.AgentPi, tmux.AgentKimi,
+		tmux.AgentMuse, tmux.AgentOpencode, tmux.AgentType("mystery"), tmux.AgentUser,
+	}
+	panes := make([]statuspkg.PaneObservation, 0, len(paneTypes))
+	for i, paneType := range paneTypes {
+		panes = append(panes, statuspkg.PaneObservation{Metadata: tmux.Pane{Index: i, Type: paneType}})
+	}
+	output := &DashboardOutput{
+		GeneratedAt: time.Unix(1700000000, 0).UTC(),
+		Fleet:       "ntm",
+		Agents:      []SnapshotSession{},
+		Summary:     newStatusSummary(),
+	}
+	addDashboardSession(output, tmux.Session{Name: "mixed", Attached: true}, panes, agent.NewParser())
+
+	summary := output.Summary
+	if summary.TotalSessions != 1 || summary.AttachedCount != 1 || summary.TotalAgents != len(paneTypes) {
+		t.Fatalf("summary totals = %+v, want 1 attached session and %d panes", summary, len(paneTypes))
+	}
+	if summary.AgentsByType["user"] != 2 || summary.AgentsByState["user"] != 2 {
+		t.Fatalf("summary user counts = by_type %d by_state %d, want 2 and 2", summary.AgentsByType["user"], summary.AgentsByState["user"])
+	}
+	for _, key := range []string{"claude", "codex", "pi", "kimi", "muse", "oc", "unknown"} {
+		if summary.AgentsByType[key] != 1 {
+			t.Fatalf("AgentsByType[%q] = %d, want 1; by_type=%+v", key, summary.AgentsByType[key], summary.AgentsByType)
+		}
+	}
+	if got, ok := summary.AgentsByType["gemini"]; !ok || got != 0 {
+		t.Fatalf("AgentsByType[gemini] = %d (present %v), want an explicit 0", got, ok)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, ok := dashboardAgentType(tt.pane)
-			if ok != tt.wantOK {
-				t.Fatalf("dashboardAgentType(%+v) ok = %v, want %v", tt.pane, ok, tt.wantOK)
-			}
-			if got != tt.want {
-				t.Fatalf("dashboardAgentType(%+v) = %q, want %q", tt.pane, got, tt.want)
-			}
-		})
+	rendered, err := captureStdout(t, func() error { return printDashboardMarkdown(*output) })
+	if err != nil {
+		t.Fatalf("printDashboardMarkdown() error = %v", err)
+	}
+	for _, want := range []string{
+		"| Panes (total) | 9 |",
+		"| Agent Panes | 7 |",
+		"| User Panes | 2 |",
+		"| Pi | 1 |",
+		"| Kimi | 1 |",
+		"| Opencode | 1 |",
+		"| Other Agents | 1 |",
+		"| mixed | yes | 9 | 2 | 1 | 1 | 0 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 1 |",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("dashboard markdown missing %q:\n%s", want, rendered)
+		}
 	}
 }
 
@@ -3995,8 +3998,14 @@ func TestSnapshotFinalizeBuildsSummary(t *testing.T) {
 	if output.Summary.AgentsByState["idle"] != 1 || output.Summary.AgentsByState["busy"] != 2 || output.Summary.AgentsByState["error"] != 1 {
 		t.Fatalf("AgentsByState = %+v", output.Summary.AgentsByState)
 	}
-	if output.Summary.OllamaCount != 1 {
-		t.Fatalf("OllamaCount = %d, want 1", output.Summary.OllamaCount)
+	for _, agentType := range agent.AgentTypes() {
+		key := ResolveAgentType(string(agentType))
+		if _, ok := output.Summary.AgentsByType[key]; !ok {
+			t.Fatalf("AgentsByType = %+v, missing launchable type %q", output.Summary.AgentsByType, key)
+		}
+	}
+	if output.Summary.AgentsByType["pi"] != 0 || output.Summary.AgentsByType["muse"] != 0 {
+		t.Fatalf("AgentsByType = %+v, want pi=0 muse=0", output.Summary.AgentsByType)
 	}
 	if output.Summary.ReadyWork != 2 || output.Summary.InProgress != 1 {
 		t.Fatalf("Work summary = ready %d in_progress %d, want 2/1", output.Summary.ReadyWork, output.Summary.InProgress)
