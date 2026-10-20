@@ -114,6 +114,37 @@ func (s mailAvailabilityDiagnosticStub) LastAvailabilityError() error {
 
 type legacyMailAvailabilityStub struct{}
 
+// TestNewAgentMailClientUsesConfig locks bd-89xi0's cli side: explicit
+// Agent Mail commands build their client through the shared constructor, so
+// AGENT_MAIL_URL overrides [agent_mail] url, and they still reach the server
+// when [agent_mail] enabled = false, which only turns off automatic
+// integration.
+func TestNewAgentMailClientUsesConfig(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer server.Close()
+
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+	cfg = &config.Config{AgentMail: config.AgentMailConfig{Enabled: false, URL: server.URL + "/"}}
+
+	t.Setenv("AGENT_MAIL_URL", "")
+	client := newAgentMailClient("")
+	if got := client.BaseURL(); got != server.URL+"/" {
+		t.Fatalf("BaseURL = %q, want the configured %q", got, server.URL+"/")
+	}
+	if !client.IsAvailableContext(t.Context()) {
+		t.Fatalf("explicit command client unavailable with enabled = false: %v", client.LastAvailabilityError())
+	}
+
+	t.Setenv("AGENT_MAIL_URL", "http://127.0.0.1:1/env/")
+	if got := newAgentMailClient("").BaseURL(); got != "http://127.0.0.1:1/env/" {
+		t.Fatalf("BaseURL = %q, want AGENT_MAIL_URL to override the config", got)
+	}
+}
+
 func TestAgentMailUnavailableErrorUsesOptionalDiagnostic(t *testing.T) {
 	reason := errors.New("health endpoint returned 503")
 	err := agentMailUnavailableError(

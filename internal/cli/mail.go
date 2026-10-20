@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -242,19 +243,16 @@ func newMailInboxCmdReal() *cobra.Command {
 }
 
 func newAgentMailClient(projectKey string) *agentmail.Client {
-	var opts []agentmail.Option
-	opts = append(opts, agentmail.WithProjectKey(projectKey))
+	var settings config.AgentMailConfig
 	if cfg != nil {
-		// Environment variables should override config; agentmail.NewClient reads env
-		// before applying options.
-		if cfg.AgentMail.URL != "" && os.Getenv("AGENT_MAIL_URL") == "" {
-			opts = append(opts, agentmail.WithBaseURL(cfg.AgentMail.URL))
-		}
-		if cfg.AgentMail.Token != "" && os.Getenv("AGENT_MAIL_TOKEN") == "" {
-			opts = append(opts, agentmail.WithToken(cfg.AgentMail.Token))
-		}
+		settings = cfg.AgentMail
 	}
-	client := agentmail.NewClient(opts...)
+	// Explicit Agent Mail commands run even when [agent_mail] enabled is
+	// false. That toggle turns off automatic integration (spawn
+	// registration, the dashboard reservation watcher, robot enrichment),
+	// and those paths check it themselves.
+	settings.Enabled = true
+	client := settings.NewClient(projectKey)
 	// Pull every cached registration_token for this project out of any
 	// on-disk session registries (mcp-agent-mail >=2.13 requires the
 	// token on identity-scoped calls — ntm#146). Failure is silent:
