@@ -221,6 +221,17 @@ func TestContextAgentTypeColor_User(t *testing.T) {
 	}
 }
 
+func TestContextAgentTypeColor_Muse(t *testing.T) {
+	t.Parallel()
+
+	panel := NewContextPanel()
+	for _, agentType := range []string{"muse", "muse-code"} {
+		if got := contextAgentTypeColor(agentType, panel.theme); got != panel.theme.Sky {
+			t.Errorf("contextAgentTypeColor(%q) = %q, want sky %q", agentType, got, panel.theme.Sky)
+		}
+	}
+}
+
 func TestFormatMinutes(t *testing.T) {
 	tests := []struct {
 		minutes  float64

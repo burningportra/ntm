@@ -60,10 +60,11 @@ func newTestModel(width int) Model {
 }
 
 type dashboardReplayTestClient struct {
-	panes       []tmux.Pane
-	getErr      error
-	getCalls    int
-	sentTargets []string
+	panes          []tmux.Pane
+	getErr         error
+	getCalls       int
+	sentTargets    []string
+	sentAgentTypes []tmux.AgentType
 }
 
 func (c *dashboardReplayTestClient) GetPanes(string) ([]tmux.Pane, error) {
@@ -71,8 +72,9 @@ func (c *dashboardReplayTestClient) GetPanes(string) ([]tmux.Pane, error) {
 	return append([]tmux.Pane(nil), c.panes...), c.getErr
 }
 
-func (c *dashboardReplayTestClient) SendKeys(target string, _ string, _ bool) error {
+func (c *dashboardReplayTestClient) SendKeysForAgent(target string, _ string, _ bool, agentType tmux.AgentType) error {
 	c.sentTargets = append(c.sentTargets, target)
+	c.sentAgentTypes = append(c.sentAgentTypes, agentType)
 	return nil
 }
 
@@ -138,6 +140,37 @@ func TestDashboardHistoryReplaySendsResolvedStablePaneIDs(t *testing.T) {
 	wantTargets := []string{"%11", "%22"}
 	if !reflect.DeepEqual(client.sentTargets, wantTargets) {
 		t.Fatalf("replay send targets = %v, want resolved IDs %v", client.sentTargets, wantTargets)
+	}
+}
+
+// A replayed prompt typed with the plain send and its 100 ms Enter stays an
+// unsent draft in Muse Code's composer, so replay must hand each pane's agent
+// type to the agent-aware send, which holds Enter for tmux.MuseEnterDelay.
+func TestDashboardHistoryReplaySendsWithPaneAgentType(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	m := New("replay-muse", "")
+	client := &dashboardReplayTestClient{panes: []tmux.Pane{
+		{ID: "%31", WindowIndex: 0, Index: 1, Type: tmux.AgentMuse},
+		{ID: "%32", WindowIndex: 0, Index: 2, Type: tmux.AgentCodex},
+	}}
+	entry := history.HistoryEntry{
+		Targets: []string{"1", "2"},
+		Prompt:  "replay to muse and codex",
+	}
+
+	msg := m.executeReplayWithClient(entry, client)()
+	result, ok := msg.(dashboardReplayResultMsg)
+	if !ok {
+		t.Fatalf("executeReplayWithClient() message = %T, want dashboardReplayResultMsg", msg)
+	}
+	if result.Err != nil {
+		t.Fatalf("executeReplayWithClient() error = %v", result.Err)
+	}
+	wantTargets := []string{"%31", "%32"}
+	wantTypes := []tmux.AgentType{tmux.AgentMuse, tmux.AgentCodex}
+	if !reflect.DeepEqual(client.sentTargets, wantTargets) || !reflect.DeepEqual(client.sentAgentTypes, wantTypes) {
+		t.Fatalf("replay sends = targets %v types %v, want targets %v types %v", client.sentTargets, client.sentAgentTypes, wantTargets, wantTypes)
 	}
 }
 
@@ -3421,6 +3454,64 @@ func TestAgentRowTypePresentation_Grok(t *testing.T) {
 	}
 	if gotIcon != "󰚩" {
 		t.Errorf("agentRowTypePresentation(%q) icon = %q, want robot glyph", tmux.AgentGrok, gotIcon)
+	}
+}
+
+// Muse Code panes get the sky accent and robot icon that `ntm status` and the
+// agent badges use, instead of the generic fallback (user green in the pane
+// cards, detail badge and rows, plain text in the border).
+func TestMusePanePresentationUsesSky(t *testing.T) {
+	m := newTestModel(120)
+
+	for _, agentType := range []string{string(tmux.AgentMuse), "muse-code"} {
+		if got := AgentBorderColor(agentType, m.theme); got != m.theme.Sky {
+			t.Errorf("AgentBorderColor(%q) = %q, want sky %q", agentType, got, m.theme.Sky)
+		}
+		gotColor, gotIcon := agentRowTypePresentation(agentType, m.theme)
+		if gotColor != m.theme.Sky || gotIcon != "󰚩" {
+			t.Errorf("agentRowTypePresentation(%q) = (%q, %q), want (%q, robot glyph)", agentType, gotColor, gotIcon, m.theme.Sky)
+		}
+		gotColor, gotIcon = paneTypePresentation(tmux.AgentType(agentType), m.theme, m.icons)
+		if wantIcon := m.icons.AgentIcon(string(tmux.AgentMuse)); gotColor != m.theme.Sky || gotIcon != wantIcon {
+			t.Errorf("paneTypePresentation(%q) = (%q, %q), want (%q, %q)", agentType, gotColor, gotIcon, m.theme.Sky, wantIcon)
+		}
+	}
+}
+
+// Muse Code panes are agents: they count as Muse in the header badge and the
+// ticker, and toward the ticker's active-agent fallback, not as user panes.
+func TestUpdateStatsCountsMusePanes(t *testing.T) {
+	m := New("test", "")
+	m.width = 140
+	m.height = 40
+	m.tier = layout.TierForWidth(m.width)
+	m.panes = []tmux.Pane{
+		{ID: "%1", Index: 1, Title: "test__muse_1", Type: tmux.AgentMuse},
+		{ID: "%2", Index: 2, Title: "test__muse_2_spark", Type: tmux.AgentMuse, Variant: "spark"},
+		{ID: "%3", Index: 3, Title: "test__cc_1", Type: tmux.AgentClaude},
+		{ID: "%4", Index: 4, Title: "test__user_1", Type: tmux.AgentUser},
+	}
+
+	m.updateStats()
+	if m.museCount != 2 || m.claudeCount != 1 || m.userCount != 1 {
+		t.Fatalf("counts = muse:%d claude:%d user:%d, want muse:2 claude:1 user:1", m.museCount, m.claudeCount, m.userCount)
+	}
+
+	statsBar := status.StripANSI(m.renderStatsBar())
+	if want := fmt.Sprintf("%s 2", m.icons.AgentIcon(string(tmux.AgentMuse))); !strings.Contains(statsBar, want) {
+		t.Errorf("stats bar = %q, want Muse badge %q", statsBar, want)
+	}
+	if want := fmt.Sprintf("%s 1", m.icons.User); !strings.Contains(statsBar, want) {
+		t.Errorf("stats bar = %q, want one user pane %q", statsBar, want)
+	}
+
+	// No pane status yet, so the ticker's active count falls back to the
+	// agent panes: two Muse and one Claude.
+	m.updateTickerData()
+	m.tickerPanel.SetSize(400, 1)
+	ticker := status.StripANSI(m.tickerPanel.View())
+	if !strings.Contains(ticker, "Fleet: 3 active / 4 total") || !strings.Contains(ticker, "Muse:2") || !strings.Contains(ticker, "U:1") {
+		t.Errorf("ticker = %q, want 3 active of 4 with Muse:2 and U:1", ticker)
 	}
 }
 

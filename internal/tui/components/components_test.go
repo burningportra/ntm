@@ -120,6 +120,8 @@ func TestRenderAgentBadgeStyle(t *testing.T) {
 		{"codex alias", "openai-codex", string(currentTheme.Codex), currentIcons.Codex},
 		{"gemini alias", "google-gemini", string(currentTheme.Gemini), currentIcons.Gemini},
 		{"grok alias", "grok-build", string(currentTheme.Pink), currentIcons.Robot},
+		{"muse", "muse", string(currentTheme.Sky), currentIcons.AgentIcon("muse")},
+		{"muse alias", "muse-code", string(currentTheme.Sky), currentIcons.AgentIcon("muse")},
 		{"cursor", "cursor", string(currentTheme.Cursor), currentIcons.Cursor},
 		{"windsurf alias", "ws", string(currentTheme.Windsurf), currentIcons.Windsurf},
 		{"aider", "aider", string(currentTheme.Aider), currentIcons.Aider},

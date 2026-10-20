@@ -405,6 +405,7 @@ func (m Model) renderFooterSection() string {
 		GeminiCount:      m.geminiCount,
 		GrokCount:        m.grokCount,
 		AntigravityCount: m.antigravityCount,
+		MuseCount:        m.museCount,
 		UserCount:        m.userCount,
 		FocusedPanel:     panelIDString(m.focusedPanel),
 		LayoutTier:       tierLabel(m.tier),
@@ -515,6 +516,14 @@ func (m Model) renderStatsBar() string {
 			Bold(true).
 			Padding(0, 1).
 			Render(fmt.Sprintf("%s %d", ic.Gemini, m.antigravityCount)))
+	}
+	if m.museCount > 0 {
+		parts = append(parts, lipgloss.NewStyle().
+			Background(t.Sky).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %d", ic.AgentIcon(string(tmux.AgentMuse)), m.museCount)))
 	}
 	if m.cursorCount > 0 {
 		parts = append(parts, lipgloss.NewStyle().

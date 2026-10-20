@@ -66,6 +66,23 @@ func TestRenderStatusBar_AgentBadgesPresent(t *testing.T) {
 	}
 }
 
+func TestRenderStatusBar_MuseBadge(t *testing.T) {
+	got := RenderStatusBar(StatusBarOptions{
+		Width:     120,
+		Session:   "dev",
+		MuseCount: 2,
+		UserCount: 1,
+	})
+	for _, label := range []string{"MUSE:2", "USR:1"} {
+		if !strings.Contains(got, label) {
+			t.Errorf("expected badge %q in output, got %q", label, got)
+		}
+	}
+	if none := RenderStatusBar(StatusBarOptions{Width: 120, Session: "dev"}); strings.Contains(none, "MUSE:") {
+		t.Errorf("expected no MUSE badge when count is zero, got %q", none)
+	}
+}
+
 func TestRenderStatusBar_AllLayoutTiers(t *testing.T) {
 	tiers := []string{"Narrow", "Split", "Wide", "Ultra", "Mega"}
 	for _, tier := range tiers {

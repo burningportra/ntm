@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	ctxmon "github.com/Dicklesworthstone/ntm/internal/context"
 	pt "github.com/Dicklesworthstone/ntm/internal/integrations/pt"
 	"github.com/Dicklesworthstone/ntm/internal/status"
@@ -875,6 +876,81 @@ func TestMultiWindowSameLocalIndexKeepsAllPaneStateIndependent(t *testing.T) {
 	alert := status.StripANSI(m.renderRateLimitAlert())
 	if !strings.Contains(alert, "pane 0.0") || strings.Contains(alert, "pane 1.0") {
 		t.Fatalf("rate-limit rendering attributed the wrong physical pane: %q", alert)
+	}
+}
+
+// Muse Code panes are titled with the alias they were spawned with plus an
+// optional @effort ("spark", "wonder-full@xhigh"). Passed to the context
+// registry raw, neither matched and the pane showed the 128K fallback window,
+// and a bare Muse pane had no model at all. Every Muse pane must resolve to a
+// Muse model and its 1,007,997-token window, including an operator alias.
+func TestMusePaneContextLimitResolvesAliasAndEffort(t *testing.T) {
+	lockAttentionFeedForTest(t)
+
+	now := time.Now()
+	panes := []tmux.Pane{
+		{ID: "%41", WindowIndex: 0, Index: 1, Title: "session__muse_1", Type: tmux.AgentMuse},
+		{ID: "%42", WindowIndex: 0, Index: 2, Title: "session__muse_2_spark", Type: tmux.AgentMuse, Variant: "spark"},
+		{ID: "%43", WindowIndex: 0, Index: 3, Title: "session__muse_3_wonder-full@xhigh", Type: tmux.AgentMuse, Variant: "wonder-full@xhigh"},
+		{ID: "%44", WindowIndex: 0, Index: 4, Title: "session__muse_4_quick", Type: tmux.AgentMuse, Variant: "quick"},
+	}
+	wantModels := map[string]string{
+		"%41": "muse-wonder-1.0",
+		"%42": "muse-spark-1.3",
+		"%43": "muse-wonder-full-1.0",
+		"%44": "muse-spark-1.2",
+	}
+
+	m := New("session", "")
+	m.startupWarmupDone = true
+	m.width = 140
+	m.tier = layout.TierForWidth(m.width)
+	m.panes = panes
+	m.cfg = config.Default()
+	m.cfg.Models.Muse["quick"] = "muse-spark-1.2"
+
+	var outputs []PaneOutputData
+	for _, pane := range panes {
+		observation := dashboardStatusObservation(now, status.AgentStatus{
+			PaneID:    pane.ID,
+			PaneName:  pane.Title,
+			AgentType: string(tmux.AgentMuse),
+			State:     status.StateIdle,
+			UpdatedAt: now,
+		}).Panes[0]
+		observation.Pane = pane.Ref()
+		outputs = append(outputs, PaneOutputData{
+			PaneID:       pane.ID,
+			PaneIndex:    pane.Index,
+			LastActivity: now,
+			Output:       strings.Repeat("muse output ", 500),
+			AgentType:    string(pane.Type),
+			Observation:  observation,
+		})
+	}
+
+	updated, _ := m.Update(SessionDataWithOutputMsg{Panes: panes, Outputs: outputs})
+	m = updated.(Model)
+
+	for _, pane := range panes {
+		ps := m.paneStatus[paneStatusKey(pane)]
+		if ps.ContextModel != wantModels[pane.ID] || ps.ContextLimit != 1007997 {
+			t.Errorf("Muse pane %s (variant %q) context = model %q limit %d, want model %q limit 1007997",
+				pane.ID, pane.Variant, ps.ContextModel, ps.ContextLimit, wantModels[pane.ID])
+		}
+		if got := m.resolveCostModelForPane(pane); got != wantModels[pane.ID] {
+			t.Errorf("resolveCostModelForPane(%s, variant %q) = %q, want %q", pane.ID, pane.Variant, got, wantModels[pane.ID])
+		}
+	}
+
+	// Before a config load the dashboard has no cfg; the built-in Muse
+	// aliases and default model still apply.
+	unconfigured := New("session", "")
+	if got := unconfigured.resolveCostModelForPane(panes[2]); got != "muse-wonder-full-1.0" {
+		t.Errorf("resolveCostModelForPane(wonder-full@xhigh) without cfg = %q, want muse-wonder-full-1.0", got)
+	}
+	if got := unconfigured.resolveCostModelForPane(panes[0]); got != "muse-wonder-1.0" {
+		t.Errorf("resolveCostModelForPane(bare muse) without cfg = %q, want muse-wonder-1.0", got)
 	}
 }
 

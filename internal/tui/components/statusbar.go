@@ -20,6 +20,7 @@ type StatusBarOptions struct {
 	GeminiCount      int
 	GrokCount        int
 	AntigravityCount int
+	MuseCount        int
 	UserCount        int
 	FocusedPanel     string
 	LayoutTier       string // "Narrow", "Split", "Wide", "Ultra", "Mega"
@@ -104,6 +105,7 @@ func renderStatusLeft(t theme.Theme, base lipgloss.Style, opts StatusBarOptions)
 		{"GMI", t.Gemini, opts.GeminiCount},
 		{"GRK", t.Pink, opts.GrokCount},
 		{"AGY", t.Lavender, opts.AntigravityCount},
+		{"MUSE", t.Sky, opts.MuseCount},
 	}
 
 	for _, ab := range badges {

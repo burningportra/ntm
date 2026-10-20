@@ -198,6 +198,16 @@ func TestTickerPanelBuildFleetSegment(t *testing.T) {
 			contains: []string{"Fleet", "2 active / 2 total", "Grk:2"},
 		},
 		{
+			name: "with Muse and a user pane",
+			data: TickerData{
+				TotalAgents:  3,
+				ActiveAgents: 2,
+				MuseCount:    2,
+				UserCount:    1,
+			},
+			contains: []string{"Fleet", "2 active / 3 total", "Muse:2", "U:1"},
+		},
+		{
 			name: "empty fleet",
 			data: TickerData{
 				TotalAgents:  0,

@@ -194,6 +194,8 @@ func renderAgentBadgeStyle(agentType string, t theme.Theme, ic icons.IconSet) (s
 		return string(t.Pink), ic.Robot
 	case agent.AgentTypeAntigravity:
 		return string(t.Lavender), ic.Gemini
+	case agent.AgentTypeMuse:
+		return string(t.Sky), ic.AgentIcon(string(agent.AgentTypeMuse))
 	case agent.AgentTypeCursor:
 		return string(t.Cursor), ic.Cursor
 	case agent.AgentTypeWindsurf:

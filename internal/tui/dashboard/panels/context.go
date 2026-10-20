@@ -374,6 +374,8 @@ func contextAgentTypeColor(agentType string, t theme.Theme) lipgloss.Color {
 		return t.Gemini
 	case agent.AgentTypeAntigravity:
 		return t.Lavender
+	case agent.AgentTypeMuse:
+		return t.Sky
 	case agent.AgentTypeCursor:
 		return t.Cursor
 	case agent.AgentTypeWindsurf:

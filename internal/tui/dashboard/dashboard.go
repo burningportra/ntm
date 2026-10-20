@@ -2494,6 +2494,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						modelName = "gemini-2.0-flash"
 					}
+				case string(tmux.AgentMuse):
+					modelName = m.museModelForVariant("")
 				case string(tmux.AgentCursor):
 					modelName = "cursor"
 				case string(tmux.AgentWindsurf):
@@ -2502,9 +2504,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					modelName = "aider"
 				}
 
-				// Use variant if available
+				// Use variant if available. A Muse variant is a spawn alias
+				// with an optional @effort, so it resolves to a model id.
 				if found && currentPane.Variant != "" {
-					modelName = currentPane.Variant
+					if currentPane.Type.Canonical() == tmux.AgentMuse {
+						modelName = m.museModelForVariant(currentPane.Variant)
+					} else {
+						modelName = currentPane.Variant
+					}
 				}
 
 				// Compute delta once (used for cost + local perf).
@@ -3701,6 +3708,7 @@ func (m *Model) updateStats() {
 	m.geminiCount = 0
 	m.grokCount = 0
 	m.antigravityCount = 0
+	m.museCount = 0
 	m.cursorCount = 0
 	m.windsurfCount = 0
 	m.aiderCount = 0
@@ -3719,6 +3727,8 @@ func (m *Model) updateStats() {
 			m.grokCount++
 		case tmux.AgentAntigravity:
 			m.antigravityCount++
+		case tmux.AgentMuse:
+			m.museCount++
 		case tmux.AgentCursor:
 			m.cursorCount++
 		case tmux.AgentWindsurf:
@@ -3772,7 +3782,7 @@ func (m *Model) updateTickerData() {
 	if activeAgents == 0 && len(m.panes) > 0 {
 		// Status detection hasn't populated yet; show total agents as placeholder
 		// This prevents showing "0/17" when we simply haven't fetched status yet
-		activeAgents = m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.antigravityCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount
+		activeAgents = m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.antigravityCount + m.museCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount
 	}
 
 	// Count alerts by severity
@@ -3797,6 +3807,7 @@ func (m *Model) updateTickerData() {
 		GeminiCount:      m.geminiCount,
 		GrokCount:        m.grokCount,
 		AntigravityCount: m.antigravityCount,
+		MuseCount:        m.museCount,
 		CursorCount:      m.cursorCount,
 		WindsurfCount:    m.windsurfCount,
 		AiderCount:       m.aiderCount,
@@ -3997,35 +4008,8 @@ func (m Model) renderPaneGrid() string {
 		ps, hasPaneStatus := m.paneStatus[paneStatusKey(p)]
 
 		// Determine card colors based on agent type
-		var borderColor, iconColor lipgloss.Color
-		var agentIcon string
-
-		switch p.Type.Canonical() {
-		case tmux.AgentClaude:
-			borderColor = t.Claude
-			iconColor = t.Claude
-			agentIcon = ic.Claude
-		case tmux.AgentCodex:
-			borderColor = t.Codex
-			iconColor = t.Codex
-			agentIcon = ic.Codex
-		case tmux.AgentGemini:
-			borderColor = t.Gemini
-			iconColor = t.Gemini
-			agentIcon = ic.Gemini
-		case tmux.AgentGrok:
-			borderColor = t.Pink
-			iconColor = t.Pink
-			agentIcon = ic.Robot
-		case tmux.AgentAntigravity:
-			borderColor = t.Lavender
-			iconColor = t.Lavender
-			agentIcon = ic.Gemini
-		default:
-			borderColor = t.Green
-			iconColor = t.Green
-			agentIcon = ic.User
-		}
+		iconColor, agentIcon := paneTypePresentation(p.Type, t, ic)
+		borderColor := iconColor
 
 		// Selection highlight
 		if isSelected {
@@ -4689,7 +4673,28 @@ func (m *Model) updateCostFromPrompts(now time.Time) {
 	m.costError = nil
 }
 
+// museModelForVariant resolves a Muse Code pane's title variant to a model id
+// the context and pricing registries know. Muse panes are titled with the
+// alias they were spawned with ("spark") plus "@effort" when one was given
+// ("wonder-full@xhigh"). Passed through raw, neither matched the registry and
+// the pane showed the 128K fallback context window instead of Muse's
+// 1,007,997. An empty variant resolves to the default Muse model. This mirrors
+// museModelForVariant in internal/cli/session.go, which fixed `ntm status`.
+func (m *Model) museModelForVariant(variant string) string {
+	alias, _ := tmux.ParsePaneVariant(variant)
+	if m.cfg != nil {
+		if name := m.cfg.Models.GetModelName(string(tmux.AgentMuse), alias); name != "" {
+			return name
+		}
+	}
+	defaults := config.DefaultModels()
+	return defaults.GetModelName(string(tmux.AgentMuse), alias)
+}
+
 func (m *Model) resolveCostModelForPane(pane tmux.Pane) string {
+	if pane.Type.Canonical() == tmux.AgentMuse {
+		return m.museModelForVariant(pane.Variant)
+	}
 	if pane.Variant != "" {
 		return pane.Variant
 	}
@@ -5731,6 +5736,28 @@ func dashboardPaneIdentityForProject(p tmux.Pane, projectDir string) (string, *p
 }
 
 // renderPaneDetail renders detailed info for the selected pane
+// paneTypePresentation returns the accent color and icon that the pane cards
+// and the pane detail type badge use for a pane's agent type. Types without
+// their own presentation fall back to the user pane's green and icon.
+func paneTypePresentation(agentType tmux.AgentType, t theme.Theme, ic icons.IconSet) (lipgloss.Color, string) {
+	switch agentType.Canonical() {
+	case tmux.AgentClaude:
+		return t.Claude, ic.Claude
+	case tmux.AgentCodex:
+		return t.Codex, ic.Codex
+	case tmux.AgentGemini:
+		return t.Gemini, ic.Gemini
+	case tmux.AgentGrok:
+		return t.Pink, ic.Robot
+	case tmux.AgentAntigravity:
+		return t.Lavender, ic.Gemini
+	case tmux.AgentMuse:
+		return t.Sky, ic.AgentIcon(string(tmux.AgentMuse))
+	default:
+		return t.Green, ic.User
+	}
+}
+
 func (m Model) renderPaneDetail(width int) string {
 	t := m.theme
 	ic := m.icons
@@ -5763,28 +5790,7 @@ func (m Model) renderPaneDetail(width int) string {
 	valueStyle := lipgloss.NewStyle().Foreground(t.Text)
 
 	// Type badge
-	var typeColor lipgloss.Color
-	var typeIcon string
-	switch p.Type.Canonical() {
-	case tmux.AgentClaude:
-		typeColor = t.Claude
-		typeIcon = ic.Claude
-	case tmux.AgentCodex:
-		typeColor = t.Codex
-		typeIcon = ic.Codex
-	case tmux.AgentGemini:
-		typeColor = t.Gemini
-		typeIcon = ic.Gemini
-	case tmux.AgentGrok:
-		typeColor = t.Pink
-		typeIcon = ic.Robot
-	case tmux.AgentAntigravity:
-		typeColor = t.Lavender
-		typeIcon = ic.Gemini
-	default:
-		typeColor = t.Green
-		typeIcon = ic.User
-	}
+	typeColor, typeIcon := paneTypePresentation(p.Type, t, ic)
 	typeBadge := lipgloss.NewStyle().
 		Background(typeColor).
 		Foreground(t.Base).
@@ -6167,7 +6173,7 @@ func (m *Model) handleConflictAction(conflict watcher.FileConflict, action watch
 
 type dashboardReplayClient interface {
 	GetPanes(session string) ([]tmux.Pane, error)
-	SendKeys(target, keys string, enter bool) error
+	SendKeysForAgent(target, keys string, enter bool, agentType tmux.AgentType) error
 }
 
 type dashboardReplayResultMsg struct {
@@ -6221,8 +6227,12 @@ func (m Model) executeReplayWithClient(entry history.HistoryEntry, client dashbo
 			replayEntry.Template = entry.Template
 		}
 
+		// Send with each pane's agent type: Muse Code keeps a prompt typed
+		// with the default 100 ms Enter as an unsent draft, and the agent-aware
+		// send raises its Enter delay to tmux.MuseEnterDelay and pastes
+		// multi-line prompts the way each agent needs.
 		for _, pane := range targetPanes {
-			if err := client.SendKeys(pane.ID, entry.Prompt, true); err != nil {
+			if err := client.SendKeysForAgent(pane.ID, entry.Prompt, true, pane.Type); err != nil {
 				log.Printf("[Replay] Failed to send to target %s: %v", pane.ID, err)
 				replayEntry.SetError(fmt.Errorf("failed to send to target %s: %w", pane.ID, err))
 			}

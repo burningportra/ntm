@@ -838,6 +838,8 @@ func agentRowTypePresentation(agentType string, t theme.Theme) (lipgloss.Color, 
 		return t.Pink, "󰚩"
 	case tmux.AgentAntigravity:
 		return t.Lavender, "󰇮"
+	case tmux.AgentMuse:
+		return t.Sky, "󰚩"
 	default:
 		return t.Green, "󰄛"
 	}
@@ -1225,7 +1227,7 @@ func WorkingSpinnerFrame(tick int) string {
 }
 
 // AgentBorderColor returns the theme color for a given agent type.
-// Each agent type has a unique color: Claude=purple/Mauve, Codex=blue, Gemini=yellow, Grok=pink, User=green.
+// Each agent type has a unique color: Claude=purple/Mauve, Codex=blue, Gemini=yellow, Grok=pink, Muse=sky, User=green.
 func AgentBorderColor(agentType string, t theme.Theme) lipgloss.Color {
 	switch tmux.AgentType(agentType).Canonical() {
 	case tmux.AgentClaude:
@@ -1238,6 +1240,8 @@ func AgentBorderColor(agentType string, t theme.Theme) lipgloss.Color {
 		return t.Pink
 	case tmux.AgentAntigravity:
 		return t.Lavender
+	case tmux.AgentMuse:
+		return t.Sky
 	case tmux.AgentCursor:
 		return t.Claude
 	case tmux.AgentWindsurf:
