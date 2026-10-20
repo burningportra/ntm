@@ -136,6 +136,15 @@ func defaultPatterns() []Pattern {
 		{Name: "pi_editor", RegexStr: agent.PiEmptyEditorPattern, Agent: "pi", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Pi empty editor box"},
 		{Name: "pi_working", RegexStr: agent.PiWorkingLinePattern, Agent: "pi", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "Pi status indicator (e.g. ── ⠋ Working ───)"},
 
+		// opencode patterns. opencode keeps its prompt box drawn for the
+		// whole turn, so an empty box alone is not idle: a busy pane shows a
+		// progress bar on the footer line below the box, which oc_working
+		// must outrank the box for. These keep the library's verdicts in
+		// line with agent.OpencodeIdlePromptShowing and
+		// agent.OpencodeActivelyWorking.
+		{Name: "oc_prompt", RegexStr: agent.OpencodeEmptyPromptPattern, Agent: "oc", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "opencode empty prompt box"},
+		{Name: "oc_working", RegexStr: agent.OpencodeWorkingFooterPattern, Agent: "oc", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "opencode progress bar below the prompt box (e.g. ⬝⬝■■■■⬝⬝ esc interrupt)"},
+
 		// Kimi patterns
 		{Name: "kimi_prompt", RegexStr: `(?im)^\s*kimi>\s*$`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Kimi prompt"},
 		{Name: "kimi_banner", RegexStr: `(?i)kimi\s+(code|cli)`, Agent: "kimi", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Kimi code/cli banner"},

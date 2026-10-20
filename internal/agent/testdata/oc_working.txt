@@ -1,0 +1,40 @@
+ ⠇ Stand-in title                +
+
+  ┃
+  ┃  Say some words slowly CHUNKS=60 DELAY=0.5
+  ┃
+
+     word0 word1 word2 word3 word4 word5 word6 word7 word8 word9
+     word10 word11 word12 word13 word14
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Fake Model Standin
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                        shift+tab agents  ctrl+p commands
+

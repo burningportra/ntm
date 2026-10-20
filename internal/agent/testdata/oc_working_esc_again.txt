@@ -1,0 +1,30 @@
+ ⠙ Stand-in title                +
+     word10 word11 word12 word13 word14 word15 word16 word17 word18 word19
+     word20 word21 word22 word23 word24 word25 word26 word27 word28 word29
+     word30 word31 word32 word33 word34 word35 word36 word37 word38 word39
+
+     Build · Fake Model · 21.4s · 7.5 tok/s
+
+  ┃
+  ┃  Ask me CALLJSON {"name":"question","arguments":{"questions":[{"question":
+  ┃  "Which file should I fix first?","header":"File","options":[{"label":
+  ┃  "main.go","description":"The entry point"},{"label":"util.go",
+  ┃  "description":"The helpers"}]}]}}
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which file should I fix first?
+  ┃  main.go
+  ┃
+
+     After the tool: word0 word1 word2 word3 word4 word5
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Fake Model Standin
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ■⬝⬝⬝⬝⬝⬝⬝ esc again to interrupt                  1.3K (1%)  ctrl+p commands
+

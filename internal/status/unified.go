@@ -187,6 +187,19 @@ func (d *UnifiedDetector) determineStateAt(output, agentType string, lastActivit
 		}
 	}
 
+	// opencode likewise: the progress bar below its prompt box is the only
+	// live-turn marker, and a box with no bar is waiting for input. A draft
+	// in the box is idle here but not an idle prompt, so
+	// observationConfidence keeps it from being dispatched to.
+	if agentType == string(agent.AgentTypeOpencode) {
+		if agent.OpencodeActivelyWorking(output) {
+			return StateWorking, ErrorNone
+		}
+		if agent.OpencodePromptShowing(output) {
+			return StateIdle, ErrorNone
+		}
+	}
+
 	// Check if at prompt (idle) - prioritize this when velocity is low
 	isAtPrompt := DetectIdleFromOutput(output, agentType)
 	if isAtPrompt && isLowVelocity {

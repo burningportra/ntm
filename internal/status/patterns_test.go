@@ -1,6 +1,8 @@
 package status
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -587,6 +589,76 @@ func TestPiIdleAgreesWithUnifiedDetector(t *testing.T) {
 				}
 			}
 			parsed, err := parser.ParseWithHint(tt.output, agent.AgentTypePi)
+			if err != nil {
+				t.Fatalf("ParseWithHint error: %v", err)
+			}
+			if parsed.IsIdle != tt.wantIdle {
+				t.Errorf("parser IsIdle = %v, want %v", parsed.IsIdle, tt.wantIdle)
+			}
+			if parsed.IsWorking != (tt.wantState == StateWorking) {
+				t.Errorf("parser IsWorking = %v, want %v", parsed.IsWorking, tt.wantState == StateWorking)
+			}
+		})
+	}
+}
+
+// TestOpencodeIdleAgreesWithUnifiedDetector is the bd-qbs61 regression:
+// DetectIdleFromOutput read opencode with the generic prompt patterns, which
+// never match its prompt box, so an idle opencode pane never read idle and
+// was never dispatched to. The captures are opencode 2.0.28 screens from the
+// agent package's testdata, trimmed the way tmux.Client returns captures.
+func TestOpencodeIdleAgreesWithUnifiedDetector(t *testing.T) {
+	t.Parallel()
+
+	d := NewDetector()
+	observedAt := time.Date(2026, 10, 20, 4, 0, 0, 0, time.UTC)
+	parser := agent.NewParser()
+
+	tests := []struct {
+		file      string
+		wantState AgentState // empty: the velocity heuristics decide
+		wantIdle  bool
+	}{
+		{"oc_idle_fresh.txt", StateIdle, true},
+		{"oc_idle_fresh_narrow.txt", StateIdle, true},
+		{"oc_idle.txt", StateIdle, true},
+		{"oc_idle_narrow.txt", StateIdle, true},
+		{"oc_idle_after_tool.txt", StateIdle, true},
+		{"oc_idle_interrupted.txt", StateIdle, true},
+		{"oc_idle_styled.txt", StateIdle, true},
+		{"oc_draft.txt", StateIdle, false},
+		{"oc_question.txt", "", false},
+		{"oc_working.txt", StateWorking, false},
+		{"oc_working_narrow.txt", StateWorking, false},
+		{"oc_working_tool.txt", StateWorking, false},
+		{"oc_working_tool_narrow.txt", StateWorking, false},
+		{"oc_working_esc_again.txt", StateWorking, false},
+		{"oc_working_styled.txt", StateWorking, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("..", "agent", "testdata", tt.file))
+			if err != nil {
+				t.Fatalf("read capture: %v", err)
+			}
+			output := strings.TrimSpace(string(raw))
+			for _, activity := range []time.Time{observedAt, observedAt.Add(-time.Hour)} {
+				state, _ := d.determineStateAt(output, "oc", activity, observedAt)
+				if tt.wantState != "" && state != tt.wantState {
+					t.Errorf("determineStateAt() = %v, want %v", state, tt.wantState)
+				}
+				confidence := observationConfidence(AgentStatus{AgentType: "oc", State: state}, output)
+				dispatchable := state == StateIdle && ObservationConfidenceIsActionable(confidence)
+				if dispatchable != tt.wantIdle {
+					t.Errorf("unified dispatchable = %v (state %v, confidence %.2f), want %v", dispatchable, state, confidence, tt.wantIdle)
+				}
+			}
+			for _, agentType := range []string{"oc", "opencode"} {
+				if got := DetectIdleFromOutput(output, agentType); got != tt.wantIdle {
+					t.Errorf("DetectIdleFromOutput(%s) = %v, want %v", agentType, got, tt.wantIdle)
+				}
+			}
+			parsed, err := parser.ParseWithHint(output, agent.AgentTypeOpencode)
 			if err != nil {
 				t.Fatalf("ParseWithHint error: %v", err)
 			}

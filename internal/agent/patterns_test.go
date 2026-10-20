@@ -874,7 +874,10 @@ func TestIsReadyOutput(t *testing.T) {
 		{"pi_codex_screen", AgentTypePi, "› Ask Codex to do anything", false},
 
 		// opencode reads only its prompt box; the logo's "▀" runs are not it.
+		// A draft in the box still takes input, while a live turn does not.
 		{"opencode_logo_only", AgentTypeOpencode, strings.SplitN(opencodeReadyNarrowScreen, "\n\n\n", 2)[0], false},
+		{"opencode_draft", AgentTypeOpencode, strings.Replace(opencodeReadyNarrowScreen, `Ask anything… "Fix broken tests"`, "fix the flaky test", 1), true},
+		{"opencode_working", AgentTypeOpencode, strings.Replace(opencodeReadyNarrowScreen, "  /…/bd-1zadt/ws:master", "   ⬝⬝⬝■■■■■ esc interrupt", 1), false},
 		{"opencode_ansi_colored", AgentTypeOpencode, "\x1b[38;5;240m  ╹" + strings.Repeat("▀", 20) + "\x1b[0m\n  shift+tab agents", true},
 		{"opencode_codex_screen", AgentTypeOpencode, "› Ask Codex to do anything", false},
 

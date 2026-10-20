@@ -369,6 +369,10 @@ func (p *parserImpl) detectWorking(output string, agentType AgentType) bool {
 		return matchAny(recentOutput, windsurfWorkingPatterns)
 	case AgentTypeAider:
 		return matchAny(recentOutput, aiderWorkingPatterns)
+	case AgentTypeOpencode:
+		// The progress bar below the prompt box is opencode's only in-flight
+		// marker; the box itself stays drawn for the whole turn.
+		return OpencodeActivelyWorking(output)
 	case AgentTypeOllama:
 		return matchAny(recentOutput, ollamaWorkingPatterns)
 	default:
@@ -451,6 +455,10 @@ func (p *parserImpl) detectIdle(output string, agentType AgentType) bool {
 		return matchAnyRegex(lastLines, windsurfIdlePatterns)
 	case AgentTypeAider:
 		return matchAnyRegex(lastLines, aiderIdlePatterns)
+	case AgentTypeOpencode:
+		// opencode draws no prompt glyph: its prompt is a box above the
+		// footer, anchored from the bottom of the whole capture as for Pi.
+		return OpencodeIdlePromptShowing(output)
 	case AgentTypeOllama:
 		return matchAnyRegex(lastLines, ollamaIdlePatterns)
 	default:
@@ -581,6 +589,8 @@ func (p *parserImpl) collectWorkIndicators(output string, agentType AgentType) [
 		return collectMatches(recentOutput, windsurfWorkingPatterns)
 	case AgentTypeAider:
 		return collectMatches(recentOutput, aiderWorkingPatterns)
+	case AgentTypeOpencode:
+		return []string{"opencode_progress_bar"}
 	case AgentTypeOllama:
 		return collectMatches(recentOutput, ollamaWorkingPatterns)
 	default:

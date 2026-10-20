@@ -1,6 +1,8 @@
 package robot
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -1540,6 +1542,89 @@ func TestPiPatterns_AgreeWithPiIdlePromptShowing(t *testing.T) {
 				if got := HasIdlePattern(tc.screen, "pi"); got != tc.idle {
 					t.Errorf("HasIdlePattern = %v, want %v", got, tc.idle)
 				}
+			}
+		})
+	}
+}
+
+// TestOpencodePatterns_AgreeWithRecognizers is the bd-qbs61 regression in
+// the robot layer: the library had no opencode patterns, so robot status read
+// an idle opencode pane as active. The captures are opencode 2.0.28 screens
+// from the agent package's testdata, trimmed the way tmux.Client returns
+// captures. opencode keeps its empty prompt box drawn for the whole turn, so
+// oc_prompt matches busy screens too and oc_working must outrank it.
+func TestOpencodePatterns_AgreeWithRecognizers(t *testing.T) {
+	lib := NewPatternLibrary()
+
+	for _, tc := range []struct {
+		file    string
+		idle    bool
+		working bool
+	}{
+		{file: "oc_idle_fresh.txt", idle: true},
+		{file: "oc_idle_fresh_narrow.txt", idle: true},
+		{file: "oc_idle.txt", idle: true},
+		{file: "oc_idle_narrow.txt", idle: true},
+		{file: "oc_idle_after_tool.txt", idle: true},
+		{file: "oc_idle_interrupted.txt", idle: true},
+		{file: "oc_draft.txt"},
+		{file: "oc_question.txt"},
+		{file: "oc_working.txt", working: true},
+		{file: "oc_working_narrow.txt", working: true},
+		{file: "oc_working_tool.txt", working: true},
+		{file: "oc_working_tool_narrow.txt", working: true},
+		{file: "oc_working_esc_again.txt", working: true},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("..", "agent", "testdata", tc.file))
+			if err != nil {
+				t.Fatalf("read capture: %v", err)
+			}
+			screen := strings.TrimSpace(string(raw))
+			if got := agent.OpencodeIdlePromptShowing(screen); got != tc.idle {
+				t.Fatalf("fixture: agent.OpencodeIdlePromptShowing = %v, want %v", got, tc.idle)
+			}
+
+			wantState := "active"
+			if tc.idle {
+				wantState = "idle"
+			}
+			for _, agentType := range []string{"oc", "opencode"} {
+				if got := determineState(screen, agentType); got != wantState {
+					t.Errorf("determineState(%s) = %q, want %q", agentType, got, wantState)
+				}
+				if got := IsLiveBusy(screen, agentType); got != tc.working {
+					t.Errorf("IsLiveBusy(%s) = %v, want %v", agentType, got, tc.working)
+				}
+			}
+
+			wantClassified := StateWaiting
+			if tc.working {
+				wantClassified = StateThinking
+				if got := lib.MatchFirst(screen, "oc"); got == nil || got.Pattern != "oc_working" {
+					t.Errorf("MatchFirst = %+v, want oc_working ahead of the prompt box", got)
+				}
+			} else {
+				if got := HasIdlePattern(screen, "oc"); got != tc.idle {
+					t.Errorf("HasIdlePattern = %v, want %v", got, tc.idle)
+				}
+				if lib.HasThinkingIndicator(screen, "oc") {
+					t.Errorf("matched a thinking pattern: %v", lib.MatchByCategory(screen, "oc", CategoryThinking))
+				}
+			}
+			if !tc.idle && !tc.working {
+				return
+			}
+			sc := NewStateClassifier("%1", &ClassifierConfig{AgentType: "oc", HysteresisDuration: 0})
+			if _, err := sc.ClassifyWithOutput(screen); err != nil {
+				t.Fatalf("baseline: %v", err)
+			}
+			activity, err := sc.ClassifyWithOutput(screen)
+			if err != nil {
+				t.Fatalf("ClassifyWithOutput: %v", err)
+			}
+			if activity.State != wantClassified {
+				t.Errorf("classifier State = %q, want %q (patterns %v)", activity.State, wantClassified, activity.DetectedPatterns)
 			}
 		})
 	}

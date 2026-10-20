@@ -1067,22 +1067,137 @@ var (
 	ollamaHeaderPattern = regexp.MustCompile(`(?im)(^ollama>\s*$|\bollama\s+(run|chat|serve|pull)\b|^\s*ollama\s+cli\b)`)
 )
 
-// Opencode (oc) patterns, measured against opencode 2.0.28 in tmux. Its
-// prompt is a box with a "┃" left edge and a bottom edge of "╹" and a run of
-// "▀", holding the input and a line naming the agent, model and provider
-// (here a stand-in provider), with the cwd and key hints below it:
+// Opencode (oc) screen, measured against opencode 2.0.28 in tmux with a
+// stand-in provider streaming slow replies (testdata/oc_*.txt). Its prompt is
+// a box with a "┃" left edge and a bottom edge of "╹" and a run of "▀". The
+// box holds the input between blank lines, then a line naming the agent,
+// model and provider; the footer line below it shows the cwd and key hints:
 //
+//	┃
 //	┃  Ask anything… "Fix broken tests"
 //	┃
-//	┃  Build · Fake Model Fake
+//	┃  Build · Fake Model Standin
 //	╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-//	/…/repo:master  shift+tab agents  ctrl+p commands
+//	/…/repo:main  shift+tab agents  ctrl+p commands
 //
-// The home screen centres the box under the logo, so it can sit well above
-// the bottom of a tall pane. No opencode turn has been captured, so there is
-// no idle or working detection for it: the box only tells IsReadyOutput that
-// the TUI is up.
-var opencodePromptBoxBottomRe = regexp.MustCompile(`(?m)^[ \t]*╹▀+[ \t]*$`)
+// The dim "Ask anything…" hint shows only on the home screen, which
+// centres the box under the logo with the version line at the bottom of the
+// pane. A session pins the box to the bottom, and draws the user's messages
+// and tool output in the transcript with the same "┃" edge but no bottom
+// edge.
+//
+// The box stays drawn while a turn runs. The footer line then starts with a
+// progress bar of "⬝" and "■" cells, followed by the interrupt hint:
+//
+//	⬝⬝⬝⬝■■■■ esc interrupt          1.3K (1%)  ctrl+p commands
+//
+// The hint reads "esc again to interrupt" after one esc and is cut to
+// "esc...upt" in a narrow pane, but the bar is drawn at every width. When
+// the turn ends the footer shows the cwd again. A question the agent asks
+// replaces the box and footer until it is answered.
+const (
+	// OpencodeWorkingFooterPattern matches the prompt box's bottom edge with
+	// a live turn's progress bar on the footer line below it.
+	OpencodeWorkingFooterPattern = `(?m)^[ \t]*╹▀+[ \t]*\n[ \t]*[⬝■]{3,}`
+
+	// OpencodeEmptyPromptPattern matches the prompt box with nothing typed
+	// in it: from the line above the box, which is not part of it, through
+	// box lines that are empty or hold the home screen's hint, the
+	// agent and model line, and the bottom edge, with at most three
+	// non-blank lines below it (opencodeFooterScanLines).
+	OpencodeEmptyPromptPattern = `(?m)(?:\A|^[ \t]*(?:[^┃ \t\n][^\n]*)?\n)(?:[ \t]*┃[ \t]*(?:Ask anything…[^\n]*)?\n)+[ \t]*┃[^\n]*\n[ \t]*╹▀+[ \t]*(?:\n[ \t]*)*(?:\n[^\n]*\S[^\n]*(?:\n[ \t]*)*){0,3}\z`
+)
+
+// opencodeFooterScanLines bounds how many non-blank lines up from the bottom
+// opencodePromptBox looks for the box's bottom edge: the footer, and on the
+// home screen the version line below it.
+const opencodeFooterScanLines = 4
+
+var (
+	// opencodePromptBoxBottomRe matches the prompt box's bottom edge. The
+	// logo's "▀" runs are broken by spaces and other blocks, so they never
+	// match.
+	opencodePromptBoxBottomRe = regexp.MustCompile(`^[ \t]*╹▀+[ \t]*$`)
+
+	// opencodeProgressBarRe matches the start of the footer line while a
+	// turn runs.
+	opencodeProgressBarRe = regexp.MustCompile(`^[ \t]*[⬝■]{3,}`)
+)
+
+// OpencodeActivelyWorking reports whether an opencode pane shows a live
+// turn: the progress bar on the footer line below the prompt box. The
+// transcript is never read, so tool output or prose that looks like a
+// spinner or a progress bar does not count.
+func OpencodeActivelyWorking(output string) bool {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	bottom, ok := opencodePromptBox(lines)
+	return ok && opencodeTurnShowing(lines, bottom)
+}
+
+// OpencodeIdlePromptShowing reports whether an opencode pane is waiting for
+// input with an empty prompt box and no live turn. A box holding a draft
+// returns false, so a pane is never offered new work on top of unsent text.
+// status.DetectIdleFromOutput and the agent parser's detectIdle both call it.
+func OpencodeIdlePromptShowing(output string) bool {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	bottom, ok := opencodePromptBox(lines)
+	if !ok || opencodeTurnShowing(lines, bottom) {
+		return false
+	}
+	top := bottom
+	for top > 0 && strings.HasPrefix(strings.TrimSpace(lines[top-1]), "┃") {
+		top--
+	}
+	// The input line and the agent and model line at least.
+	if bottom-top < 2 {
+		return false
+	}
+	// The box's last line names the agent and model; the lines above it
+	// hold the input.
+	for _, line := range lines[top : bottom-1] {
+		text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "┃"))
+		if text != "" && !strings.HasPrefix(text, "Ask anything…") {
+			return false
+		}
+	}
+	return true
+}
+
+// OpencodePromptShowing reports whether an opencode pane is waiting for
+// input: its prompt box is drawn with no live turn, whether or not it holds
+// a draft.
+func OpencodePromptShowing(output string) bool {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	bottom, ok := opencodePromptBox(lines)
+	return ok && !opencodeTurnShowing(lines, bottom)
+}
+
+// opencodePromptBox returns the line index of the prompt box's bottom edge.
+// ok is false when no box is drawn near the bottom of the screen.
+func opencodePromptBox(lines []string) (bottom int, ok bool) {
+	seen := 0
+	for i := len(lines) - 1; i >= 0 && seen < opencodeFooterScanLines; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		seen++
+		if opencodePromptBoxBottomRe.MatchString(lines[i]) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// opencodeTurnShowing reports whether the footer line below the prompt box's
+// bottom edge starts with the progress bar of a live turn.
+func opencodeTurnShowing(lines []string, bottom int) bool {
+	for _, line := range lines[bottom+1:] {
+		if strings.TrimSpace(line) != "" {
+			return opencodeProgressBarRe.MatchString(line)
+		}
+	}
+	return false
+}
 
 // claudeLiveTailLines bounds the live-tail window scanned for Claude
 // working/idle classification. Claude Code pins its input box to the BOTTOM of
@@ -1581,9 +1696,10 @@ func IsReadyOutput(output string, agentType AgentType) bool {
 		// from an extension status that happens to say "ready".
 		return PiEditorShowing(output)
 	case AgentTypeOpencode:
-		// opencode draws none either: its prompt is the box above its key
-		// hints (opencodePromptBoxBottomRe).
-		return opencodePromptBoxBottomRe.MatchString(stripANSICodes(output))
+		// opencode draws none either: its prompt is the box above its
+		// footer, the box its idle detection (OpencodeIdlePromptShowing)
+		// reads too.
+		return OpencodePromptShowing(output)
 	}
 
 	lower := strings.ToLower(output)

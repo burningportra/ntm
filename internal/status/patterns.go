@@ -241,6 +241,14 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 		return agent.PiIdlePromptShowing(output)
 	}
 
+	// opencode draws no prompt glyph either: its prompt is a box above the
+	// footer, drawn for the whole turn, and only the progress bar on the
+	// footer line marks a live turn. The shared recognizer is authoritative,
+	// as for Pi.
+	if agentType == string(agent.AgentTypeOpencode) {
+		return agent.OpencodeIdlePromptShowing(output)
+	}
+
 	// Strip ANSI first for cleaner processing
 	clean := StripANSI(output)
 

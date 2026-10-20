@@ -886,6 +886,12 @@ func IsLiveBusy(scrollback string, agentType string) bool {
 	if normalizeAgentType(agentType) == "pi" {
 		return agent.PiActivelyWorking(scrollback)
 	}
+	// opencode panes defer to the opencode recognizer: it reads the footer
+	// line below the prompt box, where opencode draws its progress bar for
+	// the whole turn, and never the transcript.
+	if normalizeAgentType(agentType) == "oc" {
+		return agent.OpencodeActivelyWorking(scrollback)
+	}
 
 	live := lastNLines(scrollback, liveThinkingWindowLines)
 	if live == "" {

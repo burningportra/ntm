@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -1033,6 +1034,151 @@ func TestParser_Parse_PiStates(t *testing.T) {
 				if shared := PiIdlePromptShowing(tt.output); state.IsIdle != shared {
 					t.Errorf("hint %q: IsIdle = %v but PiIdlePromptShowing = %v", hint, state.IsIdle, shared)
 				}
+			}
+		})
+	}
+}
+
+// opencodeCaptures are opencode 2.0.28 screens captured with tmux
+// capture-pane -p in testdata/oc_*.txt (bd-qbs61). opencode ran with its HOME
+// and XDG directories in a scratch dir, and its only provider was a local
+// stand-in on 127.0.0.1 that streamed slow replies and made the tool calls.
+var opencodeCaptures = []struct {
+	file    string
+	desc    string
+	working bool
+	idle    bool
+}{
+	{file: "oc_idle_fresh.txt", desc: "home screen, 100 columns", idle: true},
+	{file: "oc_idle_fresh_narrow.txt", desc: "home screen with a session tab, 40 columns", idle: true},
+	{file: "oc_idle.txt", desc: "after a streamed reply, 100 columns", idle: true},
+	{file: "oc_idle_narrow.txt", desc: "after a streamed reply, 40 columns", idle: true},
+	{file: "oc_idle_after_tool.txt", desc: "after a tool call and its reply, 60 columns", idle: true},
+	{file: "oc_idle_interrupted.txt", desc: "after an interrupted turn, 80 columns", idle: true},
+	{file: "oc_draft.txt", desc: "unsent text in the prompt box, 80 columns"},
+	{file: "oc_question.txt", desc: "the agent's question replaces the prompt box, 80 columns"},
+	{file: "oc_working.txt", desc: "reply streaming, 100 columns", working: true},
+	{file: "oc_working_narrow.txt", desc: "reply streaming, 40 columns", working: true},
+	{file: "oc_working_tool.txt", desc: "shell tool running, 100 columns", working: true},
+	{file: "oc_working_tool_narrow.txt", desc: "shell tool running, hint cut to esc...upt, 40 columns", working: true},
+	{file: "oc_working_esc_again.txt", desc: "after one esc: esc again to interrupt, 80 columns", working: true},
+	// Captured with capture-pane -p -e, as tmux.CapturePaneVisible does.
+	{file: "oc_idle_styled.txt", desc: "after a streamed reply, with colors, 40 columns", idle: true},
+	{file: "oc_working_styled.txt", desc: "shell tool running, with colors, 100 columns", working: true},
+}
+
+// TestParser_Parse_OpencodeCaptures is the bd-qbs61 regression: the parser
+// read opencode with the union of every other agent's patterns, none of which
+// match its screen, so an idle opencode pane never read idle.
+func TestParser_Parse_OpencodeCaptures(t *testing.T) {
+	t.Parallel()
+	p := NewParser()
+
+	for _, tc := range opencodeCaptures {
+		t.Run(tc.file, func(t *testing.T) {
+			t.Parallel()
+			output := loadTestData(t, tc.file)
+			for _, hint := range []AgentType{AgentTypeOpencode, AgentType("opencode")} {
+				state, err := p.ParseWithHint(output, hint)
+				if err != nil {
+					t.Fatalf("ParseWithHint(%q) error: %v", hint, err)
+				}
+				if state.Type != AgentTypeOpencode {
+					t.Errorf("hint %q: Type = %v, want %v", hint, state.Type, AgentTypeOpencode)
+				}
+				if state.IsWorking != tc.working || state.IsIdle != tc.idle {
+					t.Errorf("hint %q (%s): IsWorking = %v, IsIdle = %v, want %v, %v (indicators %v)",
+						hint, tc.desc, state.IsWorking, state.IsIdle, tc.working, tc.idle, state.WorkIndicators)
+				}
+				if state.IsRateLimited || state.IsInError {
+					t.Errorf("hint %q: IsRateLimited = %v, IsInError = %v, want both false", hint, state.IsRateLimited, state.IsInError)
+				}
+				if shared := OpencodeIdlePromptShowing(output); state.IsIdle != shared {
+					t.Errorf("hint %q: IsIdle = %v but OpencodeIdlePromptShowing = %v", hint, state.IsIdle, shared)
+				}
+				if shared := OpencodeActivelyWorking(output); state.IsWorking != shared {
+					t.Errorf("hint %q: IsWorking = %v but OpencodeActivelyWorking = %v", hint, state.IsWorking, shared)
+				}
+			}
+		})
+	}
+}
+
+func TestOpencodeRecognizers(t *testing.T) {
+	t.Parallel()
+
+	idle := strings.TrimRight(loadTestData(t, "oc_idle.txt"), "\n")
+	working := strings.TrimRight(loadTestData(t, "oc_working.txt"), "\n")
+	fresh := loadTestData(t, "oc_idle_fresh.txt")
+	const emptyBox = "  ┃\n  ┃\n  ┃\n  ┃  Build · Fake Model Standin\n"
+
+	tests := []struct {
+		name          string
+		output        string
+		wantWorking   bool
+		wantIdle      bool
+		wantPrompt    bool
+		wantPatternOK bool // OpencodeEmptyPromptPattern matches
+	}{
+		{name: "idle", output: idle, wantIdle: true, wantPrompt: true, wantPatternOK: true},
+		{name: "idle home screen", output: fresh, wantIdle: true, wantPrompt: true, wantPatternOK: true},
+		// The box stays empty while a turn runs, so the pattern matches
+		// there too; the working pattern decides.
+		{name: "working", output: working, wantWorking: true, wantPatternOK: true},
+		{name: "draft", output: loadTestData(t, "oc_draft.txt"), wantPrompt: true},
+		{
+			name:       "draft on the home screen",
+			output:     strings.Replace(fresh, `Ask anything… "What is the tech stack of this project?"`, "fix the flaky test", 1),
+			wantPrompt: true,
+		},
+		{
+			name:       "draft on two lines",
+			output:     strings.Replace(idle, emptyBox, "  ┃\n  ┃  fix the flaky test\n  ┃  in main.go\n  ┃\n  ┃  Build · Fake Model Standin\n", 1),
+			wantPrompt: true,
+		},
+		{
+			name:       "draft on the box's first line",
+			output:     strings.Replace(idle, emptyBox, "  ┃  fix the flaky test\n  ┃\n  ┃\n  ┃  Build · Fake Model Standin\n", 1),
+			wantPrompt: true,
+		},
+		{name: "question replaces the box", output: loadTestData(t, "oc_question.txt")},
+		{
+			name:          "progress bar quoted in the transcript",
+			output:        strings.Replace(idle, "     Build · Fake Model · 30.3s", "     ⬝⬝⬝■■■■■ esc interrupt\n     Build · Fake Model · 30.3s", 1),
+			wantIdle:      true,
+			wantPrompt:    true,
+			wantPatternOK: true,
+		},
+		{
+			name:   "box above five lines of other output",
+			output: idle + "\n$ exit\nlogout\n\n[Process completed]\n$ ",
+		},
+		{name: "shell prompt", output: "$ git pull\nAlready up to date.\n$ "},
+		{name: "logo only", output: strings.SplitN(fresh, "\n\n\n", 2)[0]},
+		{name: "empty output", output: ""},
+	}
+	pattern := regexp.MustCompile(OpencodeEmptyPromptPattern)
+	workingPattern := regexp.MustCompile(OpencodeWorkingFooterPattern)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := OpencodeActivelyWorking(tt.output); got != tt.wantWorking {
+				t.Errorf("OpencodeActivelyWorking() = %v, want %v", got, tt.wantWorking)
+			}
+			if got := OpencodeIdlePromptShowing(tt.output); got != tt.wantIdle {
+				t.Errorf("OpencodeIdlePromptShowing() = %v, want %v", got, tt.wantIdle)
+			}
+			if got := OpencodePromptShowing(tt.output); got != tt.wantPrompt {
+				t.Errorf("OpencodePromptShowing() = %v, want %v", got, tt.wantPrompt)
+			}
+			if tt.wantWorking && tt.wantIdle {
+				t.Fatal("fixture wants a working pane to read idle")
+			}
+			if got := pattern.MatchString(tt.output); got != tt.wantPatternOK {
+				t.Errorf("OpencodeEmptyPromptPattern match = %v, want %v", got, tt.wantPatternOK)
+			}
+			if got := workingPattern.MatchString(tt.output); got != tt.wantWorking {
+				t.Errorf("OpencodeWorkingFooterPattern match = %v, want %v", got, tt.wantWorking)
 			}
 		})
 	}

@@ -1,0 +1,30 @@
+   Stand-in title                +
+  ┃
+  ┃  Ask me CALLJSON {"name":"question","arguments":{"questions":[{"question":
+  ┃  "Which file should I fix first?","header":"File","options":[{"label":
+  ┃  "main.go","description":"The entry point"},{"label":"util.go",
+  ┃  "description":"The helpers"}]}]}}
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which file should I fix first?
+  ┃  main.go
+  ┃
+
+     After the tool: word0 word1 word2 word3 word4 word5 word6 word7 word8
+     word9
+     word10 word11 word12 word13 word14 word15 word16 word17 word18 word19
+     word20 word21 word22 word23 word24 word25 word26 word27 word28 word29
+     word30 word31
+
+     Build · Fake Model · 27.1s · 4.5 tok/s · interrupted
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Fake Model Standin
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  /…/c63d7fe8-3892-44…/scratchpad/bd-qbs61/ws:main  1.3K (1%)  ctrl+p commands
+
