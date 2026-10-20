@@ -145,6 +145,65 @@ func TestNewAgentMailClientUsesConfig(t *testing.T) {
 	}
 }
 
+// TestDashboardReservationWatcherProbesWithPing locks bd-rost6: the dashboard
+// checks Agent Mail with the JSON-RPC ping before starting the reservation
+// watcher. The health_check tool it used before runs the server's full
+// diagnostics, which takes longer than the probe budget on a busy server.
+func TestDashboardReservationWatcherProbesWithPing(t *testing.T) {
+	requests := make(chan string, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		label := req.Method
+		if req.Params.Name != "" {
+			label += " " + req.Params.Name
+		}
+		select {
+		case requests <- label:
+		default:
+		}
+		// Unauthorized is not retried, so the probe sends one request and the
+		// watcher stays off without needing tmux.
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("AGENT_MAIL_URL", "")
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+	cfg = &config.Config{
+		AgentMail:       config.AgentMailConfig{Enabled: true, URL: server.URL + "/"},
+		FileReservation: config.FileReservationConfig{Enabled: true},
+	}
+
+	stop := startDashboardReservationWatcher("bd-rost6-dash", t.TempDir())
+	if stop == nil {
+		t.Fatal("watcher not started with Agent Mail and file reservations enabled")
+	}
+	var first string
+	select {
+	case first = <-requests:
+	case <-time.After(10 * time.Second):
+		stop()
+		t.Fatal("watcher never probed Agent Mail")
+	}
+	stop()
+	if first != "ping" {
+		t.Fatalf("probe request = %q, want the JSON-RPC ping", first)
+	}
+	select {
+	case extra := <-requests:
+		t.Errorf("unexpected request after a failed probe: %q", extra)
+	default:
+	}
+}
+
 func TestAgentMailUnavailableErrorUsesOptionalDiagnostic(t *testing.T) {
 	reason := errors.New("health endpoint returned 503")
 	err := agentMailUnavailableError(

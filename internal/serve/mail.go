@@ -528,11 +528,29 @@ func (s *Server) handleMailHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	// Availability comes from the ping, which the server answers at once. The
+	// health_check report takes seconds on a busy server, so a report that
+	// misses the deadline leaves the status unknown instead of calling a
+	// reachable server unavailable.
+	if !client.IsAvailableContext(ctx) {
+		resp := map[string]interface{}{
+			"status":    "error",
+			"available": false,
+		}
+		if err := client.LastAvailabilityError(); err != nil {
+			resp["error"] = err.Error()
+		} else if ctx.Err() != nil {
+			resp["error"] = ctx.Err().Error()
+		}
+		writeSuccessResponse(w, http.StatusOK, resp, reqID)
+		return
+	}
+
 	health, err := client.HealthCheck(ctx)
 	if err != nil {
 		writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-			"status":    "error",
-			"available": false,
+			"status":    "unknown",
+			"available": true,
 			"error":     err.Error(),
 		}, reqID)
 		return

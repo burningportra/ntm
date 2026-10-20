@@ -13,7 +13,6 @@ import (
 	"github.com/spf13/cobra"
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
-	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard"
 	"github.com/Dicklesworthstone/ntm/internal/watcher"
@@ -137,14 +136,7 @@ func startDashboardReservationWatcher(session, projectDir string) func() {
 		return nil
 	}
 
-	amOpts := []agentmail.Option{
-		agentmail.WithBaseURL(cfg.AgentMail.URL),
-		agentmail.WithProjectKey(projectDir),
-	}
-	if cfg.AgentMail.Token != "" {
-		amOpts = append(amOpts, agentmail.WithToken(cfg.AgentMail.Token))
-	}
-	amClient := agentmail.NewClient(amOpts...)
+	amClient := newAgentMailClient(projectDir)
 
 	watcherCtx, cancelWatcher := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -152,10 +144,10 @@ func startDashboardReservationWatcher(session, projectDir string) func() {
 	go func() {
 		defer close(done)
 
-		healthCtx, cancelHealth := context.WithTimeout(watcherCtx, 2*time.Second)
-		_, err := amClient.HealthCheck(healthCtx)
-		cancelHealth()
-		if err != nil || watcherCtx.Err() != nil {
+		// Probe with the ping: the health_check tool runs the server's full
+		// diagnostics and takes seconds on a busy server, which left the
+		// watcher off whenever a live server was under load.
+		if !amClient.IsAvailableContext(watcherCtx) || watcherCtx.Err() != nil {
 			return
 		}
 

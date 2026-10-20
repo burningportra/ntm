@@ -1020,6 +1020,19 @@ var queueDryNewAgentMailClient = func(projectDir string) *agentmail.Client {
 
 var queueDryFetchActiveReservations = fetchActiveReservations
 
+// queueDryAgentMailPing checks that the Agent Mail server answers at all. The
+// JSON-RPC ping returns at once, while the health_check tool runs the server's
+// full diagnostics and can take seconds on a busy server.
+var queueDryAgentMailPing = func(ctx context.Context, client *agentmail.Client) error {
+	if client.IsAvailableContext(ctx) {
+		return nil
+	}
+	if err := client.LastAvailabilityError(); err != nil {
+		return err
+	}
+	return agentmail.ErrServerUnavailable
+}
+
 var queueDryAgentMailHealthCheck = func(ctx context.Context, client *agentmail.Client) (*agentmail.HealthStatus, error) {
 	return client.HealthCheck(ctx)
 }
@@ -1297,35 +1310,69 @@ func applyAgentMailHealthToMailEvidence(client *agentmail.Client, evidence *Comm
 	if errText == "" {
 		errText = "unknown error"
 	}
-	evidence.Diagnostics = []string{"inbox lookup failed: " + errText}
+	probe := probeAgentMailAfterLookupFailure(client)
+	evidence.Diagnostics = append([]string{"inbox lookup failed: " + errText}, probe.Diagnostics...)
+	evidence.HealthReachable = probe.Reachable
+	evidence.HealthStatus = probe.HealthStatus
+	evidence.HealthLevel = probe.HealthLevel
+	evidence.RecoveryMode = probe.RecoveryMode
+	evidence.RecoveryNextAction = probe.RecoveryNextAction
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), queueDryReservationHealthTimeout)
-	defer cancel()
-	health, healthErr := queueDryAgentMailHealthCheck(ctx, client)
+// agentMailLookupProbe is what the queue dry-run and commit-ready learn about
+// the Agent Mail server after a reservation or inbox lookup fails.
+type agentMailLookupProbe struct {
+	Reachable          bool
+	HealthStatus       string
+	HealthLevel        string
+	RecoveryMode       string
+	RecoveryNextAction string
+	Diagnostics        []string
+}
+
+// probeAgentMailAfterLookupFailure tells a down server from a slow or broken
+// one. Reachability comes from the ping, so a busy server still counts as
+// reachable; the health_check report, which carries the recovery next action,
+// is best effort because a busy server takes longer than the budget to build it.
+func probeAgentMailAfterLookupFailure(client *agentmail.Client) agentMailLookupProbe {
+	var probe agentMailLookupProbe
+
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), queueDryReservationHealthTimeout)
+	pingErr := queueDryAgentMailPing(pingCtx, client)
+	cancelPing()
+	if pingErr != nil {
+		probe.Diagnostics = append(probe.Diagnostics, "ping failed: "+strings.TrimSpace(pingErr.Error()))
+		return probe
+	}
+	probe.Reachable = true
+
+	healthCtx, cancelHealth := context.WithTimeout(context.Background(), queueDryReservationHealthTimeout)
+	defer cancelHealth()
+	health, healthErr := queueDryAgentMailHealthCheck(healthCtx, client)
 	if healthErr != nil {
-		evidence.Diagnostics = append(evidence.Diagnostics, "health_check failed: "+strings.TrimSpace(healthErr.Error()))
-		return
+		probe.Diagnostics = append(probe.Diagnostics, "health_check failed: "+strings.TrimSpace(healthErr.Error()))
+		return probe
 	}
 
-	evidence.HealthReachable = true
-	evidence.HealthStatus = strings.TrimSpace(health.Status)
-	evidence.HealthLevel = strings.TrimSpace(health.HealthLevel)
-	if evidence.HealthStatus != "" || evidence.HealthLevel != "" {
-		evidence.Diagnostics = append(evidence.Diagnostics, "health_check "+strings.Join(queueDryKeyValues(map[string]string{
-			"status":       evidence.HealthStatus,
-			"health_level": evidence.HealthLevel,
+	probe.HealthStatus = strings.TrimSpace(health.Status)
+	probe.HealthLevel = strings.TrimSpace(health.HealthLevel)
+	if probe.HealthStatus != "" || probe.HealthLevel != "" {
+		probe.Diagnostics = append(probe.Diagnostics, "health_check "+strings.Join(queueDryKeyValues(map[string]string{
+			"status":       probe.HealthStatus,
+			"health_level": probe.HealthLevel,
 		}), " "))
 	}
 	if health.Recovery != nil {
-		evidence.RecoveryMode = strings.TrimSpace(health.Recovery.Mode)
-		evidence.RecoveryNextAction = strings.TrimSpace(health.Recovery.NextAction)
-		if evidence.RecoveryMode != "" || evidence.RecoveryNextAction != "" {
-			evidence.Diagnostics = append(evidence.Diagnostics, "recovery "+strings.Join(queueDryKeyValues(map[string]string{
-				"mode":        evidence.RecoveryMode,
-				"next_action": evidence.RecoveryNextAction,
+		probe.RecoveryMode = strings.TrimSpace(health.Recovery.Mode)
+		probe.RecoveryNextAction = strings.TrimSpace(health.Recovery.NextAction)
+		if probe.RecoveryMode != "" || probe.RecoveryNextAction != "" {
+			probe.Diagnostics = append(probe.Diagnostics, "recovery "+strings.Join(queueDryKeyValues(map[string]string{
+				"mode":        probe.RecoveryMode,
+				"next_action": probe.RecoveryNextAction,
 			}), " "))
 		}
 	}
+	return probe
 }
 
 func agentMailCoordinationRemediation(recoveryNextAction, status string, includeInbox bool) string {
@@ -1910,43 +1957,17 @@ func collectQueueDryReservations(projectDir string) QueueDryReservations {
 func collectQueueDryReservationFailure(client *agentmail.Client, lookupErr error) QueueDryReservations {
 	status := classifyQueueDryReservationError(lookupErr)
 	errText := strings.TrimSpace(errorString(lookupErr))
+	probe := probeAgentMailAfterLookupFailure(client)
 	out := QueueDryReservations{
-		Available:   false,
-		Status:      status,
-		Error:       errText,
-		Diagnostics: []string{"reservation lookup failed: " + errText},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), queueDryReservationHealthTimeout)
-	defer cancel()
-	health, healthErr := queueDryAgentMailHealthCheck(ctx, client)
-	if healthErr != nil {
-		out.Diagnostics = append(out.Diagnostics, "health_check failed: "+strings.TrimSpace(healthErr.Error()))
-		out.Coordination = agentMailCoordinationBlocked(
-			"Agent Mail reservation state could not be verified",
-			agentMailCoordinationRemediation(out.RecoveryNextAction, out.Status, false),
-		)
-		return out
-	}
-
-	out.HealthReachable = true
-	out.HealthStatus = strings.TrimSpace(health.Status)
-	out.HealthLevel = strings.TrimSpace(health.HealthLevel)
-	if out.HealthStatus != "" || out.HealthLevel != "" {
-		out.Diagnostics = append(out.Diagnostics, "health_check "+strings.Join(queueDryKeyValues(map[string]string{
-			"status":       out.HealthStatus,
-			"health_level": out.HealthLevel,
-		}), " "))
-	}
-	if health.Recovery != nil {
-		out.RecoveryMode = strings.TrimSpace(health.Recovery.Mode)
-		out.RecoveryNextAction = strings.TrimSpace(health.Recovery.NextAction)
-		if out.RecoveryMode != "" || out.RecoveryNextAction != "" {
-			out.Diagnostics = append(out.Diagnostics, "recovery "+strings.Join(queueDryKeyValues(map[string]string{
-				"mode":        out.RecoveryMode,
-				"next_action": out.RecoveryNextAction,
-			}), " "))
-		}
+		Available:          false,
+		Status:             status,
+		Error:              errText,
+		HealthReachable:    probe.Reachable,
+		HealthStatus:       probe.HealthStatus,
+		HealthLevel:        probe.HealthLevel,
+		RecoveryMode:       probe.RecoveryMode,
+		RecoveryNextAction: probe.RecoveryNextAction,
+		Diagnostics:        append([]string{"reservation lookup failed: " + errText}, probe.Diagnostics...),
 	}
 	if out.HealthReachable {
 		out.Status = status + "_health_ok"

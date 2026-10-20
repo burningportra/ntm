@@ -1529,6 +1529,45 @@ func TestHandleListMailProjects_DoesNotRegisterProject(t *testing.T) {
 	}
 }
 
+// TestHandleMailHealth_PingDecidesAvailability locks bd-rost6: a server that
+// answers the ping is available even when its health_check report fails or
+// misses the deadline, as it does on a busy server.
+func TestHandleMailHealth_PingDecidesAvailability(t *testing.T) {
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Method != "ping" {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": map[string]interface{}{}})
+	}))
+	defer mock.Close()
+
+	srv, _ := setupTestServer(t)
+	srv.mailClient = agentmail.NewClient(agentmail.WithBaseURL(mock.URL + "/"))
+
+	rec := httptest.NewRecorder()
+	srv.handleMailHealth(rec, httptest.NewRequest(http.MethodGet, "/api/v1/mail/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["available"] != true || body["status"] != "unknown" {
+		t.Fatalf("response = %v, want available with an unknown status while health_check fails", body)
+	}
+	if errText, _ := body["error"].(string); !strings.Contains(errText, "health_check") {
+		t.Fatalf("error = %q, want the health_check failure", errText)
+	}
+}
+
 func TestHandleCreateMailAgent_InvalidRequest(t *testing.T) {
 
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
