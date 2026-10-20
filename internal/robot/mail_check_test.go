@@ -427,6 +427,7 @@ func TestGetMailCheck_DefaultsZeroLimit(t *testing.T) {
 
 func TestGetMailCheck_HasMoreUsesOverfetch(t *testing.T) {
 	fetchLimits := []int{}
+	markReads := []interface{}{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -445,6 +446,7 @@ func TestGetMailCheck_HasMoreUsesOverfetch(t *testing.T) {
 			case "fetch_inbox":
 				args, _ := params["arguments"].(map[string]interface{})
 				fetchLimits = append(fetchLimits, int(args["limit"].(float64)))
+				markReads = append(markReads, fetchInboxMarkRead(args))
 				resp := agentmail.JSONRPCResponse{
 					JSONRPC: "2.0",
 					ID:      req.ID,
@@ -489,6 +491,21 @@ func TestGetMailCheck_HasMoreUsesOverfetch(t *testing.T) {
 	if len(fetchLimits) != 2 || fetchLimits[0] != 2 || fetchLimits[1] != mailCheckBackfillLimit {
 		t.Fatalf("fetch limits = %v, want [2 %d]", fetchLimits, mailCheckBackfillLimit)
 	}
+	// Both the page and the count backfill (up to 1000 messages) only report
+	// on the inbox; neither may mark it read.
+	if want := []interface{}{false, false}; !reflect.DeepEqual(markReads, want) {
+		t.Fatalf("fetch_inbox mark_read = %v, want %v", markReads, want)
+	}
+}
+
+// fetchInboxMarkRead returns a fetch_inbox call's mark_read argument, or
+// "<unset>" when the caller left it to the server default, which marks the
+// returned messages read.
+func fetchInboxMarkRead(args map[string]interface{}) interface{} {
+	if markRead, ok := args["mark_read"]; ok {
+		return markRead
+	}
+	return "<unset>"
 }
 
 func TestGetMailCheck_UsesFullInboxWindowForCounts(t *testing.T) {
@@ -683,6 +700,7 @@ func TestMailCheckMessageBodyOmittedWhenBodiesDisabled(t *testing.T) {
 
 func TestGetMailCheck_AggregatesProjectAgentsWhenAgentOmitted(t *testing.T) {
 	const wantSince = "2026-01-01T00:00:00Z"
+	markReads := map[string]interface{}{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req agentmail.JSONRPCRequest
@@ -702,6 +720,7 @@ func TestGetMailCheck_AggregatesProjectAgentsWhenAgentOmitted(t *testing.T) {
 			case "fetch_inbox":
 				args, _ := params["arguments"].(map[string]interface{})
 				agentName, _ := args["agent_name"].(string)
+				markReads[agentName] = fetchInboxMarkRead(args)
 				if got, _ := args["since_ts"].(string); got != wantSince {
 					t.Fatalf("fetch_inbox since_ts = %q, want %q", got, wantSince)
 				}
@@ -781,6 +800,9 @@ func TestGetMailCheck_AggregatesProjectAgentsWhenAgentOmitted(t *testing.T) {
 	}
 	if output.Messages[1].Read {
 		t.Fatal("shared aggregate message should remain unread when any recipient is unread")
+	}
+	if want := map[string]interface{}{"BlueLake": false, "GreenStone": false}; !reflect.DeepEqual(markReads, want) {
+		t.Fatalf("fetch_inbox mark_read by agent = %v, want %v", markReads, want)
 	}
 }
 

@@ -6265,6 +6265,10 @@ func TestIsAgentMailDBLockError(t *testing.T) {
 func TestGetInboxTallyAndCountInboxIgnoreReadMessages(t *testing.T) {
 
 	readAt := &agentmail.FlexTime{Time: time.Now()}
+	var (
+		mu        sync.Mutex
+		markReads []interface{}
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			JSONRPC string          `json:"jsonrpc"`
@@ -6281,6 +6285,9 @@ func TestGetInboxTallyAndCountInboxIgnoreReadMessages(t *testing.T) {
 			t.Fatalf("decode tool params: %v", err)
 		}
 		urgentOnly, _ := params.Arguments["urgent_only"].(bool)
+		mu.Lock()
+		markReads = append(markReads, fetchInboxMarkRead(params.Arguments))
+		mu.Unlock()
 
 		var messages []agentmail.InboxMessage
 		if urgentOnly {
@@ -6323,6 +6330,18 @@ func TestGetInboxTallyAndCountInboxIgnoreReadMessages(t *testing.T) {
 	}
 	if got := countInbox(ctx, client, "/data/projects/ntm", "BlueLake", true); got != 1 {
 		t.Fatalf("countInbox(urgent) = %d, want 1", got)
+	}
+	// --robot-mail tallies every agent's inbox; counting must not mark the
+	// agents' mail read.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(markReads) != 3 {
+		t.Fatalf("fetch_inbox calls = %d, want 3", len(markReads))
+	}
+	for _, got := range markReads {
+		if got != false {
+			t.Fatalf("fetch_inbox mark_read = %v, want false on every call", markReads)
+		}
 	}
 }
 
@@ -6453,6 +6472,7 @@ func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *t
 	threadRead := "bd-read"
 	threadUnread := "bd-unread"
 	readAt := &agentmail.FlexTime{Time: time.Now()}
+	var inboxMarkRead atomic.Value
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -6490,6 +6510,7 @@ func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *t
 					},
 				})
 			case "fetch_inbox":
+				inboxMarkRead.Store(fetchInboxMarkRead(params.Arguments))
 				result, err := json.Marshal([]agentmail.InboxMessage{
 					{ID: 1, Subject: "read thread", ThreadID: &threadRead, ReadAt: readAt, CreatedTS: agentmail.FlexTime{Time: time.Now().Add(-1 * time.Minute)}},
 					{ID: 2, Subject: "unread thread", ThreadID: &threadUnread, CreatedTS: agentmail.FlexTime{Time: time.Now()}},
@@ -6552,6 +6573,11 @@ func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *t
 	}
 	if got := corr.MailSummary[threadUnread].Unread; got != 1 {
 		t.Fatalf("MailSummary[%s].Unread = %d, want 1", threadUnread, got)
+	}
+	// --robot-graph reads every agent's inbox to correlate threads; that must
+	// not mark the agents' mail read.
+	if got := inboxMarkRead.Load(); got != false {
+		t.Fatalf("fetch_inbox sent mark_read=%v, want false", got)
 	}
 }
 

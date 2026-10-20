@@ -110,6 +110,9 @@ func buildMailCheckFilters(opts MailCheckOptions) MailCheckFilters {
 }
 
 func fetchMailCheckEntries(ctx context.Context, client *agentmail.Client, opts MailCheckOptions, fetchLimit int, sinceTS *time.Time) ([]mailCheckInboxEntry, error) {
+	// Every fetch peeks: mail-check reports unread counts and filters by read
+	// state, which a consuming fetch (up to the 1000-message backfill) would
+	// erase for the agents it checks.
 	if opts.Agent != "" {
 		msgs, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 			ProjectKey:    opts.Project,
@@ -118,6 +121,7 @@ func fetchMailCheckEntries(ctx context.Context, client *agentmail.Client, opts M
 			IncludeBodies: opts.IncludeBodies,
 			Limit:         fetchLimit,
 			SinceTS:       sinceTS,
+			Peek:          true,
 		})
 		if err != nil {
 			return nil, err
@@ -152,6 +156,7 @@ func fetchMailCheckEntries(ctx context.Context, client *agentmail.Client, opts M
 			IncludeBodies: opts.IncludeBodies,
 			Limit:         fetchLimit,
 			SinceTS:       sinceTS,
+			Peek:          true,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("fetch_inbox for %s: %w", agentName, err)
@@ -299,7 +304,7 @@ func GetMailCheck(opts MailCheckOptions) (*MailCheckOutput, error) {
 	}
 
 	// Create Agent Mail client
-	client := agentmail.NewClient()
+	client := newAgentMailClient(opts.Project)
 
 	// Check availability
 	if !client.IsAvailable() {

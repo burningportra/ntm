@@ -3162,6 +3162,7 @@ func getInboxTally(ctx context.Context, client *agentmail.Client, projectKey, ag
 		UrgentOnly:    false,
 		Limit:         limit,
 		IncludeBodies: false,
+		Peek:          true,
 	}
 	msgs, err := client.FetchInbox(ctx, opts)
 	if err != nil {
@@ -9515,6 +9516,7 @@ func buildCorrelationGraph() *GraphCorrelation {
 				AgentName:     a.Name,
 				Limit:         inboxLimit,
 				IncludeBodies: false,
+				Peek:          true,
 			})
 			if err != nil {
 				corr.Errors = append(corr.Errors, fmt.Sprintf("agent mail fetch_inbox %s: %v", a.Name, err))
@@ -10413,6 +10415,7 @@ func countInbox(ctx context.Context, client *agentmail.Client, projectKey, agent
 		UrgentOnly:    urgentOnly,
 		Limit:         limit,
 		IncludeBodies: false,
+		Peek:          true,
 	}
 	msgs, err := client.FetchInbox(ctx, opts)
 	if err != nil {
