@@ -160,6 +160,8 @@ type PaneSpawner interface {
 	// SubmitPrompt types prompt into a pane and submits it with the protocol
 	// ntm send uses for the pane's agent type.
 	SubmitPrompt(ctx context.Context, paneID string, agentType tmux.AgentType, prompt string) error
+	// CapturePaneOutput returns the last lines of a pane's output.
+	CapturePaneOutput(paneID string, lines int) (string, error)
 	// GetPanes returns all panes in a session.
 	GetPanes(session string) ([]tmux.Pane, error)
 }
@@ -233,6 +235,11 @@ func (s *DefaultPaneSpawner) KillPane(paneID string) error {
 // second Enter 0.5 s later and, for Claude and Codex, the submission check.
 func (s *DefaultPaneSpawner) SubmitPrompt(ctx context.Context, paneID string, agentType tmux.AgentType, prompt string) error {
 	return dispatch.TMUXDeliverer{}.SubmitPrompt(ctx, paneID, agentType, prompt)
+}
+
+// CapturePaneOutput returns the last lines of a pane's output.
+func (s *DefaultPaneSpawner) CapturePaneOutput(paneID string, lines int) (string, error) {
+	return tmux.CapturePaneOutput(paneID, lines)
 }
 
 // GetPanes returns all panes in a session.
@@ -878,8 +885,9 @@ func (r *Rotator) rotateAgent(session, agentID, workDir string, method ...Rotati
 	// Wait for agent to respond
 	time.Sleep(5 * time.Second)
 
-	// Capture the summary response
-	summaryText, captureErr := tmux.CapturePaneOutput(oldPane.ID, 100)
+	// Capture the summary response through the spawner, which reaches the
+	// pane's tmux server like the rest of the rotation.
+	summaryText, captureErr := r.spawner.CapturePaneOutput(oldPane.ID, 100)
 	if captureErr != nil {
 		slog.Warn("failed to capture summary from agent", "agent", agentID, "error", captureErr)
 		summaryText = ""
@@ -895,7 +903,7 @@ func (r *Rotator) rotateAgent(session, agentID, workDir string, method ...Rotati
 		// Generate fallback summary from recent output (reuse captured text if available)
 		fallbackText := summaryText
 		if fallbackText == "" {
-			fallbackText, _ = tmux.CapturePaneOutput(oldPane.ID, 50)
+			fallbackText, _ = r.spawner.CapturePaneOutput(oldPane.ID, 50)
 		}
 		handoffSummary = r.summary.GenerateFallbackSummary(agentID, agentTypeName, session, []string{fallbackText})
 	}

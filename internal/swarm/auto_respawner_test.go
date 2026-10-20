@@ -101,6 +101,10 @@ func (m *mockPaneSpawner) SubmitPrompt(context.Context, string, tmux.AgentType, 
 	return nil
 }
 
+func (m *mockPaneSpawner) CapturePaneOutput(string, int) (string, error) {
+	return "", nil
+}
+
 func (m *mockPaneSpawner) GetPanes(session string) ([]tmux.Pane, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -3,6 +3,7 @@ package context
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -27,6 +28,10 @@ type MockPaneSpawner struct {
 	sendError    error
 	panesError   error
 	getPanesFunc func(string) ([]tmux.Pane, error)
+	// paneOutput is what CapturePaneOutput returns per pane; captures
+	// records each call as "pane:lines".
+	paneOutput map[string]string
+	captures   []string
 }
 
 // submittedPrompt is one prompt handed to the shared submit, with the agent
@@ -66,6 +71,11 @@ func (m *MockPaneSpawner) SubmitPrompt(_ context.Context, paneID string, agentTy
 	}
 	m.submitted[paneID] = append(m.submitted[paneID], submittedPrompt{agentType: agentType, prompt: prompt})
 	return nil
+}
+
+func (m *MockPaneSpawner) CapturePaneOutput(paneID string, lines int) (string, error) {
+	m.captures = append(m.captures, fmt.Sprintf("%s:%d", paneID, lines))
+	return m.paneOutput[paneID], nil
 }
 
 func (m *MockPaneSpawner) GetPanes(session string) ([]tmux.Pane, error) {
@@ -319,7 +329,11 @@ func TestRotateAgentFailureEmitsRotationAlert(t *testing.T) {
 // TestRotateAgentSuccessSubmitsPromptsAndEmitsCompletionAlert also checks
 // that the summary request and the handoff context go to the shared submit
 // with each pane's agent type, so Claude gets the paste, the double Enter and
-// the submission check; the old path pasted both and pressed Enter once.
+// the submission check; the old path pasted both and pressed Enter once. The
+// old agent's summary has to be read through the spawner, which reaches the
+// pane's tmux server: the rotation used to capture it on the default tmux
+// client, so a rotation on another server handed off whatever the local %0
+// showed.
 func TestRotateAgentSuccessSubmitsPromptsAndEmitsCompletionAlert(t *testing.T) {
 	tracker := alerts.GetGlobalTracker()
 	tracker.Clear()
@@ -334,6 +348,7 @@ func TestRotateAgentSuccessSubmitsPromptsAndEmitsCompletionAlert(t *testing.T) {
 		Title: "test__cc_1",
 		Type:  tmux.AgentClaude,
 	}}
+	spawner.paneOutput = map[string]string{"%0": "## CURRENT TASK\nPort the auth middleware to chi\n\n## PROGRESS\nRouter wired, tests pending\n"}
 	cfg := config.DefaultContextRotationConfig()
 	cfg.TryCompactFirst = false
 	r := NewRotator(RotatorConfig{Monitor: monitor, Spawner: spawner, Config: cfg})
@@ -347,9 +362,15 @@ func TestRotateAgentSuccessSubmitsPromptsAndEmitsCompletionAlert(t *testing.T) {
 	if len(oldPane) != 1 || oldPane[0].prompt != SummaryPromptTemplate || oldPane[0].agentType != tmux.AgentClaude {
 		t.Fatalf("old pane submits = %+v, want the summary request as claude", oldPane)
 	}
+	if len(spawner.captures) != 1 || spawner.captures[0] != "%0:100" {
+		t.Fatalf("spawner captures = %v, want the old pane's summary read once through the spawner", spawner.captures)
+	}
 	newPane := spawner.submitted["%new-pane"]
 	if len(newPane) != 1 || !strings.Contains(newPane[0].prompt, "HANDOFF CONTEXT") || newPane[0].agentType.Canonical() != tmux.AgentClaude {
 		t.Fatalf("replacement pane submits = %+v, want the handoff context as claude", newPane)
+	}
+	if !strings.Contains(newPane[0].prompt, "### Current Task\nPort the auth middleware to chi") {
+		t.Fatalf("handoff context = %q, want the old agent's summary captured through the spawner", newPane[0].prompt)
 	}
 
 	active := tracker.GetActive()
