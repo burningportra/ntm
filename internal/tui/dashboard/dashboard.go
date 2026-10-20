@@ -6098,7 +6098,24 @@ func (m *Model) handleConflictAction(conflict watcher.FileConflict, action watch
 				log.Printf("[ConflictAction] Failed to force-release reservation %d: %v", reservationID, err)
 				return fmt.Errorf("failed to force-release reservation %d: %w", reservationID, err)
 			}
-			log.Printf("[ConflictAction] Force-released reservation %d: success=%v", reservationID, result.Success)
+			switch {
+			case result.AlreadyReleased:
+				// Released before this call, which leaves the same end state.
+				if result.ReleasedAt != nil {
+					log.Printf("[ConflictAction] Reservation %d was already released at %s", reservationID, result.ReleasedAt.Format(time.RFC3339))
+				} else {
+					log.Printf("[ConflictAction] Reservation %d was already released", reservationID)
+				}
+			case result.Success:
+				log.Printf("[ConflictAction] Force-released reservation %d (%s held by %s)", reservationID, result.PathPattern, result.PreviousHolder)
+			default:
+				// Both servers refuse a reservation that still looks active
+				// with a tool error, so a reply that released nothing yet does
+				// not say it was already released is unexpected; keep the
+				// conflict on the panel.
+				log.Printf("[ConflictAction] Agent Mail released nothing for reservation %d", reservationID)
+				return fmt.Errorf("agent mail released nothing for reservation %d", reservationID)
+			}
 		}
 		return nil
 

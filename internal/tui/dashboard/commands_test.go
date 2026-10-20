@@ -1,10 +1,12 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -651,6 +654,86 @@ func TestHandleConflictAction_ForceRegistersDashboardAgent(t *testing.T) {
 	wantCalls := []string{"register_agent", "force_release_file_reservation"}
 	if !slices.Equal(gotCalls, wantCalls) {
 		t.Fatalf("tool call order = %v, want %v", gotCalls, wantCalls)
+	}
+}
+
+// TestHandleConflictActionForceReportsOutcome locks bd-mi0zb: the dashboard's
+// force-release reports an id Agent Mail says was already released as
+// released at that time (the Rust server's live reply), and treats a reply
+// that released nothing without saying so as a failure that keeps the
+// conflict on the panel, as `ntm locks force-release` and serve do.
+func TestHandleConflictActionForceReportsOutcome(t *testing.T) {
+	tests := []struct {
+		name    string
+		reply   string
+		wantErr bool
+		wantLog string
+	}{
+		{
+			name:    "released",
+			reply:   `{"released":1,"released_at":"2026-10-20T02:54:51.367874Z","reservation":{"id":42,"agent":"holder-a","path_pattern":"internal/robot/attention_feed.go","notified":true}}`,
+			wantLog: "Force-released reservation 42 (internal/robot/attention_feed.go held by holder-a)",
+		},
+		{
+			name:    "already released",
+			reply:   `{"released":0,"released_at":"2026-10-20T02:54:51.367874Z","already_released":true}`,
+			wantLog: "Reservation 42 was already released at 2026-10-20T02:54:51Z",
+		},
+		{
+			name:    "released nothing",
+			reply:   `{"released":0}`,
+			wantErr: true,
+			wantLog: "Agent Mail released nothing for reservation 42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode request: %v", err)
+					return
+				}
+				params, _ := req["params"].(map[string]any)
+				var result any
+				switch params["name"] {
+				case "register_agent":
+					result = agentmail.Agent{ID: 1, Name: "sess_dashboard", Program: "ntm-dashboard", Model: "local"}
+				case "force_release_file_reservation":
+					result = json.RawMessage(tt.reply)
+				default:
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req["id"], "result": result})
+			}))
+			defer server.Close()
+			t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+
+			var logs bytes.Buffer
+			prevOutput, prevFlags := log.Writer(), log.Flags()
+			log.SetOutput(&logs)
+			log.SetFlags(0)
+			defer func() {
+				log.SetOutput(prevOutput)
+				log.SetFlags(prevFlags)
+			}()
+
+			model := &Model{session: "sess", projectDir: "/tmp/ntm"}
+			err := model.handleConflictAction(watcher.FileConflict{
+				Path:                 "internal/robot/attention_feed.go",
+				RequestorAgent:       "worker-a",
+				HolderReservationIDs: []int{42},
+			}, watcher.ConflictActionForce)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("handleConflictAction(force) error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got := logs.String(); !strings.Contains(got, tt.wantLog) || strings.Contains(got, "success=") {
+				t.Fatalf("log = %q, want it to contain %q", got, tt.wantLog)
+			}
+		})
 	}
 }
 
