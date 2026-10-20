@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS runtime_agents (
     type_method TEXT NOT NULL DEFAULT 'unknown',  -- process, title, output, manual
 
     -- State
-    state TEXT NOT NULL DEFAULT 'unknown',  -- idle, active, busy, error, compacting
+    state TEXT NOT NULL DEFAULT 'unknown',  -- idle, busy, error, unknown, user
     state_reason TEXT,
     previous_state TEXT,
     state_changed_at TIMESTAMP,

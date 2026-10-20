@@ -1595,6 +1595,10 @@ type Agent struct {
 	ContextPercent       float64   `json:"context_percent,omitempty"`         // Usage percentage (0-100+)
 	ContextModel         string    `json:"context_model,omitempty"`           // Model name for context limit lookup
 	CaptureError         string    `json:"capture_error,omitempty"`
+
+	// work is the --robot-is-working verdict for this pane's capture, which
+	// the runtime projection reports as the agent's state (bd-p7es6).
+	work *PaneWorkStatus
 }
 
 // SystemInfo contains system and runtime information
@@ -4912,6 +4916,10 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 		}
 	}
 
+	// One capture per pane feeds type detection, the context estimate and the
+	// --robot-is-working classifier that decides each agent's state (bd-p7es6).
+	observer := newRobotSessionObserver(tmux.LinesHealthCheck)
+	parser := agent.NewParser()
 	for _, sess := range sessions {
 		snapSession := SnapshotSession{
 			Name:     sess.Name,
@@ -4919,24 +4927,27 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 			Agents:   []SnapshotAgent{},
 		}
 
-		// Get panes for this session
-		panes, err := tmux.GetPanes(sess.Name)
+		observation, err := observer.Observe(context.Background(), sess.Name)
 		if err != nil {
 			output.Alerts = append(output.Alerts, fmt.Sprintf("failed to get panes for %s: %v", sess.Name, err))
 			continue
 		}
 
 		// Resolve agent mapping for this session
-		agentMapping := resolveAgentsForSession(panes, mailAgents)
+		agentMapping := resolveAgentsForSession(observationPanes(observation), mailAgents)
 
-		for _, pane := range panes {
-			// Capture output for state detection and enhanced type detection
-			captured := ""
-			capturedErr := error(nil)
-			captured, capturedErr = tmux.CapturePaneOutput(pane.ID, 50)
+		for _, paneObservation := range observation.Panes {
+			pane := paneObservation.Metadata
+			captured := paneObservation.RawOutput
 
-			// Use enhanced agent type detection
+			// Use enhanced agent type detection. It reports a plain shell as
+			// unknown, so fall back to tmux's user type the way the runtime
+			// projection does.
 			detection := DetectAgentTypeEnhanced(pane, captured)
+			paneType := paneAgentType(pane)
+			if detection.Type == "unknown" && paneType == "user" {
+				detection = AgentDetection{Type: paneType, Confidence: 1.0, Method: MethodTmuxPane}
+			}
 
 			agent := SnapshotAgent{
 				// Emit the pane's real window index (#172) so the W.P address
@@ -4947,7 +4958,7 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 				Variant:          pane.Variant,
 				TypeConfidence:   detection.Confidence,
 				TypeMethod:       string(detection.Method),
-				State:            "unknown",
+				State:            string(runtimeAgentState(paneType, observedPaneWork(parser, paneObservation))),
 				LastOutputAgeSec: -1, // Unknown without pane_last_activity
 				OutputTailLines:  0,
 				CurrentBead:      nil,
@@ -4969,11 +4980,9 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 				}
 			}
 
-			// Process captured output for state
-			if capturedErr == nil {
+			if paneObservation.Current.Error == "" {
 				lines := splitLines(status.StripANSI(captured))
 				agent.OutputTailLines = len(lines)
-				agent.State = determineState(captured, agent.Type)
 				if !strings.EqualFold(agent.Type, "user") {
 					if usage := tokens.GetUsageInfo(captured, detectModel(agent.Type, pane.Title)); usage != nil {
 						agent.ContextPercent = usage.UsagePercent
@@ -7759,14 +7768,22 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 		}, nil
 	}
 
-	// Optimization: Get all panes across all sessions in one tmux call
-	allPanes, err := tmux.GetAllPanesContext(ctx)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+	// List each session's panes with their window activity: the work
+	// classifier below reads activity the way --robot-is-working's observer
+	// does (bd-p7es6).
+	allPanes := make(map[string][]tmux.PaneActivity, len(sessions))
+	totalPaneCount := 0
+	for _, sess := range sessions {
+		panes, err := tmux.GetPanesWithActivityContext(ctx, sess.Name)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			// The session may have closed since it was listed.
+			continue
 		}
-		// Fallback: create empty map if failed
-		allPanes = make(map[string][]tmux.Pane)
+		allPanes[sess.Name] = panes
+		totalPaneCount += len(panes)
 	}
 
 	adapterConfig := DefaultTmuxAdapterConfig()
@@ -7777,19 +7794,13 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 	adapter := NewTmuxAdapter(adapterConfig)
 
 	agentsBySession := make(map[string][]Agent, len(sessions))
-	outputTailsBySession := make(map[string]map[string]string, len(sessions))
 
-	totalPaneCount := 0
-	for _, panes := range allPanes {
-		totalPaneCount += len(panes)
-	}
 	captureJobs := make([]normalizedTmuxCaptureJob, 0, totalPaneCount)
 	for _, sess := range sessions {
-		panes := allPanes[sess.Name]
-		for _, pane := range panes {
+		for _, pane := range allPanes[sess.Name] {
 			captureJobs = append(captureJobs, normalizedTmuxCaptureJob{
-				paneID:    pane.ID,
-				modelName: modelNameForPane(pane, cfg),
+				paneID:    pane.Pane.ID,
+				modelName: modelNameForPane(pane.Pane, cfg),
 			})
 		}
 	}
@@ -7804,16 +7815,22 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 		return nil, err
 	}
 
+	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
+	parser := agent.NewParser()
 	for i := range sessions {
-		panes := allPanes[sessions[i].Name]
+		paneActivity := allPanes[sessions[i].Name]
+		panes := make([]tmux.Pane, 0, len(paneActivity))
+		for _, activity := range paneActivity {
+			panes = append(panes, activity.Pane)
+		}
 		// Ensure panes are associated with the session for the adapter
-		sessions[i].Panes = append([]tmux.Pane(nil), panes...)
+		sessions[i].Panes = panes
 
 		agentMapping := resolveAgentsForSession(panes, mailAgents)
 		agents := make([]Agent, 0, len(panes))
-		outputTails := make(map[string]string, len(panes))
 
-		for _, pane := range panes {
+		for _, activity := range paneActivity {
+			pane := activity.Pane
 			agent := Agent{
 				Pane:     pane.ID,
 				Window:   pane.WindowIndex,
@@ -7833,18 +7850,15 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 			content := captured.content
 			agent.CaptureError = captured.captureErr
 			enrichAgentStatus(&agent, sessions[i].Name, modelNameForPane(pane, cfg), content)
-			if content != "" {
-				outputTails[pane.ID] = content
-			}
+			agent.work = classifyCapturedPaneWork(observer, parser, sessions[i].Name, activity, content, captured.captureErr)
 
 			agents = append(agents, agent)
 		}
 
 		agentsBySession[sessions[i].Name] = agents
-		outputTailsBySession[sessions[i].Name] = outputTails
 	}
 
-	snapshot := adapter.NormalizeSnapshot(sessions, agentsBySession, outputTailsBySession)
+	snapshot := adapter.NormalizeSnapshot(sessions, agentsBySession)
 	if snapshot == nil {
 		snapshot = &NormalizedSnapshot{
 			Sessions:    []state.RuntimeSession{},

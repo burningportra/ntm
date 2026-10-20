@@ -137,7 +137,7 @@ type Agent struct {
     PaneID      string    `json:"pane_id"`       // "0.1", "0.2", etc.
     Type        string    `json:"type"`          // "claude", "codex", "antigravity", "gemini" (legacy)
     Model       string    `json:"model,omitempty"`
-    State       string    `json:"state"`         // "idle", "busy", "error", "compacting"
+    State       string    `json:"state"`         // "idle", "busy", "error", "unknown", "user"
     StateAge    string    `json:"state_age"`     // "2m30s"
     ContextPct  float64   `json:"context_pct,omitempty"`
     LastOutput  time.Time `json:"last_output,omitempty"`

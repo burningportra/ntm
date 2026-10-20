@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS robot_agents (
     pane_id             TEXT NOT NULL,     -- "0.2"
     agent_type          TEXT NOT NULL,     -- "claude", "codex", "antigravity", "gemini" (legacy)
     model               TEXT,
-    state               TEXT NOT NULL,     -- "idle", "busy", "error", "compacting"
+    state               TEXT NOT NULL,     -- "idle", "busy", "error", "unknown", "user"
     state_changed_at    TEXT NOT NULL,     -- RFC3339
     context_pct         REAL,
     last_output_at      TEXT,              -- RFC3339

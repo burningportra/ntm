@@ -234,6 +234,23 @@ Treat a pane waiting on a background terminal as working only when a current
 live indicator is present; elapsed labels and old scrollback alone are not
 authoritative.
 
+### 3.3.1 Agent State Vocabulary
+
+`--robot-snapshot` (`sessions[].agents[].state`), `--robot-status`
+(`summary.agents_by_state`) and `--robot-dashboard` (`agents[].agents[].state`)
+classify each pane with the `--robot-is-working` classifier, from one capture
+per pane, and report its verdict as one of these values:
+
+| `state` | Meaning |
+|---|---|
+| `busy` | `--robot-is-working` recommends `DO_NOT_INTERRUPT` or `CONTEXT_LOW_CONTINUE`. |
+| `idle` | `--robot-is-working` recommends `SAFE_TO_RESTART`. |
+| `error` | `--robot-is-working` recommends `RATE_LIMITED_WAIT` or `ERROR_STATE`, or the agent process is a zombie or stopped. |
+| `unknown` | `--robot-is-working` recommends `UNKNOWN`, or the pane's output could not be captured. |
+| `user` | A user shell pane. It holds no agent, so it is not classified and is never a dispatch target. |
+
+The dashboard lists agent panes only, so it never reports `user`.
+
 ### 3.4 Post-Action Verification Evidence
 
 `success: true` means the requested API operation completed. It is not, by

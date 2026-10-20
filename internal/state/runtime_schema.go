@@ -36,6 +36,8 @@ const (
 	AgentStateError      AgentState = "error"
 	AgentStateCompacting AgentState = "compacting"
 	AgentStateUnknown    AgentState = "unknown"
+	// AgentStateUser marks a user shell pane, which holds no agent to classify.
+	AgentStateUser AgentState = "user"
 )
 
 // SourceStatus represents the availability status of a data source.

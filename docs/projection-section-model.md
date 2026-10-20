@@ -72,7 +72,7 @@ type SummarySection struct {
     AgentCount    int    `json:"agent_count"`
 
     // Agent state breakdown
-    AgentsByState map[string]int `json:"agents_by_state"` // idle, busy, error, compacting
+    AgentsByState map[string]int `json:"agents_by_state"` // idle, busy, error, unknown, user
     AgentsByType  map[string]int `json:"agents_by_type"`  // claude, codex, antigravity, gemini (legacy)
 
     // Work state
@@ -137,7 +137,7 @@ type AgentSection struct {
     Type      string `json:"type"`        // claude, codex, antigravity, gemini (legacy), user
 
     // State
-    State       string `json:"state"`       // idle, busy, error, compacting, unknown
+    State       string `json:"state"`       // idle, busy, error, unknown, user
     StateReason string `json:"state_reason,omitempty"`
     StateSince  string `json:"state_since"` // RFC3339
 

@@ -99,7 +99,7 @@ CREATE TABLE runtime_agents (
     agent_type    TEXT NOT NULL,     -- claude, codex, antigravity, gemini (legacy), user
 
     -- State
-    state         TEXT NOT NULL DEFAULT 'unknown',  -- idle, busy, error, compacting, unknown
+    state         TEXT NOT NULL DEFAULT 'unknown',  -- idle, busy, error, unknown, user
     state_reason  TEXT,
     state_since   TEXT,              -- RFC3339
 

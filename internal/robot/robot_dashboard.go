@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -69,30 +71,36 @@ func GetDashboard() (*DashboardOutput, error) {
 		},
 	}
 
-	// Sessions and agents (best-effort)
+	// Sessions and agents (best-effort). One capture per pane feeds the
+	// --robot-is-working classifier that decides each agent's state, the same
+	// classification --robot-snapshot reports (bd-p7es6).
 	if tmux.IsInstalled() {
 		sessions, err := tmux.ListSessions()
 		if err == nil {
+			observer := newRobotSessionObserver(tmux.LinesHealthCheck)
+			parser := agent.NewParser()
 			for _, sess := range sessions {
 				snapSession := SnapshotSession{
 					Name:     sess.Name,
 					Attached: sess.Attached,
 					Agents:   []SnapshotAgent{},
 				}
-				panes, err := tmux.GetPanes(sess.Name)
+				observation, err := observer.Observe(context.Background(), sess.Name)
 				if err == nil {
-					for _, pane := range panes {
+					for _, paneObservation := range observation.Panes {
+						pane := paneObservation.Metadata
 						agentType, ok := dashboardAgentType(pane)
 						if !ok {
 							continue
 						}
+						agentState := string(runtimeAgentState(agentType, observedPaneWork(parser, paneObservation)))
 						snapSession.Agents = append(snapSession.Agents, SnapshotAgent{
 							Pane:           fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
 							Type:           agentType,
 							Variant:        pane.Variant,
 							TypeConfidence: 0.5,
 							TypeMethod:     "tmux-pane",
-							State:          "unknown",
+							State:          agentState,
 						})
 
 						switch agentType {
@@ -125,7 +133,7 @@ func GetDashboard() (*DashboardOutput, error) {
 						}
 						output.Summary.TotalAgents++
 						output.Summary.AgentsByType[agentType]++
-						output.Summary.AgentsByState["unknown"]++
+						output.Summary.AgentsByState[agentState]++
 					}
 				}
 				output.Agents = append(output.Agents, snapSession)

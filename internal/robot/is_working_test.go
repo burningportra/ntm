@@ -3,14 +3,19 @@ package robot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 func TestDefaultIsWorkingOptions(t *testing.T) {
@@ -835,6 +840,262 @@ func TestSelectIsWorkingPanes_RequestedMissingIndexIsNotFound(t *testing.T) {
 	}
 	if sel[0].Index != 9 {
 		t.Fatalf("expected placeholder Index 9, got %d", sel[0].Index)
+	}
+}
+
+// userShellTestScreen is a zsh prompt in a user pane.
+const userShellTestScreen = "kevtrinh@Kevins-Mac-Studio proj % ls\nREADME.md\nkevtrinh@Kevins-Mac-Studio proj %"
+
+// TestRuntimeAgentStateFollowsIsWorkingVerdict pins the agent state that
+// --robot-snapshot, --robot-status and --robot-dashboard report to the
+// --robot-is-working classifier (bd-p7es6): an idle Muse pane is idle, a Muse
+// pane with a turn in flight is busy, a user shell is "user" whatever it
+// shows, and a pane whose capture failed is unknown.
+func TestRuntimeAgentStateFollowsIsWorkingVerdict(t *testing.T) {
+	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
+	parser := agent.NewParser()
+	tests := []struct {
+		name       string
+		pane       tmux.Pane
+		output     string
+		captureErr string
+		want       state.AgentState
+	}{
+		{
+			name:   "idle muse composer",
+			pane:   tmux.Pane{ID: "%1", Index: 1, Title: "proj__muse_1", Type: tmux.AgentMuse},
+			output: museTestIdleScreen,
+			want:   state.AgentStateIdle,
+		},
+		{
+			name:   "muse turn in flight",
+			pane:   tmux.Pane{ID: "%2", Index: 2, Title: "proj__muse_2", Type: tmux.AgentMuse},
+			output: museTestWorkingScreen,
+			want:   state.AgentStateBusy,
+		},
+		{
+			name:   "user shell at its prompt",
+			pane:   tmux.Pane{ID: "%3", Index: 0, Title: "host", Type: tmux.AgentUser},
+			output: userShellTestScreen,
+			want:   state.AgentStateUser,
+		},
+		{
+			name:   "user shell beside a busy pane",
+			pane:   tmux.Pane{ID: "%4", Index: 0, Title: "host", Type: tmux.AgentUser},
+			output: "go test ./...\nok  \tgithub.com/x/y\t3.2s",
+			want:   state.AgentStateUser,
+		},
+		{
+			name:       "capture failed",
+			pane:       tmux.Pane{ID: "%5", Index: 3, Title: "proj__muse_3", Type: tmux.AgentMuse},
+			captureErr: "can't find pane: %5",
+			want:       state.AgentStateUnknown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A fresh window timestamp, as tmux reports for a window with a
+			// busy neighbor: the user shell must still not read as busy.
+			activity := tmux.PaneActivity{Pane: tt.pane, LastActivity: time.Now()}
+			work := classifyCapturedPaneWork(observer, parser, "proj", activity, tt.output, tt.captureErr)
+			if got := runtimeAgentState(paneAgentType(tt.pane), work); got != tt.want {
+				t.Fatalf("runtimeAgentState = %q, want %q (work=%+v)", got, tt.want, work)
+			}
+		})
+	}
+}
+
+func TestRuntimeAgentStateMapsRecommendations(t *testing.T) {
+	tests := []struct {
+		recommendation agent.Recommendation
+		want           state.AgentState
+	}{
+		{agent.RecommendRateLimitedWait, state.AgentStateError},
+		{agent.RecommendErrorState, state.AgentStateError},
+		{agent.RecommendDoNotInterrupt, state.AgentStateBusy},
+		{agent.RecommendContextLowContinue, state.AgentStateBusy},
+		{agent.RecommendSafeToRestart, state.AgentStateIdle},
+		{agent.RecommendUnknown, state.AgentStateUnknown},
+	}
+	for _, tt := range tests {
+		work := &PaneWorkStatus{Recommendation: string(tt.recommendation)}
+		if got := runtimeAgentState("codex", work); got != tt.want {
+			t.Errorf("runtimeAgentState(codex, %s) = %q, want %q", tt.recommendation, got, tt.want)
+		}
+	}
+	if got := runtimeAgentState("codex", nil); got != state.AgentStateUnknown {
+		t.Errorf("runtimeAgentState(codex, nil) = %q, want unknown", got)
+	}
+	if got := runtimeAgentState("user", &PaneWorkStatus{Recommendation: string(agent.RecommendDoNotInterrupt)}); got != state.AgentStateUser {
+		t.Errorf("runtimeAgentState(user, working) = %q, want user", got)
+	}
+}
+
+// TestTmuxAdapterFirstSightingIsNotBusy is the bd-p7es6 regression. A one-shot
+// robot command sees every pane for the first time, and updateActivity reports
+// a first sighting as "all lines just appeared, zero seconds ago". The adapter
+// used to turn that into busy for every pane, idle agents and user shells
+// included. The state now comes from the pane's work verdict.
+func TestTmuxAdapterFirstSightingIsNotBusy(t *testing.T) {
+	observer := newRobotSessionObserver(DefaultIsWorkingOptions().LinesCaptured)
+	parser := agent.NewParser()
+	adapter := NewTmuxAdapter(DefaultTmuxAdapterConfig())
+
+	firstSighting := func(pane tmux.Pane, output string) Agent {
+		lastOutput, linesDelta := updateActivity(fmt.Sprintf("p7es6-%d-%s", time.Now().UnixNano(), pane.ID), output)
+		agent := Agent{
+			Pane:                 pane.ID,
+			PaneIdx:              pane.Index,
+			Type:                 paneAgentType(pane),
+			LastOutputTS:         lastOutput,
+			SecondsSinceOutput:   int(time.Since(lastOutput).Seconds()),
+			OutputLinesSinceLast: linesDelta,
+		}
+		if agent.SecondsSinceOutput != 0 || agent.OutputLinesSinceLast == 0 {
+			t.Fatalf("first sighting should look like fresh output: %+v", agent)
+		}
+		agent.work = classifyCapturedPaneWork(observer, parser, "proj", tmux.PaneActivity{Pane: pane, LastActivity: time.Now()}, output, "")
+		return agent
+	}
+
+	agents := []Agent{
+		firstSighting(tmux.Pane{ID: "%10", Index: 0, Title: "host", Type: tmux.AgentUser}, userShellTestScreen),
+		firstSighting(tmux.Pane{ID: "%11", Index: 1, Title: "proj__muse_1", Type: tmux.AgentMuse}, museTestIdleScreen),
+		firstSighting(tmux.Pane{ID: "%12", Index: 2, Title: "proj__muse_2", Type: tmux.AgentMuse}, museTestWorkingScreen),
+	}
+	want := []state.AgentState{state.AgentStateUser, state.AgentStateIdle, state.AgentStateBusy}
+
+	snapshot := adapter.NormalizeSnapshot([]tmux.Session{{Name: "proj"}}, map[string][]Agent{"proj": agents})
+	if len(snapshot.Agents) != len(want) {
+		t.Fatalf("normalized %d agents, want %d", len(snapshot.Agents), len(want))
+	}
+	for i, row := range snapshot.Agents {
+		if row.State != want[i] {
+			t.Errorf("agent %s state = %q (%s), want %q", row.Pane, row.State, row.StateReason, want[i])
+		}
+	}
+	sess := snapshot.Sessions[0]
+	if sess.ActiveAgents != 1 || sess.IdleAgents != 1 || sess.ErrorAgents != 0 {
+		t.Errorf("session counts active=%d idle=%d error=%d, want 1/1/0", sess.ActiveAgents, sess.IdleAgents, sess.ErrorAgents)
+	}
+
+	zombie := agents[1]
+	zombie.ProcessState = "Z"
+	if got := adapter.NormalizeAgent("proj", &zombie); got.State != state.AgentStateError || got.StateReason != "process zombie" {
+		t.Errorf("zombie agent = %q (%s), want error (process zombie)", got.State, got.StateReason)
+	}
+}
+
+// TestAgentStateSurfacesMatchIsWorkingRealTmux drives the three surfaces that
+// report agent state against real panes: the runtime projection collector
+// behind --robot-snapshot and --robot-status, the live snapshot fallback, and
+// --robot-dashboard. Each must agree with --robot-is-working (bd-p7es6).
+func TestAgentStateSurfacesMatchIsWorkingRealTmux(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	// Keep the snapshot's Agent Mail and beads lookups off the host's services.
+	t.Setenv("AGENT_MAIL_URL", "http://127.0.0.1:1")
+	sessionName := fmt.Sprintf("p7es6state%d", time.Now().UnixNano())
+	projectDir := t.TempDir()
+	t.Chdir(projectDir)
+	screens := map[string]string{"idle": museTestIdleScreen, "working": museTestWorkingScreen}
+	for name, screen := range screens {
+		if err := os.WriteFile(filepath.Join(projectDir, name+".txt"), []byte(screen+"\n"), 0o644); err != nil {
+			t.Fatalf("write %s screen: %v", name, err)
+		}
+	}
+	if _, err := tmux.DefaultClient.Run("new-session", "-d", "-s", sessionName, "-x", "160", "-y", "45", "-c", projectDir,
+		"/bin/bash --noprofile --norc -i"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(sessionName) })
+	for index, name := range []string{"idle", "working"} {
+		paneID, err := tmux.DefaultClient.Run("new-window", "-t", sessionName, "-c", projectDir, "-P", "-F", "#{pane_id}",
+			fmt.Sprintf("cat %q; exec sleep 600", filepath.Join(projectDir, name+".txt")))
+		if err != nil {
+			t.Fatalf("create %s window: %v", name, err)
+		}
+		paneID = strings.TrimSpace(paneID)
+		if _, err := tmux.DefaultClient.Run("select-pane", "-t", paneID, "-T", fmt.Sprintf("%s__muse_%d", sessionName, index+1)); err != nil {
+			t.Fatalf("title %s pane: %v", name, err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			output, err := tmux.CapturePaneOutput(paneID, 50)
+			if err == nil && strings.Contains(output, "Muse Code") {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s screen: output=%q err=%v", name, output, err)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+	want := map[string]string{"0.0": "user", "1.0": "idle", "2.0": "busy"}
+
+	isWorking, err := GetIsWorking(t.Context(), IsWorkingOptions{Session: sessionName, PaneSelectors: []string{"1.0", "2.0"}})
+	if err != nil || !isWorking.Success {
+		t.Fatalf("GetIsWorking: err=%v out=%+v", err, isWorking)
+	}
+	for pane, recommendation := range map[string]agent.Recommendation{"1.0": agent.RecommendSafeToRestart, "2.0": agent.RecommendDoNotInterrupt} {
+		if got := isWorking.Panes[pane].Recommendation; got != string(recommendation) {
+			t.Fatalf("is-working %s recommendation = %q, want %q", pane, got, recommendation)
+		}
+	}
+
+	projection, err := collectNormalizedTmuxProjection(projectDir, time.Minute)
+	if err != nil {
+		t.Fatalf("collectNormalizedTmuxProjection: %v", err)
+	}
+	labels := snapshotPaneLabelMap([]tmux.Session{{Name: sessionName}})
+	projected := map[string]string{}
+	for _, row := range projection.Agents {
+		if row.SessionName == sessionName {
+			projected[labels[sessionName+":"+row.Pane]] = string(row.State)
+		}
+	}
+	assertPaneStates(t, "projection", projected, want)
+
+	snapshot, err := GetSnapshotWithOptions(nil, PaginationOptions{})
+	if err != nil {
+		t.Fatalf("GetSnapshotWithOptions: %v", err)
+	}
+	live := map[string]string{}
+	for _, sess := range snapshot.Sessions {
+		if sess.Name == sessionName {
+			for _, a := range sess.Agents {
+				live[a.Pane] = a.State
+			}
+		}
+	}
+	assertPaneStates(t, "snapshot", live, want)
+
+	dashboard, err := GetDashboard()
+	if err != nil {
+		t.Fatalf("GetDashboard: %v", err)
+	}
+	dashboardStates := map[string]string{}
+	for _, sess := range dashboard.Agents {
+		if sess.Name == sessionName {
+			for _, a := range sess.Agents {
+				dashboardStates[a.Pane] = a.State
+			}
+		}
+	}
+	// The dashboard lists agent panes only.
+	assertPaneStates(t, "dashboard", dashboardStates, map[string]string{"1.0": "idle", "2.0": "busy"})
+}
+
+func assertPaneStates(t *testing.T, surface string, got, want map[string]string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("%s pane states = %v, want %v", surface, got, want)
+		return
+	}
+	for pane, state := range want {
+		if got[pane] != state {
+			t.Errorf("%s pane %s state = %q, want %q (all: %v)", surface, pane, got[pane], state, got)
+		}
 	}
 }
 

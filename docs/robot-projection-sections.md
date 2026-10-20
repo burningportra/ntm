@@ -127,7 +127,7 @@ type AgentInfo struct {
     Pane           string   `json:"pane"`           // "window.pane" format
     Type           string   `json:"type"`           // claude, codex, antigravity, gemini (legacy)
     Variant        string   `json:"variant,omitempty"` // Model variant
-    State          string   `json:"state"`          // idle, busy, error, compacting
+    State          string   `json:"state"`          // idle, busy, error, unknown, user
     StateTimestamp string   `json:"state_timestamp"` // When state last changed
     Confidence     float64  `json:"confidence"`     // Detection confidence
     DetectionMethod string  `json:"detection_method"` // How agent was detected

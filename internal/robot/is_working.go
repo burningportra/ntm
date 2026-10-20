@@ -12,6 +12,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/process"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -412,120 +413,12 @@ func GetIsWorking(ctx context.Context, opts IsWorkingOptions) (*IsWorkingOutput,
 			continue
 		}
 
-		paneHint := sel.hint
 		paneObservation, found := observationsByID[sel.id]
-		if !found || paneObservation.Current.Freshness != statuspkg.FreshnessFresh || paneObservation.Current.Error != "" {
-			workStatus := paneWorkStatusFromObservation(paneObservation)
-			if !found {
-				workStatus.ObservationState = string(statuspkg.StateUnknown)
-				workStatus.ObservationFreshness = string(statuspkg.FreshnessUnavailable)
-				workStatus.ObservationError = "pane missing from canonical observation"
-			}
-			workStatus.Recommendation = string(agent.RecommendErrorState)
-			workStatus.RecommendationReason = "Current pane output is unavailable; inspect the pane before acting"
-			workStatus.Confidence = 0
-			workStatus.Indicators = WorkIndicators{Work: []string{}, Limit: []string{}}
-			workStatus.IndicatorBasis = "observation_unavailable"
-			if workStatus.AgentType == "" {
-				workStatus.AgentType = string(agent.AgentTypeUnknown)
-			}
-			output.Panes[paneKey] = workStatus
+		status, classified := classifyPaneWork(parser, paneObservation, found, sel.hint, opts.Verbose)
+		if !classified {
+			output.Panes[paneKey] = status
 			output.Summary.ErrorCount++
 			continue
-		}
-		content := paneObservation.RawOutput
-
-		if paneObservation.Current.Status.State == statuspkg.StateUnknown {
-			// The richer parser below may still recognize provider-specific UI
-			// chrome, but preserve the canonical state alongside that verdict.
-			paneObservation.Current.Confidence = 0.25
-		}
-
-		// Parse the already-captured output. Hint with the tmux-tracked agent
-		// type so we do not misclassify mixed historical scrollback.
-		state, err := parser.ParseWithHint(content, paneHint)
-		if err != nil {
-			workStatus := paneWorkStatusFromObservation(paneObservation)
-			workStatus.AgentType = string(agent.AgentTypeUnknown)
-			workStatus.Recommendation = string(agent.RecommendUnknown)
-			workStatus.RecommendationReason = fmt.Sprintf("Parse failed: %v", err)
-			workStatus.ObservationError = err.Error()
-			workStatus.Confidence = 0
-			workStatus.Indicators = WorkIndicators{Work: []string{}, Limit: []string{}}
-			workStatus.IndicatorBasis = "parse_error"
-			output.Panes[paneKey] = workStatus
-			output.Summary.ErrorCount++
-			continue
-		}
-
-		// Build the pane status.
-		workStatus := paneWorkStatusFromObservation(paneObservation)
-		workStatus.AgentType = string(state.Type)
-		workStatus.IsWorking = state.IsWorking
-		workStatus.IsIdle = state.IsIdle
-		workStatus.IsRateLimited = state.IsRateLimited
-		workStatus.IsContextLow = state.IsContextLow
-		workStatus.ContextRemaining = state.ContextRemaining
-		workStatus.Confidence = state.Confidence
-		workStatus.Indicators = WorkIndicators{
-			Work:  state.WorkIndicators,
-			Limit: state.LimitIndicators,
-		}
-		workStatus.Recommendation = string(state.GetRecommendation())
-		workStatus.RecommendationReason = getRecommendationReason(state)
-		status := workStatus
-
-		// Live-window THINKING override (#133). The legacy parser can mark a
-		// pane idle when its prompt-pattern view does not see in-flight work
-		// driven by another orchestrator, but `--robot-activity` would still
-		// classify the same scrollback as THINKING from the trailing live
-		// window. Without this override, --robot-is-working and downstream
-		// --robot-agent-health (which reads our IsWorking) recommend
-		// SAFE_TO_RESTART for a Codex pane that is actually mid-tool-call.
-		// The canonical SessionObserver applies the same live-window gate
-		// before dispatch; this brings the restart/health
-		// surfaces into agreement with --robot-activity / IsLiveBusy.
-		//
-		// Skip the override on user/unknown panes: the wildcard
-		// CategoryThinking patterns in the library (braille spinner,
-		// "loading…", "processing…", trailing dots) would otherwise falsely
-		// flag normal shell output as agent work, and these panes have no
-		// AI agent for --robot-is-working to reason about. Use state.Type
-		// (parser's view, hint-confirmed) rather than the raw tmux hint so
-		// content-detected agents on hint-less panes still get the override.
-		//
-		// Re-derive the recommendation from the corrected current state. A live
-		// window supersedes stale prompt/error matches, while rate-limit and
-		// context-low signals retain their normal precedence. ParseWithHint
-		// returns a fresh *AgentState, so this mutation is local to this pane.
-		liveBusy := applyLiveBusyOverride(content, state)
-		if liveBusy {
-			status.IsWorking = true
-			status.IsIdle = false
-			status.Recommendation = string(state.GetRecommendation())
-			status.RecommendationReason = getRecommendationReason(state)
-			// Defensive copy: append might extend the underlying array of
-			// state.WorkIndicators in place if it has spare capacity. Even
-			// though the parser is not known to reuse slices today, copying
-			// keeps the override marker stable regardless of parser internals.
-			work := make([]string, len(status.Indicators.Work), len(status.Indicators.Work)+1)
-			copy(work, status.Indicators.Work)
-			status.Indicators.Work = append(work, "live_window_thinking")
-		}
-		parsedStatus := status
-		applyCanonicalWorkSafety(&status, paneObservation, liveBusy)
-		status.IndicatorBasis = workIndicatorBasis(state, liveBusy, parsedStatus, status, paneObservation)
-
-		// Ensure indicators are never nil
-		if status.Indicators.Work == nil {
-			status.Indicators.Work = []string{}
-		}
-		if status.Indicators.Limit == nil {
-			status.Indicators.Limit = []string{}
-		}
-
-		if opts.Verbose {
-			status.RawSample = state.RawSample
 		}
 
 		// OPTIONAL semantic-progress signal (#199). Computed ONLY under
@@ -570,6 +463,178 @@ func GetIsWorking(ctx context.Context, opts IsWorkingOptions) (*IsWorkingOutput,
 	output.Query.PanesRequested = requestedTargets
 
 	return output, nil
+}
+
+// classifyPaneWork is the per-pane work classifier behind --robot-is-working.
+// Through runtimeAgentState it also decides the agent state that
+// --robot-snapshot, --robot-status and --robot-dashboard report (bd-p7es6).
+// It reads only the observation's captured output and never calls tmux, so a
+// caller that already captured a pane classifies it without capturing again.
+// observed is false when the pane is missing from the observation. The bool
+// result is false when there is no current output to classify or the parser
+// rejected it; the returned status then says why.
+func classifyPaneWork(parser agent.Parser, paneObservation statuspkg.PaneObservation, observed bool, hint agent.AgentType, verbose bool) (PaneWorkStatus, bool) {
+	if !observed || paneObservation.Current.Freshness != statuspkg.FreshnessFresh || paneObservation.Current.Error != "" {
+		workStatus := paneWorkStatusFromObservation(paneObservation)
+		if !observed {
+			workStatus.ObservationState = string(statuspkg.StateUnknown)
+			workStatus.ObservationFreshness = string(statuspkg.FreshnessUnavailable)
+			workStatus.ObservationError = "pane missing from canonical observation"
+		}
+		workStatus.Recommendation = string(agent.RecommendErrorState)
+		workStatus.RecommendationReason = "Current pane output is unavailable; inspect the pane before acting"
+		workStatus.Confidence = 0
+		workStatus.Indicators = WorkIndicators{Work: []string{}, Limit: []string{}}
+		workStatus.IndicatorBasis = "observation_unavailable"
+		if workStatus.AgentType == "" {
+			workStatus.AgentType = string(agent.AgentTypeUnknown)
+		}
+		return workStatus, false
+	}
+	content := paneObservation.RawOutput
+
+	if paneObservation.Current.Status.State == statuspkg.StateUnknown {
+		// The richer parser below may still recognize provider-specific UI
+		// chrome, but preserve the canonical state alongside that verdict.
+		paneObservation.Current.Confidence = 0.25
+	}
+
+	// Parse the already-captured output. Hint with the tmux-tracked agent
+	// type so we do not misclassify mixed historical scrollback.
+	parsed, err := parser.ParseWithHint(content, hint)
+	if err != nil {
+		workStatus := paneWorkStatusFromObservation(paneObservation)
+		workStatus.AgentType = string(agent.AgentTypeUnknown)
+		workStatus.Recommendation = string(agent.RecommendUnknown)
+		workStatus.RecommendationReason = fmt.Sprintf("Parse failed: %v", err)
+		workStatus.ObservationError = err.Error()
+		workStatus.Confidence = 0
+		workStatus.Indicators = WorkIndicators{Work: []string{}, Limit: []string{}}
+		workStatus.IndicatorBasis = "parse_error"
+		return workStatus, false
+	}
+
+	// Build the pane status.
+	status := paneWorkStatusFromObservation(paneObservation)
+	status.AgentType = string(parsed.Type)
+	status.IsWorking = parsed.IsWorking
+	status.IsIdle = parsed.IsIdle
+	status.IsRateLimited = parsed.IsRateLimited
+	status.IsContextLow = parsed.IsContextLow
+	status.ContextRemaining = parsed.ContextRemaining
+	status.Confidence = parsed.Confidence
+	status.Indicators = WorkIndicators{
+		Work:  parsed.WorkIndicators,
+		Limit: parsed.LimitIndicators,
+	}
+	status.Recommendation = string(parsed.GetRecommendation())
+	status.RecommendationReason = getRecommendationReason(parsed)
+
+	// Live-window THINKING override (#133). The legacy parser can mark a
+	// pane idle when its prompt-pattern view does not see in-flight work
+	// driven by another orchestrator, but `--robot-activity` would still
+	// classify the same scrollback as THINKING from the trailing live
+	// window. Without this override, --robot-is-working and downstream
+	// --robot-agent-health (which reads our IsWorking) recommend
+	// SAFE_TO_RESTART for a Codex pane that is actually mid-tool-call.
+	// The canonical SessionObserver applies the same live-window gate
+	// before dispatch; this brings the restart/health
+	// surfaces into agreement with --robot-activity / IsLiveBusy.
+	//
+	// Skip the override on user/unknown panes: the wildcard
+	// CategoryThinking patterns in the library (braille spinner,
+	// "loading…", "processing…", trailing dots) would otherwise falsely
+	// flag normal shell output as agent work, and these panes have no
+	// AI agent for --robot-is-working to reason about. Use parsed.Type
+	// (parser's view, hint-confirmed) rather than the raw tmux hint so
+	// content-detected agents on hint-less panes still get the override.
+	//
+	// Re-derive the recommendation from the corrected current state. A live
+	// window supersedes stale prompt/error matches, while rate-limit and
+	// context-low signals retain their normal precedence. ParseWithHint
+	// returns a fresh *AgentState, so this mutation is local to this pane.
+	liveBusy := applyLiveBusyOverride(content, parsed)
+	if liveBusy {
+		status.IsWorking = true
+		status.IsIdle = false
+		status.Recommendation = string(parsed.GetRecommendation())
+		status.RecommendationReason = getRecommendationReason(parsed)
+		// Defensive copy: append might extend the underlying array of
+		// parsed.WorkIndicators in place if it has spare capacity. Even
+		// though the parser is not known to reuse slices today, copying
+		// keeps the override marker stable regardless of parser internals.
+		work := make([]string, len(status.Indicators.Work), len(status.Indicators.Work)+1)
+		copy(work, status.Indicators.Work)
+		status.Indicators.Work = append(work, "live_window_thinking")
+	}
+	parsedStatus := status
+	applyCanonicalWorkSafety(&status, paneObservation, liveBusy)
+	status.IndicatorBasis = workIndicatorBasis(parsed, liveBusy, parsedStatus, status, paneObservation)
+
+	// Ensure indicators are never nil
+	if status.Indicators.Work == nil {
+		status.Indicators.Work = []string{}
+	}
+	if status.Indicators.Limit == nil {
+		status.Indicators.Limit = []string{}
+	}
+
+	if verbose {
+		status.RawSample = parsed.RawSample
+	}
+	return status, true
+}
+
+// observedPaneWork classifies one pane of a canonical session observation with
+// classifyPaneWork, hinted with the pane's tmux agent type exactly as
+// --robot-is-working hints it. It returns nil when the pane could not be
+// classified.
+func observedPaneWork(parser agent.Parser, paneObservation statuspkg.PaneObservation) *PaneWorkStatus {
+	hint := agent.AgentType(paneAgentType(paneObservation.Metadata)).Canonical()
+	status, classified := classifyPaneWork(parser, paneObservation, true, hint, false)
+	if !classified {
+		return nil
+	}
+	return &status
+}
+
+// classifyCapturedPaneWork classifies output another collector already
+// captured. It feeds the capture through the observer's state machine without
+// another tmux call, then classifies it with observedPaneWork.
+func classifyCapturedPaneWork(observer *statuspkg.SessionObserver, parser agent.Parser, session string, pane tmux.PaneActivity, output, captureErr string) *PaneWorkStatus {
+	var err error
+	if captureErr != "" {
+		err = errors.New(captureErr)
+	}
+	return observedPaneWork(parser, observer.ObservePaneCapture(session, pane, output, err))
+}
+
+// runtimeAgentState maps a pane's work verdict onto the agent state vocabulary
+// that --robot-snapshot, --robot-status and --robot-dashboard report: idle,
+// busy, error, unknown, and user.
+//
+// User panes report "user" whatever their output shows. They hold no agent,
+// --robot-is-working skips them as control panes, and the canonical detector's
+// activity signal is window-scoped, so a shell sitting at its prompt reads as
+// working whenever a sibling pane in the same window is busy. A user pane is
+// never a dispatch target, so reporting it idle would invite misrouted prompts.
+func runtimeAgentState(agentType string, work *PaneWorkStatus) state.AgentState {
+	if normalizeAgentType(agentType) == "user" {
+		return state.AgentStateUser
+	}
+	if work == nil {
+		return state.AgentStateUnknown
+	}
+	switch agent.Recommendation(work.Recommendation) {
+	case agent.RecommendRateLimitedWait, agent.RecommendErrorState:
+		return state.AgentStateError
+	case agent.RecommendDoNotInterrupt, agent.RecommendContextLowContinue:
+		return state.AgentStateBusy
+	case agent.RecommendSafeToRestart:
+		return state.AgentStateIdle
+	default:
+		return state.AgentStateUnknown
+	}
 }
 
 func newRobotSessionObserver(lines int) *statuspkg.SessionObserver {
