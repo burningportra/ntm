@@ -142,8 +142,10 @@ func defaultPatterns() []Pattern {
 		// "◇ Thinking (3s · esc to interrupt)" line for the whole turn, so
 		// muse_working must outrank the composer; it is a thinking pattern and
 		// so only counts in the live tail, where Muse replaces the working line
-		// with the reply once the turn ends.
-		{Name: "muse_banner", RegexStr: `(?m)^\s*Muse Code \d+\.\d+`, Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Muse Code version banner"},
+		// with the reply once the turn ends. The "Muse Code 1.4.11" banner is
+		// not an idle signal: it stays on screen above a draft or a dialog, and
+		// an idle Muse always shows the empty composer, so the composer alone
+		// keeps these verdicts in line with agent.MuseIdlePromptShowing.
 		{Name: "muse_composer", RegexStr: museComposerRegex(), Agent: "muse", State: StateWaiting, Category: CategoryIdle, Priority: 101, Description: "Muse Code empty composer, or one showing a dim tip"},
 		{Name: "muse_working", RegexStr: agent.MuseWorkingLinePattern, Agent: "muse", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "Muse Code live working line (e.g. ◇ Thinking (3s · esc to interrupt))"},
 		// Muse asks "Do you trust this workspace?" before its first turn in an

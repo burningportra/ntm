@@ -1113,8 +1113,10 @@ func TestMusePatterns_ComposerIdleUnlessWorkingLineLive(t *testing.T) {
 		"finished":    museTestFinishedScreen,
 		"interrupted": museTestInterruptedScreen,
 	} {
-		if !lib.HasIdlePrompt(screen, "muse") {
-			t.Errorf("%s Muse screen has no idle pattern match", name)
+		// The interrupted screen's composer holds the restored prompt as a
+		// draft, so it is not idle (TestMusePatterns_DraftAgreesWithMuseIdlePromptShowing).
+		if wantIdle := name != "interrupted"; lib.HasIdlePrompt(screen, "muse") != wantIdle {
+			t.Errorf("%s Muse screen: HasIdlePrompt = %v, want %v", name, !wantIdle, wantIdle)
 		}
 		if lib.HasThinkingIndicator(screen, "muse") {
 			t.Errorf("%s Muse screen matched a thinking pattern", name)
@@ -1161,6 +1163,53 @@ func TestMusePatterns_ClassifierStates(t *testing.T) {
 			}
 			if activity.State != tc.want {
 				t.Fatalf("State = %q, want %q (patterns %v)", activity.State, tc.want, activity.DetectedPatterns)
+			}
+		})
+	}
+}
+
+// TestMusePatterns_DraftAgreesWithMuseIdlePromptShowing pins the robot
+// verdicts for a Muse composer holding a draft to agent.MuseIdlePromptShowing,
+// which the parser and status detectors use. The muse_banner idle pattern
+// matched the banner anywhere in the capture, so the same drafted pane read
+// idle while the banner was on screen and active once it scrolled off.
+func TestMusePatterns_DraftAgreesWithMuseIdlePromptShowing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		screen string
+		idle   bool
+	}{
+		{name: "empty composer under the banner", screen: museTestIdleScreen, idle: true},
+		{name: "finished turn under the banner", screen: museTestFinishedScreen, idle: true},
+		{name: "tip composer, banner scrolled off", screen: museTestTipScreen, idle: true},
+		{name: "draft restored by an interrupt, banner on screen", screen: museTestInterruptedScreen},
+		{name: "draft, banner scrolled off", screen: museTestTipDraftScreen},
+		{name: "draft under the banner", screen: strings.Replace(museTestIdleScreen, "\n❯\n", "\n❯ draft not sent\n", 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agent.MuseIdlePromptShowing(tc.screen); got != tc.idle {
+				t.Fatalf("fixture: agent.MuseIdlePromptShowing = %v, want %v", got, tc.idle)
+			}
+			wantState := "active"
+			if tc.idle {
+				wantState = "idle"
+			}
+			if got := determineState(tc.screen, "muse"); got != wantState {
+				t.Errorf("determineState = %q, want %q", got, wantState)
+			}
+			if got := HasIdlePattern(tc.screen, "muse"); got != tc.idle {
+				t.Errorf("HasIdlePattern = %v, want %v", got, tc.idle)
+			}
+			sc := NewStateClassifier("%1", &ClassifierConfig{AgentType: "muse", HysteresisDuration: 0})
+			if _, err := sc.ClassifyWithOutput(tc.screen); err != nil {
+				t.Fatalf("baseline: %v", err)
+			}
+			activity, err := sc.ClassifyWithOutput(tc.screen)
+			if err != nil {
+				t.Fatalf("ClassifyWithOutput: %v", err)
+			}
+			if gotIdle := activity.State == StateWaiting; gotIdle != tc.idle {
+				t.Errorf("classifier State = %q, want idle=%v (patterns %v)", activity.State, tc.idle, activity.DetectedPatterns)
 			}
 		})
 	}
