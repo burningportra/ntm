@@ -6439,6 +6439,109 @@ func TestFetchAgentMailDataIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 	}
 }
 
+// newSlowInboxMailServer serves an Agent Mail project whose agents are names
+// plus the human overseer. fetch_inbox answers each agent with one unread
+// message after delay, fails "Broken" with a tool error, and holds "Stuck"
+// until the caller gives up. It counts the fetch_inbox calls that peeked.
+func newSlowInboxMailServer(t *testing.T, names []string, delay time.Duration) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	agentRows := []map[string]string{{"name": agentmail.HumanOverseerAgentName, "program": "ntm"}}
+	for _, name := range names {
+		agentRows = append(agentRows, map[string]string{"name": name, "program": "claude-code", "model": "opus"})
+	}
+	agentsJSON, err := json.Marshal(agentRows)
+	if err != nil {
+		t.Fatalf("marshal agents: %v", err)
+	}
+	var peeked atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		resp := agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{}`)}
+		params, _ := req.Params.(map[string]interface{})
+		switch req.Method {
+		case "resources/read":
+			uri, _ := params["uri"].(string)
+			text := "[]"
+			if strings.Contains(uri, "resource://agents/") {
+				text = string(agentsJSON)
+			}
+			contents, _ := json.Marshal(map[string]interface{}{"contents": []map[string]string{{"text": text}}})
+			resp.Result = contents
+		case "tools/call":
+			args, _ := params["arguments"].(map[string]interface{})
+			if params["name"] != "fetch_inbox" {
+				break
+			}
+			if args["mark_read"] == false {
+				peeked.Add(1)
+			}
+			agentName, _ := args["agent_name"].(string)
+			wait := delay
+			if agentName == "Stuck" {
+				wait = time.Minute
+			}
+			select {
+			case <-time.After(wait):
+			case <-r.Context().Done():
+				return
+			}
+			if agentName == "Broken" {
+				resp.Result = nil
+				resp.Error = &agentmail.JSONRPCError{Code: -32000, Message: "inbox unavailable"}
+				break
+			}
+			resp.Result = json.RawMessage(`[{"id":1,"subject":"for ` + agentName + `","thread_id":"t-` + agentName + `","created_ts":"2026-10-20T00:00:00Z","importance":"normal","kind":"to"}]`)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(server.Close)
+	return server, &peeked
+}
+
+// bd-o4u96: snapshot read inboxes one at a time inside its budget, so on a
+// project with dozens of agents most never appeared, with nothing saying so.
+func TestFetchAgentMailDataReadsInboxesConcurrentlyAndListsUnreadOnes(t *testing.T) {
+	healthy := make([]string, 3*agentmail.InboxPeekConcurrency)
+	for i := range healthy {
+		healthy[i] = fmt.Sprintf("Agent%02d", i)
+	}
+	server, peeked := newSlowInboxMailServer(t, append([]string{"Broken", "Stuck"}, healthy...), 150*time.Millisecond)
+	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
+
+	// Read serially, the healthy inboxes alone take 3.6 s.
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	summary, _, statsMap := fetchAgentMailDataContext(ctx, client, "/data/projects/ntm")
+	if summary == nil || !summary.Available {
+		t.Fatalf("summary = %+v, want available", summary)
+	}
+	if len(summary.Agents) != len(healthy)+2 || len(statsMap) != len(healthy)+2 {
+		t.Fatalf("agents = %d, stats = %d, want every agent but the overseer (%d)", len(summary.Agents), len(statsMap), len(healthy)+2)
+	}
+	for _, name := range healthy {
+		if stats := summary.Agents[name]; stats.Error != "" || stats.Unread != 1 {
+			t.Fatalf("%s = %+v, want its one unread message", name, stats)
+		}
+	}
+	for _, name := range []string{"Broken", "Stuck"} {
+		if stats := summary.Agents[name]; stats.Error == "" {
+			t.Fatalf("%s = %+v, want an error saying its inbox was not read", name, stats)
+		}
+	}
+	if summary.AgentsNotRead != 2 || summary.TotalUnread != len(healthy) || summary.ThreadsKnown != len(healthy) {
+		t.Fatalf("summary = %+v, want 2 agents not read and %d unread in %d threads", summary, len(healthy), len(healthy))
+	}
+	if got := peeked.Load(); got != int64(len(healthy)+2) {
+		t.Fatalf("peeked fetch_inbox calls = %d, want %d", got, len(healthy)+2)
+	}
+}
+
 func TestBuildCorrelationGraphMailSummaryIgnoresReadMessagesForUnreadCounts(t *testing.T) {
 	origDir, _ := os.Getwd()
 	t.Cleanup(func() {

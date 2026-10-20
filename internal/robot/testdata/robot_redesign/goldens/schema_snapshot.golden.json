@@ -776,6 +776,10 @@
             "description": "Agents",
             "type": "object"
           },
+          "agents_not_read": {
+            "description": "Agents not read",
+            "type": "integer"
+          },
           "available": {
             "description": "Available",
             "type": "boolean"
@@ -804,6 +808,10 @@
       },
       "SnapshotAgentMailStats": {
         "properties": {
+          "error": {
+            "description": "Error",
+            "type": "string"
+          },
           "pane": {
             "description": "Pane",
             "type": "string"

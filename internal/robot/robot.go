@@ -4580,42 +4580,32 @@ func fetchAgentMailDataContext(parent context.Context, client *agentmail.Client,
 	}
 	statsMap := make(map[string]SnapshotAgentMailStats)
 
+	// Read one at a time, a few dozen inboxes on a busy server never fit the
+	// budget and most agents went missing (bd-o4u96).
+	peeks := client.PeekInboxes(ctx, agentmail.FetchInboxOptions{
+		ProjectKey: projectKey,
+		Limit:      25,
+	}, mailAgentNames(agents))
 	threadSet := make(map[string]struct{})
-	for _, agent := range agents {
-		if agent.Name == "HumanOverseer" {
-			continue
+	for name, peek := range peeks {
+		var stats SnapshotAgentMailStats
+		if peek.Err != nil {
+			stats.Error = fmt.Sprintf("inbox not read: %v", peek.Err)
+			summary.AgentsNotRead++
 		}
-
-		inbox, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
-			ProjectKey:    projectKey,
-			AgentName:     agent.Name,
-			Limit:         25,
-			IncludeBodies: false,
-			Peek:          true,
-		})
-		if err != nil {
-			continue
-		}
-		unread := 0
-		pendingAck := 0
-		for _, msg := range inbox {
+		for _, msg := range peek.Messages {
 			if msg.AckRequired {
-				pendingAck++
+				stats.PendingAck++
 			}
 			if !isUnreadInboxMessage(msg) {
 				continue
 			}
-			unread++
-			threadKey := inboxThreadKey(msg)
-			threadSet[threadKey] = struct{}{}
+			stats.Unread++
+			threadSet[inboxThreadKey(msg)] = struct{}{}
 		}
-		summary.TotalUnread += unread
-		stats := SnapshotAgentMailStats{
-			Unread:     unread,
-			PendingAck: pendingAck,
-		}
-		summary.Agents[agent.Name] = stats
-		statsMap[agent.Name] = stats
+		summary.TotalUnread += stats.Unread
+		summary.Agents[name] = stats
+		statsMap[name] = stats
 	}
 
 	if len(threadSet) > 0 {
@@ -4623,6 +4613,19 @@ func fetchAgentMailDataContext(parent context.Context, client *agentmail.Client,
 	}
 
 	return summary, agents, statsMap
+}
+
+// mailAgentNames lists the agents whose inboxes robot surfaces read: every
+// registered agent but the human overseer.
+func mailAgentNames(agents []agentmail.Agent) []string {
+	names := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		if agent.Name == agentmail.HumanOverseerAgentName {
+			continue
+		}
+		names = append(names, agent.Name)
+	}
+	return names
 }
 
 // resolveAgentsForSession maps stable pane identifiers to agent names for a specific session.
@@ -4796,12 +4799,16 @@ type SnapshotAgent struct {
 
 // SnapshotAgentMail represents Agent Mail availability and inbox state.
 type SnapshotAgentMail struct {
-	Available    bool                              `json:"available"`
-	Reason       string                            `json:"reason,omitempty"`
-	Project      string                            `json:"project,omitempty"`
-	TotalUnread  int                               `json:"total_unread,omitempty"`
-	Agents       map[string]SnapshotAgentMailStats `json:"agents,omitempty"`
-	ThreadsKnown int                               `json:"threads_known,omitempty"`
+	Available   bool   `json:"available"`
+	Reason      string `json:"reason,omitempty"`
+	Project     string `json:"project,omitempty"`
+	TotalUnread int    `json:"total_unread,omitempty"`
+	// AgentsNotRead counts the agents whose inbox could not be read in time.
+	// Each stays in Agents with its Error, and TotalUnread and ThreadsKnown
+	// leave them out.
+	AgentsNotRead int                               `json:"agents_not_read,omitempty"`
+	Agents        map[string]SnapshotAgentMailStats `json:"agents,omitempty"`
+	ThreadsKnown  int                               `json:"threads_known,omitempty"`
 }
 
 // SnapshotAgentMailStats holds per-agent inbox counts.
@@ -4809,6 +4816,9 @@ type SnapshotAgentMailStats struct {
 	Pane       string `json:"pane,omitempty"`
 	Unread     int    `json:"unread"`
 	PendingAck int    `json:"pending_ack"`
+	// Error says why the inbox was not read; Unread and PendingAck are then
+	// unknown rather than zero.
+	Error string `json:"error,omitempty"`
 }
 
 // SnapshotCoordinationSummary is the compact projection-backed coordination

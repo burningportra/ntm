@@ -1390,6 +1390,175 @@ func TestFetchInbox_UnmarshalFormats(t *testing.T) {
 	})
 }
 
+// peekInboxServer answers fetch_inbox with one message per agent after delay,
+// fails the agent named "Broken" with a tool error, and records every call's
+// arguments and the most calls it held at once.
+type peekInboxServer struct {
+	*httptest.Server
+	mu          sync.Mutex
+	inFlight    int
+	maxInFlight int
+	calls       []map[string]interface{}
+}
+
+func newPeekInboxServer(t *testing.T, delay time.Duration) *peekInboxServer {
+	t.Helper()
+	s := &peekInboxServer{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		args, _ := params["arguments"].(map[string]interface{})
+		s.mu.Lock()
+		s.calls = append(s.calls, args)
+		s.inFlight++
+		s.maxInFlight = max(s.maxInFlight, s.inFlight)
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			s.inFlight--
+			s.mu.Unlock()
+		}()
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+
+		resp := JSONRPCResponse{JSONRPC: "2.0", ID: req.ID}
+		agentName, _ := args["agent_name"].(string)
+		if agentName == "Broken" {
+			resp.Error = &JSONRPCError{Code: -32000, Message: "inbox unavailable"}
+		} else {
+			resp.Result = json.RawMessage(`[{"id":1,"subject":"hi ` + agentName + `","created_ts":"2026-01-01T00:00:00Z","importance":"normal","kind":"to"}]`)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	return s
+}
+
+func peekAgentNames(prefix string, n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = prefix + string(rune('A'+i))
+	}
+	return names
+}
+
+// bd-o4u96: snapshot, --robot-mail and the coordination source all read every
+// agent's inbox through PeekInboxes. Callers sharing one client, like the
+// projection refresh's coordination source and tmux enrichment, share one
+// bound, and nothing is marked read.
+func TestPeekInboxesSharesOneBoundAcrossCallers(t *testing.T) {
+	t.Parallel()
+
+	const delay = 40 * time.Millisecond
+	server := newPeekInboxServer(t, delay)
+	defer server.Close()
+	c := NewClient(WithBaseURL(server.URL + "/"))
+
+	first := peekAgentNames("First", 2*InboxPeekConcurrency)
+	second := peekAgentNames("Second", 2*InboxPeekConcurrency)
+	results := make([]map[string]InboxPeek, 2)
+	started := time.Now()
+	var wg sync.WaitGroup
+	for i, names := range [][]string{first, second} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = c.PeekInboxes(context.Background(), FetchInboxOptions{ProjectKey: "/test/project", Limit: 25}, names)
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(started)
+
+	for i, names := range [][]string{first, second} {
+		if len(results[i]) != len(names) {
+			t.Fatalf("call %d returned %d inboxes, want %d", i, len(results[i]), len(names))
+		}
+		for _, name := range names {
+			peek, ok := results[i][name]
+			if !ok || peek.Err != nil || len(peek.Messages) != 1 || peek.Messages[0].Subject != "hi "+name {
+				t.Fatalf("inbox %s = %+v (present %v), want its one message", name, peek, ok)
+			}
+		}
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.maxInFlight > InboxPeekConcurrency || server.maxInFlight < 2 {
+		t.Fatalf("max concurrent fetch_inbox calls = %d, want 2..%d across both callers", server.maxInFlight, InboxPeekConcurrency)
+	}
+	if serial := time.Duration(len(first)+len(second)) * delay; elapsed >= serial {
+		t.Fatalf("PeekInboxes took %v, no faster than reading serially (%v)", elapsed, serial)
+	}
+	for _, args := range server.calls {
+		if args["mark_read"] != false || args["project_key"] != "/test/project" || args["limit"] != float64(25) {
+			t.Fatalf("fetch_inbox arguments = %v, want mark_read=false with the caller's project and limit", args)
+		}
+	}
+}
+
+// bd-o4u96, bd-7x7t7: an inbox that could not be read must stay visible to
+// the caller instead of reading as an empty one.
+func TestPeekInboxesReportsEveryInboxItCouldNotRead(t *testing.T) {
+	t.Parallel()
+
+	t.Run("tool error", func(t *testing.T) {
+		t.Parallel()
+		server := newPeekInboxServer(t, 0)
+		defer server.Close()
+		c := NewClient(WithBaseURL(server.URL + "/"))
+
+		peeks := c.PeekInboxes(context.Background(), FetchInboxOptions{ProjectKey: "/test/project"}, []string{"Broken", "BlueLake"})
+		if peek := peeks["Broken"]; peek.Err == nil || len(peek.Messages) != 0 {
+			t.Fatalf("Broken = %+v, want the tool error and no messages", peek)
+		}
+		if peek := peeks["BlueLake"]; peek.Err != nil || len(peek.Messages) != 1 {
+			t.Fatalf("BlueLake = %+v, want its one message", peek)
+		}
+	})
+
+	t.Run("context ends mid fan-out", func(t *testing.T) {
+		t.Parallel()
+		server := newPeekInboxServer(t, 5*time.Second)
+		defer server.Close()
+		c := NewClient(WithBaseURL(server.URL + "/"))
+		names := peekAgentNames("Slow", 3*InboxPeekConcurrency)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		peeks := c.PeekInboxes(ctx, FetchInboxOptions{ProjectKey: "/test/project"}, names)
+		if len(peeks) != len(names) {
+			t.Fatalf("PeekInboxes returned %d entries, want one per agent (%d)", len(peeks), len(names))
+		}
+		for _, name := range names {
+			if peek := peeks[name]; peek.Err == nil {
+				t.Fatalf("%s = %+v, want an error once the context ended", name, peek)
+			}
+		}
+	})
+
+	t.Run("context already ended", func(t *testing.T) {
+		t.Parallel()
+		server := newPeekInboxServer(t, 0)
+		defer server.Close()
+		c := NewClient(WithBaseURL(server.URL + "/"))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		peeks := c.PeekInboxes(ctx, FetchInboxOptions{ProjectKey: "/test/project"}, []string{"BlueLake", "GreenCastle"})
+		for _, name := range []string{"BlueLake", "GreenCastle"} {
+			if peek, ok := peeks[name]; !ok || peek.Err == nil {
+				t.Fatalf("%s = %+v (present %v), want a context error", name, peek, ok)
+			}
+		}
+	})
+}
+
 // TestDisabledClientNeverContactsServer locks bd-89xi0: a client built for an
 // [agent_mail] enabled = false configuration refuses probes, tool calls,
 // resource reads and the HTTP overseer fallback with ErrDisabled, and never

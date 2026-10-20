@@ -74,6 +74,11 @@ type Client struct {
 	// health surfaces can explain WHY Agent Mail looks unavailable instead
 	// of collapsing the reason into a bare bool.
 	lastAvailabilityErr atomic.Value // of availabilityErrBox
+
+	// inboxPeekSlots holds one token per PeekInboxes fetch in flight, so
+	// every caller sharing this client shares InboxPeekConcurrency.
+	inboxPeekSlotsOnce sync.Once
+	inboxPeekSlots     chan struct{}
 }
 
 // availabilityErrBox wraps an error for atomic.Value storage (atomic.Value
@@ -676,6 +681,59 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (json.RawMessage,
 	return c.rpc(ctx, "resources/read", "resources/read", map[string]string{
 		"uri": uri,
 	})
+}
+
+// InboxPeekConcurrency bounds how many inboxes one client's PeekInboxes calls
+// read from Agent Mail at once. On the live server 45 inboxes took 57.5 s one
+// at a time, 13.3 s eight at a time and 21.6 s sixteen at a time, since more
+// slows the server every other agent shares (bd-jv2dq).
+const InboxPeekConcurrency = 8
+
+// InboxPeek is one agent's inbox as PeekInboxes read it.
+type InboxPeek struct {
+	Messages []InboxMessage
+	// Err is why the inbox was not read: the fetch_inbox failure, or ctx's
+	// error when ctx ended before the read started.
+	Err error
+}
+
+// PeekInboxes reads each named agent's inbox without marking anything read,
+// at most InboxPeekConcurrency at a time across every caller sharing this
+// client. Observers peek so they never consume other agents' mail
+// (bd-ntu8w). opts supplies every field but AgentName and Peek. The result
+// holds an entry for every name, so a caller can tell an inbox it could not
+// read from an empty one.
+func (c *Client) PeekInboxes(ctx context.Context, opts FetchInboxOptions, agentNames []string) map[string]InboxPeek {
+	c.inboxPeekSlotsOnce.Do(func() {
+		c.inboxPeekSlots = make(chan struct{}, InboxPeekConcurrency)
+	})
+
+	peeks := make([]InboxPeek, len(agentNames))
+	var wg sync.WaitGroup
+	for i, name := range agentNames {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case c.inboxPeekSlots <- struct{}{}:
+			case <-ctx.Done():
+				peeks[i].Err = ctx.Err()
+				return
+			}
+			defer func() { <-c.inboxPeekSlots }()
+			agentOpts := opts
+			agentOpts.AgentName = name
+			agentOpts.Peek = true
+			peeks[i].Messages, peeks[i].Err = c.FetchInbox(ctx, agentOpts)
+		}()
+	}
+	wg.Wait()
+
+	byAgent := make(map[string]InboxPeek, len(agentNames))
+	for i, name := range agentNames {
+		byAgent[name] = peeks[i]
+	}
+	return byAgent
 }
 
 // httpBaseURL returns the HTTP REST API base URL derived from the MCP base URL.

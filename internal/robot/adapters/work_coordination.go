@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
@@ -26,11 +25,6 @@ const (
 	defaultMailBacklogThreshold      = 5
 	defaultSafePreviewLimit          = 120
 
-	// inboxFetchConcurrency bounds how many inboxes the coordination source
-	// reads from Agent Mail at once. Read one at a time, a project's few
-	// dozen agents took tens of seconds (bd-jv2dq); read all at once, they
-	// saturate the shared server every other agent is using.
-	inboxFetchConcurrency = 8
 	// triageEnrichmentReserve is the part of a work collection's deadline
 	// triage may not use, so the section is returned before the deadline
 	// and the source still counts as available.
@@ -497,52 +491,26 @@ func (a *CoordinationAdapter) collectCoordination(ctx context.Context, now time.
 	return NormalizeCoordination(inputs)
 }
 
-// fetchInboxes peeks at every agent's inbox, at most inboxFetchConcurrency at
-// a time. Peeking leaves the messages unread for their recipients (bd-ntu8w).
-// An inbox that fails to load is left out.
+// fetchInboxes peeks at every agent's inbox but the human overseer's through
+// client.PeekInboxes. An inbox that fails to load is left out.
 func fetchInboxes(ctx context.Context, client *agentmail.Client, projectKey string, agents []agentmail.Agent) map[string][]agentmail.InboxMessage {
 	names := make([]string, 0, len(agents))
 	for _, agent := range agents {
-		if agent.Name == "HumanOverseer" {
+		if agent.Name == agentmail.HumanOverseerAgentName {
 			continue
 		}
 		names = append(names, agent.Name)
 	}
 
-	inboxes := make([][]agentmail.InboxMessage, len(names))
-	fetched := make([]bool, len(names))
-	slots := make(chan struct{}, inboxFetchConcurrency)
-	var wg sync.WaitGroup
-	for i, name := range names {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case slots <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			defer func() { <-slots }()
-			inbox, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
-				ProjectKey:    projectKey,
-				AgentName:     name,
-				Limit:         25,
-				IncludeBodies: true,
-				Peek:          true,
-			})
-			if err != nil {
-				return
-			}
-			inboxes[i] = inbox
-			fetched[i] = true
-		}()
-	}
-	wg.Wait()
-
-	byAgent := make(map[string][]agentmail.InboxMessage, len(names))
-	for i, name := range names {
-		if fetched[i] {
-			byAgent[name] = inboxes[i]
+	peeks := client.PeekInboxes(ctx, agentmail.FetchInboxOptions{
+		ProjectKey:    projectKey,
+		Limit:         25,
+		IncludeBodies: true,
+	}, names)
+	byAgent := make(map[string][]agentmail.InboxMessage, len(peeks))
+	for name, peek := range peeks {
+		if peek.Err == nil {
+			byAgent[name] = peek.Messages
 		}
 	}
 	return byAgent

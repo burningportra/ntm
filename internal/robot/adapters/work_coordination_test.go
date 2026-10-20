@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -873,14 +872,13 @@ func TestWorkAdapterUsesTriageThatIsReadyInTime(t *testing.T) {
 	}
 }
 
-// bd-jv2dq: inboxes were read one at a time, 0.5-1.2 s each on the shared
-// server, so a few dozen agents never fit the source budget.
-func TestFetchInboxesReadsConcurrentlyWithinTheBound(t *testing.T) {
+// The coordination source peeks at every inbox but the overseer's, with
+// bodies for the previews, and leaves out an inbox that failed to load.
+func TestFetchInboxesPeeksEveryAgentButTheOverseer(t *testing.T) {
 	t.Parallel()
 
 	var mu sync.Mutex
-	inFlight, maxInFlight := 0, 0
-	markRead := map[string]any{}
+	requested := map[string]map[string]interface{}{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -889,52 +887,33 @@ func TestFetchInboxesReadsConcurrentlyWithinTheBound(t *testing.T) {
 		}
 		params, _ := req.Params.(map[string]interface{})
 		args, _ := params["arguments"].(map[string]interface{})
-		mu.Lock()
-		inFlight++
-		if inFlight > maxInFlight {
-			maxInFlight = inFlight
-		}
 		agentName, _ := args["agent_name"].(string)
-		value, set := args["mark_read"]
-		if !set {
-			value = "<unset>"
-		}
-		markRead[agentName] = value
-		mu.Unlock()
-		time.Sleep(50 * time.Millisecond)
 		mu.Lock()
-		inFlight--
+		requested[agentName] = args
 		mu.Unlock()
-		writeJSONRPCResult(t, w, req.ID, []any{})
+		if agentName == "Broken" {
+			writeJSONRPCError(t, w, req.ID, -32000, "inbox unavailable")
+			return
+		}
+		writeJSONRPCResult(t, w, req.ID, []map[string]any{{"id": 1, "subject": "hi " + agentName}})
 	}))
 	defer server.Close()
 
-	agents := []agentmail.Agent{{Name: "HumanOverseer"}}
-	for i := 0; i < 3*inboxFetchConcurrency; i++ {
-		agents = append(agents, agentmail.Agent{Name: "Agent" + strconv.Itoa(i)})
-	}
+	agents := []agentmail.Agent{{Name: agentmail.HumanOverseerAgentName}, {Name: "BlueLake"}, {Name: "Broken"}, {Name: "GreenCastle"}}
 	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL + "/"))
-	started := time.Now()
 	inboxes := fetchInboxes(context.Background(), client, "/data/projects/ntm", agents)
-	elapsed := time.Since(started)
 
-	if len(inboxes) != 3*inboxFetchConcurrency {
-		t.Fatalf("fetched %d inboxes, want %d", len(inboxes), 3*inboxFetchConcurrency)
-	}
-	if _, ok := inboxes["HumanOverseer"]; ok {
-		t.Fatal("fetched the HumanOverseer inbox")
+	if len(inboxes) != 2 || len(inboxes["BlueLake"]) != 1 || len(inboxes["GreenCastle"]) != 1 {
+		t.Fatalf("inboxes = %+v, want BlueLake and GreenCastle with one message each", inboxes)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if maxInFlight > inboxFetchConcurrency || maxInFlight < 2 {
-		t.Fatalf("max concurrent inbox reads = %d, want 2..%d", maxInFlight, inboxFetchConcurrency)
+	if _, ok := requested[agentmail.HumanOverseerAgentName]; ok {
+		t.Fatal("fetched the HumanOverseer inbox")
 	}
-	if serial := time.Duration(len(inboxes)) * 50 * time.Millisecond; elapsed >= serial {
-		t.Fatalf("fan-out took %v, no faster than reading serially (%v)", elapsed, serial)
-	}
-	for agent, value := range markRead {
-		if value != false {
-			t.Fatalf("fetch_inbox for %s sent mark_read=%v, want false", agent, value)
+	for agent, args := range requested {
+		if args["mark_read"] != false || args["include_bodies"] != true {
+			t.Fatalf("fetch_inbox for %s sent %v, want mark_read=false and include_bodies=true", agent, args)
 		}
 	}
 }
