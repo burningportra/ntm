@@ -141,6 +141,49 @@ func TestSessionRelaunchCommandsMuse(t *testing.T) {
 	}
 }
 
+// A pane spawned with an effort is titled `model@effort`, and save captures
+// that variant as the pane's model. Restore passed it whole to --model, so a
+// `wonder-full@xhigh` Muse pane relaunched as `--model 'wonder-full@xhigh'`,
+// which Muse rejects at launch. Restore must split the variant and render the
+// model and effort through the launch template, as spawn does.
+func TestApplyModelCommands_SplitsModelAndEffort(t *testing.T) {
+	prevCfg := cfg
+	cfg = config.Default()
+	t.Cleanup(func() { cfg = prevCfg })
+
+	state := &session.SessionState{
+		Name:    "demo",
+		WorkDir: "/data/projects/demo",
+		Panes: []session.PaneState{
+			{Index: 1, AgentType: "muse", Model: "wonder-full@xhigh"},
+			{Index: 2, AgentType: "cod", Model: "gpt-5.5@high"},
+			{Index: 3, AgentType: "cc", Model: "opus@max"},
+			{Index: 4, AgentType: "muse", Model: "spark"},
+		},
+	}
+	applyModelCommands(state)
+
+	if want := "muse --yolo --model 'muse-wonder-full-1.0' --reasoning-effort 'xhigh'"; state.Panes[0].Command != want {
+		t.Errorf("muse model@effort pane Command = %q, want %q", state.Panes[0].Command, want)
+	}
+	codex := state.Panes[1].Command
+	if !strings.Contains(codex, "-m 'gpt-5.5'") || !strings.Contains(codex, "model_reasoning_effort='high'") {
+		t.Errorf("codex model@effort pane Command = %q, want -m 'gpt-5.5' and model_reasoning_effort='high'", codex)
+	}
+	claude := state.Panes[2].Command
+	if !strings.Contains(claude, "--model '"+cfg.Models.GetModelName("cc", "opus")+"'") || !strings.Contains(claude, "--effort 'max'") {
+		t.Errorf("claude model@effort pane Command = %q, want the resolved opus model and --effort 'max'", claude)
+	}
+	for i, ps := range state.Panes {
+		if strings.Contains(ps.Command, "@") {
+			t.Errorf("pane %d Command = %q still carries the model@effort variant", i+1, ps.Command)
+		}
+	}
+	if want := "muse --yolo --model 'muse-spark-1.3'"; state.Panes[3].Command != want {
+		t.Errorf("muse bare-alias pane Command = %q, want %q", state.Panes[3].Command, want)
+	}
+}
+
 // The save, show and restore summaries listed only Claude, Codex, Gemini and
 // Grok, so a saved Muse session read "0 Claude, 0 Codex, 0 Gemini" as if it had
 // no agents at all.

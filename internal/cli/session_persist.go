@@ -872,13 +872,19 @@ func buildAgentCommands(state *session.SessionState) session.AgentCommands {
 // Panes without a captured model are left untouched (Command stays empty) and
 // fall back to the no-model type command. Render failures are non-fatal: the
 // pane keeps its empty Command rather than receiving a broken template string.
+//
+// The captured model is the pane's title variant, which spawn writes as
+// `model@effort` when the pane has a reasoning effort (bd-qs6rj). It is split
+// back into model and effort here, as spawn passes them, so a
+// `wonder-full@xhigh` pane relaunches with the resolved model and
+// `--reasoning-effort xhigh` rather than `--model 'wonder-full@xhigh'`.
 func applyModelCommands(state *session.SessionState) {
 	if cfg == nil || state == nil {
 		return
 	}
 	for i := range state.Panes {
 		ps := &state.Panes[i]
-		modelAlias := strings.TrimSpace(ps.Model)
+		modelAlias, reasoningEffort := tmux.ParsePaneVariant(ps.Model)
 		if modelAlias == "" {
 			continue
 		}
@@ -887,13 +893,14 @@ func applyModelCommands(state *session.SessionState) {
 			continue
 		}
 		v := config.AgentTemplateVars{
-			SessionName:    state.Name,
-			ProjectDir:     state.WorkDir,
-			PaneIndex:      ps.Index,
-			AgentType:      string(cliType),
-			Model:          ResolveModel(cliType, modelAlias),
-			ModelAlias:     modelAlias,
-			ModelRequested: true,
+			SessionName:     state.Name,
+			ProjectDir:      state.WorkDir,
+			PaneIndex:       ps.Index,
+			AgentType:       string(cliType),
+			Model:           ResolveModel(cliType, modelAlias),
+			ModelAlias:      modelAlias,
+			ModelRequested:  true,
+			ReasoningEffort: reasoningEffort,
 		}
 		if rendered, err := config.GenerateAgentCommand(tmpl, v); err == nil && rendered != "" {
 			ps.Command = rendered
