@@ -1618,8 +1618,12 @@ func TestUpdateSessionActivityUsesSavedSessionAgentProjectKey(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, ".config"))
+	newAgentMailActivityRecorder(t)
 
-	cfg = &config.Config{ProjectsBase: filepath.Join(t.TempDir(), "projects")}
+	cfg = &config.Config{
+		ProjectsBase: filepath.Join(t.TempDir(), "projects"),
+		AgentMail:    config.AgentMailConfig{Enabled: true},
+	}
 
 	cwdDir := t.TempDir()
 	if err := os.Chdir(cwdDir); err != nil {
@@ -1670,8 +1674,12 @@ func TestUpdateSessionActivityIgnoresCWDMatchedWrongProject(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, ".config"))
+	newAgentMailActivityRecorder(t)
 
-	cfg = &config.Config{ProjectsBase: filepath.Join(t.TempDir(), "projects")}
+	cfg = &config.Config{
+		ProjectsBase: filepath.Join(t.TempDir(), "projects"),
+		AgentMail:    config.AgentMailConfig{Enabled: true},
+	}
 
 	wrongProject := filepath.Join(t.TempDir(), "wrong-project")
 	if err := os.MkdirAll(filepath.Join(wrongProject, ".git"), 0o755); err != nil {
@@ -1730,6 +1738,82 @@ func TestUpdateSessionActivityIgnoresCWDMatchedWrongProject(t *testing.T) {
 	if !updatedActual.LastActiveAt.After(actualTime) {
 		t.Fatalf("expected actual project timestamp to advance beyond %v, got %v", actualTime, updatedActual.LastActiveAt)
 	}
+}
+
+// TestUpdateSessionActivitySilentWhenDisabled locks bd-h90o7: refreshing the
+// session agent's activity on attach is automatic integration, so with
+// [agent_mail] enabled = false it neither contacts the server nor touches the
+// saved session agent.
+func TestUpdateSessionActivitySilentWhenDisabled(t *testing.T) {
+	origCfg := cfg
+	t.Cleanup(func() { cfg = origCfg })
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, ".config"))
+	server := newAgentMailActivityRecorder(t)
+
+	cfg = &config.Config{
+		ProjectsBase: filepath.Join(t.TempDir(), "projects"),
+		AgentMail:    config.AgentMailConfig{Enabled: false},
+	}
+
+	session := "mysession"
+	project := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir project git dir: %v", err)
+	}
+	oldTime := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	info := &agentmail.SessionAgentInfo{
+		AgentName:    "GreenCastle",
+		ProjectKey:   project,
+		RegisteredAt: oldTime,
+		LastActiveAt: oldTime,
+	}
+	if err := agentmail.SaveSessionAgent(session, project, info); err != nil {
+		t.Fatalf("save session agent: %v", err)
+	}
+
+	updateSessionActivity(t.Context(), session)
+
+	if got := server.requests(); len(got) != 0 {
+		t.Fatalf("Agent Mail requests = %v, want none when [agent_mail] enabled = false", got)
+	}
+	saved, err := agentmail.LoadSessionAgent(session, project)
+	if err != nil || saved == nil {
+		t.Fatalf("load session agent = %v, %v", saved, err)
+	}
+	if !saved.LastActiveAt.Equal(oldTime) {
+		t.Fatalf("LastActiveAt = %v, want it left at %v when [agent_mail] enabled = false", saved.LastActiveAt, oldTime)
+	}
+}
+
+// agentMailActivityRecorder stands in for the Agent Mail server in the
+// session activity tests, so they never reach a real server on 8765.
+type agentMailActivityRecorder struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func newAgentMailActivityRecorder(t *testing.T) *agentMailActivityRecorder {
+	t.Helper()
+	rec := &agentMailActivityRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		rec.seen = append(rec.seen, r.Method+" "+r.URL.Path)
+		rec.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("AGENT_MAIL_URL", server.URL+"/")
+	return rec
+}
+
+func (r *agentMailActivityRecorder) requests() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.seen...)
 }
 
 func TestResolveAgentMailScopeWithPreferenceNormalizesExplicitPrefix(t *testing.T) {

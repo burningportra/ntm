@@ -84,6 +84,42 @@ type serveOptions struct {
 	CORSAllowOrigins []string
 }
 
+// newServeConfig assembles the server settings from the command options and
+// the loaded config. The mail endpoints build their Agent Mail client from
+// cfg.AgentMail, so serve honours [agent_mail] url, token and enabled.
+func newServeConfig(opts serveOptions, mode serve.AuthMode, stateStore *state.Store, auditStore *serve.AuditStore) serve.Config {
+	agentMailCfg := config.Default().AgentMail
+	if cfg != nil {
+		agentMailCfg = cfg.AgentMail
+	}
+
+	return serve.Config{
+		Host:           opts.Host,
+		Port:           opts.Port,
+		PublicBaseURL:  opts.PublicBaseURL,
+		Version:        Version,
+		EventBus:       events.DefaultBus,
+		StateStore:     stateStore,
+		AllowedOrigins: opts.CORSAllowOrigins,
+		AuditStore:     auditStore,
+		AgentMail:      agentMailCfg,
+		Auth: serve.AuthConfig{
+			Mode:   mode,
+			APIKey: opts.APIKey,
+			OIDC: serve.OIDCConfig{
+				Issuer:   opts.OIDCIssuer,
+				Audience: opts.OIDCAudience,
+				JWKSURL:  opts.OIDCJWKSURL,
+			},
+			MTLS: serve.MTLSConfig{
+				CertFile:     opts.MTLSCert,
+				KeyFile:      opts.MTLSKey,
+				ClientCAFile: opts.MTLSCA,
+			},
+		},
+	}
+}
+
 func runServe(opts serveOptions) error {
 	// Open state store
 	stateStore, err := state.Open("")
@@ -154,36 +190,7 @@ func runServe(opts serveOptions) error {
 		}()
 	}
 
-	agentMailCfg := config.Default().AgentMail
-	if cfg != nil {
-		agentMailCfg = cfg.AgentMail
-	}
-
-	serverCfg := serve.Config{
-		Host:           opts.Host,
-		Port:           opts.Port,
-		PublicBaseURL:  opts.PublicBaseURL,
-		Version:        Version,
-		EventBus:       events.DefaultBus,
-		StateStore:     stateStore,
-		AllowedOrigins: opts.CORSAllowOrigins,
-		AuditStore:     auditStore,
-		AgentMail:      agentMailCfg,
-		Auth: serve.AuthConfig{
-			Mode:   mode,
-			APIKey: opts.APIKey,
-			OIDC: serve.OIDCConfig{
-				Issuer:   opts.OIDCIssuer,
-				Audience: opts.OIDCAudience,
-				JWKSURL:  opts.OIDCJWKSURL,
-			},
-			MTLS: serve.MTLSConfig{
-				CertFile:     opts.MTLSCert,
-				KeyFile:      opts.MTLSKey,
-				ClientCAFile: opts.MTLSCA,
-			},
-		},
-	}
+	serverCfg := newServeConfig(opts, mode, stateStore, auditStore)
 	if err := serve.ValidateConfig(serverCfg); err != nil {
 		return err
 	}

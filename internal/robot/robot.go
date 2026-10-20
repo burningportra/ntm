@@ -10340,11 +10340,7 @@ const agentMailProjectNotRegistered = "project not registered with Agent Mail"
 // the merged config for projectKey, the way the cli builds its own, so the
 // [agent_mail] url, token and enabled settings apply to robot commands too.
 func newAgentMailClient(projectKey string) *agentmail.Client {
-	cfg, err := config.LoadMerged(projectKey, config.DefaultPath())
-	if err != nil {
-		cfg = config.Default()
-	}
-	return cfg.AgentMail.NewClient(projectKey)
+	return config.AgentMailForProject(projectKey).NewClient(projectKey)
 }
 
 func isAgentMailDBLockError(err error) bool {

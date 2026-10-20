@@ -1350,6 +1350,18 @@ func (a AgentMailConfig) NewClient(projectKey string) *agentmail.Client {
 	return agentmail.NewClient(opts...)
 }
 
+// AgentMailForProject returns the [agent_mail] settings that apply in
+// projectDir: the global config merged with that project's overlay, or the
+// built-in defaults when the global config cannot be loaded. Packages that
+// have no loaded config of their own build their clients from these.
+func AgentMailForProject(projectDir string) AgentMailConfig {
+	cfg, err := LoadMerged(projectDir, DefaultPath())
+	if err != nil {
+		cfg = Default()
+	}
+	return cfg.AgentMail
+}
+
 // IntegrationsConfig holds external tool integration settings.
 type IntegrationsConfig struct {
 	DCG           DCGConfig           `toml:"dcg"`

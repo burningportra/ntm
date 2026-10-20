@@ -1626,8 +1626,13 @@ func runStatusWatch(parent context.Context, w io.Writer, session string, opts st
 }
 
 // updateSessionActivity updates the Agent Mail activity for a session.
-// This is non-blocking and silently ignores errors.
+// This is non-blocking and silently ignores errors. Attach refreshes the
+// activity automatically, so it stays silent when [agent_mail] enabled is
+// false.
 func updateSessionActivity(parent context.Context, sessionName string) {
+	if cfg != nil && !cfg.AgentMail.Enabled {
+		return
+	}
 	projectKey, err := resolveExplicitProjectDirForSessionContext(parent, sessionName)
 	if err != nil {
 		return

@@ -83,11 +83,7 @@ func (c *agentMailClientCache) get(projectKey string) *agentmail.Client {
 	// The merged config for the project supplies the server url and token.
 	// Mail steps are explicit actions, like ntm mail commands, so they run
 	// even when [agent_mail] enabled is false.
-	cfg, err := config.LoadMerged(projectKey, config.DefaultPath())
-	if err != nil {
-		cfg = config.Default()
-	}
-	settings := cfg.AgentMail
+	settings := config.AgentMailForProject(projectKey)
 	settings.Enabled = true
 	client := settings.NewClient(projectKey)
 	c.byProject[projectKey] = client

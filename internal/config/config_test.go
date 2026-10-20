@@ -87,6 +87,51 @@ func TestAgentMailConfigNewClient(t *testing.T) {
 	})
 }
 
+// TestAgentMailForProject locks bd-h90o7: the shared loader returns the global
+// [agent_mail] settings with the project's integrations.agent_mail overlay
+// applied, and the built-in defaults when the global config cannot be loaded.
+func TestAgentMailForProject(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	t.Setenv("NTM_CONFIG", configPath)
+	writeConfig := func(t *testing.T, path, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	writeConfig(t, configPath, "[agent_mail]\nenabled = true\nurl = \"http://127.0.0.1:1/mcp/\"\ntoken = \"global-token\"\n")
+
+	t.Run("global settings", func(t *testing.T) {
+		got := AgentMailForProject(t.TempDir())
+		if !got.Enabled || got.URL != "http://127.0.0.1:1/mcp/" || got.Token != "global-token" {
+			t.Fatalf("AgentMailForProject = %+v, want the global [agent_mail] settings", got)
+		}
+	})
+	t.Run("project overlay disables", func(t *testing.T) {
+		project := t.TempDir()
+		writeConfig(t, filepath.Join(project, ".ntm", "config.toml"), "[integrations]\nagent_mail = false\n")
+		got := AgentMailForProject(project)
+		if got.Enabled {
+			t.Fatalf("AgentMailForProject = %+v, want Enabled false from the project overlay", got)
+		}
+		if got.URL != "http://127.0.0.1:1/mcp/" || got.Token != "global-token" {
+			t.Fatalf("AgentMailForProject = %+v, want the global url and token kept", got)
+		}
+	})
+	t.Run("unreadable global config", func(t *testing.T) {
+		broken := filepath.Join(t.TempDir(), "broken.toml")
+		writeConfig(t, broken, "[agent_mail\nurl = \n")
+		t.Setenv("NTM_CONFIG", broken)
+		got := AgentMailForProject(t.TempDir())
+		if want := Default().AgentMail; !reflect.DeepEqual(got, want) {
+			t.Fatalf("AgentMailForProject = %+v, want the defaults %+v", got, want)
+		}
+	})
+}
+
 func TestDefault(t *testing.T) {
 	cfg := Default()
 
