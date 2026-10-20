@@ -282,6 +282,14 @@ func newMockAgentMailMCPHandler(
 		params, _ := req.Params.(map[string]interface{})
 		toolName, _ := params["name"].(string)
 		args, _ := params["arguments"].(map[string]interface{})
+		if req.Method == "resources/read" {
+			// Resource reads are keyed "resource:" plus the URI without its
+			// query; the handler gets the full URI as args["uri"].
+			uri, _ := params["uri"].(string)
+			base, _, _ := strings.Cut(uri, "?")
+			toolName = "resource:" + base
+			args = map[string]interface{}{"uri": uri}
+		}
 
 		handler, ok := handlers[toolName]
 		if !ok {
@@ -501,19 +509,24 @@ func TestHandleMailInbox_SanitizesDisclosureFields(t *testing.T) {
 func TestHandleGetMessage_SanitizesDisclosureFields(t *testing.T) {
 
 	secret := strings.Repeat("s", 20)
+	var readURI string
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
-		"get_message": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
-			return &agentmail.Message{
-				ID:          42,
-				ProjectID:   1,
-				SenderID:    2,
-				Subject:     "Rotate credential",
-				BodyMD:      "Need token=" + secret + " before merge",
-				From:        "BlueLake",
-				To:          []string{"GreenStone"},
-				Importance:  "urgent",
-				AckRequired: true,
-				CreatedTS:   agentmail.FlexTime{},
+		// Neither Agent Mail server has a get_message tool; a message is read
+		// through its resource, answered here in the Rust server's shape.
+		"resource:resource://message/42": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+			readURI, _ = args["uri"].(string)
+			text, err := json.Marshal(map[string]interface{}{
+				"id": 42, "project_id": 1, "sender_id": 2, "thread_id": nil, "topic": nil,
+				"subject": "Rotate credential", "body_md": "Need token=" + secret + " before merge",
+				"importance": "urgent", "ack_required": true, "created_ts": "2026-10-20T03:04:19.300659Z",
+				"attachments": []interface{}{}, "from": "BlueLake", "to": []string{"GreenStone"},
+				"cc": []string{}, "bcc": []string{},
+			})
+			if err != nil {
+				t.Errorf("marshal message: %v", err)
+			}
+			return map[string]interface{}{
+				"contents": []map[string]interface{}{{"uri": readURI, "mimeType": "text/plain", "text": string(text)}},
 			}, nil
 		},
 	})
@@ -523,7 +536,7 @@ func TestHandleGetMessage_SanitizesDisclosureFields(t *testing.T) {
 	srv.mailClient = mailClient
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/messages/42", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/mail/messages/42?agent_name=GreenStone", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", "42")
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -532,6 +545,9 @@ func TestHandleGetMessage_SanitizesDisclosureFields(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(readURI, "agent=GreenStone") {
+		t.Fatalf("resource URI = %q, want the agent_name reader passed through", readURI)
 	}
 
 	var resp struct {
@@ -2055,17 +2071,13 @@ func TestHandleForceReleaseReservation_ReturnsMCPResultFields(t *testing.T) {
 	}
 }
 
-func TestHandleForceReleaseReservation_DeniedReturnsConflict(t *testing.T) {
+func TestHandleForceReleaseReservation_AlreadyReleasedReportsIt(t *testing.T) {
 
 	mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
 		"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
-			// The servers release nothing and send no reservation block for
-			// an id that was already released.
-			return map[string]interface{}{
-				"released":         0,
-				"released_at":      "2026-03-23T01:02:03Z",
-				"already_released": true,
-			}, nil
+			// The Rust server's reply for an id released before the call
+			// (am 0.3.36); the Python server sends the same shape.
+			return json.RawMessage(`{"released":0,"released_at":"2026-10-20T03:06:17.074611Z","already_released":true}`), nil
 		},
 	})
 
@@ -2081,16 +2093,22 @@ func TestHandleForceReleaseReservation_DeniedReturnsConflict(t *testing.T) {
 
 	srv.handleForceReleaseReservation(rec, req)
 
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var resp APIError
+	var resp map[string]interface{}
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp.ErrorCode != ErrCodeConflict {
-		t.Fatalf("error_code = %q, want %q", resp.ErrorCode, ErrCodeConflict)
+	if resp["already_released"] != true || resp["force_released"] != false {
+		t.Fatalf("response = %v, want already_released true and force_released false", resp)
+	}
+	if resp["released_at"] != "2026-10-20T03:06:17.074611Z" {
+		t.Fatalf("released_at = %#v, want the server's release time", resp["released_at"])
+	}
+	if resp["reservation_id"] != float64(17) {
+		t.Fatalf("reservation_id = %#v, want 17", resp["reservation_id"])
 	}
 }
 

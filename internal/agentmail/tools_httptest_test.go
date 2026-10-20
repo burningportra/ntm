@@ -3,8 +3,10 @@ package agentmail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -1065,19 +1067,155 @@ func TestUninstallPrecommitGuard(t *testing.T) {
 	}
 }
 
-func TestGetMessage_NotImplemented(t *testing.T) {
+// capturedRustMessageResourceResult is the JSON-RPC result of a real
+// resources/read of resource://message/54719 against the Rust Agent Mail
+// server, am 0.3.36: a self-addressed message.
+const capturedRustMessageResourceResult = `{"contents":[{"uri":"resource://message/54719?project=/Volumes/1tb/Projects/ntm","text":"{\"id\":54719,\"project_id\":65,\"sender_id\":2121,\"thread_id\":\"bd-xqu7h\",\"topic\":null,\"subject\":\"[bd-xqu7h] fixture: read through resource://message\",\"body_md\":\"Self-addressed fixture for bd-xqu7h. Body line with **markdown**.\",\"importance\":\"high\",\"ack_required\":true,\"created_ts\":\"2026-10-20T03:04:19.300659Z\",\"attachments\":[],\"from\":\"VioletLantern\",\"to\":[\"VioletLantern\"],\"cc\":[],\"bcc\":[]}","mimeType":"text/plain"}]}`
+
+// pythonMessageResourceResult is the same message as the Python server's
+// message_resource builds it (app.py _message_to_dict plus
+// _apply_sender_identity): reply_to and an offset timestamp, and no to, cc or
+// bcc.
+const pythonMessageResourceResult = `{"contents":[{"uri":"resource://message/54719?project=/Volumes/1tb/Projects/ntm","mimeType":"application/json","text":"{\"id\":54719,\"project_id\":65,\"sender_id\":2121,\"thread_id\":\"bd-xqu7h\",\"reply_to\":null,\"topic\":null,\"subject\":\"[bd-xqu7h] fixture: read through resource://message\",\"importance\":\"high\",\"ack_required\":true,\"created_ts\":\"2026-10-20T03:04:19.300659+00:00\",\"attachments\":[],\"body_md\":\"Self-addressed fixture for bd-xqu7h. Body line with **markdown**.\",\"from\":\"VioletLantern\"}"}]}`
+
+// messageResourceServer answers resources/read with result and every other
+// method with "Method not found", as the servers answer a get_message call.
+// It records each resource URI it was asked for.
+func messageResourceServer(t *testing.T, result string, uris *[]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		resp := JSONRPCResponse{JSONRPC: "2.0", ID: req.ID}
+		if req.Method == "resources/read" {
+			params, _ := req.Params.(map[string]interface{})
+			uri, _ := params["uri"].(string)
+			*uris = append(*uris, uri)
+			resp.Result = json.RawMessage(result)
+		} else {
+			resp.Error = &JSONRPCError{Code: -32601, Message: "Method not found"}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+// TestGetMessage_ReadsMessageResource replays both servers' message resource
+// through GetMessage. Neither server has a get_message tool, so the read must
+// go through resource://message/{id}.
+func TestGetMessage_ReadsMessageResource(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){}))
+	created := time.Date(2026, 10, 20, 3, 4, 19, 300659000, time.UTC)
+	tests := []struct {
+		name   string
+		result string
+		wantTo []string
+	}{
+		{name: "rust", result: capturedRustMessageResourceResult, wantTo: []string{"VioletLantern"}},
+		{name: "python", result: pythonMessageResourceResult},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var uris []string
+			server := messageResourceServer(t, tt.result, &uris)
+			defer server.Close()
+
+			c := NewClient(WithBaseURL(server.URL + "/"))
+			msg, err := c.GetMessage(context.Background(), "/Volumes/1tb/Projects/ntm", "", 54719)
+			if err != nil {
+				t.Fatalf("GetMessage: %v", err)
+			}
+			if msg.ID != 54719 || msg.ProjectID != 65 || msg.SenderID != 2121 || msg.From != "VioletLantern" ||
+				msg.Subject != "[bd-xqu7h] fixture: read through resource://message" ||
+				msg.BodyMD != "Self-addressed fixture for bd-xqu7h. Body line with **markdown**." ||
+				msg.Importance != "high" || !msg.AckRequired ||
+				msg.ThreadID == nil || *msg.ThreadID != "bd-xqu7h" || !msg.CreatedTS.Time.Equal(created) {
+				t.Errorf("message decoded as %+v", *msg)
+			}
+			if strings.Join(msg.To, ",") != strings.Join(tt.wantTo, ",") {
+				t.Errorf("To = %v, want %v", msg.To, tt.wantTo)
+			}
+
+			if len(uris) != 1 {
+				t.Fatalf("resource reads = %v, want one", uris)
+			}
+			u, err := url.Parse(uris[0])
+			if err != nil {
+				t.Fatalf("parse resource URI %q: %v", uris[0], err)
+			}
+			if u.Scheme != "resource" || u.Host != "message" || u.Path != "/54719" {
+				t.Errorf("resource URI = %q, want resource://message/54719", uris[0])
+			}
+			q := u.Query()
+			if q.Get("project") != "/Volumes/1tb/Projects/ntm" || q.Get("format") != "json" {
+				t.Errorf("resource query = %v, want project and format=json", q)
+			}
+			if q.Has("agent") || q.Has("agent_token") {
+				t.Errorf("resource query = %v, want no reader without an agent name", q)
+			}
+		})
+	}
+}
+
+// TestGetMessage_SendsReaderAndCachedToken checks the reader the Python server
+// authenticates: the agent name, plus its registration token once cached.
+func TestGetMessage_SendsReaderAndCachedToken(t *testing.T) {
+	t.Parallel()
+
+	var uris []string
+	server := messageResourceServer(t, capturedRustMessageResourceResult, &uris)
 	defer server.Close()
 
 	c := NewClient(WithBaseURL(server.URL + "/"))
-	_, err := c.GetMessage(context.Background(), "/test", 42)
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	if _, err := c.GetMessage(context.Background(), "/proj", "BlueLake", 54719); err != nil {
+		t.Fatalf("GetMessage without token: %v", err)
 	}
-	if !IsNotImplemented(err) {
-		t.Fatalf("expected not-implemented error, got %v", err)
+	c.SetRegistrationToken("/proj", "BlueLake", "tok-123")
+	if _, err := c.GetMessage(context.Background(), "/proj", "BlueLake", 54719); err != nil {
+		t.Fatalf("GetMessage with token: %v", err)
+	}
+
+	if len(uris) != 2 {
+		t.Fatalf("resource reads = %v, want two", uris)
+	}
+	for i, wantToken := range []string{"", "tok-123"} {
+		u, err := url.Parse(uris[i])
+		if err != nil {
+			t.Fatalf("parse resource URI %q: %v", uris[i], err)
+		}
+		q := u.Query()
+		if q.Get("project") != "/proj" || q.Get("agent") != "BlueLake" || q.Get("agent_token") != wantToken {
+			t.Errorf("read %d query = %v, want project /proj, agent BlueLake, agent_token %q", i, q, wantToken)
+		}
+	}
+}
+
+// TestGetMessage_NotFound replays the Rust server's answer for a missing id
+// (am 0.3.36, error data trimmed to its type).
+func TestGetMessage_NotFound(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"Message not found: 999999999","data":{"error":{"type":"NOT_FOUND","message":"Message not found: 999999999","recoverable":true}}},"id":1}`))
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	_, err := c.GetMessage(context.Background(), "/Volumes/1tb/Projects/ntm", "", 999999999)
+	if !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("GetMessage error = %v, want ErrMessageNotFound", err)
 	}
 }
 
@@ -1211,7 +1349,14 @@ func TestForceReleaseReservation(t *testing.T) {
 		{
 			name:  "already released",
 			reply: `{"released":0,"released_at":"2026-10-20T02:54:51.367874Z","already_released":true}`,
-			want:  ForceReleaseResult{ReleasedAt: releasedAt},
+			want:  ForceReleaseResult{AlreadyReleased: true, ReleasedAt: releasedAt},
+		},
+		{
+			// The Python server releases a reservation whose TTL ran out
+			// before it looks at activity, and says so with expired.
+			name:  "python expired",
+			reply: `{"released":0,"released_at":"2026-10-20T02:54:51.367874+00:00","already_released":true,"expired":true}`,
+			want:  ForceReleaseResult{AlreadyReleased: true, ReleasedAt: releasedAt},
 		},
 	}
 
@@ -1237,7 +1382,8 @@ func TestForceReleaseReservation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if result.Success != tt.want.Success || result.PreviousHolder != tt.want.PreviousHolder ||
+			if result.Success != tt.want.Success || result.AlreadyReleased != tt.want.AlreadyReleased ||
+				result.PreviousHolder != tt.want.PreviousHolder ||
 				result.PathPattern != tt.want.PathPattern || result.Notified != tt.want.Notified {
 				t.Errorf("result = %+v, want %+v", *result, tt.want)
 			}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -597,12 +598,16 @@ func TestCustomCodecsWriteTheServerShape(t *testing.T) {
 		t.Errorf("force-release round trip = %+v, want %+v", back, released)
 	}
 
-	data, err = json.Marshal(ForceReleaseResult{})
+	data, err = json.Marshal(ForceReleaseResult{AlreadyReleased: true, ReleasedAt: released.ReleasedAt})
 	if err != nil {
-		t.Fatalf("Marshal empty ForceReleaseResult: %v", err)
+		t.Fatalf("Marshal already-released ForceReleaseResult: %v", err)
 	}
-	if err := json.Unmarshal(data, &back); err != nil || back.Success {
-		t.Errorf("already-released round trip = %+v (err %v) from %s, want Success false", back, err, data)
+	if err := json.Unmarshal(data, &back); err != nil || back.Success || !back.AlreadyReleased ||
+		back.ReleasedAt == nil || !back.ReleasedAt.Time.Equal(released.ReleasedAt.Time) {
+		t.Errorf("already-released round trip = %+v (err %v) from %s, want AlreadyReleased and no Success", back, err, data)
+	}
+	if !strings.Contains(string(data), `"already_released":true`) || strings.Contains(string(data), `"reservation"`) {
+		t.Errorf("already-released wire = %s, want already_released and no reservation", data)
 	}
 
 	row := SearchResult{ID: 7, Subject: "s", AckRequired: true, From: "BlueLake"}

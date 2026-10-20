@@ -2,7 +2,12 @@ package agentmail
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,8 +31,9 @@ type fakeAMClient struct {
 	ackCalls  []int
 	ackErr    error
 
-	getMessageCalls []int
-	getMessageErr   error
+	getMessageCalls  []int
+	getMessageAgents []string
+	getMessageErr    error
 }
 
 func (f *fakeAMClient) IsAvailableContext(ctx context.Context) bool {
@@ -44,8 +50,9 @@ func (f *fakeAMClient) IsAvailableContext(ctx context.Context) bool {
 	return f.available
 }
 
-func (f *fakeAMClient) GetMessage(ctx context.Context, projectKey string, messageID int) (*Message, error) {
+func (f *fakeAMClient) GetMessage(ctx context.Context, projectKey, agentName string, messageID int) (*Message, error) {
 	f.getMessageCalls = append(f.getMessageCalls, messageID)
+	f.getMessageAgents = append(f.getMessageAgents, agentName)
 	if f.getMessageErr != nil {
 		return nil, f.getMessageErr
 	}
@@ -269,8 +276,60 @@ func TestUnifiedMessengerRead_AgentMailMarksRead(t *testing.T) {
 	if len(am.getMessageCalls) != 1 || am.getMessageCalls[0] != 42 {
 		t.Fatalf("expected GetMessage called with 42, got %+v", am.getMessageCalls)
 	}
+	if len(am.getMessageAgents) != 1 || am.getMessageAgents[0] != "agent" {
+		t.Fatalf("GetMessage reader = %+v, want the messenger's agent", am.getMessageAgents)
+	}
 	if len(am.readCalls) != 1 || am.readCalls[0] != 42 {
 		t.Fatalf("expected MarkMessageRead called with 42, got %+v", am.readCalls)
+	}
+}
+
+// TestUnifiedMessengerRead_ReadsMessageResource drives Read through a real
+// Client against a server that, like both Agent Mail servers, has no
+// get_message tool: the message comes from resource://message/{id}, and Read
+// marks it read itself because the resource does not.
+func TestUnifiedMessengerRead_ReadsMessageResource(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		resp := JSONRPCResponse{JSONRPC: "2.0", ID: req.ID}
+		switch {
+		case req.Method == "resources/read":
+			calls = append(calls, "resources/read")
+			resp.Result = json.RawMessage(capturedRustMessageResourceResult)
+		case req.Method == "tools/call" && params["name"] == "mark_message_read":
+			calls = append(calls, "mark_message_read")
+			resp.Result = json.RawMessage(`{"message_id":54719,"read":true,"read_at":"2026-10-20T03:10:00Z"}`)
+		default:
+			if req.Method == "tools/call" {
+				calls = append(calls, fmt.Sprint(params["name"]))
+			}
+			resp.Error = &JSONRPCError{Code: -32601, Message: "Method not found"}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	messenger := NewUnifiedMessenger(client, nil, "/Volumes/1tb/Projects/ntm", "VioletLantern")
+	msg, err := messenger.Read(context.Background(), "am-54719")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if msg.ID != "am-54719" || msg.Channel != "agentmail" || msg.From != "VioletLantern" ||
+		msg.Subject != "[bd-xqu7h] fixture: read through resource://message" ||
+		msg.Body != "Self-addressed fixture for bd-xqu7h. Body line with **markdown**." ||
+		!msg.Timestamp.Equal(time.Date(2026, 10, 20, 3, 4, 19, 300659000, time.UTC)) {
+		t.Errorf("Read = %+v", *msg)
+	}
+	if got := strings.Join(calls, ","); got != "resources/read,mark_message_read" {
+		t.Errorf("calls = %s, want resources/read,mark_message_read", got)
 	}
 }
 

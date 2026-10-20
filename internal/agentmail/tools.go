@@ -1138,21 +1138,46 @@ func (c *Client) UninstallPrecommitGuard(ctx context.Context, repoPath string) e
 	return err
 }
 
-// GetMessage retrieves a specific message by ID.
-func (c *Client) GetMessage(ctx context.Context, projectKey string, messageID int) (*Message, error) {
-	args := map[string]interface{}{
-		"project_key": projectKey,
-		"message_id":  messageID,
+// GetMessage reads one message, body included, through the
+// resource://message/{id} resource, which both Agent Mail servers serve
+// (neither has a get_message tool). The Rust server needs only the project.
+// The Python server also needs the reading agent and its registration token,
+// and returns the message only to its sender or a recipient, so agentName
+// names the reader and its cached token goes along when the client has one;
+// the Rust server ignores both. Reading the resource does not mark the
+// message read on either server.
+func (c *Client) GetMessage(ctx context.Context, projectKey, agentName string, messageID int) (*Message, error) {
+	query := url.Values{}
+	query.Set("project", projectKey)
+	query.Set("format", "json")
+	if agentName != "" {
+		query.Set("agent", agentName)
+		if token := c.RegistrationToken(projectKey, agentName); token != "" {
+			query.Set("agent_token", token)
+		}
 	}
+	uri := fmt.Sprintf("resource://message/%d?%s", messageID, query.Encode())
 
-	result, err := c.callTool(ctx, "get_message", args)
+	result, err := c.ReadResource(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
 
+	var resource struct {
+		Contents []struct {
+			Text string `json:"text"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(result, &resource); err != nil {
+		return nil, NewAPIError("resource://message", 0, err)
+	}
+	if len(resource.Contents) == 0 {
+		return nil, NewAPIError("resource://message", 0, fmt.Errorf("%w: %d", ErrMessageNotFound, messageID))
+	}
+
 	var msg Message
-	if err := json.Unmarshal(result, &msg); err != nil {
-		return nil, NewAPIError("get_message", 0, err)
+	if err := json.Unmarshal([]byte(resource.Contents[0].Text), &msg); err != nil {
+		return nil, NewAPIError("resource://message", 0, err)
 	}
 
 	return &msg, nil

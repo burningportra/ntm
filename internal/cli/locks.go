@@ -982,17 +982,20 @@ Examples:
 	return cmd
 }
 
-// ForceReleaseResult is the JSON output for force-release.
+// ForceReleaseResult is the JSON output for force-release. An id that was
+// already released succeeds with AlreadyReleased set and ReleasedAt holding
+// when it was released.
 type ForceReleaseResult struct {
-	Success        bool       `json:"success"`
-	Session        string     `json:"session"`
-	Agent          string     `json:"agent"`
-	ReservationID  int        `json:"reservation_id"`
-	PreviousHolder string     `json:"previous_holder,omitempty"`
-	PathPattern    string     `json:"path_pattern,omitempty"`
-	ReleasedAt     *time.Time `json:"released_at,omitempty"`
-	Notified       bool       `json:"notified,omitempty"`
-	Error          string     `json:"error,omitempty"`
+	Success         bool       `json:"success"`
+	Session         string     `json:"session"`
+	Agent           string     `json:"agent"`
+	ReservationID   int        `json:"reservation_id"`
+	AlreadyReleased bool       `json:"already_released,omitempty"`
+	PreviousHolder  string     `json:"previous_holder,omitempty"`
+	PathPattern     string     `json:"path_pattern,omitempty"`
+	ReleasedAt      *time.Time `json:"released_at,omitempty"`
+	Notified        bool       `json:"notified,omitempty"`
+	Error           string     `json:"error,omitempty"`
 }
 
 func runForceRelease(ctx context.Context, session string, reservationID int, note string, notify, skipConfirm bool) error {
@@ -1076,7 +1079,9 @@ func runForceRelease(ctx context.Context, session string, reservationID int, not
 		result.Success = false
 		result.Error = err.Error()
 	} else if releaseResult != nil {
-		result.Success = releaseResult.Success
+		// An id that was already released leaves the same end state.
+		result.Success = releaseResult.Success || releaseResult.AlreadyReleased
+		result.AlreadyReleased = releaseResult.AlreadyReleased
 		result.PreviousHolder = releaseResult.PreviousHolder
 		result.PathPattern = releaseResult.PathPattern
 		if releaseResult.ReleasedAt != nil {
@@ -1084,9 +1089,11 @@ func runForceRelease(ctx context.Context, session string, reservationID int, not
 			result.ReleasedAt = &t
 		}
 		result.Notified = releaseResult.Notified
-		// Server may return success=false if reservation is not stale enough
-		if !releaseResult.Success {
-			result.Error = "force-release denied: reservation may not be stale or agent may still be active"
+		// Both servers refuse a reservation that still looks active with a
+		// tool error, so a reply that released nothing yet does not say the
+		// id was already released is unexpected.
+		if !result.Success {
+			result.Error = fmt.Sprintf("Agent Mail released nothing for reservation #%d", reservationID)
 		}
 	}
 
@@ -1102,6 +1109,14 @@ func runForceRelease(ctx context.Context, session string, reservationID int, not
 		return nil
 	}
 
+	if result.AlreadyReleased {
+		if result.ReleasedAt != nil {
+			fmt.Printf("Reservation #%d was already released at %s\n", reservationID, result.ReleasedAt.Format(time.RFC3339))
+		} else {
+			fmt.Printf("Reservation #%d was already released\n", reservationID)
+		}
+		return nil
+	}
 	if result.Success {
 		fmt.Printf("Force released reservation #%d\n", reservationID)
 		if result.PathPattern != "" {

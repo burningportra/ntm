@@ -27,7 +27,7 @@ type agentMailClient interface {
 	SendMessage(ctx context.Context, opts SendMessageOptions) (*SendResult, error)
 	MarkMessageRead(ctx context.Context, projectKey, agentName string, messageID int) (*MessageReadResult, error)
 	AcknowledgeMessage(ctx context.Context, projectKey, agentName string, messageID int) (*MessageAckResult, error)
-	GetMessage(ctx context.Context, projectKey string, messageID int) (*Message, error)
+	GetMessage(ctx context.Context, projectKey, agentName string, messageID int) (*Message, error)
 }
 
 type bdMessageClient interface {
@@ -233,8 +233,8 @@ func (m *UnifiedMessenger) Read(ctx context.Context, id string) (*UnifiedMessage
 				return nil, fmt.Errorf("invalid agent mail message ID: %w", err)
 			}
 
-			// Use the direct tool to fetch the message (much more efficient than scanning inbox)
-			found, err := m.amClient.GetMessage(ctx, m.projectKey, msgID)
+			// Read the message resource, which marks nothing read, so mark it below.
+			found, err := m.amClient.GetMessage(ctx, m.projectKey, m.agentName, msgID)
 			if cancellationErr := unifiedCancellationError(ctx, err, "get agent mail message"); cancellationErr != nil {
 				return nil, cancellationErr
 			}

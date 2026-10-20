@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/reservationsim"
 )
 
@@ -442,4 +445,65 @@ func TestLocksCheckResult_HeldStatePopulatesHolder(t *testing.T) {
 // envelope-shape tests above.
 func jsonMarshalIndent(v interface{}) ([]byte, error) {
 	return jsonEncodeIndent(v)
+}
+
+// TestRunForceReleaseReportsAlreadyReleased covers force-releasing an id that
+// was released before the call. Both servers reply {released: 0,
+// already_released: true}, which ntm locks force-release used to report as
+// "force-release denied" with a non-zero exit.
+func TestRunForceReleaseReportsAlreadyReleased(t *testing.T) {
+	resetFlags()
+	isolateSessionAgentStorage(t)
+
+	projectsBase := canonicalTempDir(t)
+	projectKey := filepath.Join(projectsBase, "mysession")
+	if err := os.MkdirAll(projectKey, 0755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	session := "mysession"
+	saveSessionAgentForTest(t, session, projectKey, "BlueLake")
+
+	releasedAt := time.Date(2026, 10, 20, 3, 6, 17, 74611000, time.UTC)
+	stub := newMailStub(t, nil)
+	defer stub.Close()
+	stub.forceReleaseResult = agentmail.ForceReleaseResult{
+		AlreadyReleased: true,
+		ReleasedAt:      &agentmail.FlexTime{Time: releasedAt},
+	}
+
+	oldCfg := cfg
+	cfg = &config.Config{ProjectsBase: projectsBase}
+	t.Cleanup(func() { cfg = oldCfg })
+	t.Setenv("AGENT_MAIL_URL", stub.server.URL+"/")
+	t.Chdir(canonicalTempDir(t))
+
+	out, err := captureStdout(t, func() error {
+		return runForceRelease(t.Context(), session, 14525, "", false, true)
+	})
+	if err != nil {
+		t.Fatalf("runForceRelease: %v (stdout %q)", err, out)
+	}
+	if want := "Reservation #14525 was already released at 2026-10-20T03:06:17Z"; !strings.Contains(out, want) {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = false })
+	out, err = captureStdout(t, func() error {
+		return runForceRelease(t.Context(), session, 14525, "", false, true)
+	})
+	if err != nil {
+		t.Fatalf("runForceRelease --json: %v (stdout %q)", err, out)
+	}
+	var got ForceReleaseResult
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode %q: %v", out, err)
+	}
+	if !got.Success || !got.AlreadyReleased || got.Error != "" || got.ReservationID != 14525 ||
+		got.ReleasedAt == nil || !got.ReleasedAt.Equal(releasedAt) {
+		t.Errorf("--json result = %+v, want success, already_released and released_at %s", got, releasedAt)
+	}
+	if len(stub.forceReleaseCalls) != 2 || stub.forceReleaseCalls[0].ReservationID != 14525 {
+		t.Errorf("force-release calls = %+v, want two for #14525", stub.forceReleaseCalls)
+	}
 }

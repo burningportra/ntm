@@ -846,12 +846,16 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	}, reqID)
 }
 
-// handleGetMessage handles GET /api/v1/mail/messages/{id}
+// handleGetMessage handles GET /api/v1/mail/messages/{id}. The optional
+// agent_name query parameter names the reader: the Python Agent Mail server
+// returns a message only to its sender or a recipient, and the Rust server
+// ignores it. Reading a message does not mark it read.
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	idStr := chi.URLParam(r, "id")
+	agentName := r.URL.Query().Get("agent_name")
 
-	slog.Info("get mail message", "request_id", reqID, "message_id", idStr)
+	slog.Info("get mail message", "request_id", reqID, "message_id", idStr, "agent", agentName)
 
 	messageID, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -872,7 +876,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	message, err := client.GetMessage(ctx, s.projectDirSnapshot(), messageID)
+	message, err := client.GetMessage(ctx, s.projectDirSnapshot(), agentName, messageID)
 	if err != nil {
 		writeAgentMailHandlerError(w, reqID, err, ErrCodeMessageNotFound, func(err error) bool {
 			return errors.Is(err, agentmail.ErrMessageNotFound) || agentmail.IsNotFound(err)
@@ -1847,7 +1851,23 @@ func (s *Server) handleForceReleaseReservation(w http.ResponseWriter, r *http.Re
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "force release returned no result", nil, reqID)
 		return
 	}
+	if result.AlreadyReleased {
+		// Released before this call: the end state holds, nothing changed,
+		// so no reservation event either.
+		response := map[string]interface{}{
+			"reservation_id":   reservationID,
+			"force_released":   false,
+			"already_released": true,
+		}
+		if result.ReleasedAt != nil {
+			response["released_at"] = result.ReleasedAt
+		}
+		writeSuccessResponse(w, http.StatusOK, response, reqID)
+		return
+	}
 	if !result.Success {
+		// Both servers refuse a reservation that still looks active with a
+		// tool error, handled above, so this reply is unexpected.
 		details := map[string]interface{}{
 			"notified": result.Notified,
 		}
@@ -1857,7 +1877,7 @@ func (s *Server) handleForceReleaseReservation(w http.ResponseWriter, r *http.Re
 		if result.PathPattern != "" {
 			details["path_pattern"] = result.PathPattern
 		}
-		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, "force-release denied: reservation may not be stale or agent may still be active", details, reqID)
+		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, "Agent Mail released nothing for this reservation", details, reqID)
 		return
 	}
 
