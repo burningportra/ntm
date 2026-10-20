@@ -227,6 +227,15 @@ func TestValidation(t *testing.T) {
 			},
 			expectValid: true,
 		},
+		{
+			name: "muse agent_type",
+			handoff: &Handoff{
+				Goal:      "Test goal",
+				Now:       "Test now",
+				AgentType: "muse",
+			},
+			expectValid: true,
+		},
 	}
 
 	for _, tc := range tests {

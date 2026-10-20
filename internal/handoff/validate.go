@@ -83,7 +83,7 @@ func (h *Handoff) Validate() ValidationErrors {
 	if h.AgentType != "" && !ValidAgentTypes[h.AgentType] {
 		errs = append(errs, ValidationError{
 			Field:   "agent_type",
-			Message: "must be cc, cod, or gmi",
+			Message: "must be cc, cod, gmi, or muse",
 			Value:   h.AgentType,
 		})
 	}

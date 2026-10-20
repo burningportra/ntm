@@ -47,6 +47,7 @@ const (
 	AgentTypeClaude = "cc"
 	AgentTypeCodex  = "cod"
 	AgentTypeGemini = "gmi"
+	AgentTypeMuse   = "muse"
 )
 
 // ValidAgentTypes is the set of valid agent type values.
@@ -54,6 +55,7 @@ var ValidAgentTypes = map[string]bool{
 	AgentTypeClaude: true,
 	AgentTypeCodex:  true,
 	AgentTypeGemini: true,
+	AgentTypeMuse:   true,
 	"":              true, // Empty is allowed (optional field)
 }
 
