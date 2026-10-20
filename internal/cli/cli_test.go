@@ -3462,6 +3462,73 @@ func TestConfigShowJSONIncludesSafetyProfile(t *testing.T) {
 	}
 }
 
+// The agents map of `config show --json` was a hand-kept list that left out
+// muse, pi, kimi and ollama. Every agent launch command in config.AgentConfig
+// must appear under its TOML key with the configured value.
+func TestConfigShowJSONListsEveryAgentCommand(t *testing.T) {
+	resetFlags()
+	t.Setenv("NTM_CONFIG", "")
+	previousCfg := cfg
+	previousCfgFile := cfgFile
+	t.Cleanup(func() {
+		cfg = previousCfg
+		cfgFile = previousCfgFile
+		startup.ResetConfig()
+	})
+
+	want := map[string]string{}
+	var toml strings.Builder
+	toml.WriteString("[agents]\n")
+	agentFields := reflect.TypeOf(config.AgentConfig{})
+	for i := 0; i < agentFields.NumField(); i++ {
+		field := agentFields.Field(i)
+		key, _, _ := strings.Cut(field.Tag.Get("toml"), ",")
+		// ClaudeTokenFile is a credential path, not a launch command.
+		if field.Type.Kind() != reflect.String || key == "" || key == "-" || field.Name == "ClaudeTokenFile" {
+			continue
+		}
+		want[key] = "launch-" + key + " --yolo"
+		fmt.Fprintf(&toml, "%s = %q\n", key, want[key])
+	}
+	for _, key := range []string{"muse", "pi", "kimi", "ollama"} {
+		if _, ok := want[key]; !ok {
+			t.Fatalf("config.AgentConfig has no %q launch command field", key)
+		}
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte(toml.String()), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) failed: %v", err)
+	}
+	cfg = nil
+	startup.ResetConfig()
+
+	output, err := captureStdout(t, func() error {
+		rootCmd.SetArgs([]string{"--json", "--config", configPath, "config", "show"})
+		return rootCmd.Execute()
+	})
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	var parsed struct {
+		Agents map[string]string `json:"agents"`
+	}
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("Failed to parse JSON output: %v\nOutput: %s", err, output)
+	}
+	for key, command := range want {
+		got, ok := parsed.Agents[key]
+		if !ok {
+			t.Errorf("config show --json agents map has no %q entry", key)
+			continue
+		}
+		if got != command {
+			t.Errorf("agents[%q] = %q, want %q", key, got, command)
+		}
+	}
+}
+
 // TestDepsCmdExecutes tests the deps command runs
 func TestDepsCmdExecutes(t *testing.T) {
 	fakeToolsDir := filepath.Join(repoRoot(t), "testdata", "faketools")

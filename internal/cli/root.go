@@ -4392,7 +4392,7 @@ func init() {
 	rootCmd.Flags().StringVar(&robotInspectQuota, "robot-inspect-quota", "", "Projection-backed quota drill-down. Required: PROVIDER/ACCOUNT. Canonical aliases like claude/default are accepted. Example: ntm --robot-inspect-quota=claude/default")
 	rootCmd.Flags().StringVar(&robotInspectIncident, "robot-inspect-incident", "", "Store-backed incident drill-down. Required: INCIDENT_ID. Example: ntm --robot-inspect-incident=inc_20260323_abc123")
 	rootCmd.Flags().StringVar(&robotIncidentResolve, "robot-incident-resolve", "", "Mark a store-backed incident resolved. Required: INCIDENT_ID. Example: ntm --robot-incident-resolve=inc_20260323_abc123")
-	rootCmd.Flags().StringVar(&robotExitCLI, "robot-exit-cli", "", "Gracefully exit agent CLIs (double Ctrl+C choreography) without destroying panes. Required: SESSION. Optional: --panes, --relaunch. Example: ntm --robot-exit-cli=myproject --panes=1")
+	rootCmd.Flags().StringVar(&robotExitCLI, "robot-exit-cli", "", "Gracefully exit agent CLIs (double Ctrl+C choreography; Escape then three Ctrl+Cs for Muse Code panes) without destroying panes. Required: SESSION. Optional: --panes, --relaunch. Example: ntm --robot-exit-cli=myproject --panes=1")
 	rootCmd.Flags().StringVar(&robotKillAgent, "robot-kill-agent", "", "SIGTERM/SIGKILL agent process trees while preserving panes and shells. Required: SESSION. Optional: --panes, --relaunch. Example: ntm --robot-kill-agent=myproject --panes=2")
 	rootCmd.Flags().BoolVar(&robotLifecycleRelaunch, "relaunch", false, "Relaunch the agent CLI after --robot-exit-cli/--robot-kill-agent and verify boot")
 	rootCmd.Flags().StringVar(&robotKillPane, "robot-kill-pane", "", "Remove specific panes; session and sibling panes survive. Required: SESSION and --panes. Example: ntm --robot-kill-pane=myproject --panes=2")
@@ -5527,7 +5527,11 @@ Examples:
 						"codex":       effectiveCfg.Agents.Codex,
 						"antigravity": effectiveCfg.Agents.Antigravity,
 						"gemini":      effectiveCfg.Agents.Gemini,
+						"pi":          effectiveCfg.Agents.Pi,
+						"kimi":        effectiveCfg.Agents.Kimi,
+						"muse":        effectiveCfg.Agents.Muse,
 						"grok":        effectiveCfg.Agents.Grok,
+						"ollama":      effectiveCfg.Agents.Ollama,
 						"cursor":      effectiveCfg.Agents.Cursor,
 						"windsurf":    effectiveCfg.Agents.Windsurf,
 						"aider":       effectiveCfg.Agents.Aider,
